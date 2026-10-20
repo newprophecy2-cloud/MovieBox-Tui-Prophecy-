@@ -17,8 +17,8 @@ use tokio::{
 
 use crate::{
     providers::models::{
-        CatalogItem, MediaDetails, PlaybackSource, ProviderError, ProviderKind, ProviderMediaId,
-        Release, Season,
+        CatalogItem, MediaDetails, MediaType, PlaybackSource, ProviderError, ProviderKind,
+        ProviderMediaId, Release, Season,
     },
     service::MovieBoxService,
 };
@@ -123,6 +123,35 @@ struct ApiCatalogItem {
     year: Option<String>,
     poster_url: Option<String>,
     season_count: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogItemResponse {
+    id: String,
+    title: String,
+    provider: ProviderKind,
+    media_type: MediaType,
+    year: Option<String>,
+    poster_url: Option<String>,
+    season_count: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogSectionResponse {
+    id: String,
+    title: String,
+    provider: ProviderKind,
+    page: usize,
+    next_page: Option<usize>,
+    ranking_basis: &'static str,
+    items: Vec<CatalogItemResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct HomeResponse {
+    sections: Vec<CatalogSectionResponse>,
+    page: usize,
+    provider_status: HashMap<String, String>,
 }
 #[derive(Debug, Serialize)]
 struct ApiDetails {
@@ -476,11 +505,331 @@ async fn route(stream: &mut TcpStream, target: &str, state: ApiState) -> std::io
         "/docs" => write_text(stream, 200, "text/html; charset=utf-8", "<!doctype html><html><head><title>MovieBox API</title></head><body><h1>MovieBox API</h1><p>OpenAPI: <a href=\"/openapi.json\">/openapi.json</a></p><p>Swagger UI can load this document from a local or trusted client.</p></body></html>", None).await,
         "/api/v1/anime/search" => search_json(stream, query, state).await,
         "/api/v1/anime/search/stream" => search_sse(stream, query, state).await,
+        "/api/v1/home" => home_route(stream, query, state).await,
+        "/api/v1/home/featured" => home_section_route(stream, query, state, "featured").await,
+        "/api/v1/trending" => home_section_route(stream, query, state, "trending").await,
+        "/api/v1/trending/anime" => home_section_route(stream, query, state, "trending_anime").await,
+        "/api/v1/trending/movies" => home_section_route(stream, query, state, "trending_movies").await,
+        "/api/v1/trending/k-dramas" => unsupported_catalog(stream, "K-Drama trending is not exposed by the available providers.").await,
+        "/api/v1/popular" => home_section_route(stream, query, state, "popular").await,
+        "/api/v1/popular/anime" => home_section_route(stream, query, state, "popular_anime").await,
+        "/api/v1/popular/movies" => home_section_route(stream, query, state, "popular_movies").await,
+        "/api/v1/popular/k-dramas" => unsupported_catalog(stream, "K-Drama popularity is not exposed by the available providers.").await,
+        "/api/v1/latest" => unsupported_catalog(stream, "Reliable release-date metadata is not exposed consistently by the available providers.").await,
+        "/api/v1/movies" => catalog_list_route(stream, query, state, MediaType::Movie).await,
+        "/api/v1/k-dramas" => unsupported_catalog(stream, "A verified K-Drama catalogue is not exposed by the available providers.").await,
+        "/api/v1/categories" => categories_route(stream, state).await,
+        _ if path.starts_with("/api/v1/movies/") => catalog_details_route(stream, path, state, MediaType::Movie).await,
+        _ if path.starts_with("/api/v1/k-dramas/") => unsupported_catalog(stream, "A verified K-Drama catalogue is not exposed by the available providers.").await,
         _ if path.starts_with("/api/v1/anime/") => anime_route(stream, path, state).await,
         _ if path.starts_with("/api/v1/episodes/") => episode_route(stream, path, state).await,
         _ if path.starts_with("/api/v1/sources/") => source_route(stream, path, state).await,
         _ => { let (s,b) = err("INTERNAL_ERROR", "Route not found.", None, 404); write_raw_json(stream, s, &b, None).await }
     }
+}
+
+fn catalog_item_response(item: &CatalogItem) -> CatalogItemResponse {
+    CatalogItemResponse {
+        id: encode(&OpaqueRef {
+            p: item.id.provider,
+            v: item.id.value.clone(),
+            s: 0,
+            e: 0,
+        }),
+        title: item.title.clone(),
+        provider: item.id.provider,
+        media_type: item.media_type,
+        year: item.year.clone(),
+        poster_url: item.poster_url.clone(),
+        season_count: item.season_count,
+    }
+}
+
+fn parse_page_limit(query: &str) -> (usize, usize) {
+    let mut page = 1usize;
+    let mut limit = DEFAULT_LIMIT;
+    for part in query.split('&') {
+        let Some((key, value)) = part.split_once('=') else {
+            continue;
+        };
+        match key {
+            "page" => page = value.parse().unwrap_or(1).clamp(1, 1000),
+            "limit" => limit = value.parse().unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT),
+            _ => {}
+        }
+    }
+    (page, limit)
+}
+
+async fn homepage_items(
+    state: &ApiState,
+    page: usize,
+) -> Result<
+    (
+        Vec<CatalogItem>,
+        HashMap<String, crate::models::BrowseMetrics>,
+    ),
+    String,
+> {
+    tokio::time::timeout(OVERALL_TIMEOUT, state.service.homepage("2", page))
+        .await
+        .map_err(|_| "MovieBox homepage request timed out.".to_string())?
+}
+
+fn section_items(
+    items: &[CatalogItem],
+    metrics: &HashMap<String, crate::models::BrowseMetrics>,
+    section: &str,
+    limit: usize,
+) -> (Vec<CatalogItem>, &'static str) {
+    let metric = match section {
+        "trending" => crate::models::BrowseMetric::Trending,
+        "popular" => crate::models::BrowseMetric::Popularity,
+        _ => {
+            return (
+                items.iter().take(limit).cloned().collect(),
+                "MovieBox homepage ordering",
+            );
+        }
+    };
+    let mut ranked = items
+        .iter()
+        .filter_map(|item| {
+            metrics
+                .get(&item.id.value)
+                .and_then(|m| m.value(metric))
+                .map(|score| (score, item.clone()))
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let basis = match metric {
+        crate::models::BrowseMetric::Trending => "MovieBox trending metric",
+        crate::models::BrowseMetric::Popularity => "MovieBox popularity metric",
+        _ => "MovieBox homepage ordering",
+    };
+    (
+        ranked
+            .into_iter()
+            .take(limit)
+            .map(|(_, item)| item)
+            .collect(),
+        basis,
+    )
+}
+
+fn section_response(
+    section: &str,
+    page: usize,
+    limit: usize,
+    items: Vec<CatalogItem>,
+    metrics: &HashMap<String, crate::models::BrowseMetrics>,
+) -> CatalogSectionResponse {
+    let (items, basis) = match section {
+        "movies" => (
+            items
+                .into_iter()
+                .filter(|i| i.media_type == MediaType::Movie)
+                .take(limit)
+                .collect(),
+            "MovieBox homepage metadata",
+        ),
+        "anime" => (
+            items
+                .into_iter()
+                .filter(|i| i.media_type == MediaType::Series)
+                .take(limit)
+                .collect(),
+            "MovieBox homepage metadata",
+        ),
+        "trending_movies" => section_items(
+            &items
+                .into_iter()
+                .filter(|i| i.media_type == MediaType::Movie)
+                .collect::<Vec<_>>(),
+            metrics,
+            "trending",
+            limit,
+        ),
+        "trending_anime" => section_items(
+            &items
+                .into_iter()
+                .filter(|i| i.media_type == MediaType::Series)
+                .collect::<Vec<_>>(),
+            metrics,
+            "trending",
+            limit,
+        ),
+        "popular_movies" => section_items(
+            &items
+                .into_iter()
+                .filter(|i| i.media_type == MediaType::Movie)
+                .collect::<Vec<_>>(),
+            metrics,
+            "popular",
+            limit,
+        ),
+        "popular_anime" => section_items(
+            &items
+                .into_iter()
+                .filter(|i| i.media_type == MediaType::Series)
+                .collect::<Vec<_>>(),
+            metrics,
+            "popular",
+            limit,
+        ),
+        _ => section_items(&items, metrics, section, limit),
+    };
+    CatalogSectionResponse {
+        id: section.to_string(),
+        title: section.replace('_', " "),
+        provider: ProviderKind::MovieBox,
+        page,
+        next_page: (!items.is_empty()).then_some(page + 1),
+        ranking_basis: basis,
+        items: items.iter().map(catalog_item_response).collect(),
+    }
+}
+
+async fn home_route(stream: &mut TcpStream, query: &str, state: ApiState) -> std::io::Result<()> {
+    let (page, limit) = parse_page_limit(query);
+    match homepage_items(&state, page).await {
+        Ok((items, metrics)) => {
+            let sections = ["featured", "trending", "popular", "movies", "anime"]
+                .into_iter()
+                .map(|section| section_response(section, page, limit, items.clone(), &metrics))
+                .collect::<Vec<_>>();
+            let status = HashMap::from([(
+                ProviderKind::MovieBox.cache_key().to_string(),
+                "ok".to_string(),
+            )]);
+            write_json(
+                stream,
+                200,
+                &HomeResponse {
+                    sections,
+                    page,
+                    provider_status: status,
+                },
+                None,
+            )
+            .await
+        }
+        Err(message) => {
+            let (status, body) = err(
+                "UPSTREAM_UNAVAILABLE",
+                &message,
+                Some(ProviderKind::MovieBox),
+                503,
+            );
+            write_raw_json(stream, status, &body, None).await
+        }
+    }
+}
+
+async fn home_section_route(
+    stream: &mut TcpStream,
+    query: &str,
+    state: ApiState,
+    section: &str,
+) -> std::io::Result<()> {
+    let (page, limit) = parse_page_limit(query);
+    match homepage_items(&state, page).await {
+        Ok((items, metrics)) => {
+            write_json(
+                stream,
+                200,
+                &section_response(section, page, limit, items, &metrics),
+                None,
+            )
+            .await
+        }
+        Err(message) => {
+            let (status, body) = err(
+                "UPSTREAM_UNAVAILABLE",
+                &message,
+                Some(ProviderKind::MovieBox),
+                503,
+            );
+            write_raw_json(stream, status, &body, None).await
+        }
+    }
+}
+
+async fn catalog_list_route(
+    stream: &mut TcpStream,
+    query: &str,
+    state: ApiState,
+    media_type: MediaType,
+) -> std::io::Result<()> {
+    let (page, limit) = parse_page_limit(query);
+    match homepage_items(&state, page).await {
+        Ok((items, _)) => {
+            let items = items
+                .into_iter()
+                .filter(|item| item.media_type == media_type)
+                .take(limit)
+                .map(|item| catalog_item_response(&item))
+                .collect::<Vec<_>>();
+            write_json(stream, 200, &serde_json::json!({"page": page, "next_page": (!items.is_empty()).then_some(page + 1), "provider": "moviebox", "items": items}), None).await
+        }
+        Err(message) => {
+            let (status, body) = err(
+                "UPSTREAM_UNAVAILABLE",
+                &message,
+                Some(ProviderKind::MovieBox),
+                503,
+            );
+            write_raw_json(stream, status, &body, None).await
+        }
+    }
+}
+
+async fn catalog_details_route(
+    stream: &mut TcpStream,
+    path: &str,
+    state: ApiState,
+    expected: MediaType,
+) -> std::io::Result<()> {
+    let Some(id) = path.trim_end_matches('/').rsplit('/').next() else {
+        return unsupported_catalog(stream, "A catalog identifier is required.").await;
+    };
+    let Ok(reference) = decode::<OpaqueRef>(id) else {
+        return unsupported_catalog(stream, "The catalog identifier is invalid.").await;
+    };
+    match state.service.details_typed(reference.p, &reference.v).await {
+        Ok(media) if media.media_type == expected => {
+            write_json(stream, 200, &details(media), None).await
+        }
+        Ok(_) => unsupported_catalog(stream, "The item is not in the requested catalogue.").await,
+        Err(error) => {
+            let (status, body) = provider_error(error, reference.p);
+            write_raw_json(stream, status, &body, None).await
+        }
+    }
+}
+
+async fn categories_route(stream: &mut TcpStream, state: ApiState) -> std::io::Result<()> {
+    let moviebox = state.service.capabilities(ProviderKind::MovieBox);
+    write_json(
+        stream,
+        200,
+        &serde_json::json!({
+            "categories": [
+                {"id":"anime", "supported":moviebox.supports_series},
+                {"id":"movies", "supported":moviebox.supports_search},
+                {"id":"series", "supported":moviebox.supports_series},
+                {"id":"k-dramas", "supported":false, "reason":"No verified provider metadata"}
+            ],
+            "provider_capabilities": {"moviebox": moviebox}
+        }),
+        None,
+    )
+    .await
+}
+
+async fn unsupported_catalog(stream: &mut TcpStream, message: &str) -> std::io::Result<()> {
+    let (status, body) = err("UNSUPPORTED_CATEGORY", message, None, 501);
+    write_raw_json(stream, status, &body, None).await
 }
 
 fn parse_query(query: &str) -> SearchQuery {
@@ -1450,6 +1799,22 @@ fn openapi() -> serde_json::Value {
             "/openapi.json": {"get": {"responses": {"200": {"description": "OpenAPI document"}}}},
             "/docs": {"get": {"responses": {"200": {"description": "API documentation"}}}},
             "/api/v1/anime/search": {"get": {"parameters": [{"name": "q", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 200}}, {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 100}}, {"name": "cursor", "in": "query", "schema": {"type": "string"}}], "responses": {"200": {"description": "Search results"}, "400": {"description": "Invalid query"}}}},
+            "/api/v1/home": {"get": {"parameters": [{"name": "page", "in": "query", "schema": {"type": "integer", "minimum": 1}}, {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 100}}], "responses": {"200": {"description": "MovieBox homepage sections"}, "503": {"description": "Provider unavailable"}}}},
+            "/api/v1/home/featured": {"get": {"responses": {"200": {"description": "MovieBox homepage featured section"}}}},
+            "/api/v1/latest": {"get": {"responses": {"501": {"description": "Reliable release-date metadata unavailable"}}}},
+            "/api/v1/trending": {"get": {"responses": {"200": {"description": "Provider-backed trending section"}}}},
+            "/api/v1/trending/anime": {"get": {"responses": {"200": {"description": "Provider-backed trending anime"}}}},
+            "/api/v1/trending/movies": {"get": {"responses": {"200": {"description": "Provider-backed trending movies"}}}},
+            "/api/v1/trending/k-dramas": {"get": {"responses": {"501": {"description": "Unsupported category"}}}},
+            "/api/v1/popular": {"get": {"responses": {"200": {"description": "Provider-backed popular section"}}}},
+            "/api/v1/popular/anime": {"get": {"responses": {"200": {"description": "Provider-backed popular anime"}}}},
+            "/api/v1/popular/movies": {"get": {"responses": {"200": {"description": "Provider-backed popular movies"}}}},
+            "/api/v1/popular/k-dramas": {"get": {"responses": {"501": {"description": "Unsupported category"}}}},
+            "/api/v1/movies": {"get": {"responses": {"200": {"description": "MovieBox movie catalogue"}}}},
+            "/api/v1/movies/{movie_id}": {"get": {"responses": {"200": {"description": "Movie details"}}}},
+            "/api/v1/k-dramas": {"get": {"responses": {"501": {"description": "Unsupported category"}}}},
+            "/api/v1/k-dramas/{id}": {"get": {"responses": {"501": {"description": "Unsupported category"}}}},
+            "/api/v1/categories": {"get": {"responses": {"200": {"description": "Supported content categories"}}}},
             "/api/v1/anime/search/stream": {"get": {"responses": {"200": {"description": "SSE search_result, search_provider_error, search_complete events"}}}},
             "/api/v1/anime/{anime_id}": {"get": {"responses": {"200": {"description": "Anime details"}}}},
             "/api/v1/anime/{anime_id}/seasons": {"get": {"responses": {"200": {"description": "Seasons"}}}},
@@ -1737,8 +2102,61 @@ mod tests {
             "/api/v1/episodes/{episode_id}/sources/stream",
             "/api/v1/sources/{source_id}/audio-tracks",
             "/api/v1/sources/{source_id}/subtitle-tracks",
+            "/api/v1/home",
+            "/api/v1/home/featured",
+            "/api/v1/trending",
+            "/api/v1/popular",
+            "/api/v1/movies",
+            "/api/v1/movies/{movie_id}",
+            "/api/v1/k-dramas",
+            "/api/v1/categories",
         ] {
             assert!(paths.get(route).is_some(), "missing {route}");
         }
+    }
+
+    #[test]
+    fn catalog_paging_is_bounded_and_defaults_safely() {
+        assert_eq!(parse_page_limit("page=0&limit=999"), (1, 100));
+        assert_eq!(parse_page_limit("page=bad&limit=bad"), (1, 20));
+        assert_eq!(parse_page_limit(""), (1, 20));
+    }
+
+    #[test]
+    fn provider_catalog_id_round_trip_preserves_movie_identity() {
+        let item = CatalogItem {
+            id: ProviderMediaId {
+                provider: ProviderKind::MovieBox,
+                value: "movie-123".into(),
+            },
+            title: "Example Movie".into(),
+            media_type: MediaType::Movie,
+            year: Some("2024".into()),
+            poster_url: None,
+            season_count: None,
+        };
+        let public = catalog_item_response(&item);
+        let decoded = decode::<OpaqueRef>(&public.id).unwrap();
+        assert_eq!(decoded.p, ProviderKind::MovieBox);
+        assert_eq!(decoded.v, "movie-123");
+        assert_eq!(public.media_type, MediaType::Movie);
+    }
+
+    #[test]
+    fn trending_and_popular_sections_use_only_real_metrics() {
+        let items = vec![CatalogItem {
+            id: ProviderMediaId {
+                provider: ProviderKind::MovieBox,
+                value: "one".into(),
+            },
+            title: "One".into(),
+            media_type: MediaType::Movie,
+            year: None,
+            poster_url: None,
+            season_count: None,
+        }];
+        let metrics = HashMap::new();
+        assert!(section_items(&items, &metrics, "trending", 20).0.is_empty());
+        assert!(section_items(&items, &metrics, "popular", 20).0.is_empty());
     }
 }
