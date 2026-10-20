@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
+    process::Command,
     sync::Mutex,
     task::JoinSet,
 };
@@ -21,6 +22,7 @@ const DEFAULT_LIMIT: usize = 20;
 const MAX_LIMIT: usize = 100;
 const SOURCE_TIMEOUT: Duration = Duration::from_secs(8);
 const OVERALL_TIMEOUT: Duration = Duration::from_secs(30);
+const TRACK_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 const PROVIDERS: [ProviderKind; 6] = [
     ProviderKind::Dramachi,
     ProviderKind::FourKHdHub,
@@ -138,6 +140,61 @@ struct ApiSource {
 struct SourcesResponse {
     sources: Vec<ApiSource>,
     partial: bool,
+}
+#[derive(Debug, Serialize)]
+struct ApiAudioTrack {
+    track_index: u32,
+    language_code: String,
+    language_name: String,
+    original_language: Option<String>,
+    codec: Option<String>,
+    channels: Option<u16>,
+    is_default: bool,
+}
+#[derive(Debug, Serialize)]
+struct AudioTracksResponse {
+    source_id: String,
+    media_type: &'static str,
+    status: &'static str,
+    available: bool,
+    tracks: Vec<ApiAudioTrack>,
+}
+#[derive(Debug, Serialize)]
+struct ApiSubtitleTrack {
+    subtitle_index: u32,
+    language_code: String,
+    language_name: String,
+    original_language: Option<String>,
+    format: Option<String>,
+    kind: &'static str,
+    is_default: bool,
+}
+#[derive(Debug, Serialize)]
+struct SubtitleTracksResponse {
+    source_id: String,
+    media_type: &'static str,
+    status: &'static str,
+    available: bool,
+    subtitles: Vec<ApiSubtitleTrack>,
+}
+#[derive(Debug, Deserialize)]
+struct ProbeOutput {
+    #[serde(default)]
+    streams: Vec<ProbeStream>,
+}
+#[derive(Debug, Deserialize)]
+struct ProbeStream {
+    index: Option<u32>,
+    codec_name: Option<String>,
+    codec_type: Option<String>,
+    channels: Option<u16>,
+    disposition: Option<ProbeDisposition>,
+    tags: Option<HashMap<String, String>>,
+}
+#[derive(Debug, Deserialize)]
+struct ProbeDisposition {
+    #[serde(default)]
+    default: i32,
 }
 
 fn request_id() -> String {
@@ -786,6 +843,160 @@ async fn source_sse(stream: &mut TcpStream, r: OpaqueRef, state: ApiState) -> st
         }
     }
 }
+async fn probe_media(url: &str, headers: &[(String, String)]) -> Result<ProbeOutput, String> {
+    let mut command = Command::new("ffprobe");
+    command
+        .arg("-v")
+        .arg("error")
+        .arg("-show_entries")
+        .arg("stream=index,codec_name,codec_type,channels,disposition:stream_tags=language,title,handler_name")
+        .arg("-of")
+        .arg("json")
+        .arg("-timeout")
+        .arg("15000000");
+    if !headers.is_empty() {
+        let header_text = headers
+            .iter()
+            .map(|(name, value)| format!("{name}: {value}"))
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        command.arg("-headers").arg(header_text);
+    }
+    command.arg(url);
+    let output = tokio::time::timeout(TRACK_PROBE_TIMEOUT, command.output())
+        .await
+        .map_err(|_| "Media track probing timed out.".to_string())?
+        .map_err(|_| "The ffprobe media tool is unavailable.".to_string())?;
+    if !output.status.success() {
+        return Err("The media source could not be probed.".to_string());
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|_| "The media probe returned malformed metadata.".to_string())
+}
+
+fn tag_value<'a>(tags: Option<&'a HashMap<String, String>>, key: &str) -> Option<&'a str> {
+    tags?
+        .iter()
+        .find_map(|(name, value)| name.eq_ignore_ascii_case(key).then_some(value.as_str()))
+}
+
+fn normalized_language(raw: Option<&str>) -> (String, String, Option<String>) {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return ("und".into(), "Unknown".into(), None);
+    };
+    let original = Some(raw.to_string());
+    match raw.to_ascii_lowercase().as_str() {
+        "hi" | "hin" => ("hi".into(), "Hindi".into(), original),
+        "en" | "eng" => ("en".into(), "English".into(), original),
+        "ja" | "jpn" => ("ja".into(), "Japanese".into(), original),
+        "ko" | "kor" => ("ko".into(), "Korean".into(), original),
+        "zh" | "zho" | "chi" => ("zh".into(), "Chinese".into(), original),
+        "es" | "spa" => ("es".into(), "Spanish".into(), original),
+        "fr" | "fra" | "fre" => ("fr".into(), "French".into(), original),
+        "de" | "deu" | "ger" => ("de".into(), "German".into(), original),
+        "und" => ("und".into(), "Unknown".into(), original),
+        _ => (raw.to_ascii_lowercase(), raw.to_string(), original),
+    }
+}
+
+async fn write_track_response(
+    stream: &mut TcpStream,
+    source_id: &str,
+    provider: ProviderKind,
+    release: &Release,
+    subtitles: bool,
+) -> std::io::Result<()> {
+    let Some(url) = release.direct_url() else {
+        let (s, b) = err(
+            "TRACK_DISCOVERY_UNAVAILABLE",
+            "This source has no directly probeable media URL.",
+            Some(provider),
+            503,
+        );
+        return write_raw_json(stream, s, &b, None).await;
+    };
+    let headers = release
+        .mirrors
+        .first()
+        .map(|mirror| mirror.headers.as_slice())
+        .unwrap_or(&[]);
+    let probe = match probe_media(url, headers).await {
+        Ok(probe) => probe,
+        Err(message) => {
+            let (s, b) = err("TRACK_DISCOVERY_UNAVAILABLE", message, Some(provider), 503);
+            return write_raw_json(stream, s, &b, None).await;
+        }
+    };
+    if subtitles {
+        let tracks = probe
+            .streams
+            .into_iter()
+            .filter(|stream| stream.codec_type.as_deref() == Some("subtitle"))
+            .map(|stream| {
+                let (language_code, language_name, original_language) =
+                    normalized_language(tag_value(stream.tags.as_ref(), "language"));
+                ApiSubtitleTrack {
+                    subtitle_index: stream.index.unwrap_or_default(),
+                    language_code,
+                    language_name,
+                    original_language,
+                    format: stream.codec_name,
+                    kind: "embedded",
+                    is_default: stream
+                        .disposition
+                        .is_some_and(|disposition| disposition.default > 0),
+                }
+            })
+            .collect::<Vec<_>>();
+        return write_json(
+            stream,
+            200,
+            &SubtitleTracksResponse {
+                source_id: source_id.to_string(),
+                media_type: "video",
+                status: "confirmed",
+                available: !tracks.is_empty(),
+                subtitles: tracks,
+            },
+            None,
+        )
+        .await;
+    }
+    let tracks = probe
+        .streams
+        .into_iter()
+        .filter(|stream| stream.codec_type.as_deref() == Some("audio"))
+        .map(|stream| {
+            let (language_code, language_name, original_language) =
+                normalized_language(tag_value(stream.tags.as_ref(), "language"));
+            ApiAudioTrack {
+                track_index: stream.index.unwrap_or_default(),
+                language_code,
+                language_name,
+                original_language,
+                codec: stream.codec_name,
+                channels: stream.channels,
+                is_default: stream
+                    .disposition
+                    .is_some_and(|disposition| disposition.default > 0),
+            }
+        })
+        .collect::<Vec<_>>();
+    write_json(
+        stream,
+        200,
+        &AudioTracksResponse {
+            source_id: source_id.to_string(),
+            media_type: "video",
+            status: "confirmed",
+            available: !tracks.is_empty(),
+            tracks,
+        },
+        None,
+    )
+    .await
+}
+
 async fn source_route(stream: &mut TcpStream, path: &str, state: ApiState) -> std::io::Result<()> {
     let parts: Vec<_> = path.trim_matches('/').split('/').collect();
     let Some(id) = parts.get(3) else {
@@ -826,23 +1037,11 @@ async fn source_route(stream: &mut TcpStream, path: &str, state: ApiState) -> st
         );
         return write_raw_json(stream, s, &b, None).await;
     };
-    if parts.get(4) == Some(&"audio") {
-        return write_json(
-            stream,
-            200,
-            &serde_json::json!({"available":false,"tracks":[]}),
-            None,
-        )
-        .await;
+    if matches!(parts.get(4), Some(&"audio") | Some(&"audio-tracks")) {
+        return write_track_response(stream, id, sr.p, rel, false).await;
     }
-    if parts.get(4) == Some(&"subtitles") {
-        return write_json(
-            stream,
-            200,
-            &serde_json::json!({"available":false,"subtitles":[]}),
-            None,
-        )
-        .await;
+    if matches!(parts.get(4), Some(&"subtitles") | Some(&"subtitle-tracks")) {
+        return write_track_response(stream, id, sr.p, rel, true).await;
     }
     if parts.get(4) == Some(&"download") {
         return if rel.mirrors.iter().any(|m| m.direct_file) {
@@ -940,8 +1139,10 @@ fn openapi() -> serde_json::Value {
             "/api/v1/episodes/{episode_id}/sources": {"get": {"responses": {"200": {"description": "Fresh source candidates"}}}},
             "/api/v1/episodes/{episode_id}/sources/stream": {"get": {"responses": {"200": {"description": "SSE source_result, source_error, source_complete events"}}}},
             "/api/v1/sources/{source_id}": {"get": {"responses": {"200": {"description": "Resolved source metadata"}}}},
-            "/api/v1/sources/{source_id}/audio": {"get": {"responses": {"200": {"description": "Audio options"}}}},
-            "/api/v1/sources/{source_id}/subtitles": {"get": {"responses": {"200": {"description": "Subtitle options"}}}},
+            "/api/v1/sources/{source_id}/audio": {"get": {"responses": {"200": {"description": "Confirmed embedded audio tracks"}, "503": {"description": "Track discovery unavailable"}}}},
+            "/api/v1/sources/{source_id}/audio-tracks": {"get": {"responses": {"200": {"description": "Confirmed embedded audio tracks"}, "503": {"description": "Track discovery unavailable"}}}},
+            "/api/v1/sources/{source_id}/subtitles": {"get": {"responses": {"200": {"description": "Confirmed embedded subtitle tracks"}, "503": {"description": "Track discovery unavailable"}}}},
+            "/api/v1/sources/{source_id}/subtitle-tracks": {"get": {"responses": {"200": {"description": "Confirmed embedded subtitle tracks"}, "503": {"description": "Track discovery unavailable"}}}},
             "/api/v1/sources/{source_id}/download": {"get": {"responses": {"200": {"description": "Download metadata"}, "501": {"description": "Unsupported"}}}}
         }
     })
@@ -1095,6 +1296,56 @@ mod tests {
     }
 
     #[test]
+    fn track_language_normalization_preserves_original_tags() {
+        assert_eq!(
+            normalized_language(Some("hin")),
+            ("hi".into(), "Hindi".into(), Some("hin".into()))
+        );
+        assert_eq!(
+            normalized_language(Some("jpn")),
+            ("ja".into(), "Japanese".into(), Some("jpn".into()))
+        );
+        assert_eq!(
+            normalized_language(None),
+            ("und".into(), "Unknown".into(), None)
+        );
+    }
+
+    #[test]
+    fn probe_metadata_separates_audio_and_subtitle_streams() {
+        let probe: ProbeOutput = serde_json::from_value(serde_json::json!({
+            "streams": [
+                {"index": 0, "codec_type": "video", "codec_name": "hevc"},
+                {"index": 1, "codec_type": "audio", "codec_name": "aac", "channels": 2,
+                 "tags": {"language": "hin"}, "disposition": {"default": 1}},
+                {"index": 2, "codec_type": "audio", "codec_name": "aac", "channels": 2,
+                 "tags": {"language": "jpn"}},
+                {"index": 3, "codec_type": "subtitle", "codec_name": "subrip",
+                 "tags": {"language": "eng"}}
+            ]
+        }))
+        .unwrap();
+        let audio = probe
+            .streams
+            .iter()
+            .filter(|stream| stream.codec_type.as_deref() == Some("audio"))
+            .collect::<Vec<_>>();
+        let subtitles = probe
+            .streams
+            .iter()
+            .filter(|stream| stream.codec_type.as_deref() == Some("subtitle"))
+            .collect::<Vec<_>>();
+        assert_eq!(audio.len(), 2);
+        assert_eq!(subtitles.len(), 1);
+        assert_eq!(
+            normalized_language(tag_value(audio[0].tags.as_ref(), "language")).0,
+            "hi"
+        );
+        assert_eq!(audio[0].channels, Some(2));
+        assert_eq!(subtitles[0].codec_name.as_deref(), Some("subrip"));
+    }
+
+    #[test]
     fn search_query_limits_are_bounded() {
         let query = parse_query("q=Naruto&limit=999&cursor=bad");
         assert_eq!(query.q.as_deref(), Some("Naruto"));
@@ -1112,6 +1363,8 @@ mod tests {
             "/openapi.json",
             "/api/v1/anime/search/stream",
             "/api/v1/episodes/{episode_id}/sources/stream",
+            "/api/v1/sources/{source_id}/audio-tracks",
+            "/api/v1/sources/{source_id}/subtitle-tracks",
         ] {
             assert!(paths.get(route).is_some(), "missing {route}");
         }
