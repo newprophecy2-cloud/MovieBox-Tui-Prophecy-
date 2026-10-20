@@ -1,12 +1,12 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     process::Command,
-    sync::Mutex,
     task::JoinSet,
 };
 
@@ -42,7 +42,6 @@ fn provider_priority(provider: ProviderKind) -> usize {
 #[derive(Clone)]
 pub struct ApiState {
     pub service: Arc<MovieBoxService>,
-    pub rate_limiter: Arc<Mutex<HashMap<String, u32>>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -58,6 +57,9 @@ struct OpaqueSource {
     v: String,
     s: usize,
     e: usize,
+    #[serde(default)]
+    f: Option<String>,
+    #[serde(default)]
     i: usize,
 }
 #[derive(Debug, Deserialize)]
@@ -230,12 +232,46 @@ fn provider_ref(id: &ProviderMediaId, s: usize, e: usize) -> String {
         e,
     })
 }
+fn release_fingerprint(r: &Release) -> String {
+    let mut hasher = Sha256::new();
+    let size = r
+        .size_bytes
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    for value in [
+        r.provider.label(),
+        &r.filename,
+        r.quality.as_deref().unwrap_or_default(),
+        r.codec.as_deref().unwrap_or_default(),
+        r.language.as_deref().unwrap_or_default(),
+        &size,
+        r.resource_id.as_deref().unwrap_or_default(),
+    ] {
+        hasher.update(value.as_bytes());
+        hasher.update([0]);
+    }
+    for mirror in &r.mirrors {
+        hasher.update(mirror.label.as_bytes());
+        hasher.update([0]);
+        hasher.update(
+            mirror
+                .resolver_url
+                .split('?')
+                .next()
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+        hasher.update([0]);
+    }
+    URL_SAFE_NO_PAD.encode(hasher.finalize())
+}
 fn source_ref(r: &Release, episode: &OpaqueRef, i: usize) -> String {
     encode(&OpaqueSource {
         p: r.provider,
         v: episode.v.clone(),
         s: episode.s,
         e: episode.e,
+        f: Some(release_fingerprint(r)),
         i,
     })
 }
@@ -382,21 +418,20 @@ pub async fn run() -> std::io::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     let state = ApiState {
         service: Arc::new(MovieBoxService::new()),
-        rate_limiter: Arc::new(Mutex::new(HashMap::new())),
     };
     log::info!("MovieBox API listening on 0.0.0.0:{port}");
     loop {
-        let (stream, addr) = listener.accept().await?;
+        let (stream, _) = listener.accept().await?;
         let state = state.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle(stream, addr, state).await {
+            if let Err(e) = handle(stream, state).await {
                 log::debug!("request ended: {e}");
             }
         });
     }
 }
 
-async fn handle(mut stream: TcpStream, addr: SocketAddr, state: ApiState) -> std::io::Result<()> {
+async fn handle(mut stream: TcpStream, state: ApiState) -> std::io::Result<()> {
     let mut buf = vec![0u8; 64 * 1024];
     let n = stream.read(&mut buf).await?;
     if n == 0 {
@@ -410,15 +445,6 @@ async fn handle(mut stream: TcpStream, addr: SocketAddr, state: ApiState) -> std
     let target = parts.next().unwrap_or("/");
     if method != "GET" {
         return write_json(&mut stream, 405, &serde_json::json!({"error":{"code":"METHOD_NOT_ALLOWED","message":"Only GET is supported."}}), None).await;
-    }
-    let key = addr.ip().to_string();
-    {
-        let mut limits = state.rate_limiter.lock().await;
-        let count = limits.entry(key).or_default();
-        *count += 1;
-        if *count > 120 {
-            return write_json(&mut stream, 429, &serde_json::json!({"error":{"code":"RATE_LIMITED","message":"Too many requests."}}), Some("Retry-After: 60\r\n")).await;
-        }
     }
     route(&mut stream, target, state).await
 }
@@ -1082,7 +1108,14 @@ async fn source_route(stream: &mut TcpStream, path: &str, state: ApiState) -> st
         );
         return write_raw_json(stream, s, &b, None).await;
     };
-    let Some(rel) = rs.get(sr.i) else {
+    let rel =
+        sr.f.as_deref()
+            .and_then(|fingerprint| {
+                rs.iter()
+                    .find(|release| release_fingerprint(release) == fingerprint)
+            })
+            .or_else(|| rs.get(sr.i));
+    let Some(rel) = rel else {
         let (s, b) = err(
             "SOURCE_NOT_FOUND",
             "The source was not found.",
@@ -1102,7 +1135,7 @@ async fn source_route(stream: &mut TcpStream, path: &str, state: ApiState) -> st
             write_json(
                 stream,
                 200,
-                &serde_json::json!({"supported":true,"mirrors":rel.mirrors}),
+                &serde_json::json!({"supported":true,"mirrors":public_mirrors(&rel.mirrors)}),
                 None,
             )
             .await
@@ -1116,7 +1149,32 @@ async fn source_route(stream: &mut TcpStream, path: &str, state: ApiState) -> st
             write_raw_json(stream, s, &b, None).await
         };
     }
-    write_json(stream,200,&serde_json::json!({"source":api_sources(std::slice::from_ref(rel),&r),"url":rel.direct_url(),"headers":rel.mirrors.first().map(|m|&m.headers)}),None).await
+    write_json(stream,200,&serde_json::json!({"source":api_sources(std::slice::from_ref(rel),&r),"url":rel.direct_url(),"headers":rel.mirrors.first().map(|m| public_headers(&m.headers)),"sensitive_headers_redacted":true}),None).await
+}
+fn public_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter(|(name, _)| {
+            !matches!(
+                name.to_ascii_lowercase().as_str(),
+                "cookie" | "authorization" | "proxy-authorization" | "x-api-key" | "x-auth-token"
+            )
+        })
+        .cloned()
+        .collect()
+}
+fn public_mirrors(
+    mirrors: &[crate::providers::models::SourceMirror],
+) -> Vec<crate::providers::models::SourceMirror> {
+    mirrors
+        .iter()
+        .map(|mirror| crate::providers::models::SourceMirror {
+            label: mirror.label.clone(),
+            resolver_url: mirror.resolver_url.clone(),
+            headers: public_headers(&mirror.headers),
+            direct_file: mirror.direct_file,
+        })
+        .collect()
 }
 
 async fn write_headers(
@@ -1300,6 +1358,58 @@ mod tests {
         assert_eq!(decoded.p, ProviderKind::Addons);
         assert_eq!(decoded.v, episode.v);
         assert_eq!((decoded.s, decoded.e, decoded.i), (1, 5, 0));
+        assert!(decoded.f.is_some());
+    }
+    #[test]
+    fn source_fingerprint_survives_release_reordering() {
+        let episode = OpaqueRef {
+            p: ProviderKind::MovieBox,
+            v: "subject-1".into(),
+            s: 2,
+            e: 5,
+        };
+        let first = Release {
+            provider: ProviderKind::MovieBox,
+            filename: "show.s02e05.1080p.mkv".into(),
+            quality: Some("1080p".into()),
+            codec: Some("h264".into()),
+            language: Some("Hindi".into()),
+            size_bytes: Some(123),
+            season: Some(2),
+            episode: Some(5),
+            mirrors: vec![],
+            resource_id: Some("resource-a".into()),
+        };
+        let second = Release {
+            filename: "show.s02e05.720p.mkv".into(),
+            quality: Some("720p".into()),
+            ..first.clone()
+        };
+        let decoded = decode::<OpaqueSource>(&source_ref(&first, &episode, 0)).unwrap();
+        let reordered = vec![first, second];
+        let matched = decoded.f.as_deref().and_then(|fingerprint| {
+            reordered
+                .iter()
+                .find(|release| release_fingerprint(release) == fingerprint)
+        });
+        assert_eq!(
+            matched.map(|release| release.filename.as_str()),
+            Some("show.s02e05.1080p.mkv")
+        );
+    }
+    #[test]
+    fn public_headers_remove_secret_bearing_fields() {
+        let headers = vec![
+            ("User-Agent".into(), "player".into()),
+            ("Referer".into(), "https://example.test".into()),
+            ("Cookie".into(), "signed-cookie".into()),
+            ("Authorization".into(), "Bearer secret".into()),
+            ("X-Api-Key".into(), "secret-key".into()),
+        ];
+        let public = public_headers(&headers);
+        assert_eq!(public.len(), 2);
+        assert!(public.iter().any(|(name, _)| name == "User-Agent"));
+        assert!(public.iter().any(|(name, _)| name == "Referer"));
     }
 
     #[test]
