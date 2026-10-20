@@ -1149,6 +1149,68 @@ async fn source_route(stream: &mut TcpStream, path: &str, state: ApiState) -> st
             write_raw_json(stream, s, &b, None).await
         };
     }
+    if matches!(parts.get(4), Some(&"playback") | Some(&"play")) {
+        if sr.p != ProviderKind::FourKHdHub {
+            let (s, b) = err(
+                "UNSUPPORTED_OPERATION",
+                "Server-side playback resolution is currently available for 4KHDHub only.",
+                Some(sr.p),
+                501,
+            );
+            return write_raw_json(stream, s, &b, None).await;
+        }
+        let Some(client) = state.service.fourk_client.as_ref() else {
+            let (s, b) = err(
+                "UPSTREAM_UNAVAILABLE",
+                "4KHDHub is unavailable.",
+                Some(sr.p),
+                503,
+            );
+            return write_raw_json(stream, s, &b, None).await;
+        };
+        let resolved = tokio::time::timeout(
+            OVERALL_TIMEOUT,
+            client.resolve_release(rel, crate::providers::models::ResolutionIntent::Playback),
+        )
+        .await;
+        return match resolved {
+            Ok(Ok(playback)) => {
+                write_json(
+                    stream,
+                    200,
+                    &serde_json::json!({
+                        "provider": playback.provider,
+                        "resolved": true,
+                        "url": playback.url,
+                        "headers": playback.headers,
+                        "subtitle": playback.subtitle,
+                        "source_label": playback.source_label,
+                        "max_height": playback.max_height,
+                    }),
+                    None,
+                )
+                .await
+            }
+            Ok(Err(e)) => {
+                let (s, b) = err(
+                    "PLAYBACK_RESOLUTION_FAILED",
+                    e.user_message(),
+                    Some(sr.p),
+                    502,
+                );
+                write_raw_json(stream, s, &b, None).await
+            }
+            Err(_) => {
+                let (s, b) = err(
+                    "PLAYBACK_RESOLUTION_TIMEOUT",
+                    "4KHDHub playback resolution timed out.",
+                    Some(sr.p),
+                    504,
+                );
+                write_raw_json(stream, s, &b, None).await
+            }
+        };
+    }
     write_json(stream,200,&serde_json::json!({"source":api_sources(std::slice::from_ref(rel),&r),"url":rel.direct_url(),"headers":rel.mirrors.first().map(|m| public_headers(&m.headers)),"sensitive_headers_redacted":true}),None).await
 }
 fn public_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
@@ -1255,6 +1317,7 @@ fn openapi() -> serde_json::Value {
             "/api/v1/sources/{source_id}/audio-tracks": {"get": {"responses": {"200": {"description": "Confirmed embedded audio tracks"}, "503": {"description": "Track discovery unavailable"}}}},
             "/api/v1/sources/{source_id}/subtitles": {"get": {"responses": {"200": {"description": "Confirmed embedded subtitle tracks"}, "503": {"description": "Track discovery unavailable"}}}},
             "/api/v1/sources/{source_id}/subtitle-tracks": {"get": {"responses": {"200": {"description": "Confirmed embedded subtitle tracks"}, "503": {"description": "Track discovery unavailable"}}}},
+            "/api/v1/sources/{source_id}/playback": {"get": {"responses": {"200": {"description": "Server-resolved playable 4KHDHub URL"}, "502": {"description": "Playback resolution failed"}, "504": {"description": "Playback resolution timed out"}}}},
             "/api/v1/sources/{source_id}/download": {"get": {"responses": {"200": {"description": "Download metadata"}, "501": {"description": "Unsupported"}}}}
         }
     })
