@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
@@ -7,12 +11,14 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     process::Command,
+    sync::Mutex,
     task::JoinSet,
 };
 
 use crate::{
     providers::models::{
-        CatalogItem, MediaDetails, ProviderError, ProviderKind, ProviderMediaId, Release, Season,
+        CatalogItem, MediaDetails, PlaybackSource, ProviderError, ProviderKind, ProviderMediaId,
+        Release, Season,
     },
     service::MovieBoxService,
 };
@@ -20,9 +26,11 @@ use crate::{
 const MAX_QUERY: usize = 200;
 const DEFAULT_LIMIT: usize = 20;
 const MAX_LIMIT: usize = 100;
-const SOURCE_TIMEOUT: Duration = Duration::from_secs(8);
-const OVERALL_TIMEOUT: Duration = Duration::from_secs(30);
-const TRACK_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+const SOURCE_TIMEOUT: Duration = Duration::from_secs(15);
+const OVERALL_TIMEOUT: Duration = Duration::from_secs(45);
+const TRACK_PROBE_TIMEOUT: Duration = Duration::from_secs(45);
+const RELEASE_CACHE_TTL: Duration = Duration::from_secs(600);
+const PLAYBACK_CACHE_TTL: Duration = Duration::from_secs(120);
 const PROVIDERS: [ProviderKind; 6] = [
     ProviderKind::Dramachi,
     ProviderKind::FourKHdHub,
@@ -42,6 +50,20 @@ fn provider_priority(provider: ProviderKind) -> usize {
 #[derive(Clone)]
 pub struct ApiState {
     pub service: Arc<MovieBoxService>,
+    release_cache: Arc<Mutex<HashMap<String, ReleaseCacheEntry>>>,
+    playback_cache: Arc<Mutex<HashMap<String, PlaybackCacheEntry>>>,
+}
+
+#[derive(Clone)]
+struct ReleaseCacheEntry {
+    stored_at: Instant,
+    releases: Vec<Release>,
+}
+
+#[derive(Clone)]
+struct PlaybackCacheEntry {
+    stored_at: Instant,
+    playback: PlaybackSource,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -85,6 +107,7 @@ struct SearchResponse {
     results: Vec<ApiCatalogItem>,
     next_cursor: Option<String>,
     partial: bool,
+    provider_status: HashMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     language_intent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -253,15 +276,6 @@ fn release_fingerprint(r: &Release) -> String {
     for mirror in &r.mirrors {
         hasher.update(mirror.label.as_bytes());
         hasher.update([0]);
-        hasher.update(
-            mirror
-                .resolver_url
-                .split('?')
-                .next()
-                .unwrap_or_default()
-                .as_bytes(),
-        );
-        hasher.update([0]);
     }
     URL_SAFE_NO_PAD.encode(hasher.finalize())
 }
@@ -418,6 +432,8 @@ pub async fn run() -> std::io::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     let state = ApiState {
         service: Arc::new(MovieBoxService::new()),
+        release_cache: Arc::new(Mutex::new(HashMap::new())),
+        playback_cache: Arc::new(Mutex::new(HashMap::new())),
     };
     log::info!("MovieBox API listening on 0.0.0.0:{port}");
     loop {
@@ -528,7 +544,7 @@ async fn search_json(stream: &mut TcpStream, query: &str, state: ApiState) -> st
         let (s, b) = err("CURSOR_INVALID", "The cursor is invalid.", None, 400);
         return write_raw_json(stream, s, &b, None).await;
     }
-    let (items, failed) = search_all(&state.service, &qv).await;
+    let (items, failed, provider_status) = search_all(&state.service, &qv).await;
     let language_intent = crate::language::parse_query(&qv).language;
     let verified_language_matches = language_intent.map(|language| {
         let label = format!("({})", language.result_label());
@@ -554,6 +570,7 @@ async fn search_json(stream: &mut TcpStream, query: &str, state: ApiState) -> st
         results,
         next_cursor: None,
         partial: failed,
+        provider_status,
         language_intent: language_intent.map(|language| language.code().to_string()),
         verified_language_matches,
         message,
@@ -616,7 +633,10 @@ async fn search_sse(stream: &mut TcpStream, query: &str, state: ApiState) -> std
     .await
 }
 
-async fn search_all(service: &Arc<MovieBoxService>, query: &str) -> (Vec<CatalogItem>, bool) {
+async fn search_all(
+    service: &Arc<MovieBoxService>,
+    query: &str,
+) -> (Vec<CatalogItem>, bool, HashMap<String, String>) {
     let intent = crate::language::parse_query(query);
     let requested_language = intent.language;
     let normalized_query = intent.title;
@@ -633,11 +653,19 @@ async fn search_all(service: &Arc<MovieBoxService>, query: &str) -> (Vec<Catalog
     }
     let mut items = Vec::new();
     let mut failed = false;
+    let mut provider_status = HashMap::new();
     while let Some(Ok((p, r))) = tasks.join_next().await {
         match r {
-            Ok(Ok(mut v)) => items.append(&mut v),
-            _ => {
-                let _ = p;
+            Ok(Ok(mut v)) => {
+                provider_status.insert(p.cache_key().to_string(), "ok".to_string());
+                items.append(&mut v);
+            }
+            Ok(Err(e)) => {
+                provider_status.insert(p.cache_key().to_string(), e.user_message(p));
+                failed = true;
+            }
+            Err(_) => {
+                provider_status.insert(p.cache_key().to_string(), "timeout".to_string());
                 failed = true;
             }
         }
@@ -665,7 +693,7 @@ async fn search_all(service: &Arc<MovieBoxService>, query: &str) -> (Vec<Catalog
         language_order
             .then_with(|| provider_priority(a.id.provider).cmp(&provider_priority(b.id.provider)))
     });
-    (items, failed)
+    (items, failed, provider_status)
 }
 
 async fn anime_route(stream: &mut TcpStream, path: &str, state: ApiState) -> std::io::Result<()> {
@@ -743,7 +771,33 @@ async fn anime_route(stream: &mut TcpStream, path: &str, state: ApiState) -> std
     write_raw_json(stream, s, &b, None).await
 }
 
-async fn releases(state: &ApiState, r: &OpaqueRef) -> Result<Vec<Release>, ProviderError> {
+fn release_cache_key(r: &OpaqueRef) -> String {
+    format!("{}:{}:{}:{}", r.p.cache_key(), r.v, r.s, r.e)
+}
+
+async fn cached_releases(state: &ApiState, r: &OpaqueRef) -> Result<Vec<Release>, ProviderError> {
+    let key = release_cache_key(r);
+    if let Some(entry) = state.release_cache.lock().await.get(&key).cloned()
+        && entry.stored_at.elapsed() < RELEASE_CACHE_TTL
+    {
+        return Ok(entry.releases);
+    }
+    let fetched = releases_uncached(state, r).await?;
+    let mut cache = state.release_cache.lock().await;
+    if cache.len() >= 2048 {
+        cache.retain(|_, entry| entry.stored_at.elapsed() < RELEASE_CACHE_TTL);
+    }
+    cache.insert(
+        key,
+        ReleaseCacheEntry {
+            stored_at: Instant::now(),
+            releases: fetched.clone(),
+        },
+    );
+    Ok(fetched)
+}
+
+async fn releases_uncached(state: &ApiState, r: &OpaqueRef) -> Result<Vec<Release>, ProviderError> {
     let svc = &state.service;
     match r.p {
         ProviderKind::MovieBox => {
@@ -843,7 +897,7 @@ async fn episode_route(stream: &mut TcpStream, path: &str, state: ApiState) -> s
         if parts.get(5) == Some(&"stream") {
             return source_sse(stream, r, state).await;
         }
-        let result = tokio::time::timeout(OVERALL_TIMEOUT, releases(&state, &r)).await;
+        let result = tokio::time::timeout(OVERALL_TIMEOUT, cached_releases(&state, &r)).await;
         return match result {
             Ok(Ok(rs)) => {
                 write_json(
@@ -877,7 +931,7 @@ async fn episode_route(stream: &mut TcpStream, path: &str, state: ApiState) -> s
 }
 async fn source_sse(stream: &mut TcpStream, r: OpaqueRef, state: ApiState) -> std::io::Result<()> {
     write_headers(stream, 200, "text/event-stream", None).await?;
-    match tokio::time::timeout(OVERALL_TIMEOUT, releases(&state, &r)).await {
+    match tokio::time::timeout(OVERALL_TIMEOUT, cached_releases(&state, &r)).await {
         Ok(Ok(rs)) => {
             for x in rs {
                 send_event(
@@ -984,23 +1038,66 @@ async fn write_track_response(
     source_id: &str,
     provider: ProviderKind,
     release: &Release,
+    state: &ApiState,
     subtitles: bool,
 ) -> std::io::Result<()> {
-    let Some(url) = release.direct_url() else {
-        let (s, b) = err(
-            "TRACK_DISCOVERY_UNAVAILABLE",
-            "This source has no directly probeable media URL.",
-            Some(provider),
-            503,
-        );
-        return write_raw_json(stream, s, &b, None).await;
+    let (url, headers) = if provider == ProviderKind::FourKHdHub {
+        let Some(client) = state.service.fourk_client.as_ref() else {
+            let (s, b) = err(
+                "UPSTREAM_UNAVAILABLE",
+                "4KHDHub is unavailable.",
+                Some(provider),
+                503,
+            );
+            return write_raw_json(stream, s, &b, None).await;
+        };
+        let resolved = tokio::time::timeout(
+            OVERALL_TIMEOUT,
+            client.resolve_release(
+                release,
+                crate::providers::models::ResolutionIntent::Playback,
+            ),
+        )
+        .await;
+        match resolved {
+            Ok(Ok(playback)) => (watch_url(&playback.url), playback.headers),
+            Ok(Err(e)) => {
+                let (s, b) = err(
+                    "TRACK_DISCOVERY_UNAVAILABLE",
+                    e.user_message(),
+                    Some(provider),
+                    503,
+                );
+                return write_raw_json(stream, s, &b, None).await;
+            }
+            Err(_) => {
+                let (s, b) = err(
+                    "TRACK_DISCOVERY_UNAVAILABLE",
+                    "Media resolution timed out.",
+                    Some(provider),
+                    503,
+                );
+                return write_raw_json(stream, s, &b, None).await;
+            }
+        }
+    } else {
+        let Some(url) = release.direct_url() else {
+            let (s, b) = err(
+                "TRACK_DISCOVERY_UNAVAILABLE",
+                "This source has no directly probeable media URL.",
+                Some(provider),
+                503,
+            );
+            return write_raw_json(stream, s, &b, None).await;
+        };
+        let headers = release
+            .mirrors
+            .first()
+            .map(|mirror| mirror.headers.clone())
+            .unwrap_or_default();
+        (url.to_string(), headers)
     };
-    let headers = release
-        .mirrors
-        .first()
-        .map(|mirror| mirror.headers.as_slice())
-        .unwrap_or(&[]);
-    let probe = match probe_media(url, headers).await {
+    let probe = match probe_media(&url, &headers).await {
         Ok(probe) => probe,
         Err(message) => {
             let (s, b) = err("TRACK_DISCOVERY_UNAVAILABLE", message, Some(provider), 503);
@@ -1094,7 +1191,7 @@ async fn source_route(stream: &mut TcpStream, path: &str, state: ApiState) -> st
         s: sr.s,
         e: sr.e,
     };
-    let Ok(rs) = tokio::time::timeout(SOURCE_TIMEOUT, releases(&state, &r))
+    let Ok(rs) = tokio::time::timeout(SOURCE_TIMEOUT, cached_releases(&state, &r))
         .await
         .unwrap_or(Err(ProviderError::Unavailable(
             "Source resolution timed out".into(),
@@ -1125,10 +1222,10 @@ async fn source_route(stream: &mut TcpStream, path: &str, state: ApiState) -> st
         return write_raw_json(stream, s, &b, None).await;
     };
     if matches!(parts.get(4), Some(&"audio") | Some(&"audio-tracks")) {
-        return write_track_response(stream, id, sr.p, rel, false).await;
+        return write_track_response(stream, id, sr.p, rel, &state, false).await;
     }
     if matches!(parts.get(4), Some(&"subtitles") | Some(&"subtitle-tracks")) {
-        return write_track_response(stream, id, sr.p, rel, true).await;
+        return write_track_response(stream, id, sr.p, rel, &state, true).await;
     }
     if parts.get(4) == Some(&"download") {
         return if rel.mirrors.iter().any(|m| m.direct_file) {
@@ -1153,47 +1250,66 @@ async fn source_route(stream: &mut TcpStream, path: &str, state: ApiState) -> st
         parts.get(4),
         Some(&"playback") | Some(&"play") | Some(&"watch")
     ) {
-        if sr.p != ProviderKind::FourKHdHub {
-            let (s, b) = err(
-                "UNSUPPORTED_OPERATION",
-                "Server-side playback resolution is currently available for 4KHDHub only.",
-                Some(sr.p),
-                501,
-            );
-            return write_raw_json(stream, s, &b, None).await;
+        if sr.p == ProviderKind::FourKHdHub
+            && let Some(entry) = state.playback_cache.lock().await.get(*id).cloned()
+            && entry.stored_at.elapsed() < PLAYBACK_CACHE_TTL
+        {
+            return write_json(stream, 200, &playback_json(&entry.playback), None).await;
         }
-        let Some(client) = state.service.fourk_client.as_ref() else {
-            let (s, b) = err(
-                "UPSTREAM_UNAVAILABLE",
-                "4KHDHub is unavailable.",
-                Some(sr.p),
-                503,
-            );
-            return write_raw_json(stream, s, &b, None).await;
+        let resolved = if sr.p == ProviderKind::FourKHdHub {
+            let Some(client) = state.service.fourk_client.as_ref() else {
+                let (s, b) = err(
+                    "UPSTREAM_UNAVAILABLE",
+                    "4KHDHub is unavailable.",
+                    Some(sr.p),
+                    503,
+                );
+                return write_raw_json(stream, s, &b, None).await;
+            };
+            tokio::time::timeout(
+                OVERALL_TIMEOUT,
+                client.resolve_release(rel, crate::providers::models::ResolutionIntent::Playback),
+            )
+            .await
+        } else if let Some(url) = rel.direct_url() {
+            Ok(Ok(crate::providers::models::PlaybackSource {
+                provider: sr.p,
+                url: url.to_string(),
+                headers: rel
+                    .mirrors
+                    .first()
+                    .map(|m| m.headers.clone())
+                    .unwrap_or_default(),
+                subtitle: None,
+                source_label: rel.source_label().to_string(),
+                max_height: rel
+                    .quality
+                    .as_deref()
+                    .and_then(|q| q.trim_end_matches('p').parse().ok()),
+            }))
+        } else {
+            Ok(Err(
+                crate::providers::fourkhdhub::FourKHdHubError::NoPlayableMirror(
+                    "source has no playable URL".into(),
+                ),
+            ))
         };
-        let resolved = tokio::time::timeout(
-            OVERALL_TIMEOUT,
-            client.resolve_release(rel, crate::providers::models::ResolutionIntent::Playback),
-        )
-        .await;
         return match resolved {
             Ok(Ok(playback)) => {
-                write_json(
-                    stream,
-                    200,
-                    &serde_json::json!({
-                    "provider": playback.provider,
-                    "resolved": true,
-                    "mode": "watch",
-                    "url": watch_url(&playback.url),
-                        "headers": playback.headers,
-                        "subtitle": playback.subtitle,
-                        "source_label": playback.source_label,
-                        "max_height": playback.max_height,
-                    }),
-                    None,
-                )
-                .await
+                if sr.p == ProviderKind::FourKHdHub {
+                    let mut cache = state.playback_cache.lock().await;
+                    if cache.len() >= 2048 {
+                        cache.retain(|_, entry| entry.stored_at.elapsed() < PLAYBACK_CACHE_TTL);
+                    }
+                    cache.insert(
+                        id.to_string(),
+                        PlaybackCacheEntry {
+                            stored_at: Instant::now(),
+                            playback: playback.clone(),
+                        },
+                    );
+                }
+                write_json(stream, 200, &playback_json(&playback), None).await
             }
             Ok(Err(e)) => {
                 let (s, b) = err(
@@ -1228,6 +1344,18 @@ fn watch_url(raw: &str) -> String {
         url.set_query(None);
     }
     url.to_string()
+}
+fn playback_json(playback: &PlaybackSource) -> serde_json::Value {
+    serde_json::json!({
+        "provider": playback.provider,
+        "resolved": true,
+        "mode": "watch",
+        "url": watch_url(&playback.url),
+        "headers": public_headers(&playback.headers),
+        "subtitle": playback.subtitle,
+        "source_label": playback.source_label,
+        "max_height": playback.max_height,
+    })
 }
 fn public_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
     headers
