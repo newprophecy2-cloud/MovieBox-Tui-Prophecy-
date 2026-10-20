@@ -204,6 +204,28 @@ impl MovieBoxService {
         Ok(crate::providers::moviebox::adapt::moviebox_homepage_json_to_catalog(&payload))
     }
 
+    pub async fn moviebox_classification_metadata(
+        &self,
+        subject_id: &str,
+    ) -> Option<(Option<String>, Option<String>, Option<String>)> {
+        let payload = self.client.get_details(subject_id).await.ok()?;
+        let text = |keys: &[&str]| {
+            keys.iter().find_map(|key| {
+                payload
+                    .get(*key)
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+            })
+        };
+        Some((
+            text(&["category", "contentType", "mediaType", "kind"]),
+            text(&["country", "countries", "region", "area"]),
+            text(&["originalLanguage", "original_language", "language", "lang"]),
+        ))
+    }
+
     pub async fn fetch_collection_resolutions(&self, subject_id: &str) -> Result<Vec<u32>, String> {
         self.client
             .fetch_collection_resolutions(subject_id)
@@ -541,7 +563,50 @@ pub fn extract_browse_metrics(item: &serde_json::Value) -> BrowseMetrics {
                 "viewers",
             ],
         ),
+        genres: text_values(item, &["genre", "genres"]),
+        category: text_value(item, &["category", "contentType", "mediaType", "kind"]),
+        country: text_value(item, &["country", "countries", "region", "area"]),
+        original_language: text_value(
+            item,
+            &["originalLanguage", "original_language", "language", "lang"],
+        ),
     }
+}
+
+fn text_value(item: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        let value = item.get(*key)?;
+        value
+            .as_str()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(ToOwned::to_owned)
+    })
+}
+
+fn text_values(item: &serde_json::Value, keys: &[&str]) -> Vec<String> {
+    keys.iter()
+        .find_map(|key| {
+            let value = item.get(*key)?;
+            if let Some(array) = value.as_array() {
+                let values = array
+                    .iter()
+                    .filter_map(|entry| entry.as_str())
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>();
+                return (!values.is_empty()).then_some(values);
+            }
+            value.as_str().map(|text| {
+                text.split(',')
+                    .map(str::trim)
+                    .filter(|part| !part.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>()
+            })
+        })
+        .unwrap_or_default()
 }
 
 pub fn resolve_subtitle_dir() -> PathBuf {
@@ -732,5 +797,26 @@ mod tests {
             subtitle_extension_from_url("https://cdn.example.com/subs/unknown?format=text"),
             "srt"
         );
+    }
+
+    #[test]
+    fn test_extract_browse_metadata_for_verified_classification() {
+        let anime = extract_browse_metrics(&serde_json::json!({
+            "genre": ["Action", "Anime"],
+            "category": "anime",
+            "originalLanguage": "Japanese"
+        }));
+        assert_eq!(anime.category.as_deref(), Some("anime"));
+        assert_eq!(anime.original_language.as_deref(), Some("Japanese"));
+        assert!(anime.genres.iter().any(|genre| genre == "Anime"));
+
+        let kdrama = extract_browse_metrics(&serde_json::json!({
+            "genres": "Drama, Romance",
+            "country": "South Korea",
+            "language": "Korean"
+        }));
+        assert_eq!(kdrama.country.as_deref(), Some("South Korea"));
+        assert_eq!(kdrama.original_language.as_deref(), Some("Korean"));
+        assert_eq!(kdrama.genres, vec!["Drama", "Romance"]);
     }
 }

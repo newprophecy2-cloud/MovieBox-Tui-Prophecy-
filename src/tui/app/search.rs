@@ -536,7 +536,7 @@ impl App {
             };
             let release_year = item.year.clone().unwrap_or_default();
             let cover_url = item.poster_url.clone();
-            let metrics = metrics_map.get(&id).copied().unwrap_or_default();
+            let metrics = metrics_map.get(&id).cloned().unwrap_or_default();
 
             if let Some(existing) = self.state.search_results.iter_mut().find(|r| r.id == id) {
                 let stored_metrics = self.state.browse_metrics.entry(id.clone()).or_default();
@@ -545,6 +545,16 @@ impl App {
                 stored_metrics.recent_rating =
                     stored_metrics.recent_rating.or(metrics.recent_rating);
                 stored_metrics.popularity = stored_metrics.popularity.or(metrics.popularity);
+                if stored_metrics.genres.is_empty() {
+                    stored_metrics.genres = metrics.genres.clone();
+                }
+                stored_metrics.category =
+                    stored_metrics.category.clone().or(metrics.category.clone());
+                stored_metrics.country = stored_metrics.country.clone().or(metrics.country.clone());
+                stored_metrics.original_language = stored_metrics
+                    .original_language
+                    .clone()
+                    .or(metrics.original_language.clone());
                 if existing.title.is_empty() {
                     existing.title = clean_title.to_string();
                     existing.stype = stype;

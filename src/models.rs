@@ -132,16 +132,24 @@ impl BrowsePreset {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct BrowseMetrics {
     pub trending: Option<f64>,
     pub rating: Option<f64>,
     pub recent_rating: Option<f64>,
     pub popularity: Option<f64>,
+    #[serde(default)]
+    pub genres: Vec<String>,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub country: Option<String>,
+    #[serde(default)]
+    pub original_language: Option<String>,
 }
 
 impl BrowseMetrics {
-    pub fn value(self, metric: BrowseMetric) -> Option<f64> {
+    pub fn value(&self, metric: BrowseMetric) -> Option<f64> {
         match metric {
             BrowseMetric::Trending => self.trending,
             BrowseMetric::Rating => self.rating,

@@ -11,7 +11,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     process::Command,
-    sync::Mutex,
+    sync::{Mutex, Semaphore},
     task::JoinSet,
 };
 
@@ -510,17 +510,17 @@ async fn route(stream: &mut TcpStream, target: &str, state: ApiState) -> std::io
         "/api/v1/trending" => home_section_route(stream, query, state, "trending").await,
         "/api/v1/trending/anime" => home_section_route(stream, query, state, "trending_anime").await,
         "/api/v1/trending/movies" => home_section_route(stream, query, state, "trending_movies").await,
-        "/api/v1/trending/k-dramas" => unsupported_catalog(stream, "K-Drama trending is not exposed by the available providers.").await,
+        "/api/v1/trending/k-dramas" => home_section_route(stream, query, state, "trending_kdramas").await,
         "/api/v1/popular" => home_section_route(stream, query, state, "popular").await,
         "/api/v1/popular/anime" => home_section_route(stream, query, state, "popular_anime").await,
         "/api/v1/popular/movies" => home_section_route(stream, query, state, "popular_movies").await,
-        "/api/v1/popular/k-dramas" => unsupported_catalog(stream, "K-Drama popularity is not exposed by the available providers.").await,
+        "/api/v1/popular/k-dramas" => home_section_route(stream, query, state, "popular_kdramas").await,
         "/api/v1/latest" => unsupported_catalog(stream, "Reliable release-date metadata is not exposed consistently by the available providers.").await,
         "/api/v1/movies" => catalog_list_route(stream, query, state, MediaType::Movie).await,
-        "/api/v1/k-dramas" => unsupported_catalog(stream, "A verified K-Drama catalogue is not exposed by the available providers.").await,
+        "/api/v1/k-dramas" => classified_list_route(stream, query, state, Classification::KDrama).await,
         "/api/v1/categories" => categories_route(stream, state).await,
         _ if path.starts_with("/api/v1/movies/") => catalog_details_route(stream, path, state, MediaType::Movie).await,
-        _ if path.starts_with("/api/v1/k-dramas/") => unsupported_catalog(stream, "A verified K-Drama catalogue is not exposed by the available providers.").await,
+        _ if path.starts_with("/api/v1/k-dramas/") => unsupported_catalog(stream, "K-Drama details require a verified item classification before lookup.").await,
         _ if path.starts_with("/api/v1/anime/") => anime_route(stream, path, state).await,
         _ if path.starts_with("/api/v1/episodes/") => episode_route(stream, path, state).await,
         _ if path.starts_with("/api/v1/sources/") => source_route(stream, path, state).await,
@@ -571,9 +571,133 @@ async fn homepage_items(
     ),
     String,
 > {
-    tokio::time::timeout(OVERALL_TIMEOUT, state.service.homepage("2", page))
+    tokio::time::timeout(OVERALL_TIMEOUT, homepage_items_uncapped(state, page))
         .await
         .map_err(|_| "MovieBox homepage request timed out.".to_string())?
+}
+
+async fn homepage_items_uncapped(
+    state: &ApiState,
+    page: usize,
+) -> Result<
+    (
+        Vec<CatalogItem>,
+        HashMap<String, crate::models::BrowseMetrics>,
+    ),
+    String,
+> {
+    let (movies, dramas, anime) = tokio::join!(
+        state.service.homepage("2", page),
+        state.service.homepage("5", page),
+        state.service.homepage("8", page),
+    );
+    let mut items = Vec::new();
+    let mut metrics: HashMap<String, crate::models::BrowseMetrics> = HashMap::new();
+    let mut seen = std::collections::HashSet::new();
+    for result in [movies, dramas, anime] {
+        let (batch, batch_metrics) = result.map_err(|error| error.to_string())?;
+        for item in batch {
+            let id = item.id.value.clone();
+            if seen.insert(id.clone()) {
+                items.push(item);
+            }
+            let incoming = batch_metrics.get(&id).cloned().unwrap_or_default();
+            let stored = metrics.entry(id).or_default();
+            stored.trending = stored.trending.or(incoming.trending);
+            stored.rating = stored.rating.or(incoming.rating);
+            stored.recent_rating = stored.recent_rating.or(incoming.recent_rating);
+            stored.popularity = stored.popularity.or(incoming.popularity);
+            if stored.genres.is_empty() {
+                stored.genres = incoming.genres;
+            }
+            stored.category = stored.category.clone().or(incoming.category);
+            stored.country = stored.country.clone().or(incoming.country);
+            stored.original_language = stored
+                .original_language
+                .clone()
+                .or(incoming.original_language);
+        }
+    }
+
+    let semaphore = Arc::new(Semaphore::new(8));
+    let mut tasks = JoinSet::new();
+    for item in items
+        .iter()
+        .filter(|item| item.media_type == MediaType::Series)
+    {
+        let service = state.service.clone();
+        let semaphore = semaphore.clone();
+        let id = item.id.value.clone();
+        tasks.spawn(async move {
+            let permit = semaphore.acquire_owned().await.ok()?;
+            let metadata = service.moviebox_classification_metadata(&id).await;
+            drop(permit);
+            Some((id, metadata))
+        });
+    }
+    while let Some(result) = tasks.join_next().await {
+        if let Ok(Some((id, Some((category, country, language))))) = result {
+            if let Some(stored) = metrics.get_mut(&id) {
+                stored.category = stored.category.clone().or(category);
+                stored.country = stored.country.clone().or(country);
+                stored.original_language = stored.original_language.clone().or(language);
+            }
+        }
+    }
+    Ok((items, metrics))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Classification {
+    Anime,
+    KDrama,
+}
+
+fn normalized_contains(value: &str, needles: &[&str]) -> bool {
+    let value = value.to_ascii_lowercase();
+    needles.iter().any(|needle| value.contains(needle))
+}
+
+fn is_classified(
+    item: &CatalogItem,
+    metrics: &HashMap<String, crate::models::BrowseMetrics>,
+    classification: Classification,
+) -> bool {
+    let Some(metadata) = metrics.get(&item.id.value) else {
+        return false;
+    };
+    let category = metadata.category.as_deref().unwrap_or_default();
+    let country = metadata.country.as_deref().unwrap_or_default();
+    let language = metadata.original_language.as_deref().unwrap_or_default();
+    let anime_genre = metadata
+        .genres
+        .iter()
+        .any(|genre| normalized_contains(genre, &["anime", "animation"]));
+    match classification {
+        Classification::Anime => {
+            item.media_type == MediaType::Series
+                && (normalized_contains(category, &["anime"])
+                    || anime_genre
+                    || normalized_contains(language, &["japanese", "ja", "jpn"]))
+        }
+        Classification::KDrama => {
+            item.media_type == MediaType::Series
+                && (normalized_contains(category, &["k-drama", "korean drama", "kdrama"])
+                    || normalized_contains(country, &["south korea", "korea", "korean", "kr"])
+                    || normalized_contains(language, &["korean", "ko", "kor", "한국어"]))
+        }
+    }
+}
+
+fn classified_items(
+    items: Vec<CatalogItem>,
+    metrics: &HashMap<String, crate::models::BrowseMetrics>,
+    classification: Classification,
+) -> Vec<CatalogItem> {
+    items
+        .into_iter()
+        .filter(|item| is_classified(item, metrics, classification))
+        .collect()
 }
 
 fn section_items(
@@ -634,12 +758,18 @@ fn section_response(
             "MovieBox homepage metadata",
         ),
         "anime" => (
-            items
+            classified_items(items, metrics, Classification::Anime)
                 .into_iter()
-                .filter(|i| i.media_type == MediaType::Series)
                 .take(limit)
                 .collect(),
             "MovieBox homepage metadata",
+        ),
+        "kdramas" => (
+            classified_items(items, metrics, Classification::KDrama)
+                .into_iter()
+                .take(limit)
+                .collect(),
+            "MovieBox verified country/language/category metadata",
         ),
         "trending_movies" => section_items(
             &items
@@ -651,10 +781,13 @@ fn section_response(
             limit,
         ),
         "trending_anime" => section_items(
-            &items
-                .into_iter()
-                .filter(|i| i.media_type == MediaType::Series)
-                .collect::<Vec<_>>(),
+            &classified_items(items, metrics, Classification::Anime),
+            metrics,
+            "trending",
+            limit,
+        ),
+        "trending_kdramas" => section_items(
+            &classified_items(items, metrics, Classification::KDrama),
             metrics,
             "trending",
             limit,
@@ -669,10 +802,13 @@ fn section_response(
             limit,
         ),
         "popular_anime" => section_items(
-            &items
-                .into_iter()
-                .filter(|i| i.media_type == MediaType::Series)
-                .collect::<Vec<_>>(),
+            &classified_items(items, metrics, Classification::Anime),
+            metrics,
+            "popular",
+            limit,
+        ),
+        "popular_kdramas" => section_items(
+            &classified_items(items, metrics, Classification::KDrama),
             metrics,
             "popular",
             limit,
@@ -694,10 +830,12 @@ async fn home_route(stream: &mut TcpStream, query: &str, state: ApiState) -> std
     let (page, limit) = parse_page_limit(query);
     match homepage_items(&state, page).await {
         Ok((items, metrics)) => {
-            let sections = ["featured", "trending", "popular", "movies", "anime"]
-                .into_iter()
-                .map(|section| section_response(section, page, limit, items.clone(), &metrics))
-                .collect::<Vec<_>>();
+            let sections = [
+                "featured", "trending", "popular", "movies", "anime", "kdramas",
+            ]
+            .into_iter()
+            .map(|section| section_response(section, page, limit, items.clone(), &metrics))
+            .collect::<Vec<_>>();
             let status = HashMap::from([(
                 ProviderKind::MovieBox.cache_key().to_string(),
                 "ok".to_string(),
@@ -784,6 +922,49 @@ async fn catalog_list_route(
     }
 }
 
+async fn classified_list_route(
+    stream: &mut TcpStream,
+    query: &str,
+    state: ApiState,
+    classification: Classification,
+) -> std::io::Result<()> {
+    let (page, limit) = parse_page_limit(query);
+    match homepage_items(&state, page).await {
+        Ok((items, metrics)) => {
+            let items = classified_items(items, &metrics, classification)
+                .into_iter()
+                .take(limit)
+                .map(|item| catalog_item_response(&item))
+                .collect::<Vec<_>>();
+            write_json(
+                stream,
+                200,
+                &serde_json::json!({
+                    "page": page,
+                    "next_page": (!items.is_empty()).then_some(page + 1),
+                    "provider": "moviebox",
+                    "classification": match classification {
+                        Classification::Anime => "anime",
+                        Classification::KDrama => "k-drama",
+                    },
+                    "items": items
+                }),
+                None,
+            )
+            .await
+        }
+        Err(message) => {
+            let (status, body) = err(
+                "UPSTREAM_UNAVAILABLE",
+                &message,
+                Some(ProviderKind::MovieBox),
+                503,
+            );
+            write_raw_json(stream, status, &body, None).await
+        }
+    }
+}
+
 async fn catalog_details_route(
     stream: &mut TcpStream,
     path: &str,
@@ -818,7 +999,7 @@ async fn categories_route(stream: &mut TcpStream, state: ApiState) -> std::io::R
                 {"id":"anime", "supported":moviebox.supports_series},
                 {"id":"movies", "supported":moviebox.supports_search},
                 {"id":"series", "supported":moviebox.supports_series},
-                {"id":"k-dramas", "supported":false, "reason":"No verified provider metadata"}
+                {"id":"k-dramas", "supported":true, "classification":"country/language/category metadata"}
             ],
             "provider_capabilities": {"moviebox": moviebox}
         }),
@@ -1805,14 +1986,14 @@ fn openapi() -> serde_json::Value {
             "/api/v1/trending": {"get": {"responses": {"200": {"description": "Provider-backed trending section"}}}},
             "/api/v1/trending/anime": {"get": {"responses": {"200": {"description": "Provider-backed trending anime"}}}},
             "/api/v1/trending/movies": {"get": {"responses": {"200": {"description": "Provider-backed trending movies"}}}},
-            "/api/v1/trending/k-dramas": {"get": {"responses": {"501": {"description": "Unsupported category"}}}},
+            "/api/v1/trending/k-dramas": {"get": {"responses": {"200": {"description": "Metadata-backed trending K-Dramas"}}}},
             "/api/v1/popular": {"get": {"responses": {"200": {"description": "Provider-backed popular section"}}}},
             "/api/v1/popular/anime": {"get": {"responses": {"200": {"description": "Provider-backed popular anime"}}}},
             "/api/v1/popular/movies": {"get": {"responses": {"200": {"description": "Provider-backed popular movies"}}}},
-            "/api/v1/popular/k-dramas": {"get": {"responses": {"501": {"description": "Unsupported category"}}}},
+            "/api/v1/popular/k-dramas": {"get": {"responses": {"200": {"description": "Metadata-backed popular K-Dramas"}}}},
             "/api/v1/movies": {"get": {"responses": {"200": {"description": "MovieBox movie catalogue"}}}},
             "/api/v1/movies/{movie_id}": {"get": {"responses": {"200": {"description": "Movie details"}}}},
-            "/api/v1/k-dramas": {"get": {"responses": {"501": {"description": "Unsupported category"}}}},
+            "/api/v1/k-dramas": {"get": {"responses": {"200": {"description": "Metadata-backed K-Drama catalogue"}}}},
             "/api/v1/k-dramas/{id}": {"get": {"responses": {"501": {"description": "Unsupported category"}}}},
             "/api/v1/categories": {"get": {"responses": {"200": {"description": "Supported content categories"}}}},
             "/api/v1/anime/search/stream": {"get": {"responses": {"200": {"description": "SSE search_result, search_provider_error, search_complete events"}}}},
@@ -2158,5 +2339,56 @@ mod tests {
         let metrics = HashMap::new();
         assert!(section_items(&items, &metrics, "trending", 20).0.is_empty());
         assert!(section_items(&items, &metrics, "popular", 20).0.is_empty());
+    }
+
+    #[test]
+    fn classification_requires_verified_metadata_and_series_type() {
+        let anime = CatalogItem {
+            id: ProviderMediaId {
+                provider: ProviderKind::MovieBox,
+                value: "anime-1".into(),
+            },
+            title: "Example".into(),
+            media_type: MediaType::Series,
+            year: None,
+            poster_url: None,
+            season_count: Some(1),
+        };
+        let movie = CatalogItem {
+            id: ProviderMediaId {
+                provider: ProviderKind::MovieBox,
+                value: "movie-1".into(),
+            },
+            title: "Korean Movie".into(),
+            media_type: MediaType::Movie,
+            year: None,
+            poster_url: None,
+            season_count: None,
+        };
+        let metrics = HashMap::from([
+            (
+                "anime-1".into(),
+                crate::models::BrowseMetrics {
+                    genres: vec!["Anime".into()],
+                    category: Some("anime".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "movie-1".into(),
+                crate::models::BrowseMetrics {
+                    country: Some("South Korea".into()),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        assert!(is_classified(&anime, &metrics, Classification::Anime));
+        assert!(!is_classified(&anime, &metrics, Classification::KDrama));
+        assert!(!is_classified(&movie, &metrics, Classification::KDrama));
+        assert!(!is_classified(
+            &anime,
+            &HashMap::new(),
+            Classification::Anime
+        ));
     }
 }
