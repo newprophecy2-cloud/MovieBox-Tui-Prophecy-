@@ -32,9 +32,9 @@ const TRACK_PROBE_TIMEOUT: Duration = Duration::from_secs(45);
 const RELEASE_CACHE_TTL: Duration = Duration::from_secs(600);
 const PLAYBACK_CACHE_TTL: Duration = Duration::from_secs(120);
 const PROVIDERS: [ProviderKind; 6] = [
-    ProviderKind::Dramachi,
     ProviderKind::FourKHdHub,
     ProviderKind::MovieBox,
+    ProviderKind::Dramachi,
     ProviderKind::BdixCircleFtp,
     ProviderKind::BdixDhakaFlix,
     ProviderKind::Addons,
@@ -1638,13 +1638,13 @@ mod tests {
     #[test]
     fn provider_priority_matches_configured_order() {
         assert!(
-            provider_priority(ProviderKind::Dramachi) < provider_priority(ProviderKind::Addons)
-        );
-        assert!(
             provider_priority(ProviderKind::FourKHdHub) < provider_priority(ProviderKind::MovieBox)
         );
         assert!(
-            provider_priority(ProviderKind::MovieBox)
+            provider_priority(ProviderKind::MovieBox) < provider_priority(ProviderKind::Dramachi)
+        );
+        assert!(
+            provider_priority(ProviderKind::Dramachi)
                 < provider_priority(ProviderKind::BdixCircleFtp)
         );
     }
