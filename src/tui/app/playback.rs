@@ -1459,10 +1459,12 @@ mod tests {
         };
 
         let resolution = app.resolve_playback_player(&source);
-        assert_eq!(
-            resolution,
-            super::PlaybackResolution::Available(crate::tui::state::PlayerKind::AndroidIntent)
-        );
+        let expected = if crate::player::has_graphical_display() {
+            crate::tui::state::PlayerKind::Mpv
+        } else {
+            crate::tui::state::PlayerKind::AndroidIntent
+        };
+        assert_eq!(resolution, super::PlaybackResolution::Available(expected));
 
         app.state.is_resolving_playback = true;
         app.dispatch_playback_or_notify(source);

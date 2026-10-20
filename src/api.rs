@@ -30,6 +30,13 @@ const PROVIDERS: [ProviderKind; 6] = [
     ProviderKind::Addons,
 ];
 
+fn provider_priority(provider: ProviderKind) -> usize {
+    PROVIDERS
+        .iter()
+        .position(|candidate| *candidate == provider)
+        .unwrap_or(PROVIDERS.len())
+}
+
 #[derive(Clone)]
 pub struct ApiState {
     pub service: Arc<MovieBoxService>,
@@ -169,6 +176,14 @@ fn source_ref(r: &Release, episode: &OpaqueRef, i: usize) -> String {
         i,
     })
 }
+fn episode_ref(id: &ProviderMediaId, episode: &crate::providers::models::Episode) -> String {
+    encode(&OpaqueRef {
+        p: id.provider,
+        v: id.value.clone(),
+        s: episode.season,
+        e: episode.number,
+    })
+}
 fn catalog(item: CatalogItem) -> ApiCatalogItem {
     ApiCatalogItem {
         id: provider_ref(&item.id, 0, 0),
@@ -180,6 +195,7 @@ fn catalog(item: CatalogItem) -> ApiCatalogItem {
     }
 }
 fn details(d: MediaDetails) -> ApiDetails {
+    let provider_id = d.id.clone();
     ApiDetails {
         id: provider_ref(&d.id, 0, 0),
         title: d.title,
@@ -195,23 +211,22 @@ fn details(d: MediaDetails) -> ApiDetails {
         poster_url: d.poster_url,
         duration: d.duration,
         genres: d.genres,
-        seasons: d.seasons.into_iter().map(season).collect(),
+        seasons: d
+            .seasons
+            .into_iter()
+            .map(|s| season(s, &provider_id))
+            .collect(),
         audio: d.dubs,
     }
 }
-fn season(s: Season) -> ApiSeason {
+fn season(s: Season, provider_id: &ProviderMediaId) -> ApiSeason {
     ApiSeason {
         number: s.number,
         episodes: s
             .episodes
             .into_iter()
             .map(|e| ApiEpisode {
-                id: encode(&OpaqueRef {
-                    p: ProviderKind::MovieBox,
-                    v: String::new(),
-                    s: e.season,
-                    e: e.number,
-                }),
+                id: episode_ref(provider_id, &e),
                 season: e.season,
                 number: e.number,
                 title: e.title,
@@ -261,6 +276,26 @@ fn provider_error(e: ProviderError, p: ProviderKind) -> (u16, String) {
             Some(p),
             502,
         ),
+        ProviderError::Unavailable(message)
+            if p == ProviderKind::Addons && message == "No enabled stream addon is configured." =>
+        {
+            err(
+                "NO_STREAM_ADDON",
+                "No enabled stream addon is configured.",
+                Some(p),
+                503,
+            )
+        }
+        ProviderError::Unavailable(message)
+            if p == ProviderKind::Addons && message == "No addon stream sources available" =>
+        {
+            err(
+                "NO_SOURCE_CANDIDATES",
+                "No source candidates were returned by the enabled stream addons.",
+                Some(p),
+                404,
+            )
+        }
         ProviderError::Unavailable(_) => err(
             "UPSTREAM_UNAVAILABLE",
             "The provider is unavailable.",
@@ -492,6 +527,7 @@ async fn search_all(service: &Arc<MovieBoxService>, query: &str) -> (Vec<Catalog
     }
     let mut seen = std::collections::HashSet::new();
     items.retain(|i| seen.insert((i.id.provider, i.id.value.clone())));
+    items.sort_by_key(|item| provider_priority(item.id.provider));
     (items, failed)
 }
 
@@ -526,9 +562,28 @@ async fn anime_route(stream: &mut TcpStream, path: &str, state: ApiState) -> std
                 .collect();
             return write_json(stream, 200, &eps, None).await;
         }
-        let ep = parts[5].parse::<usize>().ok();
-        let se = r.s;
-        let e = ep.unwrap_or(r.e);
+        let (se, e) = if let Ok(episode) = decode::<OpaqueRef>(parts[5]) {
+            if episode.p != r.p || episode.v != r.v {
+                let (s, b) = err(
+                    "INVALID_ID",
+                    "The episode does not belong to the requested anime.",
+                    None,
+                    400,
+                );
+                return write_raw_json(stream, s, &b, None).await;
+            }
+            (episode.s, episode.e)
+        } else if let Ok(number) = parts[5].parse::<usize>() {
+            (r.s, number)
+        } else {
+            let (s, b) = err(
+                "INVALID_ID",
+                "The episode identifier is invalid.",
+                None,
+                400,
+            );
+            return write_raw_json(stream, s, &b, None).await;
+        };
         let found = details(d)
             .seasons
             .into_iter()
@@ -585,9 +640,35 @@ async fn releases(state: &ApiState, r: &OpaqueRef) -> Result<Vec<Release>, Provi
             )
             .await
         }
-        ProviderKind::Addons => Err(ProviderError::Unavailable(
-            "Addon source aggregation requires an installed stream addon.".into(),
-        )),
+        ProviderKind::Addons => {
+            let addons = tokio::task::spawn_blocking(crate::config::load_addons)
+                .await
+                .unwrap_or_default();
+            if !addons
+                .iter()
+                .any(|addon| addon.enabled && addon.provides_stream)
+            {
+                return Err(ProviderError::Unavailable(
+                    "No enabled stream addon is configured.".into(),
+                ));
+            }
+            let (releases, _blocked) = crate::providers::addons::aggregate_streams(
+                &svc.addon_client,
+                &addons,
+                &r.v,
+                r.s,
+                r.e,
+                true,
+            )
+            .await;
+            if releases.is_empty() {
+                Err(ProviderError::Unavailable(
+                    "No addon stream sources available".into(),
+                ))
+            } else {
+                Ok(releases)
+            }
+        }
     }
 }
 fn api_sources(rs: &[Release], episode: &OpaqueRef) -> Vec<ApiSource> {
@@ -672,11 +753,25 @@ async fn source_sse(stream: &mut TcpStream, r: OpaqueRef, state: ApiState) -> st
             send_event(stream, "source_complete", "{\"partial\":false}").await
         }
         Ok(Err(e)) => {
+            let code = match &e {
+                ProviderError::Unavailable(message)
+                    if r.p == ProviderKind::Addons
+                        && message == "No enabled stream addon is configured." =>
+                {
+                    "NO_STREAM_ADDON"
+                }
+                ProviderError::Unavailable(message)
+                    if r.p == ProviderKind::Addons
+                        && message == "No addon stream sources available" =>
+                {
+                    "NO_SOURCE_CANDIDATES"
+                }
+                _ => "UPSTREAM_UNAVAILABLE",
+            };
             send_event(
                 stream,
                 "source_error",
-                &serde_json::json!({"provider":r.p.label(),"message":e.user_message(r.p)})
-                    .to_string(),
+                &serde_json::json!({"code":code,"provider":r.p.label(),"message":e.user_message(r.p)}).to_string(),
             )
             .await?;
             send_event(stream, "source_complete", "{\"partial\":true}").await
@@ -867,6 +962,136 @@ mod tests {
         let public = encode(&original);
         assert!(!public.contains("dramachi"));
         assert_eq!(decode::<OpaqueRef>(&public).unwrap().v, "56914");
+    }
+
+    #[test]
+    fn addons_episode_id_round_trip_preserves_provider_and_subject() {
+        let media = MediaDetails {
+            id: ProviderMediaId {
+                provider: ProviderKind::Addons,
+                value: "series:tt15716676".into(),
+            },
+            title: "Devil May Cry".into(),
+            media_type: crate::providers::models::MediaType::Series,
+            year: Some("2025".into()),
+            description: None,
+            tagline: None,
+            imdb_rating: None,
+            director: None,
+            stars: None,
+            prints: None,
+            audios: None,
+            poster_url: None,
+            duration: None,
+            genres: vec![],
+            seasons: vec![Season {
+                number: 1,
+                episodes: vec![crate::providers::models::Episode {
+                    season: 1,
+                    number: 5,
+                    title: Some("Descent".into()),
+                    overview: None,
+                }],
+            }],
+            dubs: vec![],
+        };
+        let episode = details(media).seasons.remove(0).episodes.remove(0);
+        let decoded = decode::<OpaqueRef>(&episode.id).unwrap();
+        assert_eq!(decoded.p, ProviderKind::Addons);
+        assert_eq!(decoded.v, "series:tt15716676");
+        assert_eq!((decoded.s, decoded.e), (1, 5));
+    }
+
+    #[test]
+    fn moviebox_episode_id_round_trip_preserves_subject_and_provider() {
+        let id = ProviderMediaId {
+            provider: ProviderKind::MovieBox,
+            value: "29706226128880560".into(),
+        };
+        let episode = crate::providers::models::Episode {
+            season: 1,
+            number: 5,
+            title: None,
+            overview: None,
+        };
+        let decoded = decode::<OpaqueRef>(&episode_ref(&id, &episode)).unwrap();
+        assert_eq!(decoded.p, ProviderKind::MovieBox);
+        assert_eq!(decoded.v, "29706226128880560");
+        assert_eq!((decoded.s, decoded.e), (1, 5));
+    }
+
+    #[test]
+    fn source_lookup_identity_round_trip_keeps_provider_dispatch() {
+        let episode = OpaqueRef {
+            p: ProviderKind::Addons,
+            v: "series:tt15716676".into(),
+            s: 1,
+            e: 5,
+        };
+        let release = Release {
+            provider: ProviderKind::Addons,
+            filename: "Descent.1080p.mkv".into(),
+            quality: Some("1080p".into()),
+            codec: None,
+            language: None,
+            size_bytes: None,
+            season: Some(1),
+            episode: Some(5),
+            mirrors: vec![],
+            resource_id: None,
+        };
+        let source = source_ref(&release, &episode, 0);
+        let decoded = decode::<OpaqueSource>(&source).unwrap();
+        assert_eq!(decoded.p, ProviderKind::Addons);
+        assert_eq!(decoded.v, episode.v);
+        assert_eq!((decoded.s, decoded.e, decoded.i), (1, 5, 0));
+    }
+
+    #[test]
+    fn malformed_and_unresolvable_provider_ids_are_rejected_or_preserved() {
+        assert!(parse_ref("not-an-id").is_err());
+        assert!(parse_source("not-a-source-id").is_err());
+        let unresolved = OpaqueRef {
+            p: ProviderKind::Addons,
+            v: "series:provider-specific-id-that-does-not-exist".into(),
+            s: 1,
+            e: 5,
+        };
+        let round_trip = decode::<OpaqueRef>(&encode(&unresolved)).unwrap();
+        assert_eq!(round_trip.p, ProviderKind::Addons);
+        assert_eq!(round_trip.v, unresolved.v);
+    }
+
+    #[test]
+    fn provider_priority_matches_configured_order() {
+        assert!(
+            provider_priority(ProviderKind::Dramachi) < provider_priority(ProviderKind::Addons)
+        );
+        assert!(
+            provider_priority(ProviderKind::FourKHdHub) < provider_priority(ProviderKind::MovieBox)
+        );
+        assert!(
+            provider_priority(ProviderKind::MovieBox)
+                < provider_priority(ProviderKind::BdixCircleFtp)
+        );
+    }
+
+    #[test]
+    fn addons_configuration_errors_are_specific_and_safe() {
+        let (status, body) = provider_error(
+            ProviderError::Unavailable("No enabled stream addon is configured.".into()),
+            ProviderKind::Addons,
+        );
+        assert_eq!(status, 503);
+        assert!(body.contains("NO_STREAM_ADDON"));
+        assert!(!body.contains("manifest") && !body.contains("cookie"));
+
+        let (status, body) = provider_error(
+            ProviderError::Unavailable("No addon stream sources available".into()),
+            ProviderKind::Addons,
+        );
+        assert_eq!(status, 404);
+        assert!(body.contains("NO_SOURCE_CANDIDATES"));
     }
 
     #[test]

@@ -326,11 +326,8 @@ pub fn probe_android_openers() -> Vec<AndroidOpener> {
     openers
 }
 
-static ANDROID_OPENERS: std::sync::LazyLock<Vec<AndroidOpener>> =
-    std::sync::LazyLock::new(probe_android_openers);
-
-pub fn android_openers() -> &'static [AndroidOpener] {
-    ANDROID_OPENERS.as_slice()
+pub fn android_openers() -> Vec<AndroidOpener> {
+    probe_android_openers()
 }
 
 fn append_android_intent_extras(
