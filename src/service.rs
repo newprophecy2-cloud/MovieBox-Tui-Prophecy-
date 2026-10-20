@@ -93,6 +93,30 @@ impl MovieBoxService {
         }
     }
 
+    pub async fn search_language_typed(
+        &self,
+        provider: ProviderKind,
+        query: &str,
+        page: usize,
+    ) -> Result<Vec<CatalogItem>, ProviderError> {
+        let intent = crate::language::parse_query(query);
+        let mut items = self.search_typed(provider, &intent.title, page).await?;
+        if let Some(language) = intent.language {
+            let mut matching = Vec::new();
+            let mut other = Vec::new();
+            for mut item in items {
+                if crate::language::decorate_catalog_item(&mut item, Some(language)) {
+                    matching.push(item);
+                } else {
+                    other.push(item);
+                }
+            }
+            matching.extend(other);
+            items = matching;
+        }
+        Ok(items)
+    }
+
     pub async fn fetch_addon_catalog(
         &self,
         manifest_url: &str,

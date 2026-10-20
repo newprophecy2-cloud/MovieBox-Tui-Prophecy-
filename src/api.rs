@@ -83,6 +83,12 @@ struct SearchResponse {
     results: Vec<ApiCatalogItem>,
     next_cursor: Option<String>,
     partial: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    language_intent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verified_language_matches: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
 }
 #[derive(Debug, Serialize)]
 struct ApiCatalogItem {
@@ -497,6 +503,22 @@ async fn search_json(stream: &mut TcpStream, query: &str, state: ApiState) -> st
         return write_raw_json(stream, s, &b, None).await;
     }
     let (items, failed) = search_all(&state.service, &qv).await;
+    let language_intent = crate::language::parse_query(&qv).language;
+    let verified_language_matches = language_intent.map(|language| {
+        let label = format!("({})", language.result_label());
+        items
+            .iter()
+            .filter(|item| item.title.ends_with(&label))
+            .count()
+    });
+    let message = language_intent
+        .filter(|_| verified_language_matches == Some(0))
+        .map(|language| {
+            format!(
+                "No verified {} version found. Try another provider or language.",
+                language.name()
+            )
+        });
     let results = items
         .into_iter()
         .take(limit)
@@ -506,6 +528,9 @@ async fn search_json(stream: &mut TcpStream, query: &str, state: ApiState) -> st
         results,
         next_cursor: None,
         partial: failed,
+        language_intent: language_intent.map(|language| language.code().to_string()),
+        verified_language_matches,
+        message,
     };
     write_json(stream, 200, &body, None).await
 }
@@ -521,11 +546,14 @@ async fn search_sse(stream: &mut TcpStream, query: &str, state: ApiState) -> std
         );
         return write_raw_json(stream, s, &b, None).await;
     };
+    let intent = crate::language::parse_query(&qv);
+    let requested_language = intent.language;
+    let normalized_query = intent.title;
     write_headers(stream, 200, "text/event-stream", None).await?;
     let mut tasks = JoinSet::new();
     for p in PROVIDERS {
         let svc = state.service.clone();
-        let q = qv.clone();
+        let q = normalized_query.clone();
         tasks.spawn(async move {
             let result = tokio::time::timeout(OVERALL_TIMEOUT, svc.search_typed(p, &q, 1)).await;
             (p, result)
@@ -534,7 +562,10 @@ async fn search_sse(stream: &mut TcpStream, query: &str, state: ApiState) -> std
     while let Some(Ok((p, result))) = tasks.join_next().await {
         match result {
             Ok(Ok(items)) => {
-                for item in items {
+                for mut item in items {
+                    if let Some(language) = requested_language {
+                        crate::language::decorate_catalog_item(&mut item, Some(language));
+                    }
                     let payload =
                         serde_json::to_string(&serde_json::json!({"result":catalog(item)}))
                             .unwrap();
@@ -560,10 +591,13 @@ async fn search_sse(stream: &mut TcpStream, query: &str, state: ApiState) -> std
 }
 
 async fn search_all(service: &Arc<MovieBoxService>, query: &str) -> (Vec<CatalogItem>, bool) {
+    let intent = crate::language::parse_query(query);
+    let requested_language = intent.language;
+    let normalized_query = intent.title;
     let mut tasks = JoinSet::new();
     for p in PROVIDERS {
         let svc = service.clone();
-        let q = query.to_string();
+        let q = normalized_query.clone();
         tasks.spawn(async move {
             (
                 p,
@@ -584,7 +618,27 @@ async fn search_all(service: &Arc<MovieBoxService>, query: &str) -> (Vec<Catalog
     }
     let mut seen = std::collections::HashSet::new();
     items.retain(|i| seen.insert((i.id.provider, i.id.value.clone())));
-    items.sort_by_key(|item| provider_priority(item.id.provider));
+    if let Some(language) = requested_language {
+        let mut matching = Vec::new();
+        let mut other = Vec::new();
+        for mut item in items {
+            if crate::language::decorate_catalog_item(&mut item, Some(language)) {
+                matching.push(item);
+            } else {
+                other.push(item);
+            }
+        }
+        matching.extend(other);
+        items = matching;
+    }
+    items.sort_by(|a, b| {
+        let language_order = requested_language.map_or(std::cmp::Ordering::Equal, |language| {
+            let label = format!("({})", language.result_label());
+            b.title.ends_with(&label).cmp(&a.title.ends_with(&label))
+        });
+        language_order
+            .then_with(|| provider_priority(a.id.provider).cmp(&provider_priority(b.id.provider)))
+    });
     (items, failed)
 }
 

@@ -305,12 +305,15 @@ impl App {
                 let raw_count = items.len();
                 let mut new_results = Vec::new();
 
+                let intent = crate::language::parse_query(&query);
+
                 for item in items {
                     let id = item.id.value.clone();
                     let raw_title = item.title.clone();
                     let clean_title = crate::providers::moviebox::clean_moviebox_title(&raw_title);
 
-                    let normalized_query = query
+                    let normalized_query = intent
+                        .title
                         .to_lowercase()
                         .replace(|c: char| !c.is_alphanumeric(), "");
                     let normalized_title = raw_title
@@ -370,7 +373,11 @@ impl App {
                     if !id.is_empty() {
                         new_results.push(SearchResult {
                             id,
-                            title: clean_title.to_string(),
+                            title: if intent.language.is_some() {
+                                raw_title
+                            } else {
+                                clean_title.to_string()
+                            },
                             stype,
                             release_year,
                             cover_url,
@@ -386,7 +393,7 @@ impl App {
                 }
 
                 let sort_results = |results: &mut Vec<SearchResult>, q: &str| {
-                    let query_lower = q.to_lowercase();
+                    let query_lower = crate::language::parse_query(q).title.to_lowercase();
                     results.sort_by(|a, b| {
                         let a_title = a.title.to_lowercase();
                         let b_title = b.title.to_lowercase();
@@ -441,7 +448,28 @@ impl App {
                 }
 
                 self.state
-                    .set_status_default(if self.state.search_results.is_empty() {
+                    .set_status_default(if let Some(language) = intent.language {
+                        let label = format!("({})", language.result_label());
+                        let verified = self
+                            .state
+                            .search_results
+                            .iter()
+                            .filter(|result| result.title.ends_with(&label))
+                            .count();
+                        if verified == 0 {
+                            format!(
+                                "No verified {} version found. Try another provider or language.",
+                                language.name()
+                            )
+                        } else {
+                            format!(
+                                "Found {} verified {} result(s) on {}.",
+                                verified,
+                                language.name(),
+                                context.provider.label()
+                            )
+                        }
+                    } else if self.state.search_results.is_empty() {
                         format!(
                             "No matches for '{}' on {}. Press Ctrl+P to try another provider.",
                             query,

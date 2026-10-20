@@ -271,7 +271,7 @@ impl App {
         let sender = self.action_sender.clone();
         let service = self.service.clone();
         self.request_tasks.search = Some(tokio::spawn(async move {
-            if !force_refresh {
+            if !force_refresh && crate::language::parse_query(&query).language.is_none() {
                 let q = query.clone();
                 let provider = context.provider;
                 if let Ok(Some(cached)) = tokio::task::spawn_blocking(move || {
@@ -292,7 +292,9 @@ impl App {
                 }
             }
 
-            let result = service.search_typed(context.provider, &query, page).await;
+            let result = service
+                .search_language_typed(context.provider, &query, page)
+                .await;
             match result {
                 Ok(items) => {
                     let q = query.clone();
