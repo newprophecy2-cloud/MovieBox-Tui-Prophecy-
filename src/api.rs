@@ -1149,7 +1149,10 @@ async fn source_route(stream: &mut TcpStream, path: &str, state: ApiState) -> st
             write_raw_json(stream, s, &b, None).await
         };
     }
-    if matches!(parts.get(4), Some(&"playback") | Some(&"play")) {
+    if matches!(
+        parts.get(4),
+        Some(&"playback") | Some(&"play") | Some(&"watch")
+    ) {
         if sr.p != ProviderKind::FourKHdHub {
             let (s, b) = err(
                 "UNSUPPORTED_OPERATION",
@@ -1179,9 +1182,10 @@ async fn source_route(stream: &mut TcpStream, path: &str, state: ApiState) -> st
                     stream,
                     200,
                     &serde_json::json!({
-                        "provider": playback.provider,
-                        "resolved": true,
-                        "url": playback.url,
+                    "provider": playback.provider,
+                    "resolved": true,
+                    "mode": "watch",
+                    "url": watch_url(&playback.url),
                         "headers": playback.headers,
                         "subtitle": playback.subtitle,
                         "source_label": playback.source_label,
@@ -1212,6 +1216,18 @@ async fn source_route(stream: &mut TcpStream, path: &str, state: ApiState) -> st
         };
     }
     write_json(stream,200,&serde_json::json!({"source":api_sources(std::slice::from_ref(rel),&r),"url":rel.direct_url(),"headers":rel.mirrors.first().map(|m| public_headers(&m.headers)),"sensitive_headers_redacted":true}),None).await
+}
+fn watch_url(raw: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(raw) else {
+        return raw.to_string();
+    };
+    if url
+        .query_pairs()
+        .any(|(name, value)| name == "download" && value.is_empty())
+    {
+        url.set_query(None);
+    }
+    url.to_string()
 }
 fn public_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
     headers
@@ -1318,6 +1334,7 @@ fn openapi() -> serde_json::Value {
             "/api/v1/sources/{source_id}/subtitles": {"get": {"responses": {"200": {"description": "Confirmed embedded subtitle tracks"}, "503": {"description": "Track discovery unavailable"}}}},
             "/api/v1/sources/{source_id}/subtitle-tracks": {"get": {"responses": {"200": {"description": "Confirmed embedded subtitle tracks"}, "503": {"description": "Track discovery unavailable"}}}},
             "/api/v1/sources/{source_id}/playback": {"get": {"responses": {"200": {"description": "Server-resolved playable 4KHDHub URL"}, "502": {"description": "Playback resolution failed"}, "504": {"description": "Playback resolution timed out"}}}},
+            "/api/v1/sources/{source_id}/watch": {"get": {"responses": {"200": {"description": "Server-resolved watch URL with inline media disposition"}, "502": {"description": "Watch resolution failed"}, "504": {"description": "Watch resolution timed out"}}}},
             "/api/v1/sources/{source_id}/download": {"get": {"responses": {"200": {"description": "Download metadata"}, "501": {"description": "Unsupported"}}}}
         }
     })
