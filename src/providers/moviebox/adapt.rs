@@ -567,7 +567,6 @@ pub fn is_deprecation_notice_url(url: &str) -> bool {
         || lower.contains("9a0461bc39da389663bf3dbb17091d3f")
         || lower.contains("b164fbfb4347792950bdfbfb563d39d9")
         || lower.contains("/notice.mp4")
-        || (lower.contains("macdn.aoneroom.com") && lower.contains("/other/"))
 }
 
 fn to_dash_mpd(url_str: &str) -> Option<String> {
@@ -1217,6 +1216,31 @@ mod tests {
         assert_eq!(
             releases[0].direct_url(),
             Some("https://cdn.example.com/legitimate_movie.mp4")
+        );
+    }
+
+    #[test]
+    fn test_current_moviebox_macdn_other_stream_is_not_a_notice() {
+        let url =
+            "https://macdn.aoneroom.com/other/2026/10/10/80da52722ee7de7a4303290af6783424.mp4";
+        assert!(!is_deprecation_notice_url(url));
+        let payload = json!({
+            "streams": [{
+                "id": "1090996673649722824",
+                "format": "MP4",
+                "codecName": "hevc",
+                "resolutions": "1080,720,480",
+                "size": "824720",
+                "url": url,
+                "signCookie": ""
+            }]
+        });
+        let releases = moviebox_play_info_json_to_releases(&payload, 1, 1, "TestAgent/1.0");
+        assert_eq!(releases.len(), 3);
+        assert!(
+            releases
+                .iter()
+                .all(|release| release.direct_url() == Some(url))
         );
     }
 
