@@ -163,3 +163,62 @@ Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE).
 ## Disclaimer
 
 MovieBox-TUI does not host or store media. It plays publicly available streams. Users must comply with local laws.
+
+
+## Backend API conversion
+
+The binary now starts an HTTP API rather than opening a terminal UI. Existing provider clients, parsers, metadata models, release resolvers, subtitle handling, and download metadata remain in the library and are called by `src/api.rs`.
+
+### Local start
+
+```bash
+cargo run --release --locked
+PORT=8080 cargo run --release --locked
+```
+
+The service binds to `0.0.0.0:$PORT` (default `8080`) and does not require VLC, mpv, a desktop session, or a database. Rust 1.90.0 is the declared minimum toolchain.
+
+### Implemented routes
+
+| Method | Path | Behavior |
+|---|---|---|
+| GET | `/` | API information |
+| GET | `/health` | Liveness; does not call providers |
+| GET | `/ready` | Process/service-layer readiness |
+| GET | `/api/v1` | Resource summary |
+| GET | `/openapi.json` | OpenAPI 3 document |
+| GET | `/docs` | Documentation page |
+| GET | `/api/v1/anime/search?q=...&limit=...&cursor=...` | Concurrent fresh provider search |
+| GET | `/api/v1/anime/search/stream?q=...` | Incremental SSE search events |
+| GET | `/api/v1/anime/{anime_id}` | Fresh anime metadata |
+| GET | `/api/v1/anime/{anime_id}/seasons` | Season list |
+| GET | `/api/v1/anime/{anime_id}/episodes` | Episode list |
+| GET | `/api/v1/anime/{anime_id}/episodes/{episode_id}` | Episode lookup |
+| GET | `/api/v1/episodes/{episode_id}/sources` | Fresh source candidates |
+| GET | `/api/v1/episodes/{episode_id}/sources/stream` | Incremental SSE source events |
+| GET | `/api/v1/sources/{source_id}` | Fresh source resolution and metadata |
+| GET | `/api/v1/sources/{source_id}/audio` | Audio availability |
+| GET | `/api/v1/sources/{source_id}/subtitles` | Subtitle availability |
+| GET | `/api/v1/sources/{source_id}/download` | Authorized direct-download metadata or `501` |
+
+Search and source resolution run providers concurrently. Provider order is used only for priority/tie-breaking; individual failures are reported as partial success. Source re-resolution uses an eight-second per-source timeout and a bounded overall deadline. API responses do not substitute stale disk-cache values for fresh retrieval.
+
+Clients must treat URL-safe public identifiers as opaque and must not decode or construct them. Error responses use `error.code`, `message`, optional provider display name, `retryable`, and a request ID. Successful responses do not include provider identity. SSE uses `text/event-stream` with `search_result`, `search_provider_error`, `search_complete`, `source_result`, `source_error`, and `source_complete` events; there is no replay guarantee.
+
+The API does not fabricate media URLs. URLs and required headers originate from existing provider adapters and resolver implementations. Audio, subtitle, and download support is returned only when the provider release advertises it; no Render-side media storage or unrestricted URL proxy was added.
+
+### Render
+
+`render.yaml` uses the actual package binary (`moviebox-tui`), runs `cargo build --release --locked`, starts on Render's `$PORT`, and health-checks `/health`. No secrets are committed. A live Render deployment requires a connected Render account/service and was not performed by this repository-only change.
+
+### Validation
+
+```bash
+cargo fmt --all -- --check
+cargo check --locked
+cargo test --locked
+cargo build --release --locked
+cargo clippy --all-targets --all-features -- -D warnings
+```
+
+The baseline repository already had one failing TUI player test (`test_explicit_player_incompatible_does_not_launch_alternative`); this pre-existing failure is reported separately from API validation.
