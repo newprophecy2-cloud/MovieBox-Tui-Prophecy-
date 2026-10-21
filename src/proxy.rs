@@ -311,7 +311,12 @@ async fn handle_connection(
 
     loop {
         let mut request_line = String::new();
-        let n = buf_reader.read_line(&mut request_line).await?;
+        let n = tokio::time::timeout(
+            Duration::from_secs(10),
+            read_bounded_line(&mut buf_reader, &mut request_line, MAX_LINE_BYTES),
+        )
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "proxy request line timed out"))??;
         if n == 0 {
             return Ok(());
         }
@@ -332,7 +337,13 @@ async fn handle_connection(
         let mut header_count = 0usize;
         loop {
             let mut header_line = String::new();
-            if buf_reader.read_line(&mut header_line).await? == 0 {
+            let n = tokio::time::timeout(
+                Duration::from_secs(10),
+                read_bounded_line(&mut buf_reader, &mut header_line, MAX_LINE_BYTES),
+            )
+            .await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "proxy header timed out"))??;
+            if n == 0 {
                 break;
             }
             let trimmed = header_line.trim();
@@ -806,6 +817,43 @@ fn next_dash_segment_urls(url: &str, count: u32) -> Vec<String> {
     out
 }
 
+async fn read_bounded_line<R>(
+    reader: &mut R,
+    line: &mut String,
+    limit: usize,
+) -> std::io::Result<usize>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let mut bytes = Vec::with_capacity(limit.min(1024));
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if bytes.is_empty() {
+                return Ok(0);
+            }
+            break;
+        }
+        let take = available.iter().position(|byte| *byte == b'\\n')
+            .map(|position| position + 1)
+            .unwrap_or(available.len());
+        if bytes.len().saturating_add(take) > limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "proxy request line exceeds size limit",
+            ));
+        }
+        let has_newline = available[..take].last() == Some(&b'\\n');
+        bytes.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if has_newline {
+            break;
+        }
+    }
+    *line = String::from_utf8_lossy(&bytes).into_owned();
+    Ok(bytes.len())
+}
+
 fn parse_content_range_total(header_val: &str) -> Option<usize> {
     let (_, total_str) = header_val.trim().split_once('/')?;
     total_str.trim().parse::<usize>().ok()
@@ -839,7 +887,7 @@ async fn fetch_or_get_segment(
     url: &str,
     auth_headers: &[(String, String)],
     forward_all_headers: bool,
-) -> Result<(reqwest::StatusCode, String, Arc<[u8]>), reqwest::Error> {
+) -> Result<(reqwest::StatusCode, String, Arc<[u8]>), String> {
     if let Some((ct, data)) = cache.get(url) {
         return Ok((reqwest::StatusCode::OK, ct, data));
     }
@@ -883,12 +931,31 @@ async fn fetch_or_get_segment(
     Ok((status, content_type, data))
 }
 
+async fn read_response_limited(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, String> {
+    if response.content_length().is_some_and(|length| length > limit as u64) {
+        return Err(format!("upstream segment exceeds the {limit}-byte limit"));
+    }
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| error.to_string())?;
+        if body.len().saturating_add(chunk.len()) > limit {
+            return Err(format!("upstream segment exceeds the {limit}-byte limit"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 async fn fetch_m4s_chunked(
     client: &reqwest::Client,
     url: &str,
     auth_headers: &[(String, String)],
     forward_all_headers: bool,
-) -> Result<(reqwest::StatusCode, String, Arc<[u8]>), reqwest::Error> {
+) -> Result<(reqwest::StatusCode, String, Arc<[u8]>), String> {
     let first_end = DASH_RANGE_CHUNK_BYTES - 1;
     let mut req = client
         .get(url)
@@ -899,7 +966,7 @@ async fn fetch_m4s_chunked(
         }
     }
 
-    let res = req.send().await?;
+    let res = req.send().await.map_err(|error| error.to_string())?;
     let status = res.status();
     let content_type = res
         .headers()
@@ -909,64 +976,91 @@ async fn fetch_m4s_chunked(
         .to_string();
 
     if !status.is_success() {
-        let body = res.bytes().await.unwrap_or_default();
-        return Ok((status, content_type, Arc::from(body.as_ref())));
+        // Error bodies are intentionally not buffered; the caller only needs the status.
+        return Ok((status, content_type, Arc::from([])));
     }
 
     if status == reqwest::StatusCode::OK {
-        let body = res.bytes().await?;
-        return Ok((
-            reqwest::StatusCode::OK,
-            content_type,
-            Arc::from(body.as_ref()),
-        ));
+        // Some origins ignore Range. Bound this fallback instead of buffering an arbitrary file.
+        let body = read_response_limited(res, MAX_SEGMENT_BYTES).await?;
+        return Ok((status, content_type, Arc::from(body)));
     }
 
-    let total_opt = res
+    if status != reqwest::StatusCode::PARTIAL_CONTENT {
+        return Err(format!("unexpected upstream range status: {status}"));
+    }
+    let range_header = res
         .headers()
         .get(reqwest::header::CONTENT_RANGE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(parse_content_range_total);
-    let first_chunk = res.bytes().await?;
-
-    let Some(total) = total_opt.filter(|&t| t > first_chunk.len() && t <= MAX_SEGMENT_BYTES) else {
-        return Ok((
-            reqwest::StatusCode::OK,
-            content_type,
-            Arc::from(first_chunk.as_ref()),
-        ));
-    };
-
-    let mut ranges = Vec::new();
-    let mut pos = first_chunk.len();
-    while pos < total {
-        let end = (pos + DASH_RANGE_CHUNK_BYTES - 1).min(total - 1);
-        ranges.push((pos, end));
-        pos = end + 1;
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| "upstream omitted Content-Range".to_string())?;
+    let (range_start, range_end, total) = parse_content_range(range_header)
+        .ok_or_else(|| "upstream returned an invalid Content-Range".to_string())?;
+    if range_start != 0
+        || range_end < range_start
+        || range_end - range_start + 1 > DASH_RANGE_CHUNK_BYTES
+        || total <= range_end
+        || total > MAX_SEGMENT_BYTES
+    {
+        return Err("upstream returned an out-of-bounds Content-Range".to_string());
+    }
+    let first_limit = range_end - range_start + 1;
+    let first_chunk = read_response_limited(res, first_limit).await?;
+    if first_chunk.len() != first_limit {
+        return Err("upstream range length did not match Content-Range".to_string());
+    }
+    if total == first_chunk.len() {
+        return Ok((reqwest::StatusCode::OK, content_type, Arc::from(first_chunk)));
     }
 
     let mut assembled = Vec::with_capacity(total);
     assembled.extend_from_slice(&first_chunk);
-    for batch in ranges.chunks(16) {
-        let chunk_futs = batch.iter().copied().map(|(start, end)| async move {
-            let mut sub_req = client
-                .get(url)
-                .header("Range", format!("bytes={start}-{end}"));
-            for (name, val) in auth_headers {
-                if should_forward_header(forward_all_headers, name) {
-                    sub_req = sub_req.header(name.as_str(), val.as_str());
-                }
+    let mut pos = first_chunk.len();
+    while pos < total {
+        let end = (pos + DASH_RANGE_CHUNK_BYTES - 1).min(total - 1);
+        let mut sub_req = client
+            .get(url)
+            .header("Range", format!("bytes={pos}-{end}"));
+        for (name, val) in auth_headers {
+            if should_forward_header(forward_all_headers, name) {
+                sub_req = sub_req.header(name.as_str(), val.as_str());
             }
-            let sub_res = sub_req.send().await?.error_for_status()?;
-            sub_res.bytes().await
-        });
-        let batch_chunks = futures::future::try_join_all(chunk_futs).await?;
-        for chunk in batch_chunks {
-            assembled.extend_from_slice(&chunk);
         }
+        let sub_res = sub_req.send().await.map_err(|error| error.to_string())?;
+        if sub_res.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+            return Err("upstream did not honor a DASH byte-range request".to_string());
+        }
+        let expected = end - pos + 1;
+        let sub_range = sub_res
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_content_range);
+        if sub_range != Some((pos, end, total)) {
+            return Err("upstream returned a mismatched Content-Range".to_string());
+        }
+        let chunk = read_response_limited(sub_res, expected).await?;
+        if chunk.len() != expected || assembled.len().saturating_add(chunk.len()) > total {
+            return Err("upstream range length exceeded its declared bounds".to_string());
+        }
+        assembled.extend_from_slice(&chunk);
+        pos = end + 1;
     }
 
+    if assembled.len() != total {
+        return Err("assembled DASH segment length did not match Content-Range".to_string());
+    }
     Ok((reqwest::StatusCode::OK, content_type, Arc::from(assembled)))
+}
+
+fn parse_content_range(header_val: &str) -> Option<(usize, usize, usize)> {
+    let value = header_val.trim().strip_prefix("bytes ")?;
+    let (range, total) = value.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    let start = start.parse::<usize>().ok()?;
+    let end = end.parse::<usize>().ok()?;
+    let total = total.parse::<usize>().ok()?;
+    (start <= end && end < total).then_some((start, end, total))
 }
 fn format_proxy_response_headers(
     headers: &reqwest::header::HeaderMap,
