@@ -814,6 +814,73 @@ pub fn moviebox_resource_json_to_releases(payload: &serde_json::Value) -> Vec<Re
         .collect()
 }
 
+pub fn moviebox_episode_duration(
+    payload: &serde_json::Value,
+    season: usize,
+    episode: usize,
+) -> Option<u64> {
+    payload
+        .get("list")
+        .and_then(|list| list.as_array())
+        .or_else(|| payload.as_array())
+        .and_then(|items| {
+            items.iter().find(|item| {
+                item.get("se").and_then(|value| value.as_u64()) == Some(season as u64)
+                    && item.get("ep").and_then(|value| value.as_u64()) == Some(episode as u64)
+            })
+        })
+        .and_then(|item| item.get("duration"))
+        .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
+        .filter(|duration| *duration > 0)
+}
+
+pub fn moviebox_invalid_play_info_urls(
+    payload: &serde_json::Value,
+    expected_duration: Option<u64>,
+) -> std::collections::HashSet<String> {
+    let mut invalid = std::collections::HashSet::new();
+    let Some(expected) = expected_duration.filter(|duration| *duration >= 300) else {
+        return invalid;
+    };
+    let Some(streams) = payload
+        .get("data")
+        .unwrap_or(payload)
+        .get("streams")
+        .and_then(|streams| streams.as_array())
+    else {
+        return invalid;
+    };
+    for stream in streams {
+        let Some(url) = stream.get("url").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let duration = stream
+            .get("duration")
+            .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()));
+        if duration.is_none_or(|duration| duration.saturating_mul(2) < expected) {
+            invalid.insert(url.to_string());
+        }
+    }
+    invalid
+}
+
+pub fn moviebox_play_info_json_to_releases_for_episode(
+    payload: &serde_json::Value,
+    season: usize,
+    episode: usize,
+    user_agent: &str,
+    expected_duration: Option<u64>,
+) -> Vec<Release> {
+    let invalid_urls = moviebox_invalid_play_info_urls(payload, expected_duration);
+    let mut releases = moviebox_play_info_json_to_releases(payload, season, episode, user_agent);
+    releases.retain(|release| {
+        release
+            .direct_url()
+            .is_none_or(|url| !invalid_urls.contains(url))
+    });
+    releases
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1241,6 +1308,74 @@ mod tests {
             releases
                 .iter()
                 .all(|release| release.direct_url() == Some(url))
+        );
+    }
+
+    #[test]
+    fn test_episode_duration_rejects_ad_before_correct_media() {
+        let ad_url = "https://cdn.example.com/promo.mp4";
+        let episode_url = "https://cdn.example.com/naruto-s01e01.mp4";
+        let resources = json!({
+            "list": [{"se": 1, "ep": 1, "duration": 1417, "resourceLink": episode_url}]
+        });
+        let play_info = json!({
+            "streams": [
+                {"id": "ad", "duration": 23, "resolutions": "480", "url": ad_url},
+                {"id": "episode", "duration": 1417, "resolutions": "1080,720,480", "url": episode_url}
+            ]
+        });
+        let expected = moviebox_episode_duration(&resources, 1, 1);
+        assert_eq!(expected, Some(1417));
+        let invalid = moviebox_invalid_play_info_urls(&play_info, expected);
+        assert!(invalid.contains(ad_url));
+        assert!(!invalid.contains(episode_url));
+        let releases = moviebox_play_info_json_to_releases_for_episode(
+            &play_info,
+            1,
+            1,
+            "TestAgent/1.0",
+            expected,
+        );
+        assert_eq!(releases.len(), 3);
+        assert!(
+            releases
+                .iter()
+                .all(|release| release.direct_url() == Some(episode_url))
+        );
+    }
+
+    #[test]
+    fn test_ad_only_episode_response_produces_no_verified_releases() {
+        let ad_url = "https://cdn.example.com/promo.mp4";
+        let play_info = json!({
+            "streams": [{"id": "ad", "duration": 23, "resolutions": "480", "url": ad_url}]
+        });
+        let invalid = moviebox_invalid_play_info_urls(&play_info, Some(1417));
+        assert!(invalid.contains(ad_url));
+        assert!(
+            moviebox_play_info_json_to_releases_for_episode(
+                &play_info,
+                1,
+                1,
+                "TestAgent/1.0",
+                Some(1417),
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_episode_duration_does_not_cross_match_another_episode() {
+        let resources = json!({
+            "list": [{"se": 1, "ep": 2, "duration": 1410, "resourceLink": "https://example.com/e2.mp4"}]
+        });
+        assert_eq!(moviebox_episode_duration(&resources, 1, 1), None);
+        assert!(
+            moviebox_invalid_play_info_urls(
+                &json!({"streams": [{"duration": 23, "url": "https://example.com/a.mp4"}]}),
+                None,
+            )
+            .is_empty()
         );
     }
 

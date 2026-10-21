@@ -80,13 +80,22 @@ impl crate::providers::ReleaseProvider for client::MovieBoxClient {
 
         let mut releases = Vec::new();
         let mut seen_urls = std::collections::HashSet::new();
+        let expected_duration = resources_res
+            .as_ref()
+            .ok()
+            .and_then(|json| adapt::moviebox_episode_duration(json, season, episode));
+        let invalid_play_info_urls = play_info_res
+            .as_ref()
+            .map(|json| adapt::moviebox_invalid_play_info_urls(json, expected_duration))
+            .unwrap_or_default();
 
         if let Ok(json) = play_info_res {
-            for rel in adapt::moviebox_play_info_json_to_releases(
+            for rel in adapt::moviebox_play_info_json_to_releases_for_episode(
                 &json,
                 season,
                 episode,
                 self.user_agent(),
+                expected_duration,
             ) {
                 if let Some(url) = rel.direct_url() {
                     let base = url.split('?').next().unwrap_or(url).to_string();
@@ -102,6 +111,9 @@ impl crate::providers::ReleaseProvider for client::MovieBoxClient {
             for rel in adapt::moviebox_resource_json_to_releases(&res_json) {
                 if let Some(url) = rel.direct_url() {
                     let base = url.split('?').next().unwrap_or(url).to_string();
+                    if invalid_play_info_urls.contains(&base) {
+                        continue;
+                    }
                     if !base.is_empty() && seen_urls.contains(&base) {
                         continue;
                     }
