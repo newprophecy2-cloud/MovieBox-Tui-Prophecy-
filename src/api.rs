@@ -1,3 +1,8 @@
+#![allow(
+    dead_code,
+    reason = "MovieBox catalog handlers remain compiled for a controlled future re-enable while the provider is intentionally disabled"
+)]
+
 use std::{
     collections::HashMap,
     sync::Arc,
@@ -31,6 +36,9 @@ const OVERALL_TIMEOUT: Duration = Duration::from_secs(45);
 const TRACK_PROBE_TIMEOUT: Duration = Duration::from_secs(45);
 const RELEASE_CACHE_TTL: Duration = Duration::from_secs(600);
 const PLAYBACK_CACHE_TTL: Duration = Duration::from_secs(120);
+const MAX_REQUEST_BYTES: usize = 64 * 1024;
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_API_CONNECTIONS: usize = 256;
 const MOVIEBOX_PROVIDER_ENABLED: bool = false;
 const MAX_TRANSCODE_SESSIONS: usize = 2;
 const TRANSCODE_STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
@@ -66,6 +74,7 @@ pub struct ApiState {
     release_cache: Arc<Mutex<HashMap<String, ReleaseCacheEntry>>>,
     playback_cache: Arc<Mutex<HashMap<String, PlaybackCacheEntry>>>,
     transcode_slots: Arc<Semaphore>,
+    connection_slots: Arc<Semaphore>,
 }
 
 #[derive(Clone)]
@@ -478,12 +487,30 @@ pub async fn run() -> std::io::Result<()> {
         release_cache: Arc::new(Mutex::new(HashMap::new())),
         playback_cache: Arc::new(Mutex::new(HashMap::new())),
         transcode_slots: Arc::new(Semaphore::new(MAX_TRANSCODE_SESSIONS)),
+        connection_slots: Arc::new(Semaphore::new(MAX_API_CONNECTIONS)),
     };
     log::info!("MovieBox API listening on 0.0.0.0:{port}");
     loop {
         let (stream, _) = listener.accept().await?;
+        let Ok(connection_permit) = state.connection_slots.clone().try_acquire_owned() else {
+            let mut stream = stream;
+            let _ = write_json(
+                &mut stream,
+                503,
+                &serde_json::json!({
+                    "error": {
+                        "code": "SERVER_BUSY",
+                        "message": "The server is temporarily at capacity."
+                    }
+                }),
+                Some("Connection: close\r\n"),
+            )
+            .await;
+            continue;
+        };
         let state = state.clone();
         tokio::spawn(async move {
+            let _connection_permit = connection_permit;
             if let Err(e) = handle(stream, state).await {
                 log::debug!("request ended: {e}");
             }
@@ -492,17 +519,52 @@ pub async fn run() -> std::io::Result<()> {
 }
 
 async fn handle(mut stream: TcpStream, state: ApiState) -> std::io::Result<()> {
-    let mut buf = vec![0u8; 64 * 1024];
-    let n = stream.read(&mut buf).await?;
-    if n == 0 {
-        return Ok(());
+    let mut buf = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = tokio::time::timeout(REQUEST_READ_TIMEOUT, stream.read(&mut chunk))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "request read timed out")
+            })??;
+        if n == 0 {
+            return Ok(());
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.len() > MAX_REQUEST_BYTES {
+            return write_json(
+                &mut stream,
+                431,
+                &serde_json::json!({
+                    "error": {
+                        "code": "REQUEST_HEADERS_TOO_LARGE",
+                        "message": "The request headers exceed the permitted size."
+                    }
+                }),
+                Some("Connection: close\r\n"),
+            )
+            .await;
+        }
+        if buf.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
     }
-    let raw = String::from_utf8_lossy(&buf[..n]);
+    let raw = String::from_utf8_lossy(&buf);
     let mut lines = raw.split("\r\n");
     let first = lines.next().unwrap_or("");
     let mut parts = first.split_whitespace();
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("/");
+    let version = parts.next().unwrap_or("");
+    if method.is_empty() || target.is_empty() || version != "HTTP/1.1" || parts.next().is_some() {
+        return write_json(
+            &mut stream,
+            400,
+            &serde_json::json!({"error":{"code":"MALFORMED_REQUEST","message":"The HTTP request line is invalid."}}),
+            Some("Connection: close\r\n"),
+        )
+        .await;
+    }
     if method != "GET" {
         return write_json(&mut stream, 405, &serde_json::json!({"error":{"code":"METHOD_NOT_ALLOWED","message":"Only GET is supported."}}), None).await;
     }
@@ -1965,6 +2027,8 @@ fn validate_transcode_url(raw: &str) -> Option<String> {
             .parse::<std::net::IpAddr>()
             .is_ok_and(|address| !is_public_transcode_ip(address));
     if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
         || local_or_intermediate
         || path.ends_with(".zip")
         || path.contains("login.php")
@@ -1973,6 +2037,22 @@ fn validate_transcode_url(raw: &str) -> Option<String> {
         return None;
     }
     Some(url.to_string())
+}
+
+async fn validate_transcode_destination(raw: &str) -> Option<String> {
+    let normalized = validate_transcode_url(raw)?;
+    let url = reqwest::Url::parse(&normalized).ok()?;
+    let host = url.host_str()?;
+    let port = url.port_or_known_default()?;
+    let addresses = tokio::net::lookup_host((host, port)).await.ok()?;
+    let mut found = false;
+    for address in addresses {
+        found = true;
+        if !is_public_transcode_ip(address.ip()) {
+            return None;
+        }
+    }
+    found.then_some(normalized)
 }
 
 fn is_public_transcode_ip(address: std::net::IpAddr) -> bool {
@@ -2091,6 +2171,15 @@ async fn transcode_source(
             return write_raw_json(stream, status, &body, None).await;
         }
     };
+    let Some(validated_url) = validate_transcode_destination(&playback.url).await else {
+        let (status, body) = err(
+            "TRANSCODE_UNAVAILABLE",
+            "The media destination is not a permitted public HTTPS source.",
+            Some(source.provider),
+            502,
+        );
+        return write_raw_json(stream, status, &body, None).await;
+    };
     let mut command = Command::new("ffmpeg");
     command.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
     let headers = playback
@@ -2105,7 +2194,7 @@ async fn transcode_source(
         "-rw_timeout",
         "15000000",
         "-i",
-        playback.url.as_str(),
+        validated_url.as_str(),
         "-map",
         "0:v:0",
         "-map",
@@ -2468,7 +2557,7 @@ mod tests {
             ..first.clone()
         };
         let decoded = decode::<OpaqueSource>(&source_ref(&first, &episode, 0)).unwrap();
-        let reordered = vec![first, second];
+        let reordered = [first, second];
         let matched = decoded.f.as_deref().and_then(|fingerprint| {
             reordered
                 .iter()
@@ -2492,6 +2581,24 @@ mod tests {
         assert_eq!(public.len(), 2);
         assert!(public.iter().any(|(name, _)| name == "User-Agent"));
         assert!(public.iter().any(|(name, _)| name == "Referer"));
+    }
+
+    #[test]
+    fn transcode_url_rejects_credentials_private_destinations_and_non_https() {
+        assert!(validate_transcode_url("https://user:pass@example.com/video.mp4").is_none());
+        assert!(validate_transcode_url("https://127.0.0.1/video.mp4").is_none());
+        assert!(validate_transcode_url("https://10.0.0.8/video.mp4").is_none());
+        assert!(validate_transcode_url("http://example.com/video.mp4").is_none());
+        assert!(validate_transcode_url("https://example.com/video.mp4").is_some());
+    }
+
+    #[test]
+    fn public_transcode_ip_filter_covers_ipv4_and_ipv6_internal_ranges() {
+        assert!(!is_public_transcode_ip("127.0.0.1".parse().unwrap()));
+        assert!(!is_public_transcode_ip("169.254.1.1".parse().unwrap()));
+        assert!(!is_public_transcode_ip("::1".parse().unwrap()));
+        assert!(!is_public_transcode_ip("fc00::1".parse().unwrap()));
+        assert!(is_public_transcode_ip("8.8.8.8".parse().unwrap()));
     }
 
     #[test]
