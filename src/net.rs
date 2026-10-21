@@ -78,7 +78,7 @@ impl Resolve for FallbackResolver {
     }
 }
 
-pub pub fn is_public_ip(address: std::net::IpAddr) -> bool {
+pub fn is_public_ip(address: std::net::IpAddr) -> bool {
     match address {
         std::net::IpAddr::V4(address) => {
             let octets = address.octets();
