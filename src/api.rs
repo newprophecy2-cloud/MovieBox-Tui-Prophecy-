@@ -1236,27 +1236,38 @@ async fn search_sse(stream: &mut TcpStream, query: &str, state: ApiState) -> std
         });
     }
     let mut partial = false;
-    while let Some(Ok((p, result))) = tasks.join_next().await {
-        match result {
-            Ok(Ok(items)) => {
-                for mut item in items {
-                    if let Some(language) = requested_language {
-                        crate::language::decorate_catalog_item(&mut item, Some(language));
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok((p, result)) => match result {
+                Ok(Ok(items)) => {
+                    for mut item in items {
+                        if let Some(language) = requested_language {
+                            crate::language::decorate_catalog_item(&mut item, Some(language));
+                        }
+                        let payload =
+                            serde_json::to_string(&serde_json::json!({"result":catalog(item)}))
+                                .unwrap();
+                        send_event(stream, "search_result", &payload).await?;
                     }
-                    let payload =
-                        serde_json::to_string(&serde_json::json!({"result":catalog(item)}))
-                            .unwrap();
-                    send_event(stream, "search_result", &payload).await?;
                 }
-            }
-            Ok(Err(e)) => {
+                Ok(Err(e)) => {
+                    partial = true;
+                    let payload=serde_json::to_string(&serde_json::json!({"provider":p.label(),"code":"UPSTREAM_UNAVAILABLE","message":e.user_message(p)})).unwrap();
+                    send_event(stream, "search_provider_error", &payload).await?;
+                }
+                Err(_) => {
+                    partial = true;
+                    let payload=serde_json::json!({"provider":p.label(),"code":"PROVIDER_TIMEOUT","message":"Provider request timed out."}).to_string();
+                    send_event(stream, "search_provider_error", &payload).await?;
+                }
+            },
+            Err(join_error) => {
                 partial = true;
-                let payload=serde_json::to_string(&serde_json::json!({"provider":p.label(),"code":"UPSTREAM_UNAVAILABLE","message":e.user_message(p)})).unwrap();
-                send_event(stream, "search_provider_error", &payload).await?;
-            }
-            Err(_) => {
-                partial = true;
-                let payload=serde_json::json!({"provider":p.label(),"code":"PROVIDER_TIMEOUT","message":"Provider request timed out."}).to_string();
+                log::error!("search provider task failed: {join_error}");
+                let payload=serde_json::json!({
+                    "code":"PROVIDER_TASK_FAILED",
+                    "message":"A provider task ended unexpectedly."
+                }).to_string();
                 send_event(stream, "search_provider_error", &payload).await?;
             }
         }
@@ -1290,18 +1301,25 @@ async fn search_all(
     let mut items = Vec::new();
     let mut failed = false;
     let mut provider_status = HashMap::new();
-    while let Some(Ok((p, r))) = tasks.join_next().await {
-        match r {
-            Ok(Ok(mut v)) => {
-                provider_status.insert(p.cache_key().to_string(), "ok".to_string());
-                items.append(&mut v);
-            }
-            Ok(Err(e)) => {
-                provider_status.insert(p.cache_key().to_string(), e.user_message(p));
-                failed = true;
-            }
-            Err(_) => {
-                provider_status.insert(p.cache_key().to_string(), "timeout".to_string());
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok((p, r)) => match r {
+                Ok(Ok(mut v)) => {
+                    provider_status.insert(p.cache_key().to_string(), "ok".to_string());
+                    items.append(&mut v);
+                }
+                Ok(Err(e)) => {
+                    provider_status.insert(p.cache_key().to_string(), e.user_message(p));
+                    failed = true;
+                }
+                Err(_) => {
+                    provider_status.insert(p.cache_key().to_string(), "timeout".to_string());
+                    failed = true;
+                }
+            },
+            Err(error) => {
+                log::error!("search provider task failed: {error}");
+                provider_status.insert("provider_task".to_string(), "task failed unexpectedly".to_string());
                 failed = true;
             }
         }
@@ -2105,25 +2123,7 @@ async fn validate_transcode_destination(raw: &str) -> Option<String> {
 }
 
 fn is_public_transcode_ip(address: std::net::IpAddr) -> bool {
-    match address {
-        std::net::IpAddr::V4(address) => {
-            !(address.is_private()
-                || address.is_loopback()
-                || address.is_link_local()
-                || address.is_broadcast()
-                || address.is_documentation()
-                || address.is_unspecified())
-        }
-        std::net::IpAddr::V6(address) => {
-            if let Some(mapped) = address.to_ipv4_mapped() {
-                return is_public_transcode_ip(std::net::IpAddr::V4(mapped));
-            }
-            !(address.is_loopback()
-                || address.is_unspecified()
-                || address.is_unique_local()
-                || address.is_unicast_link_local())
-        }
-    }
+    crate::net::is_public_ip(address)
 }
 
 fn direct_transcode_playback_source(source: &Release) -> Option<PlaybackSource> {
