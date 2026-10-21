@@ -735,6 +735,11 @@ fn normalized_contains(value: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| value.contains(needle))
 }
 
+fn normalized_matches(value: &str, aliases: &[&str]) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    aliases.iter().any(|alias| value == *alias)
+}
+
 fn is_classified(
     item: &CatalogItem,
     metrics: &HashMap<String, crate::models::BrowseMetrics>,
@@ -755,13 +760,13 @@ fn is_classified(
             item.media_type == MediaType::Series
                 && (normalized_contains(category, &["anime"])
                     || anime_genre
-                    || normalized_contains(language, &["japanese", "ja", "jpn"]))
+                    || normalized_matches(language, &["japanese", "ja", "jpn"]))
         }
         Classification::KDrama => {
             item.media_type == MediaType::Series
                 && (normalized_contains(category, &["k-drama", "korean drama", "kdrama"])
-                    || normalized_contains(country, &["south korea", "korea", "korean", "kr"])
-                    || normalized_contains(language, &["korean", "ko", "kor", "한국어"]))
+                    || normalized_matches(country, &["south korea", "korea", "korean", "kr", "kor"])
+                    || normalized_matches(language, &["korean", "ko", "kor", "한국어"]))
         }
     }
 }
@@ -1124,25 +1129,24 @@ fn parse_query(query: &str) -> SearchQuery {
     out
 }
 fn percent_decode(v: &str) -> String {
-    let mut out = String::new();
     let bytes = v.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(n) = u8::from_str_radix(&v[i + 1..i + 3], 16) {
-                out.push(n as char);
+            if let (Some(high), Some(low)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            ) {
+                decoded.push(((high << 4) | low) as u8);
                 i += 3;
                 continue;
             }
         }
-        out.push(if bytes[i] == b'+' {
-            ' '
-        } else {
-            bytes[i] as char
-        });
+        decoded.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
         i += 1;
     }
-    out
+    String::from_utf8_lossy(&decoded).into_owned()
 }
 
 async fn search_json(stream: &mut TcpStream, query: &str, state: ApiState) -> std::io::Result<()> {
@@ -1609,7 +1613,8 @@ async fn source_sse(stream: &mut TcpStream, r: OpaqueRef, state: ApiState) -> st
                 "source_error",
                 "{\"code\":\"REQUEST_DEADLINE_EXCEEDED\"}",
             )
-            .await
+            .await?;
+            send_event(stream, "source_complete", "{\"partial\":true}").await
         }
     }
 }
@@ -1833,27 +1838,53 @@ async fn source_route(stream: &mut TcpStream, path: &str, state: ApiState) -> st
         s: sr.s,
         e: sr.e,
     };
-    let Ok(rs) = tokio::time::timeout(SOURCE_TIMEOUT, cached_releases(&state, &r))
-        .await
-        .unwrap_or(Err(ProviderError::Unavailable(
-            "Source resolution timed out".into(),
-        )))
-    else {
-        let (s, b) = err(
-            "SOURCE_TIMEOUT",
-            "Source resolution exceeded the allowed time.",
-            Some(sr.p),
-            504,
-        );
-        return write_raw_json(stream, s, &b, None).await;
+    let rs = match tokio::time::timeout(SOURCE_TIMEOUT, cached_releases(&state, &r)).await {
+        Ok(Ok(releases)) => releases,
+        Ok(Err(error)) => {
+            let (status, body) = match error {
+                ProviderError::NotFound => err(
+                    "SOURCE_NOT_FOUND",
+                    "No source was found for this episode.",
+                    Some(sr.p),
+                    404,
+                ),
+                ProviderError::RateLimited(_) => err(
+                    "RATE_LIMITED",
+                    "The upstream provider rate limited source resolution.",
+                    Some(sr.p),
+                    429,
+                ),
+                ProviderError::Network(_) | ProviderError::Unavailable(_) => err(
+                    "UPSTREAM_UNAVAILABLE",
+                    "The provider could not resolve this source.",
+                    Some(sr.p),
+                    502,
+                ),
+                ProviderError::Parsing(_) => err(
+                    "UPSTREAM_INVALID_RESPONSE",
+                    "The provider returned an invalid source response.",
+                    Some(sr.p),
+                    502,
+                ),
+            };
+            return write_raw_json(stream, status, &body, None).await;
+        }
+        Err(_) => {
+            let (status, body) = err(
+                "SOURCE_TIMEOUT",
+                "Source resolution exceeded the allowed time.",
+                Some(sr.p),
+                504,
+            );
+            return write_raw_json(stream, status, &body, None).await;
+        }
     };
-    let rel =
-        sr.f.as_deref()
-            .and_then(|fingerprint| {
-                rs.iter()
-                    .find(|release| release_fingerprint(release) == fingerprint)
-            })
-            .or_else(|| rs.get(sr.i));
+    let rel = match sr.f.as_deref() {
+        Some(fingerprint) => rs
+            .iter()
+            .find(|release| release_fingerprint(release) == fingerprint),
+        None => rs.get(sr.i),
+    };
     let Some(rel) = rel else {
         let (s, b) = err(
             "SOURCE_NOT_FOUND",
@@ -2081,6 +2112,9 @@ fn is_public_transcode_ip(address: std::net::IpAddr) -> bool {
                 || address.is_unspecified())
         }
         std::net::IpAddr::V6(address) => {
+            if let Some(mapped) = address.to_ipv4_mapped() {
+                return is_public_transcode_ip(std::net::IpAddr::V4(mapped));
+            }
             !(address.is_loopback()
                 || address.is_unspecified()
                 || address.is_unique_local()
@@ -2451,6 +2485,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn percent_decode_preserves_utf8_and_plus_spaces() {
+        assert_eq!(percent_decode("%E0%A6%AC%E0%A6%BE%E0%A6%82%E0%A6%B2%E0%A6%BE"), "বাংলা");
+        assert_eq!(percent_decode("hello+world"), "hello world");
+        assert_eq!(percent_decode("%E0%A4%B9%E0%A4%BF%E0%A4%A8%E0%A5%8D%E0%A6%A6%E0%A5%80"), "हिन्दी");
+    }
+
+    #[test]
     fn opaque_reference_round_trip_preserves_internal_identity() {
         let original = OpaqueRef {
             p: ProviderKind::Dramachi,
@@ -2637,6 +2678,9 @@ mod tests {
         assert!(!is_public_transcode_ip("169.254.1.1".parse().unwrap()));
         assert!(!is_public_transcode_ip("::1".parse().unwrap()));
         assert!(!is_public_transcode_ip("fc00::1".parse().unwrap()));
+        assert!(!is_public_transcode_ip("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(!is_public_transcode_ip("::ffff:10.0.0.8".parse().unwrap()));
+        assert!(is_public_transcode_ip("::ffff:8.8.8.8".parse().unwrap()));
         assert!(is_public_transcode_ip("8.8.8.8".parse().unwrap()));
     }
 
