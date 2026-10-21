@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
 const MAX_LINE_BYTES: usize = 8 * 1024;
@@ -326,7 +326,12 @@ async fn handle_connection(
             read_bounded_line(&mut buf_reader, &mut request_line, MAX_LINE_BYTES),
         )
         .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "proxy request line timed out"))??;
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "proxy request line timed out",
+            )
+        })??;
         if n == 0 {
             return Ok(());
         }
@@ -352,7 +357,9 @@ async fn handle_connection(
                 read_bounded_line(&mut buf_reader, &mut header_line, MAX_LINE_BYTES),
             )
             .await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "proxy header timed out"))??;
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "proxy header timed out")
+            })??;
             if n == 0 {
                 break;
             }
@@ -833,7 +840,7 @@ async fn read_bounded_line<R>(
     limit: usize,
 ) -> std::io::Result<usize>
 where
-    R: tokio::io::AsyncBufRead + Unpin,
+    R: AsyncBufRead + Unpin,
 {
     let mut bytes = Vec::with_capacity(limit.min(1024));
     loop {
@@ -844,7 +851,9 @@ where
             }
             break;
         }
-        let take = available.iter().position(|byte| *byte == b'\n')
+        let take = available
+            .iter()
+            .position(|byte| *byte == b'\n')
             .map(|position| position + 1)
             .unwrap_or(available.len());
         if bytes.len().saturating_add(take) > limit {
@@ -987,7 +996,7 @@ async fn fetch_m4s_chunked(
 
     if !status.is_success() {
         // Error bodies are intentionally not buffered; the caller only needs the status.
-        return Ok((status, content_type, Arc::from([])));
+        return Ok((status, content_type, Arc::<[u8]>::from(Vec::<u8>::new())));
     }
 
     if status == reqwest::StatusCode::OK {
