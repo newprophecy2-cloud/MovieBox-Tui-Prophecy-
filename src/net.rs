@@ -62,19 +62,98 @@ impl Resolve for FallbackResolver {
         let resolver = Arc::clone(&GLOBAL_RESOLVER);
         Box::pin(async move {
             let lookup = resolver.lookup_ip(name.as_str()).await?;
-            let addrs: Addrs = Box::new(
-                lookup
-                    .into_iter()
-                    .map(|address| SocketAddr::new(address, 0)),
-            );
+            let mut addresses = lookup
+                .into_iter()
+                .filter(|address| crate::config::is_test_environment() || is_public_ip(*address))
+                .map(|address| SocketAddr::new(address, 0));
+            let first = addresses.next().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "outbound destination resolves to a private or local address",
+                )
+            })?;
+            let addrs: Addrs = Box::new(std::iter::once(first).chain(addresses));
             Ok(addrs)
         })
+    }
+}
+
+pub fn is_public_ip(address: std::net::IpAddr) -> bool {
+    match address {
+        std::net::IpAddr::V4(address) => {
+            !(address.is_private()
+                || address.is_loopback()
+                || address.is_link_local()
+                || address.is_broadcast()
+                || address.is_documentation()
+                || address.is_unspecified())
+        }
+        std::net::IpAddr::V6(address) => {
+            !(address.is_loopback()
+                || address.is_unspecified()
+                || address.is_unique_local()
+                || address.is_unicast_link_local())
+        }
+    }
+}
+
+pub fn validate_url_syntax(raw: &str, allow_http: bool) -> Result<reqwest::Url, String> {
+    let url = reqwest::Url::parse(raw.trim()).map_err(|_| "invalid URL".to_string())?;
+    let scheme_ok = url.scheme() == "https" || (allow_http && url.scheme() == "http");
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    let literal_private = host
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|address| !is_public_ip(address));
+    if !scheme_ok
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || host == "localhost"
+        || host.ends_with(".local")
+        || literal_private
+    {
+        return Err("URL is not an allowed public HTTP(S) destination".to_string());
+    }
+    Ok(url)
+}
+
+pub async fn validate_public_url(raw: &str, allow_http: bool) -> Result<reqwest::Url, String> {
+    if crate::config::is_test_environment() {
+        let url = reqwest::Url::parse(raw.trim()).map_err(|_| "invalid URL".to_string())?;
+        let scheme_ok = url.scheme() == "https" || (allow_http && url.scheme() == "http");
+        if scheme_ok && url.host_str().is_some() {
+            return Ok(url);
+        }
+        return Err("URL is not an allowed HTTP(S) test destination".to_string());
+    }
+    let url = validate_url_syntax(raw, allow_http)?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| "URL has no host".to_string())?
+        .to_string();
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| "URL has no known port".to_string())?;
+    let mut addresses = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|_| "destination DNS lookup failed".to_string())?;
+    if addresses.all(|address| is_public_ip(address.ip())) {
+        Ok(url)
+    } else {
+        Err("destination resolves to a private or local address".to_string())
     }
 }
 
 pub fn http_client_builder_base() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .dns_resolver(Arc::new(FallbackResolver::new()))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if validate_url_syntax(attempt.url().as_str(), true).is_ok() {
+                attempt.follow()
+            } else {
+                attempt.error("redirect target is not an allowed public HTTP(S) URL")
+            }
+        }))
         .tcp_nodelay(true)
         .tcp_keepalive(Some(std::time::Duration::from_secs(45)))
         .pool_idle_timeout(Some(std::time::Duration::from_secs(90)))
@@ -228,5 +307,14 @@ mod tests {
         assert!(!is_http_url("/local/path/file.m3u"));
         assert!(!is_http_url("stremio://addon.example.com"));
         assert!(!is_http_url(""));
+    }
+
+    #[test]
+    fn outbound_url_policy_allows_public_http_media_but_rejects_private_targets() {
+        assert!(validate_url_syntax("http://media.example/video.m3u8", true).is_ok());
+        assert!(validate_url_syntax("https://media.example/video.m3u8", true).is_ok());
+        assert!(validate_url_syntax("http://media.example/video.m3u8", false).is_err());
+        assert!(validate_url_syntax("http://127.0.0.1/video.m3u8", true).is_err());
+        assert!(validate_url_syntax("https://user:pass@media.example/video.m3u8", true).is_err());
     }
 }

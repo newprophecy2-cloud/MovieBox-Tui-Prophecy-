@@ -359,6 +359,16 @@ async fn handle_connection(
                 return Ok(());
             }
         };
+        if crate::net::validate_public_url(&target_url, true)
+            .await
+            .is_err()
+        {
+            let response =
+                "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            writer.write_all(response.as_bytes()).await?;
+            writer.flush().await?;
+            return Ok(());
+        }
         let extracted_host = extract_host_authority(&target_url);
         let sub_host = subtitle_url.and_then(extract_host_authority);
         let is_allowed = match (target_host, extracted_host.as_deref()) {

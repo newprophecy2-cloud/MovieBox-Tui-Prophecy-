@@ -53,6 +53,9 @@ impl AddonClient {
 
     pub async fn fetch_manifest(&self, manifest_url: &str) -> Result<AddonManifest, String> {
         let url = Self::normalize_manifest_url(manifest_url);
+        crate::net::validate_public_url(&url, true)
+            .await
+            .map_err(|e| format!("Rejected addon manifest URL: {e}"))?;
         let url_clone = url.clone();
         if let Ok(Some(manifest)) = tokio::task::spawn_blocking(move || {
             crate::cache::get_addon_manifest_cache_typed(&url_clone)
@@ -106,6 +109,9 @@ impl AddonClient {
 
         let endpoint =
             format!("{base_url}/catalog/{type}/{catalog_id}/search={encoded_query}.json");
+        crate::net::validate_public_url(&endpoint, true)
+            .await
+            .map_err(|e| format!("Rejected addon catalog URL: {e}"))?;
         let resp = self
             .http
             .get(&endpoint)
@@ -137,6 +143,9 @@ impl AddonClient {
         } else {
             format!("{base_url}/catalog/{type}/{catalog_id}.json")
         };
+        crate::net::validate_public_url(&endpoint, true)
+            .await
+            .map_err(|e| format!("Rejected addon catalog URL: {e}"))?;
         let resp = self
             .http
             .get(&endpoint)
@@ -163,6 +172,9 @@ impl AddonClient {
         id: &str,
     ) -> Result<MetaDetail, String> {
         let endpoint = format!("{base_url}/meta/{type}/{id}.json");
+        crate::net::validate_public_url(&endpoint, true)
+            .await
+            .map_err(|e| format!("Rejected addon metadata URL: {e}"))?;
         let resp = self
             .http
             .get(&endpoint)
@@ -198,6 +210,9 @@ impl AddonClient {
         id: &str,
     ) -> Result<Vec<StreamItem>, String> {
         let endpoint = format!("{base_url}/stream/{type}/{id}.json");
+        crate::net::validate_public_url(&endpoint, true)
+            .await
+            .map_err(|e| format!("Rejected addon stream URL: {e}"))?;
         let resp = self
             .http
             .get(&endpoint)

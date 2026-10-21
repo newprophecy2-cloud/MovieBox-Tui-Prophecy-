@@ -328,6 +328,9 @@ fn release_fingerprint(r: &Release) -> String {
     for mirror in &r.mirrors {
         hasher.update(mirror.label.as_bytes());
         hasher.update([0]);
+        hasher.update(mirror.resolver_url.as_bytes());
+        hasher.update([u8::from(mirror.direct_file)]);
+        hasher.update([0]);
     }
     URL_SAFE_NO_PAD.encode(hasher.finalize())
 }
@@ -1162,6 +1165,11 @@ async fn search_json(stream: &mut TcpStream, query: &str, state: ApiState) -> st
         return write_raw_json(stream, s, &b, None).await;
     }
     let (items, failed, provider_status) = search_all(&state.service, &qv).await;
+    let offset = q
+        .cursor
+        .as_deref()
+        .and_then(|cursor| decode::<usize>(cursor).ok())
+        .unwrap_or_default();
     let language_intent = crate::language::parse_query(&qv).language;
     let verified_language_matches = language_intent.map(|language| {
         let label = format!("({})", language.result_label());
@@ -1178,14 +1186,18 @@ async fn search_json(stream: &mut TcpStream, query: &str, state: ApiState) -> st
                 language.name()
             )
         });
+    let total = items.len();
+    let next_cursor =
+        (offset.saturating_add(limit) < total).then(|| encode(&offset.saturating_add(limit)));
     let results = items
         .into_iter()
+        .skip(offset.min(total))
         .take(limit)
         .map(catalog)
         .collect::<Vec<_>>();
     let body = SearchResponse {
         results,
-        next_cursor: None,
+        next_cursor,
         partial: failed,
         provider_status,
         language_intent: language_intent.map(|language| language.code().to_string()),
@@ -2567,6 +2579,30 @@ mod tests {
             matched.map(|release| release.filename.as_str()),
             Some("show.s02e05.1080p.mkv")
         );
+    }
+
+    #[test]
+    fn source_fingerprint_distinguishes_same_label_different_mirrors() {
+        let mut first = Release {
+            provider: ProviderKind::Addons,
+            filename: "episode.mkv".into(),
+            quality: Some("1080p".into()),
+            codec: Some("h264".into()),
+            language: None,
+            size_bytes: Some(100),
+            season: Some(1),
+            episode: Some(1),
+            mirrors: vec![crate::providers::models::SourceMirror {
+                label: "Direct".into(),
+                resolver_url: "https://cdn-a.example/episode.mkv".into(),
+                headers: vec![],
+                direct_file: true,
+            }],
+            resource_id: None,
+        };
+        let first_fingerprint = release_fingerprint(&first);
+        first.mirrors[0].resolver_url = "https://cdn-b.example/episode.mkv".into();
+        assert_ne!(first_fingerprint, release_fingerprint(&first));
     }
     #[test]
     fn public_headers_remove_secret_bearing_fields() {
