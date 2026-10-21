@@ -78,24 +78,44 @@ impl Resolve for FallbackResolver {
     }
 }
 
-pub fn is_public_ip(address: std::net::IpAddr) -> bool {
+pub pub fn is_public_ip(address: std::net::IpAddr) -> bool {
     match address {
         std::net::IpAddr::V4(address) => {
+            let octets = address.octets();
+            let first = octets[0];
+            let second = octets[1];
+            let is_shared_address_space = first == 100 && (64..=127).contains(&second);
+            let is_benchmarking = first == 198 && (18..=19).contains(&second);
+            let is_protocol_assignment = first == 192 && second == 0 && octets[2] == 0;
             !(address.is_private()
                 || address.is_loopback()
                 || address.is_link_local()
                 || address.is_broadcast()
                 || address.is_documentation()
-                || address.is_unspecified())
+                || address.is_unspecified()
+                || first == 0
+                || first >= 224
+                || is_shared_address_space
+                || is_benchmarking
+                || is_protocol_assignment)
         }
         std::net::IpAddr::V6(address) => {
             if let Some(mapped) = address.to_ipv4_mapped() {
                 return is_public_ip(std::net::IpAddr::V4(mapped));
             }
-            !(address.is_loopback()
-                || address.is_unspecified()
-                || address.is_unique_local()
-                || address.is_unicast_link_local())
+            let segments = address.segments();
+            let is_global_unicast = segments[0] & 0xe000 == 0x2000;
+            let is_documentation = segments[0] == 0x2001 && segments[1] == 0x0db8;
+            let is_benchmarking = segments[0] == 0x2001 && segments[1] == 0x0002;
+            let is_orchid = segments[0] == 0x2001 && segments[1] & 0xfff0 == 0x0010;
+            is_global_unicast
+                && !is_documentation
+                && !is_benchmarking
+                && !is_orchid
+                && !address.is_loopback()
+                && !address.is_unspecified()
+                && !address.is_unique_local()
+                && !address.is_unicast_link_local()
         }
     }
 }
@@ -322,5 +342,11 @@ mod tests {
         assert!(!is_public_ip("::ffff:127.0.0.1".parse().unwrap()));
         assert!(!is_public_ip("::ffff:10.0.0.8".parse().unwrap()));
         assert!(is_public_ip("::ffff:8.8.8.8".parse().unwrap()));
+        assert!(!is_public_ip("100.64.0.1".parse().unwrap()));
+        assert!(!is_public_ip("198.18.0.1".parse().unwrap()));
+        assert!(!is_public_ip("224.0.0.1".parse().unwrap()));
+        assert!(!is_public_ip("2001:db8::1".parse().unwrap()));
+        assert!(!is_public_ip("2001:2::1".parse().unwrap()));
+        assert!(is_public_ip("2606:4700:4700::1111".parse().unwrap()));
     }
 }
