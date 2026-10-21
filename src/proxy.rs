@@ -16,6 +16,7 @@ const WATCHDOG_IDLE_SECS: u64 = 600;
 const DASH_RANGE_CHUNK_BYTES: usize = 95 * 1024;
 const MAX_CACHED_SEGMENTS: usize = 24;
 const MAX_CACHED_SEGMENT_CACHE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CONCURRENT_SEGMENT_FETCHES: usize = 4;
 const MAX_SEGMENT_BYTES: usize = 16 * 1024 * 1024;
 const PREFETCH_LOOKAHEAD: u32 = 3;
 
@@ -30,10 +31,20 @@ fn is_hls_url(url: &str) -> bool {
         .ends_with(".m3u8")
 }
 
-#[derive(Default)]
 struct SegmentCache {
     completed: Mutex<std::collections::VecDeque<CachedSegment>>,
     in_flight: Mutex<std::collections::HashMap<String, Arc<tokio::sync::Notify>>>,
+    fetch_slots: Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for SegmentCache {
+    fn default() -> Self {
+        Self {
+            completed: Mutex::new(std::collections::VecDeque::new()),
+            in_flight: Mutex::new(std::collections::HashMap::new()),
+            fetch_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SEGMENT_FETCHES)),
+        }
+    }
 }
 
 impl SegmentCache {
@@ -942,6 +953,12 @@ async fn fetch_or_get_segment(
         None
     };
 
+    let _fetch_permit = cache
+        .fetch_slots
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| "segment fetch limiter is closed".to_string())?;
     let (status, content_type, data) =
         fetch_m4s_chunked(client, url, auth_headers, forward_all_headers).await?;
     if status.is_success() && !data.is_empty() && data.len() <= MAX_SEGMENT_BYTES {
