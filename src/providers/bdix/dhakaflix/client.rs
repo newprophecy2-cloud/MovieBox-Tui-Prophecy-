@@ -16,6 +16,8 @@ pub enum DhakaFlixError {
     Network(#[from] reqwest::Error),
     #[error("parse error: {0}")]
     Parse(String),
+    #[error("provider unavailable: {0}")]
+    Unavailable(String),
 }
 
 fn parse_title_and_year(raw_title: &str) -> (String, Option<String>) {
@@ -66,6 +68,10 @@ fn quality_score(name: &str) -> u8 {
     } else {
         0
     }
+}
+
+fn all_servers_failed<T>(results: &[Result<T, DhakaFlixError>]) -> bool {
+    !results.is_empty() && results.iter().all(Result::is_err)
 }
 
 pub const SERVERS: &[(&str, &str)] = &[
@@ -148,82 +154,89 @@ impl DhakaFlixClient {
             let recent_fails = self.recent_fails.clone();
 
             futures.push(async move {
-                let mut server_results: Vec<(CatalogItem, u8)> = Vec::new();
-                match client.post(&url).json(&body).send().await {
-                    Ok(resp) => {
-                        if let Ok(text) = resp.text().await {
-                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
-                                if let Some(search_arr) =
-                                    json.get("search").and_then(|v| v.as_array())
-                                {
-                                    for item in search_arr {
-                                        if let Some(item_href) =
-                                            item.get("href").and_then(|v| v.as_str())
-                                        {
-                                            let is_dir = item_href.ends_with('/');
-                                            let mut parts: Vec<&str> = item_href
-                                                .split('/')
-                                                .filter(|p| !p.is_empty())
-                                                .collect();
+                let result = async {
+                    let response = client
+                        .post(&url)
+                        .json(&body)
+                        .send()
+                        .await?
+                        .error_for_status()?;
+                    let text = response.text().await?;
+                    let json: serde_json::Value = serde_json::from_str(&text)
+                        .map_err(|error| DhakaFlixError::Parse(error.to_string()))?;
+                    let search_arr = json
+                        .get("search")
+                        .and_then(|value| value.as_array())
+                        .ok_or_else(|| {
+                            DhakaFlixError::Parse("search response missing array field".to_string())
+                        })?;
 
-                                            if !is_dir && parts.len() > 1 {
-                                                parts.pop();
-                                            }
-
-                                            let folder_path = format!("/{}/", parts.join("/"));
-
-                                            if let Some(name) = parts.last() {
-                                                let name_decoded =
-                                                    percent_encoding::percent_decode_str(name)
-                                                        .decode_utf8_lossy()
-                                                        .to_string();
-                                                let quality = quality_score(&name_decoded);
-                                                let (clean_title, year) =
-                                                    parse_title_and_year(&name_decoded);
-
-                                                server_results.push((
-                                                    CatalogItem {
-                                                        id: ProviderMediaId {
-                                                            provider: ProviderKind::BdixDhakaFlix,
-                                                            value: format!(
-                                                                "{}:{}{}",
-                                                                base_url,
-                                                                href,
-                                                                folder_path
-                                                                    .trim_start_matches(href)
-                                                            ),
-                                                        },
-                                                        title: clean_title,
-                                                        year,
-                                                        media_type: MediaType::Movie,
-                                                        poster_url: None,
-                                                        season_count: None,
-                                                    },
-                                                    quality,
-                                                ));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                    let mut server_results = Vec::new();
+                    for item in search_arr {
+                        let Some(item_href) = item.get("href").and_then(|v| v.as_str()) else {
+                            continue;
+                        };
+                        let is_dir = item_href.ends_with('/');
+                        let mut parts: Vec<&str> =
+                            item_href.split('/').filter(|p| !p.is_empty()).collect();
+                        if !is_dir && parts.len() > 1 {
+                            parts.pop();
                         }
+                        let folder_path = format!("/{}/", parts.join("/"));
+                        let Some(name) = parts.last() else { continue };
+                        let name_decoded = percent_encoding::percent_decode_str(name)
+                            .decode_utf8_lossy()
+                            .to_string();
+                        let quality = quality_score(&name_decoded);
+                        let (clean_title, year) = parse_title_and_year(&name_decoded);
+                        server_results.push((
+                            CatalogItem {
+                                id: ProviderMediaId {
+                                    provider: ProviderKind::BdixDhakaFlix,
+                                    value: format!(
+                                        "{}:{}{}",
+                                        base_url,
+                                        href,
+                                        folder_path.trim_start_matches(href)
+                                    ),
+                                },
+                                title: clean_title,
+                                year,
+                                media_type: MediaType::Movie,
+                                poster_url: None,
+                                season_count: None,
+                            },
+                            quality,
+                        ));
                     }
-                    Err(error) => {
-                        log::warn!(
-                            "dhakaflix search request failed: {error} [{}]",
-                            crate::logging::sanitize_url(base_url)
-                        );
-                        if let Ok(mut fails) = recent_fails.write() {
-                            fails.insert(base_url.to_string(), Instant::now());
-                        }
+                    Ok::<_, DhakaFlixError>(server_results)
+                }
+                .await;
+
+                if let Err(error) = &result {
+                    log::warn!(
+                        "dhakaflix search request failed: {error} [{}]",
+                        crate::logging::sanitize_url(base_url)
+                    );
+                    if let Ok(mut fails) = recent_fails.write() {
+                        fails.insert(base_url.to_string(), Instant::now());
                     }
                 }
-                server_results
+                result
             });
         }
 
         let results_array = futures::future::join_all(futures).await;
-        let all_results: Vec<(CatalogItem, u8)> = results_array.into_iter().flatten().collect();
+        if all_servers_failed(&results_array) {
+            return Err(DhakaFlixError::Unavailable(
+                "all configured servers failed or returned invalid responses".to_string(),
+            ));
+        }
+        let all_results: Vec<(CatalogItem, u8)> = results_array
+            .into_iter()
+            .filter_map(Result::ok)
+            .flatten()
+            .collect();
         let mut all_results = Self::dedup_best_quality(all_results);
 
         let item_ids: Vec<(usize, String)> = all_results
@@ -241,33 +254,23 @@ impl DhakaFlixClient {
                     if !path_parts.is_empty() {
                         let api_href = format!("/{}/", path_parts[0]);
                         let api_url = format!("{}{}", base_url, api_href);
-
                         let body = json!({
                             "action": "get",
-                            "items": {
-                                "href": path,
-                                "what": 1
-                            }
+                            "items": {"href": path, "what": 1}
                         });
 
-                        if let Ok(resp) = client.post(&api_url).json(&body).send().await {
-                            if let Ok(json) = resp.json::<serde_json::Value>().await {
-                                if let Some(items) = json.get("items").and_then(|v| v.as_array()) {
-                                    for file in items {
-                                        if let Some(href) =
-                                            file.get("href").and_then(|v| v.as_str())
-                                        {
-                                            let href_lower = href.to_lowercase();
-                                            if href_lower.ends_with(".jpg")
-                                                || href_lower.ends_with(".jpeg")
-                                                || href_lower.ends_with(".png")
-                                            {
-                                                return (
-                                                    idx,
-                                                    Some(format!("{}{}", base_url, href)),
-                                                );
-                                            }
-                                        }
+                        if let Ok(resp) = client.post(&api_url).json(&body).send().await
+                            && let Ok(json) = resp.json::<serde_json::Value>().await
+                            && let Some(items) = json.get("items").and_then(|v| v.as_array())
+                        {
+                            for file in items {
+                                if let Some(href) = file.get("href").and_then(|v| v.as_str()) {
+                                    let href_lower = href.to_lowercase();
+                                    if href_lower.ends_with(".jpg")
+                                        || href_lower.ends_with(".jpeg")
+                                        || href_lower.ends_with(".png")
+                                    {
+                                        return (idx, Some(format!("{}{}", base_url, href)));
                                     }
                                 }
                             }
@@ -357,57 +360,61 @@ impl DhakaFlixClient {
                 .send()
                 .await?
                 .error_for_status()?;
-            if let Ok(json) = resp.json::<serde_json::Value>().await {
-                if let Some(items_arr) = json.get("items").and_then(|v| v.as_array()) {
-                    for item in items_arr {
-                        if let (Some(item_href), Some(size)) = (
-                            item.get("href").and_then(|v| v.as_str()),
-                            item.get("size").and_then(|v| v.as_u64()),
-                        ) {
-                            let filename = item_href
-                                .split('/')
-                                .next_back()
-                                .unwrap_or("Unknown")
-                                .to_string();
-                            let filename_decoded = percent_encoding::percent_decode_str(&filename)
-                                .decode_utf8_lossy()
-                                .to_string();
+            let json = resp
+                .json::<serde_json::Value>()
+                .await
+                .map_err(|error| DhakaFlixError::Parse(error.to_string()))?;
+            let items_arr = json
+                .get("items")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| {
+                    DhakaFlixError::Parse("stream response missing items array".to_string())
+                })?;
+            for item in items_arr {
+                if let (Some(item_href), Some(size)) = (
+                    item.get("href").and_then(|v| v.as_str()),
+                    item.get("size").and_then(|v| v.as_u64()),
+                ) {
+                    let filename = item_href
+                        .split('/')
+                        .next_back()
+                        .unwrap_or("Unknown")
+                        .to_string();
+                    let filename_decoded = percent_encoding::percent_decode_str(&filename)
+                        .decode_utf8_lossy()
+                        .to_string();
 
-                            let f_lower = filename_decoded.to_lowercase();
-                            if !f_lower.ends_with(".mkv")
-                                && !f_lower.ends_with(".mp4")
-                                && !f_lower.ends_with(".avi")
-                                && !f_lower.ends_with(".webm")
-                            {
-                                continue;
-                            }
-
-                            let quality =
-                                crate::providers::bdix::common::detect_resolution(&f_lower)
-                                    .or_else(|| Some("HD".to_string()));
-                            let language =
-                                crate::providers::bdix::common::detect_audio_language(&f_lower);
-                            let codec = crate::providers::bdix::common::detect_codec(&f_lower);
-
-                            releases.push(Release {
-                                provider: ProviderKind::BdixDhakaFlix,
-                                filename: filename_decoded,
-                                quality,
-                                codec,
-                                language,
-                                size_bytes: Some(size),
-                                season: None,
-                                episode: None,
-                                mirrors: vec![crate::providers::models::SourceMirror {
-                                    label: "DhakaFlix".to_string(),
-                                    resolver_url: format!("{}{}", base_url, item_href),
-                                    headers: vec![],
-                                    direct_file: true,
-                                }],
-                                resource_id: None,
-                            });
-                        }
+                    let f_lower = filename_decoded.to_lowercase();
+                    if !f_lower.ends_with(".mkv")
+                        && !f_lower.ends_with(".mp4")
+                        && !f_lower.ends_with(".avi")
+                        && !f_lower.ends_with(".webm")
+                    {
+                        continue;
                     }
+
+                    let quality = crate::providers::bdix::common::detect_resolution(&f_lower)
+                        .or_else(|| Some("HD".to_string()));
+                    let language = crate::providers::bdix::common::detect_audio_language(&f_lower);
+                    let codec = crate::providers::bdix::common::detect_codec(&f_lower);
+
+                    releases.push(Release {
+                        provider: ProviderKind::BdixDhakaFlix,
+                        filename: filename_decoded,
+                        quality,
+                        codec,
+                        language,
+                        size_bytes: Some(size),
+                        season: None,
+                        episode: None,
+                        mirrors: vec![crate::providers::models::SourceMirror {
+                            label: "DhakaFlix".to_string(),
+                            resolver_url: format!("{}{}", base_url, item_href),
+                            headers: vec![],
+                            direct_file: true,
+                        }],
+                        resource_id: None,
+                    });
                 }
             }
         }
@@ -427,6 +434,24 @@ fn parse_dhakaflix_id(id: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_failed_servers_are_not_reported_as_empty_success() {
+        let results: Vec<Result<Vec<(CatalogItem, u8)>, DhakaFlixError>> = vec![
+            Err(DhakaFlixError::Unavailable("timeout".to_string())),
+            Err(DhakaFlixError::Parse("invalid JSON".to_string())),
+        ];
+        assert!(all_servers_failed(&results));
+    }
+
+    #[test]
+    fn one_valid_empty_server_response_is_a_real_empty_result() {
+        let results: Vec<Result<Vec<(CatalogItem, u8)>, DhakaFlixError>> = vec![
+            Ok(Vec::new()),
+            Err(DhakaFlixError::Unavailable("timeout".to_string())),
+        ];
+        assert!(!all_servers_failed(&results));
+    }
 
     #[test]
     fn test_parse_dhakaflix_id_with_port() {

@@ -14,6 +14,19 @@ pub use models::{AddonManifest, InstalledAddon, MetaDetail, MetaItem, StreamItem
 use crate::providers::models::{CatalogItem, MediaDetails, ProviderError, ProviderKind};
 use crate::providers::{Provider, ProviderCapabilities};
 
+fn addon_type_matches_hint(detail: &models::MetaDetail, hint: Option<&str>) -> bool {
+    let Some(hint) = hint else { return true };
+    let detail_type = detail.r#type.to_ascii_lowercase();
+    match hint {
+        "movie" => detail_type == "movie",
+        "series" | "tv" | "anime" => {
+            matches!(detail_type.as_str(), "series" | "tv" | "anime")
+                || (detail_type.is_empty() && !detail.videos.is_empty())
+        }
+        _ => true,
+    }
+}
+
 impl Provider for AddonClient {
     fn id(&self) -> ProviderKind {
         ProviderKind::Addons
@@ -120,7 +133,10 @@ impl Provider for AddonClient {
                     let has_valid_id = d.id == clean_id;
                     let has_title = !d.name.trim().is_empty()
                         || d.title.as_deref().is_some_and(|t| !t.trim().is_empty());
-                    if has_valid_id && has_title {
+                    if has_valid_id
+                        && has_title
+                        && addon_type_matches_hint(&d, type_hint.as_deref())
+                    {
                         if !d.videos.is_empty()
                             || d.r#type.eq_ignore_ascii_case("series")
                             || d.r#type.eq_ignore_ascii_case("tv")
@@ -155,5 +171,53 @@ impl Provider for AddonClient {
         }
 
         Err(ProviderError::NotFound)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn detail(r#type: &str) -> models::MetaDetail {
+        models::MetaDetail {
+            id: "tt123".to_string(),
+            r#type: r#type.to_string(),
+            name: "Title".to_string(),
+            title: None,
+            poster: None,
+            cover: None,
+            background: None,
+            logo: None,
+            description: None,
+            overview: None,
+            synopsis: None,
+            release_info: None,
+            year: None,
+            released: None,
+            imdb_rating: None,
+            rating: None,
+            genres: Vec::new(),
+            genre: Vec::new(),
+            runtime: None,
+            cast: Vec::new(),
+            stars: Vec::new(),
+            director: Vec::new(),
+            directors: Vec::new(),
+            writer: Vec::new(),
+            writers: Vec::new(),
+            videos: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn type_hint_rejects_movie_for_series_request() {
+        assert!(!addon_type_matches_hint(&detail("movie"), Some("series")));
+        assert!(addon_type_matches_hint(&detail("series"), Some("series")));
+    }
+
+    #[test]
+    fn type_hint_rejects_series_for_movie_request() {
+        assert!(!addon_type_matches_hint(&detail("series"), Some("movie")));
+        assert!(addon_type_matches_hint(&detail("movie"), Some("movie")));
     }
 }

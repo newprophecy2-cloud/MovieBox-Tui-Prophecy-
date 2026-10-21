@@ -10,6 +10,7 @@ impl From<DhakaFlixError> for ProviderError {
         match err {
             DhakaFlixError::Network(e) => ProviderError::Network(e.to_string()),
             DhakaFlixError::Parse(p) => ProviderError::Parsing(p),
+            DhakaFlixError::Unavailable(message) => ProviderError::Unavailable(message),
         }
     }
 }

@@ -224,19 +224,22 @@ impl AddonClient {
             return Err(format!("Streams returned HTTP {}", resp.status()));
         }
 
-        let mut raw: serde_json::Value = resp
+        let raw: serde_json::Value = resp
             .json()
             .await
             .map_err(|e| format!("Invalid streams response JSON: {e}"))?;
 
-        if let Some(val) = raw.get_mut("streams").map(serde_json::Value::take) {
-            serde_json::from_value(val).map_err(|e| format!("Failed to parse streams: {e}"))
-        } else if raw.is_array() {
-            serde_json::from_value(raw)
-                .map_err(|e| format!("Failed to parse raw stream array: {e}"))
-        } else {
-            Ok(Vec::new())
-        }
+        parse_stream_response(raw)
+    }
+}
+
+fn parse_stream_response(mut raw: serde_json::Value) -> Result<Vec<StreamItem>, String> {
+    if let Some(val) = raw.get_mut("streams").map(serde_json::Value::take) {
+        serde_json::from_value(val).map_err(|e| format!("Failed to parse streams: {e}"))
+    } else if raw.is_array() {
+        serde_json::from_value(raw).map_err(|e| format!("Failed to parse raw stream array: {e}"))
+    } else {
+        Err("Invalid streams response: missing streams array".to_string())
     }
 }
 
@@ -251,5 +254,25 @@ fn parse_catalog_metas(mut raw: serde_json::Value) -> Result<Vec<MetaItem>, Stri
         serde_json::from_value(raw).map_err(|e| format!("Failed to parse raw array metas: {e}"))
     } else {
         Ok(Vec::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_streams_field_is_not_treated_as_empty_success() {
+        let error = parse_stream_response(serde_json::json!({"meta": {}})).unwrap_err();
+        assert!(error.contains("missing streams array"));
+    }
+
+    #[test]
+    fn stream_array_response_is_supported() {
+        let streams = parse_stream_response(serde_json::json!([
+            {"name": "Test", "url": "https://cdn.example/test.mkv"}
+        ]))
+        .unwrap();
+        assert_eq!(streams.len(), 1);
     }
 }
