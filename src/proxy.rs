@@ -844,7 +844,7 @@ where
             }
             break;
         }
-        let take = available.iter().position(|byte| *byte == b'\\n')
+        let take = available.iter().position(|byte| *byte == b'\n')
             .map(|position| position + 1)
             .unwrap_or(available.len());
         if bytes.len().saturating_add(take) > limit {
@@ -853,7 +853,7 @@ where
                 "proxy request line exceeds size limit",
             ));
         }
-        let has_newline = available[..take].last() == Some(&b'\\n');
+        let has_newline = available[..take].last() == Some(&b'\n');
         bytes.extend_from_slice(&available[..take]);
         reader.consume(take);
         if has_newline {
