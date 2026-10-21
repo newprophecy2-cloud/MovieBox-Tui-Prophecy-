@@ -2491,7 +2491,7 @@ mod tests {
     fn percent_decode_preserves_utf8_and_plus_spaces() {
         assert_eq!(percent_decode("%E0%A6%AC%E0%A6%BE%E0%A6%82%E0%A6%B2%E0%A6%BE"), "বাংলা");
         assert_eq!(percent_decode("hello+world"), "hello world");
-        assert_eq!(percent_decode("%E0%A4%B9%E0%A4%BF%E0%A4%A8%E0%A5%8D%E0%A6%A6%E0%A5%80"), "हिन्दी");
+        assert_eq!(percent_decode("%E0%A4%B9%E0%A4%BF%E0%A4%A8%E0%A5%8D%E0%A4%A6%E0%A5%80"), "हिन्दी");
     }
 
     #[test]
