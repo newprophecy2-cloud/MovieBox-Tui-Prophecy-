@@ -15,6 +15,7 @@ const CHUNK_IDLE_TIMEOUT_SECS: u64 = 60;
 const WATCHDOG_IDLE_SECS: u64 = 600;
 const DASH_RANGE_CHUNK_BYTES: usize = 95 * 1024;
 const MAX_CACHED_SEGMENTS: usize = 24;
+const MAX_CACHED_SEGMENT_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_SEGMENT_BYTES: usize = 16 * 1024 * 1024;
 const PREFETCH_LOOKAHEAD: u32 = 3;
 
@@ -58,12 +59,21 @@ impl SegmentCache {
     }
 
     fn insert(&self, url: String, content_type: String, data: Arc<[u8]>) {
+        if data.len() > MAX_CACHED_SEGMENT_CACHE_BYTES {
+            return;
+        }
         if let Ok(mut lock) = self.completed.lock() {
             if lock.iter().any(|(u, _, _)| u == &url) {
                 return;
             }
-            if lock.len() >= MAX_CACHED_SEGMENTS {
-                lock.pop_front();
+            let mut cached_bytes: usize = lock.iter().map(|(_, _, bytes)| bytes.len()).sum();
+            while !lock.is_empty()
+                && (lock.len() >= MAX_CACHED_SEGMENTS
+                    || cached_bytes.saturating_add(data.len()) > MAX_CACHED_SEGMENT_CACHE_BYTES)
+            {
+                if let Some((_, _, evicted)) = lock.pop_front() {
+                    cached_bytes = cached_bytes.saturating_sub(evicted.len());
+                }
             }
             lock.push_back((url, content_type, data));
         }
@@ -1346,6 +1356,27 @@ fn rewrite_dash_manifest(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_only_well_formed_content_ranges() {
+        assert_eq!(parse_content_range("bytes 0-99/200"), Some((0, 99, 200)));
+        assert_eq!(parse_content_range("bytes 100-199/200"), Some((100, 199, 200)));
+        assert_eq!(parse_content_range("bytes */200"), None);
+        assert_eq!(parse_content_range("bytes 0-200/200"), None);
+        assert_eq!(parse_content_range("bytes 10-2/200"), None);
+        assert_eq!(parse_content_range("0-99/200"), None);
+    }
+
+    #[test]
+    fn segment_cache_respects_total_byte_budget() {
+        let cache = SegmentCache::default();
+        let payload = Arc::<[u8]>::from(vec![0u8; 40 * 1024 * 1024]);
+        cache.insert("first".into(), "video/mp4".into(), Arc::clone(&payload));
+        cache.insert("second".into(), "video/mp4".into(), Arc::clone(&payload));
+        assert!(cache.get("first").is_none());
+        assert!(cache.get("second").is_some());
+        assert!(cache.get("second").unwrap().1.len() <= MAX_CACHED_SEGMENT_CACHE_BYTES);
+    }
 
     #[test]
     fn test_extract_target_url() {
