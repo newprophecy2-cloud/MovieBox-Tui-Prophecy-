@@ -57,17 +57,6 @@ fn provider_priority(provider: ProviderKind) -> usize {
         .unwrap_or(PROVIDERS.len())
 }
 
-fn suppress_dramachi_when_fourk_series_exists(items: &mut Vec<CatalogItem>) {
-    let has_usable_primary_series = items.iter().any(|item| {
-        item.id.provider == ProviderKind::FourKHdHub
-            && item.media_type == MediaType::Series
-            && item.season_count.is_some_and(|count| count > 0)
-    });
-    if has_usable_primary_series {
-        items.retain(|item| item.id.provider != ProviderKind::Dramachi);
-    }
-}
-
 #[derive(Clone)]
 pub struct ApiState {
     pub service: Arc<MovieBoxService>,
@@ -1301,7 +1290,6 @@ async fn search_all(
     }
     let mut seen = std::collections::HashSet::new();
     items.retain(|i| seen.insert((i.id.provider, i.id.value.clone())));
-    suppress_dramachi_when_fourk_series_exists(&mut items);
     if let Some(language) = requested_language {
         let mut matching = Vec::new();
         let mut other = Vec::new();
@@ -2668,7 +2656,7 @@ mod tests {
     }
 
     #[test]
-    fn fourk_series_suppresses_dramachi_but_keeps_other_provider_results() {
+    fn fourk_series_keeps_dramachi_as_a_resolution_fallback() {
         let item = |provider, media_type, id: &str| CatalogItem {
             id: ProviderMediaId {
                 provider,
@@ -2680,13 +2668,12 @@ mod tests {
             poster_url: None,
             season_count: None,
         };
-        let mut items = vec![
+        let mut items = [
             item(ProviderKind::FourKHdHub, MediaType::Series, "fourk-series"),
             item(ProviderKind::Dramachi, MediaType::Series, "drama-series"),
             item(ProviderKind::Addons, MediaType::Series, "addon-series"),
         ];
         items[0].season_count = Some(1);
-        suppress_dramachi_when_fourk_series_exists(&mut items);
         assert!(
             items
                 .iter()
@@ -2698,7 +2685,7 @@ mod tests {
                 .any(|item| item.id.provider == ProviderKind::Addons)
         );
         assert!(
-            !items
+            items
                 .iter()
                 .any(|item| item.id.provider == ProviderKind::Dramachi)
         );
@@ -2717,34 +2704,31 @@ mod tests {
             poster_url: None,
             season_count: None,
         };
-        let mut items = vec![
+        let items = [
             item(ProviderKind::FourKHdHub, MediaType::Movie, "fourk-movie"),
             item(ProviderKind::Dramachi, MediaType::Series, "drama-series"),
         ];
-        suppress_dramachi_when_fourk_series_exists(&mut items);
         assert!(
             items
                 .iter()
                 .any(|item| item.id.provider == ProviderKind::Dramachi)
         );
 
-        let mut unknown_primary = vec![
+        let unknown_primary = [
             item(ProviderKind::FourKHdHub, MediaType::Series, "fourk-unknown"),
             item(ProviderKind::Dramachi, MediaType::Series, "drama-series"),
         ];
-        suppress_dramachi_when_fourk_series_exists(&mut unknown_primary);
         assert!(
             unknown_primary
                 .iter()
                 .any(|item| item.id.provider == ProviderKind::Dramachi)
         );
 
-        let mut empty_primary = vec![item(
+        let empty_primary = [item(
             ProviderKind::Dramachi,
             MediaType::Series,
             "drama-only-series",
         )];
-        suppress_dramachi_when_fourk_series_exists(&mut empty_primary);
         assert_eq!(empty_primary.len(), 1);
         assert_eq!(empty_primary[0].id.provider, ProviderKind::Dramachi);
     }
