@@ -1,7 +1,8 @@
 # Prophecy Verse Catalog API
 
-These additive routes use the existing MovieBox metadata adapter. Home aggregation reads MovieBox's real movie (`tabId=2`), drama/series (`tabId=5`), and anime (`tabId=8`) collections. Series details are checked for classification metadata with bounded concurrency. Existing anime, episode, source, audio, subtitle, download, playback, and watch routes are unchanged.
+**Current implementation status:** the MovieBox catalog provider is intentionally disabled in `src/api.rs` (`MOVIEBOX_PROVIDER_ENABLED = false`). MovieBox-backed catalog routes such as home, trending, popular, movies, K-Dramas, and categories return `503 MOVIEBOX_PROVIDER_DISABLED` until that provider is explicitly re-enabled. The route descriptions below document the intended contract and must not be interpreted as a claim that these endpoints are currently live.
 
+The intended catalog adapter uses MovieBox movie (`tabId=2`), drama/series (`tabId=5`), and anime (`tabId=8`) collections. Series details are checked for classification metadata with bounded concurrency. Existing provider-backed anime, episode, source, audio, subtitle, download, playback, and watch routes are separate from these disabled MovieBox catalog routes.
 ## Routes
 
 - `GET /api/v1/home` returns `featured`, `trending`, `popular`, `movies`, `anime`, and `kdramas` sections from real MovieBox collection responses.

@@ -735,6 +735,11 @@ fn normalized_contains(value: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| value.contains(needle))
 }
 
+fn normalized_matches(value: &str, aliases: &[&str]) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    aliases.iter().any(|alias| value == *alias)
+}
+
 fn is_classified(
     item: &CatalogItem,
     metrics: &HashMap<String, crate::models::BrowseMetrics>,
@@ -755,13 +760,13 @@ fn is_classified(
             item.media_type == MediaType::Series
                 && (normalized_contains(category, &["anime"])
                     || anime_genre
-                    || normalized_contains(language, &["japanese", "ja", "jpn"]))
+                    || normalized_matches(language, &["japanese", "ja", "jpn"]))
         }
         Classification::KDrama => {
             item.media_type == MediaType::Series
                 && (normalized_contains(category, &["k-drama", "korean drama", "kdrama"])
-                    || normalized_contains(country, &["south korea", "korea", "korean", "kr"])
-                    || normalized_contains(language, &["korean", "ko", "kor", "한국어"]))
+                    || normalized_matches(country, &["south korea", "korea", "korean", "kr", "kor"])
+                    || normalized_matches(language, &["korean", "ko", "kor", "한국어"]))
         }
     }
 }
@@ -1124,30 +1129,29 @@ fn parse_query(query: &str) -> SearchQuery {
     out
 }
 fn percent_decode(v: &str) -> String {
-    let mut out = String::new();
     let bytes = v.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(n) = u8::from_str_radix(&v[i + 1..i + 3], 16) {
-                out.push(n as char);
+            if let (Some(high), Some(low)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            ) {
+                decoded.push(((high << 4) | low) as u8);
                 i += 3;
                 continue;
             }
         }
-        out.push(if bytes[i] == b'+' {
-            ' '
-        } else {
-            bytes[i] as char
-        });
+        decoded.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
         i += 1;
     }
-    out
+    String::from_utf8_lossy(&decoded).into_owned()
 }
 
 async fn search_json(stream: &mut TcpStream, query: &str, state: ApiState) -> std::io::Result<()> {
     let q = parse_query(query);
-    let Some(qv) = q.q.filter(|v| !v.trim().is_empty() && v.len() <= MAX_QUERY) else {
+    let Some(qv) = q.q.filter(|v| !v.trim().is_empty() && v.chars().count() <= MAX_QUERY) else {
         let (s, b) = err(
             "INVALID_QUERY",
             "q is required and must be 1-200 characters.",
@@ -1209,7 +1213,7 @@ async fn search_json(stream: &mut TcpStream, query: &str, state: ApiState) -> st
 
 async fn search_sse(stream: &mut TcpStream, query: &str, state: ApiState) -> std::io::Result<()> {
     let q = parse_query(query);
-    let Some(qv) = q.q.filter(|v| !v.trim().is_empty() && v.len() <= MAX_QUERY) else {
+    let Some(qv) = q.q.filter(|v| !v.trim().is_empty() && v.chars().count() <= MAX_QUERY) else {
         let (s, b) = err(
             "INVALID_QUERY",
             "q is required and must be 1-200 characters.",
@@ -1231,25 +1235,39 @@ async fn search_sse(stream: &mut TcpStream, query: &str, state: ApiState) -> std
             (p, result)
         });
     }
-    while let Some(Ok((p, result))) = tasks.join_next().await {
-        match result {
-            Ok(Ok(items)) => {
-                for mut item in items {
-                    if let Some(language) = requested_language {
-                        crate::language::decorate_catalog_item(&mut item, Some(language));
+    let mut partial = false;
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok((p, result)) => match result {
+                Ok(Ok(items)) => {
+                    for mut item in items {
+                        if let Some(language) = requested_language {
+                            crate::language::decorate_catalog_item(&mut item, Some(language));
+                        }
+                        let payload =
+                            serde_json::to_string(&serde_json::json!({"result":catalog(item)}))
+                                .unwrap();
+                        send_event(stream, "search_result", &payload).await?;
                     }
-                    let payload =
-                        serde_json::to_string(&serde_json::json!({"result":catalog(item)}))
-                            .unwrap();
-                    send_event(stream, "search_result", &payload).await?;
                 }
-            }
-            Ok(Err(e)) => {
-                let payload=serde_json::to_string(&serde_json::json!({"provider":p.label(),"code":"UPSTREAM_UNAVAILABLE","message":e.user_message(p)})).unwrap();
-                send_event(stream, "search_provider_error", &payload).await?;
-            }
-            Err(_) => {
-                let payload=serde_json::json!({"provider":p.label(),"code":"PROVIDER_TIMEOUT","message":"Provider request timed out."}).to_string();
+                Ok(Err(e)) => {
+                    partial = true;
+                    let payload=serde_json::to_string(&serde_json::json!({"provider":p.label(),"code":"UPSTREAM_UNAVAILABLE","message":e.user_message(p)})).unwrap();
+                    send_event(stream, "search_provider_error", &payload).await?;
+                }
+                Err(_) => {
+                    partial = true;
+                    let payload=serde_json::json!({"provider":p.label(),"code":"PROVIDER_TIMEOUT","message":"Provider request timed out."}).to_string();
+                    send_event(stream, "search_provider_error", &payload).await?;
+                }
+            },
+            Err(join_error) => {
+                partial = true;
+                log::error!("search provider task failed: {join_error}");
+                let payload=serde_json::json!({
+                    "code":"PROVIDER_TASK_FAILED",
+                    "message":"A provider task ended unexpectedly."
+                }).to_string();
                 send_event(stream, "search_provider_error", &payload).await?;
             }
         }
@@ -1257,7 +1275,7 @@ async fn search_sse(stream: &mut TcpStream, query: &str, state: ApiState) -> std
     send_event(
         stream,
         "search_complete",
-        "{\"partial\":true,\"replay\":false}",
+        &serde_json::json!({"partial":partial,"replay":false}).to_string(),
     )
     .await
 }
@@ -1283,18 +1301,25 @@ async fn search_all(
     let mut items = Vec::new();
     let mut failed = false;
     let mut provider_status = HashMap::new();
-    while let Some(Ok((p, r))) = tasks.join_next().await {
-        match r {
-            Ok(Ok(mut v)) => {
-                provider_status.insert(p.cache_key().to_string(), "ok".to_string());
-                items.append(&mut v);
-            }
-            Ok(Err(e)) => {
-                provider_status.insert(p.cache_key().to_string(), e.user_message(p));
-                failed = true;
-            }
-            Err(_) => {
-                provider_status.insert(p.cache_key().to_string(), "timeout".to_string());
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok((p, r)) => match r {
+                Ok(Ok(mut v)) => {
+                    provider_status.insert(p.cache_key().to_string(), "ok".to_string());
+                    items.append(&mut v);
+                }
+                Ok(Err(e)) => {
+                    provider_status.insert(p.cache_key().to_string(), e.user_message(p));
+                    failed = true;
+                }
+                Err(_) => {
+                    provider_status.insert(p.cache_key().to_string(), "timeout".to_string());
+                    failed = true;
+                }
+            },
+            Err(error) => {
+                log::error!("search provider task failed: {error}");
+                provider_status.insert("provider_task".to_string(), "task failed unexpectedly".to_string());
                 failed = true;
             }
         }
@@ -1609,7 +1634,8 @@ async fn source_sse(stream: &mut TcpStream, r: OpaqueRef, state: ApiState) -> st
                 "source_error",
                 "{\"code\":\"REQUEST_DEADLINE_EXCEEDED\"}",
             )
-            .await
+            .await?;
+            send_event(stream, "source_complete", "{\"partial\":true}").await
         }
     }
 }
@@ -1833,27 +1859,53 @@ async fn source_route(stream: &mut TcpStream, path: &str, state: ApiState) -> st
         s: sr.s,
         e: sr.e,
     };
-    let Ok(rs) = tokio::time::timeout(SOURCE_TIMEOUT, cached_releases(&state, &r))
-        .await
-        .unwrap_or(Err(ProviderError::Unavailable(
-            "Source resolution timed out".into(),
-        )))
-    else {
-        let (s, b) = err(
-            "SOURCE_TIMEOUT",
-            "Source resolution exceeded the allowed time.",
-            Some(sr.p),
-            504,
-        );
-        return write_raw_json(stream, s, &b, None).await;
+    let rs = match tokio::time::timeout(SOURCE_TIMEOUT, cached_releases(&state, &r)).await {
+        Ok(Ok(releases)) => releases,
+        Ok(Err(error)) => {
+            let (status, body) = match error {
+                ProviderError::NotFound => err(
+                    "SOURCE_NOT_FOUND",
+                    "No source was found for this episode.",
+                    Some(sr.p),
+                    404,
+                ),
+                ProviderError::RateLimited(_) => err(
+                    "RATE_LIMITED",
+                    "The upstream provider rate limited source resolution.",
+                    Some(sr.p),
+                    429,
+                ),
+                ProviderError::Network(_) | ProviderError::Unavailable(_) => err(
+                    "UPSTREAM_UNAVAILABLE",
+                    "The provider could not resolve this source.",
+                    Some(sr.p),
+                    502,
+                ),
+                ProviderError::Parsing(_) => err(
+                    "UPSTREAM_INVALID_RESPONSE",
+                    "The provider returned an invalid source response.",
+                    Some(sr.p),
+                    502,
+                ),
+            };
+            return write_raw_json(stream, status, &body, None).await;
+        }
+        Err(_) => {
+            let (status, body) = err(
+                "SOURCE_TIMEOUT",
+                "Source resolution exceeded the allowed time.",
+                Some(sr.p),
+                504,
+            );
+            return write_raw_json(stream, status, &body, None).await;
+        }
     };
-    let rel =
-        sr.f.as_deref()
-            .and_then(|fingerprint| {
-                rs.iter()
-                    .find(|release| release_fingerprint(release) == fingerprint)
-            })
-            .or_else(|| rs.get(sr.i));
+    let rel = match sr.f.as_deref() {
+        Some(fingerprint) => rs
+            .iter()
+            .find(|release| release_fingerprint(release) == fingerprint),
+        None => rs.get(sr.i),
+    };
     let Some(rel) = rel else {
         let (s, b) = err(
             "SOURCE_NOT_FOUND",
@@ -2071,22 +2123,7 @@ async fn validate_transcode_destination(raw: &str) -> Option<String> {
 }
 
 fn is_public_transcode_ip(address: std::net::IpAddr) -> bool {
-    match address {
-        std::net::IpAddr::V4(address) => {
-            !(address.is_private()
-                || address.is_loopback()
-                || address.is_link_local()
-                || address.is_broadcast()
-                || address.is_documentation()
-                || address.is_unspecified())
-        }
-        std::net::IpAddr::V6(address) => {
-            !(address.is_loopback()
-                || address.is_unspecified()
-                || address.is_unique_local()
-                || address.is_unicast_link_local())
-        }
-    }
+    crate::net::is_public_ip(address)
 }
 
 fn direct_transcode_playback_source(source: &Release) -> Option<PlaybackSource> {
@@ -2451,6 +2488,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn percent_decode_preserves_utf8_and_plus_spaces() {
+        assert_eq!(percent_decode("%E0%A6%AC%E0%A6%BE%E0%A6%82%E0%A6%B2%E0%A6%BE"), "বাংলা");
+        assert_eq!(percent_decode("hello+world"), "hello world");
+        assert_eq!(percent_decode("%E0%A4%B9%E0%A4%BF%E0%A4%A8%E0%A5%8D%E0%A4%A6%E0%A5%80"), "हिन्दी");
+    }
+
+    #[test]
     fn opaque_reference_round_trip_preserves_internal_identity() {
         let original = OpaqueRef {
             p: ProviderKind::Dramachi,
@@ -2637,6 +2681,9 @@ mod tests {
         assert!(!is_public_transcode_ip("169.254.1.1".parse().unwrap()));
         assert!(!is_public_transcode_ip("::1".parse().unwrap()));
         assert!(!is_public_transcode_ip("fc00::1".parse().unwrap()));
+        assert!(!is_public_transcode_ip("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(!is_public_transcode_ip("::ffff:10.0.0.8".parse().unwrap()));
+        assert!(is_public_transcode_ip("::ffff:8.8.8.8".parse().unwrap()));
         assert!(is_public_transcode_ip("8.8.8.8".parse().unwrap()));
     }
 
