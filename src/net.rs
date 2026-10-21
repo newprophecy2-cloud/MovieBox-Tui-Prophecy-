@@ -89,6 +89,9 @@ pub fn is_public_ip(address: std::net::IpAddr) -> bool {
                 || address.is_unspecified())
         }
         std::net::IpAddr::V6(address) => {
+            if let Some(mapped) = address.to_ipv4_mapped() {
+                return is_public_ip(std::net::IpAddr::V4(mapped));
+            }
             !(address.is_loopback()
                 || address.is_unspecified()
                 || address.is_unique_local()
@@ -316,5 +319,8 @@ mod tests {
         assert!(validate_url_syntax("http://media.example/video.m3u8", false).is_err());
         assert!(validate_url_syntax("http://127.0.0.1/video.m3u8", true).is_err());
         assert!(validate_url_syntax("https://user:pass@media.example/video.m3u8", true).is_err());
+        assert!(!is_public_ip("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(!is_public_ip("::ffff:10.0.0.8".parse().unwrap()));
+        assert!(is_public_ip("::ffff:8.8.8.8".parse().unwrap()));
     }
 }

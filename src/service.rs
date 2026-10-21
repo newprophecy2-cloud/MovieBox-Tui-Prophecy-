@@ -358,6 +358,13 @@ impl MovieBoxService {
     }
     pub async fn fetch_poster_bytes(&self, url: &str) -> Option<Vec<u8>> {
         const MAX_POSTER_BYTES: usize = 5 * 1024 * 1024;
+        if crate::net::validate_public_url(url, true).await.is_err() {
+            log::warn!(
+                "poster destination rejected: {}",
+                crate::logging::sanitize_url(url)
+            );
+            return None;
+        }
         let mut response = self
             .http_client
             .get(url)
@@ -422,6 +429,9 @@ impl MovieBoxService {
         headers: &[(String, String)],
         preferred_filename: Option<&str>,
     ) -> Result<PathBuf, String> {
+        crate::net::validate_public_url(url, true)
+            .await
+            .map_err(|_| "subtitle destination rejected".to_string())?;
         let mut request = self.http_client.get(url);
         let sub_host = crate::proxy::extract_host_authority(url);
         let referer_host = headers

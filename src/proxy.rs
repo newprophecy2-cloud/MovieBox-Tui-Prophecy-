@@ -21,6 +21,14 @@ const PREFETCH_LOOKAHEAD: u32 = 3;
 type CachedSegment = (String, String, Arc<[u8]>);
 type CachedManifest = (String, Arc<[u8]>);
 
+fn is_hls_url(url: &str) -> bool {
+    url.split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .to_ascii_lowercase()
+        .ends_with(".m3u8")
+}
+
 #[derive(Default)]
 struct SegmentCache {
     completed: Mutex<std::collections::VecDeque<CachedSegment>>,
@@ -387,7 +395,7 @@ async fn handle_connection(
 
         let forward_all_headers = extracted_host.as_deref() == target_host;
 
-        if method == "GET" && crate::player::is_dash_url(&target_url) {
+        if method == "GET" && (crate::player::is_dash_url(&target_url) || is_hls_url(&target_url)) {
             let cached_mpd = ctx.manifest_cache.lock().ok().and_then(|g| {
                 g.as_ref()
                     .filter(|(u, _)| u == &target_url)
@@ -399,8 +407,13 @@ async fn handle_connection(
                 } else {
                     "Connection: keep-alive\r\n"
                 };
+                let content_type = if is_hls_url(&target_url) {
+                    "application/vnd.apple.mpegurl"
+                } else {
+                    "application/dash+xml"
+                };
                 let headers_out = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/dash+xml\r\nContent-Length: {}\r\n{conn_header}\r\n",
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{conn_header}\r\n",
                     rewritten_bytes.len()
                 );
                 writer.write_all(headers_out.as_bytes()).await?;
@@ -527,6 +540,16 @@ async fn handle_connection(
                 .and_then(|v| v.to_str().ok())
                 .map(|ct| ct.contains("dash+xml") || ct.contains("xml"))
                 .unwrap_or(false);
+        let is_hls_manifest = is_hls_url(&target_url)
+            || upstream_res
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(|ct| {
+                    let lower = ct.to_ascii_lowercase();
+                    lower.contains("mpegurl") || lower.contains("x-mpegurl")
+                })
+                .unwrap_or(false);
 
         let within_manifest_limit = content_length.is_none_or(|len| len <= MAX_MANIFEST_BYTES);
 
@@ -566,6 +589,45 @@ async fn handle_connection(
             };
             let headers_out = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/dash+xml\r\nContent-Length: {}\r\n{conn_header}\r\n",
+                rewritten_bytes.len()
+            );
+            writer.write_all(headers_out.as_bytes()).await?;
+            writer.write_all(rewritten_bytes).await?;
+            writer.flush().await?;
+            if client_close {
+                return Ok(());
+            }
+            continue;
+        }
+        if is_hls_manifest && status.is_success() && within_manifest_limit {
+            let manifest_bytes = upstream_res.bytes().await?;
+            if manifest_bytes.len() > MAX_MANIFEST_BYTES {
+                let body = "Manifest too large";
+                writer
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await?;
+                writer.flush().await?;
+                return Ok(());
+            }
+            let manifest_str = String::from_utf8_lossy(&manifest_bytes);
+            let rewritten = rewrite_hls_manifest(&manifest_str, &target_url, proxy_port);
+            let rewritten_bytes = rewritten.as_bytes();
+            if let Ok(mut lock) = ctx.manifest_cache.lock() {
+                *lock = Some((target_url.clone(), Arc::from(rewritten_bytes)));
+            }
+            let conn_header = if client_close {
+                "Connection: close\r\n"
+            } else {
+                "Connection: keep-alive\r\n"
+            };
+            let headers_out = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: {}\r\n{conn_header}\r\n",
                 rewritten_bytes.len()
             );
             writer.write_all(headers_out.as_bytes()).await?;
@@ -987,6 +1049,75 @@ fn extract_target_url(path_and_query: &str) -> Option<String> {
     }
 }
 
+fn proxy_media_url(url: &str, proxy_port: u16) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    Some(format!("http://127.0.0.1:{proxy_port}/{scheme}/{rest}"))
+}
+
+fn rewrite_hls_uri_attributes(line: &str, manifest_url: &reqwest::Url, proxy_port: u16) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut cursor = 0;
+    while let Some(rel) = line[cursor..].find("URI=") {
+        let start = cursor + rel;
+        out.push_str(&line[cursor..start + 4]);
+        let Some(&quote_byte) = line.as_bytes().get(start + 4) else {
+            break;
+        };
+        let quote = quote_byte as char;
+        if quote != '"' && quote != '\'' {
+            cursor = start + 4;
+            continue;
+        }
+        let value_start = start + 5;
+        let Some(end_rel) = line[value_start..].find(quote) else {
+            out.push_str(&line[start + 4..]);
+            return out;
+        };
+        let value_end = value_start + end_rel;
+        let raw = &line[value_start..value_end];
+        let resolved = manifest_url
+            .join(raw)
+            .ok()
+            .and_then(|url| proxy_media_url(url.as_str(), proxy_port));
+        out.push(quote);
+        out.push_str(resolved.as_deref().unwrap_or(raw));
+        out.push(quote);
+        cursor = value_end + 1;
+    }
+    out.push_str(&line[cursor..]);
+    out
+}
+
+fn rewrite_hls_manifest(manifest: &str, manifest_url: &str, proxy_port: u16) -> String {
+    let Ok(base) = reqwest::Url::parse(manifest_url) else {
+        return manifest.to_string();
+    };
+    manifest
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                line.to_string()
+            } else if trimmed.starts_with('#') {
+                if trimmed.contains("URI=") {
+                    rewrite_hls_uri_attributes(line, &base, proxy_port)
+                } else {
+                    line.to_string()
+                }
+            } else {
+                base.join(trimmed)
+                    .ok()
+                    .and_then(|url| proxy_media_url(url.as_str(), proxy_port))
+                    .unwrap_or_else(|| line.to_string())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn filter_dash_representations(manifest: &str, max_height: u64) -> String {
     let mut reps = Vec::new();
     let mut cursor = 0;
@@ -1141,6 +1272,35 @@ mod tests {
             Some("https://example.com/fallback.mpd")
         );
         assert_eq!(extract_target_url("/invalid/path"), None);
+    }
+
+    #[test]
+    fn test_rewrite_hls_manifest_rewrites_relative_segments_variants_and_uri_attributes() {
+        let manifest = "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"keys/key.bin\"\n#EXT-X-STREAM-INF:BANDWIDTH=100000\nvariants/low.m3u8\n#EXTINF:5,\nsegments/001.ts\n";
+        let rewritten = rewrite_hls_manifest(
+            manifest,
+            "https://cdn.example.com/video/master.m3u8?token=abc",
+            8765,
+        );
+        assert!(
+            rewritten
+                .contains("URI=\"http://127.0.0.1:8765/https/cdn.example.com/video/keys/key.bin\"")
+        );
+        assert!(
+            rewritten
+                .contains("http://127.0.0.1:8765/https/cdn.example.com/video/variants/low.m3u8")
+        );
+        assert!(
+            rewritten.contains("http://127.0.0.1:8765/https/cdn.example.com/video/segments/001.ts")
+        );
+    }
+
+    #[test]
+    fn test_is_hls_url_ignores_query_and_fragment() {
+        assert!(is_hls_url(
+            "https://cdn.example.com/master.m3u8?token=x#part"
+        ));
+        assert!(!is_hls_url("https://cdn.example.com/video.mp4"));
     }
     #[test]
     fn test_extract_target_url_sub_rejects_non_http() {

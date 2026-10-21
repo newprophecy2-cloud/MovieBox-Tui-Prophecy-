@@ -1614,6 +1614,9 @@ async fn source_sse(stream: &mut TcpStream, r: OpaqueRef, state: ApiState) -> st
     }
 }
 async fn probe_media(url: &str, headers: &[(String, String)]) -> Result<ProbeOutput, String> {
+    crate::net::validate_public_url(url, true)
+        .await
+        .map_err(|_| "The media source URL is not an allowed public destination.".to_string())?;
     let mut command = Command::new("ffprobe");
     command
         .arg("-v")
