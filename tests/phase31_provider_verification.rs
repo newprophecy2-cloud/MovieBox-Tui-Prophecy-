@@ -88,10 +88,26 @@ async fn exact_matrix_fourkhdhub() {
                 continue;
             }
         };
-        let Some(item) = search
+        let mut selected = None;
+        for item in search
             .iter()
-            .find(|item| title_matches(&item.title, target))
-        else {
+            .filter(|item| title_matches(&item.title, target))
+        {
+            let details = match client.details(&item.id.value).await {
+                Ok(details) => details,
+                Err(_) => continue,
+            };
+            let episode_available = details.media_type == MediaType::Movie
+                || details.seasons.iter().any(|season_info| {
+                    season_info.number == season
+                        && season_info.episodes.iter().any(|ep| ep.number == episode)
+                });
+            if episode_available {
+                selected = Some((item, details));
+                break;
+            }
+        }
+        let Some((item, details)) = selected else {
             let candidates = search
                 .iter()
                 .take(8)
@@ -103,13 +119,6 @@ async fn exact_matrix_fourkhdhub() {
                 search.len()
             );
             continue;
-        };
-        let details = match client.details(&item.id.value).await {
-            Ok(details) => details,
-            Err(error) => {
-                println!("FOURK {target} PARSER_ERROR details={error}");
-                continue;
-            }
         };
         if details.media_type == MediaType::Movie && (season > 0 || episode > 0) {
             println!("FOURK {target} PARSER_ERROR type_mismatch=movie_for_episode_target");

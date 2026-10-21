@@ -531,6 +531,7 @@ async fn test_live_fourkhdhub_movie_resolution() {
         .expect("fetch movie releases");
     assert!(!releases.is_empty(), "releases should not be empty");
 
+    let mut resolved = false;
     for release in &releases {
         println!("Attempting resolve for: {}", release.filename);
         let start = std::time::Instant::now();
@@ -546,6 +547,7 @@ async fn test_live_fourkhdhub_movie_resolution() {
                     source.source_label
                 );
                 assert!(source.url.starts_with("https://"));
+                resolved = true;
                 break;
             }
             Err(e) => {
@@ -554,6 +556,10 @@ async fn test_live_fourkhdhub_movie_resolution() {
             }
         }
     }
+    assert!(
+        resolved,
+        "at least one Inception release must resolve to a playable source"
+    );
 }
 
 #[tokio::test]
@@ -579,6 +585,7 @@ async fn test_live_fourkhdhub_game_of_thrones_resolution() {
         .expect("releases for S01E01");
     assert!(!releases.is_empty(), "S01E01 releases found");
 
+    let mut resolved = false;
     for release in &releases {
         println!(
             "Attempting resolve for S01E01 release: {}",
@@ -597,6 +604,7 @@ async fn test_live_fourkhdhub_game_of_thrones_resolution() {
                     source.source_label
                 );
                 assert!(source.url.starts_with("https://"));
+                resolved = true;
                 break;
             }
             Err(e) => {
@@ -605,6 +613,10 @@ async fn test_live_fourkhdhub_game_of_thrones_resolution() {
             }
         }
     }
+    assert!(
+        resolved,
+        "at least one Game of Thrones S01E01 release must resolve to a playable source"
+    );
 }
 
 #[tokio::test]

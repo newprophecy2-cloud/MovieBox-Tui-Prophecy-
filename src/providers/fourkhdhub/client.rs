@@ -179,67 +179,72 @@ impl FourKHdHubClient {
         let mut seen = std::collections::HashSet::new();
         let mut spawned_preflights = 0usize;
         let mut fallbacks = Vec::new();
+        let mut failures = Vec::new();
 
         loop {
             tokio::select! {
                 Some(resolve_res) = resolve_tasks.next(), if !resolve_tasks.is_empty() => {
-                    if let Ok(mut cand_list) = resolve_res {
-                        cand_list.sort_by_key(|(url, label, _)| hubcloud::score(url, label, intent));
-                        for (url, label, headers) in cand_list {
-                            if spawned_preflights >= 6 || !seen.insert(url.clone()) {
-                                continue;
+                    match resolve_res {
+                        Ok(mut cand_list) => {
+                            cand_list.sort_by_key(|(url, label, _)| hubcloud::score(url, label, intent));
+                            for (url, label, headers) in cand_list {
+                                if spawned_preflights >= 6 || !seen.insert(url.clone()) {
+                                    continue;
+                                }
+                                spawned_preflights += 1;
+                                let cand_score = hubcloud::score(&url, &label, intent);
+                                let this = self.clone();
+                                let mut merged = headers;
+                                if !merged
+                                    .iter()
+                                    .any(|(name, _)| name.eq_ignore_ascii_case("referer"))
+                                {
+                                    merged.push(("Referer".to_string(), referer.clone()));
+                                }
+                                if !merged
+                                    .iter()
+                                    .any(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+                                {
+                                    merged.push(("User-Agent".to_string(), BROWSER_UA.to_string()));
+                                }
+                                preflight_tasks.push(async move {
+                                    let (playable_url, is_seekable) =
+                                        this.preflight_with_seekable(&url, &merged).await?;
+                                    let resolved_score =
+                                        cand_score.min(hubcloud::score(&playable_url, &label, intent));
+                                    Ok::<_, FourKHdHubError>((
+                                        is_seekable,
+                                        resolved_score,
+                                        playable_url,
+                                        label,
+                                        merged,
+                                    ))
+                                });
                             }
-                            spawned_preflights += 1;
-                            let cand_score = hubcloud::score(&url, &label, intent);
-                            let this = self.clone();
-                            let mut merged = headers;
-                            if !merged
-                                .iter()
-                                .any(|(name, _)| name.eq_ignore_ascii_case("referer"))
-                            {
-                                merged.push(("Referer".to_string(), referer.clone()));
-                            }
-                            if !merged
-                                .iter()
-                                .any(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
-                            {
-                                merged.push(("User-Agent".to_string(), BROWSER_UA.to_string()));
-                            }
-                            preflight_tasks.push(async move {
-                                let (playable_url, is_seekable) =
-                                    this.preflight_with_seekable(&url, &merged).await?;
-                                let resolved_score =
-                                    cand_score.min(hubcloud::score(&playable_url, &label, intent));
-                                Ok::<_, FourKHdHubError>((
-                                    is_seekable,
-                                    resolved_score,
-                                    playable_url,
-                                    label,
-                                    merged,
-                                ))
-                            });
                         }
+                        Err(error) => failures.push(error.to_string()),
                     }
                 }
                 Some(preflight_res) = preflight_tasks.next(), if !preflight_tasks.is_empty() => {
-                    if let Ok((is_seekable, resolved_score, playable_url, label, headers)) =
-                        preflight_res
-                    {
-                        if is_seekable && resolved_score <= 1 {
-                            log::info!(
-                                "4KHDHub seekable mirror playable: {label} ({})",
-                                crate::logging::sanitize_url(&playable_url)
-                            );
-                            return Ok(PlaybackSource {
-                                provider: ProviderKind::FourKHdHub,
-                                url: playable_url,
-                                headers,
-                                subtitle: None,
-                                source_label: label,
-                                max_height: None,
-                            });
+                    match preflight_res {
+                        Ok((is_seekable, resolved_score, playable_url, label, headers)) => {
+                            if is_seekable && resolved_score <= 1 {
+                                log::info!(
+                                    "4KHDHub seekable mirror playable: {label} ({})",
+                                    crate::logging::sanitize_url(&playable_url)
+                                );
+                                return Ok(PlaybackSource {
+                                    provider: ProviderKind::FourKHdHub,
+                                    url: playable_url,
+                                    headers,
+                                    subtitle: None,
+                                    source_label: label,
+                                    max_height: None,
+                                });
+                            }
+                            fallbacks.push((is_seekable, resolved_score, playable_url, label, headers));
                         }
-                        fallbacks.push((is_seekable, resolved_score, playable_url, label, headers));
+                        Err(error) => failures.push(error.to_string()),
                     }
                 }
                 else => break,
@@ -247,9 +252,11 @@ impl FourKHdHubClient {
         }
 
         if spawned_preflights == 0 {
-            return Err(FourKHdHubError::NoPlayableMirror(
-                "no working mirror links extracted".into(),
-            ));
+            return Err(FourKHdHubError::NoPlayableMirror(if failures.is_empty() {
+                "no working mirror links extracted".into()
+            } else {
+                format!("no working mirror links extracted: {}", failures.join("; "))
+            }));
         }
         fallbacks
             .sort_by_key(|(is_seekable, resolved_score, _, _, _)| (!*is_seekable, *resolved_score));
@@ -271,9 +278,14 @@ impl FourKHdHubClient {
             "4KHDHub: no playable mirror for release {:?}",
             release.filename
         );
-        Err(FourKHdHubError::NoPlayableMirror(
-            "all candidate mirrors failed preflight".into(),
-        ))
+        Err(FourKHdHubError::NoPlayableMirror(if failures.is_empty() {
+            "all candidate mirrors failed preflight".into()
+        } else {
+            format!(
+                "all candidate mirrors failed preflight: {}",
+                failures.join("; ")
+            )
+        }))
     }
 
     pub async fn preflight(
