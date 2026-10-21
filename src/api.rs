@@ -200,7 +200,7 @@ struct ApiSeason {
     number: usize,
     episodes: Vec<ApiEpisode>,
 }
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct ApiEpisode {
     id: String,
     season: usize,
@@ -208,6 +208,16 @@ struct ApiEpisode {
     title: Option<String>,
     overview: Option<String>,
 }
+#[derive(Debug, Serialize)]
+struct AnimeEpisodeFullResponse {
+    anime: ApiDetails,
+    selected_episode: ApiEpisode,
+    sources: Vec<ApiSource>,
+    sources_status: &'static str,
+    sources_partial: bool,
+    source_error: Option<serde_json::Value>,
+}
+
 #[derive(Debug, Serialize)]
 struct ApiSource {
     id: String,
@@ -1376,6 +1386,9 @@ async fn anime_route(stream: &mut TcpStream, path: &str, state: ApiState) -> std
     if parts[4] == "seasons" {
         return write_json(stream, 200, &details(d).seasons, None).await;
     }
+    if parts.len() == 7 && parts[4] == "episodes" && parts[6] == "full" {
+        return anime_episode_full_route(stream, parts[3], parts[5], r, d, state).await;
+    }
     if parts[4] == "episodes" {
         if parts.len() == 5 {
             let eps: Vec<_> = details(d)
@@ -1427,6 +1440,101 @@ async fn anime_route(stream: &mut TcpStream, path: &str, state: ApiState) -> std
     }
     let (s, b) = err("INTERNAL_ERROR", "Unsupported anime route.", None, 404);
     write_raw_json(stream, s, &b, None).await
+}
+
+async fn anime_episode_full_route(
+    stream: &mut TcpStream,
+    anime_id: &str,
+    episode_id: &str,
+    anime_ref: OpaqueRef,
+    details_result: MediaDetails,
+    state: ApiState,
+) -> std::io::Result<()> {
+    let episode_ref = match decode::<OpaqueRef>(episode_id) {
+        Ok(episode) => episode,
+        Err(_) => {
+            let (status, body) = err(
+                "INVALID_ID",
+                "The episode identifier is invalid.",
+                None,
+                400,
+            );
+            return write_raw_json(stream, status, &body, None).await;
+        }
+    };
+    if episode_ref.p != anime_ref.p || episode_ref.v != anime_ref.v {
+        let (status, body) = err(
+            "INVALID_ID",
+            "The episode does not belong to the requested anime.",
+            None,
+            400,
+        );
+        return write_raw_json(stream, status, &body, None).await;
+    }
+
+    let anime = details(details_result);
+    if anime.id != anime_id {
+        let (status, body) = err(
+            "INVALID_ID",
+            "The anime identifier does not match the requested item.",
+            Some(anime_ref.p),
+            400,
+        );
+        return write_raw_json(stream, status, &body, None).await;
+    }
+    let selected_episode = anime
+        .seasons
+        .iter()
+        .flat_map(|season| season.episodes.iter())
+        .find(|episode| {
+            episode.season == episode_ref.s && episode.number == episode_ref.e
+        })
+        .cloned();
+    let Some(selected_episode) = selected_episode else {
+        let (status, body) = err(
+            "EPISODE_NOT_FOUND",
+            "The episode was not found in this anime.",
+            Some(anime_ref.p),
+            404,
+        );
+        return write_raw_json(stream, status, &body, None).await;
+    };
+
+    let mut source_error = None;
+    let (sources, sources_status, sources_partial) =
+        match tokio::time::timeout(OVERALL_TIMEOUT, cached_releases(&state, &episode_ref)).await {
+            Ok(Ok(releases)) => (api_sources(&releases, &episode_ref), "ok", false),
+            Ok(Err(error)) => {
+                let (_, body) = provider_error(error, episode_ref.p);
+                source_error = serde_json::from_str(&body).ok();
+                (Vec::new(), "unavailable", true)
+            }
+            Err(_) => {
+                let (_, body) = err(
+                    "REQUEST_DEADLINE_EXCEEDED",
+                    "The source request deadline was exceeded.",
+                    Some(episode_ref.p),
+                    504,
+                );
+                source_error = serde_json::from_str(&body).ok();
+                (Vec::new(), "timeout", true)
+            }
+        };
+
+    write_json(
+        stream,
+        200,
+        &AnimeEpisodeFullResponse {
+            anime,
+            selected_episode,
+            sources,
+            sources_status,
+            sources_partial,
+            source_error,
+        },
+        None,
+    )
+    .await
 }
 
 fn release_cache_key(r: &OpaqueRef) -> String {
@@ -2469,6 +2577,7 @@ fn openapi() -> serde_json::Value {
             "/api/v1/anime/{anime_id}": {"get": {"responses": {"200": {"description": "Anime details"}}}},
             "/api/v1/anime/{anime_id}/seasons": {"get": {"responses": {"200": {"description": "Seasons"}}}},
             "/api/v1/anime/{anime_id}/episodes": {"get": {"responses": {"200": {"description": "Episodes"}}}},
+            "/api/v1/anime/{anime_id}/episodes/{episode_id}/full": {"get": {"responses": {"200": {"description": "Anime details, selected episode, and source candidates"}, "400": {"description": "Invalid anime or episode ID"}, "404": {"description": "Episode not found"}}}},
             "/api/v1/episodes/{episode_id}/sources": {"get": {"responses": {"200": {"description": "Fresh source candidates"}}}},
             "/api/v1/episodes/{episode_id}/sources/stream": {"get": {"responses": {"200": {"description": "SSE source_result, source_error, source_complete events"}}}},
             "/api/v1/sources/{source_id}": {"get": {"responses": {"200": {"description": "Resolved source metadata"}}}},
@@ -2960,6 +3069,7 @@ mod tests {
             "/ready",
             "/openapi.json",
             "/api/v1/anime/search/stream",
+            "/api/v1/anime/{anime_id}/episodes/{episode_id}/full",
             "/api/v1/episodes/{episode_id}/sources/stream",
             "/api/v1/sources/{source_id}/audio-tracks",
             "/api/v1/sources/{source_id}/subtitle-tracks",
