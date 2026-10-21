@@ -32,6 +32,7 @@ const TRACK_PROBE_TIMEOUT: Duration = Duration::from_secs(45);
 const RELEASE_CACHE_TTL: Duration = Duration::from_secs(600);
 const PLAYBACK_CACHE_TTL: Duration = Duration::from_secs(120);
 const MOVIEBOX_PROVIDER_ENABLED: bool = false;
+const MAX_TRANSCODE_SESSIONS: usize = 2;
 const PROVIDERS: [ProviderKind; 5] = [
     ProviderKind::FourKHdHub,
     ProviderKind::Dramachi,
@@ -52,6 +53,7 @@ pub struct ApiState {
     pub service: Arc<MovieBoxService>,
     release_cache: Arc<Mutex<HashMap<String, ReleaseCacheEntry>>>,
     playback_cache: Arc<Mutex<HashMap<String, PlaybackCacheEntry>>>,
+    transcode_slots: Arc<Semaphore>,
 }
 
 #[derive(Clone)]
@@ -463,6 +465,7 @@ pub async fn run() -> std::io::Result<()> {
         service: Arc::new(MovieBoxService::new()),
         release_cache: Arc::new(Mutex::new(HashMap::new())),
         playback_cache: Arc::new(Mutex::new(HashMap::new())),
+        transcode_slots: Arc::new(Semaphore::new(MAX_TRANSCODE_SESSIONS)),
     };
     log::info!("MovieBox API listening on 0.0.0.0:{port}");
     loop {
@@ -1773,6 +1776,9 @@ async fn source_route(stream: &mut TcpStream, path: &str, state: ApiState) -> st
     if matches!(parts.get(4), Some(&"audio") | Some(&"audio-tracks")) {
         return write_track_response(stream, id, sr.p, rel, &state, false).await;
     }
+    if parts.get(4) == Some(&"transcode") {
+        return transcode_source(stream, id, rel, &state).await;
+    }
     if matches!(parts.get(4), Some(&"subtitles") | Some(&"subtitle-tracks")) {
         return write_track_response(stream, id, sr.p, rel, &state, true).await;
     }
@@ -1930,6 +1936,109 @@ fn public_mirrors(
             direct_file: mirror.direct_file,
         })
         .collect()
+}
+
+async fn transcode_source(
+    stream: &mut TcpStream,
+    source_id: &str,
+    source: &crate::providers::models::Release,
+    state: &ApiState,
+) -> std::io::Result<()> {
+    let Some(permit) = state.transcode_slots.clone().try_acquire_owned().ok() else {
+        let (status, body) = err(
+            "TRANSCODE_BUSY",
+            "All H.264 transcoding slots are currently busy. Try again later.",
+            Some(source.provider),
+            429,
+        );
+        return write_raw_json(stream, status, &body, None).await;
+    };
+    let Some(url) = source.direct_url() else {
+        let (status, body) = err(
+            "TRANSCODE_UNAVAILABLE",
+            "This source does not expose a direct media URL for transcoding.",
+            Some(source.provider),
+            501,
+        );
+        return write_raw_json(stream, status, &body, None).await;
+    };
+    let mut command = Command::new("ffmpeg");
+    command.args(["-hide_banner", "-loglevel", "warning", "-nostdin"]);
+    if !source.mirrors.is_empty() {
+        let headers = source.mirrors[0]
+            .headers
+            .iter()
+            .map(|(name, value)| format!("{name}: {value}\r\n"))
+            .collect::<String>();
+        if !headers.is_empty() {
+            command.arg("-headers").arg(headers);
+        }
+    }
+    command.args([
+        "-i",
+        url,
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-profile:v",
+        "main",
+        "-pix_fmt",
+        "yuv420p",
+        "-crf",
+        "23",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-ac",
+        "2",
+        "-f",
+        "mpegts",
+        "pipe:1",
+    ]);
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let (status, body) = err(
+                "TRANSCODE_UNAVAILABLE",
+                &format!("FFmpeg is not available: {error}"),
+                Some(source.provider),
+                503,
+            );
+            return write_raw_json(stream, status, &body, None).await;
+        }
+    };
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill().await;
+        let (status, body) = err(
+            "TRANSCODE_FAILED",
+            "FFmpeg did not open an output stream.",
+            Some(source.provider),
+            502,
+        );
+        return write_raw_json(stream, status, &body, None).await;
+    };
+    write_headers(
+        stream,
+        200,
+        "video/mp2t",
+        Some(&format!(
+            "X-Transcode: h264\r\nX-Source-Id: {source_id}\r\n"
+        )),
+    )
+    .await?;
+    let result = tokio::io::copy(&mut stdout, stream).await;
+    let _ = child.kill().await;
+    drop(permit);
+    result.map(|_| ())
 }
 
 async fn write_headers(
