@@ -1235,6 +1235,7 @@ async fn search_sse(stream: &mut TcpStream, query: &str, state: ApiState) -> std
             (p, result)
         });
     }
+    let mut partial = false;
     while let Some(Ok((p, result))) = tasks.join_next().await {
         match result {
             Ok(Ok(items)) => {
@@ -1249,10 +1250,12 @@ async fn search_sse(stream: &mut TcpStream, query: &str, state: ApiState) -> std
                 }
             }
             Ok(Err(e)) => {
+                partial = true;
                 let payload=serde_json::to_string(&serde_json::json!({"provider":p.label(),"code":"UPSTREAM_UNAVAILABLE","message":e.user_message(p)})).unwrap();
                 send_event(stream, "search_provider_error", &payload).await?;
             }
             Err(_) => {
+                partial = true;
                 let payload=serde_json::json!({"provider":p.label(),"code":"PROVIDER_TIMEOUT","message":"Provider request timed out."}).to_string();
                 send_event(stream, "search_provider_error", &payload).await?;
             }
@@ -1261,7 +1264,7 @@ async fn search_sse(stream: &mut TcpStream, query: &str, state: ApiState) -> std
     send_event(
         stream,
         "search_complete",
-        "{\"partial\":true,\"replay\":false}",
+        &serde_json::json!({"partial":partial,"replay":false}).to_string(),
     )
     .await
 }
