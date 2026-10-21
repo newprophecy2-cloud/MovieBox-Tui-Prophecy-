@@ -1151,7 +1151,7 @@ fn percent_decode(v: &str) -> String {
 
 async fn search_json(stream: &mut TcpStream, query: &str, state: ApiState) -> std::io::Result<()> {
     let q = parse_query(query);
-    let Some(qv) = q.q.filter(|v| !v.trim().is_empty() && v.len() <= MAX_QUERY) else {
+    let Some(qv) = q.q.filter(|v| !v.trim().is_empty() && v.chars().count() <= MAX_QUERY) else {
         let (s, b) = err(
             "INVALID_QUERY",
             "q is required and must be 1-200 characters.",
@@ -1213,7 +1213,7 @@ async fn search_json(stream: &mut TcpStream, query: &str, state: ApiState) -> st
 
 async fn search_sse(stream: &mut TcpStream, query: &str, state: ApiState) -> std::io::Result<()> {
     let q = parse_query(query);
-    let Some(qv) = q.q.filter(|v| !v.trim().is_empty() && v.len() <= MAX_QUERY) else {
+    let Some(qv) = q.q.filter(|v| !v.trim().is_empty() && v.chars().count() <= MAX_QUERY) else {
         let (s, b) = err(
             "INVALID_QUERY",
             "q is required and must be 1-200 characters.",
