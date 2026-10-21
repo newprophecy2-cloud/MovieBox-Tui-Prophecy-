@@ -28,6 +28,8 @@ static SEL_METADATA_LABEL: LazyLock<Selector> =
     LazyLock::new(|| Selector::parse(".metadata-label").unwrap());
 static SEL_METADATA_VALUE: LazyLock<Selector> =
     LazyLock::new(|| Selector::parse(".metadata-value").unwrap());
+static SEL_EPISODES_CONTAINER: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("#episodes").unwrap());
 static SEL_EPISODE_ITEM: LazyLock<Selector> =
     LazyLock::new(|| Selector::parse("#episodes .episode-download-item").unwrap());
 static SEL_DOWNLOAD_ITEM: LazyLock<Selector> =
@@ -126,6 +128,16 @@ pub fn parse_details(id: &str, html: &str) -> Result<MediaDetails, FourKHdHubErr
         .filter(|value| is_genre(value))
         .collect();
     let seasons = parse_seasons(&document)?;
+    if media_type == MediaType::Series {
+        let has_episode_container = document.select(&SEL_EPISODES_CONTAINER).next().is_some();
+        let has_parseable_episode = seasons.iter().any(|season| !season.episodes.is_empty());
+        let has_episode_rows = document.select(&SEL_EPISODE_ITEM).next().is_some();
+        if !has_episode_container || (has_episode_rows && !has_parseable_episode) {
+            return Err(FourKHdHubError::Parse(
+                "series episode list is missing or could not be parsed".into(),
+            ));
+        }
+    }
 
     Ok(MediaDetails {
         id: ProviderMediaId {
@@ -546,7 +558,9 @@ fn normalize_filename(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_trailing_year;
+    use super::{parse_details, strip_trailing_year};
+    use crate::providers::fourkhdhub::FourKHdHubError;
+    use crate::providers::models::MediaType;
 
     #[test]
     fn strips_parenthesized_year() {
@@ -582,6 +596,52 @@ mod tests {
         assert_eq!(strip_trailing_year("12345"), "12345");
         assert_eq!(strip_trailing_year("123456"), "123456");
     }
+
+    #[test]
+    fn series_without_episode_container_is_a_parse_error() {
+        let result = parse_details("/example-series-1/", "<html><h1>Example</h1></html>");
+        assert!(matches!(result, Err(FourKHdHubError::Parse(_))));
+    }
+
+    #[test]
+    fn explicitly_empty_series_episode_container_stays_empty() {
+        let details = parse_details(
+            "/example-series-1/",
+            "<html><h1>Example</h1><div id='episodes'></div></html>",
+        )
+        .unwrap();
+        assert_eq!(details.media_type, MediaType::Series);
+        assert!(details.seasons.is_empty());
+    }
+
+    #[test]
+    fn unparseable_episode_rows_are_not_reported_as_zero_episodes() {
+        let result = parse_details(
+            "/example-series-1/",
+            "<html><h1>Example</h1><div id='episodes'><div class='episode-download-item'><div class='episode-file-title'>Episode unknown</div></div></div></html>",
+        );
+        assert!(matches!(result, Err(FourKHdHubError::Parse(_))));
+    }
+
+    #[test]
+    fn movie_details_do_not_require_an_episode_container() {
+        let details =
+            parse_details("/example-movie-1/", "<html><h1>Example Movie</h1></html>").unwrap();
+        assert_eq!(details.media_type, MediaType::Movie);
+        assert!(details.seasons.is_empty());
+    }
+
+    #[test]
+    fn parseable_series_episode_is_preserved() {
+        let details = parse_details(
+            "/example-series-1/",
+            "<html><h1>Example</h1><div id='episodes'><div class='episode-download-item'><div class='episode-file-title'>Example S01E01</div></div></div></html>",
+        )
+        .unwrap();
+        assert_eq!(details.seasons.len(), 1);
+        assert_eq!(details.seasons[0].episodes[0].number, 1);
+    }
+
     #[test]
     fn test_detect_quality_tokens() {
         use super::detect_quality;

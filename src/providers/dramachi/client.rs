@@ -50,6 +50,31 @@ pub struct DramachiClient {
     eplist_cache: EpListCache,
 }
 
+fn season_from_episode_result(
+    season_number: usize,
+    result: Result<Vec<DramachiEpisodeItem>, DramachiError>,
+) -> Result<Season, DramachiError> {
+    let episodes = result?;
+    let mut seen_ep_numbers = std::collections::HashSet::new();
+    let mut mapped = Vec::new();
+    for (index, episode) in episodes.iter().enumerate() {
+        let number = parse_episode_number(&episode.f_title).unwrap_or(index + 1);
+        if seen_ep_numbers.insert(number) {
+            mapped.push(Episode {
+                season: season_number,
+                number,
+                title: Some(clean_episode_title(&episode.f_title)),
+                overview: None,
+            });
+        }
+    }
+    mapped.sort_by_key(|episode| episode.number);
+    Ok(Season {
+        number: season_number,
+        episodes: mapped,
+    })
+}
+
 impl Default for DramachiClient {
     fn default() -> Self {
         Self::new()
@@ -296,45 +321,13 @@ impl DramachiClient {
                     .map(|(season_num, rip)| {
                         let rip_clone = rip.clone();
                         async move {
-                            let episodes = self
-                                .fetch_episodes(title_id, &rip_clone)
-                                .await
-                                .unwrap_or_default();
-                            let eps_models = if !episodes.is_empty() {
-                                let mut seen_ep_numbers = std::collections::HashSet::new();
-                                let mut unique_eps = Vec::new();
-                                for (idx, ep) in episodes.iter().enumerate() {
-                                    let ep_num =
-                                        parse_episode_number(&ep.f_title).unwrap_or(idx + 1);
-                                    if seen_ep_numbers.insert(ep_num) {
-                                        let clean_title = clean_episode_title(&ep.f_title);
-                                        unique_eps.push(Episode {
-                                            season: season_num,
-                                            number: ep_num,
-                                            title: Some(clean_title),
-                                            overview: None,
-                                        });
-                                    }
-                                }
-                                unique_eps.sort_by_key(|e| e.number);
-                                unique_eps
-                            } else {
-                                vec![Episode {
-                                    season: season_num,
-                                    number: 1,
-                                    title: None,
-                                    overview: None,
-                                }]
-                            };
-                            Season {
-                                number: season_num,
-                                episodes: eps_models,
-                            }
+                            let episodes = self.fetch_episodes(title_id, &rip_clone).await;
+                            season_from_episode_result(season_num, episodes)
                         }
                     })
                     .collect();
 
-                seasons_vec = futures::future::join_all(season_futures).await;
+                seasons_vec = futures::future::try_join_all(season_futures).await?;
             }
         }
 
@@ -656,6 +649,20 @@ mod tests {
         assert_eq!(parse_episode_number("Parasite 2019 001"), Some(1));
         assert_eq!(parse_episode_number("Parasite 2019 002"), Some(2));
         assert_eq!(parse_episode_number("The Mentalist S07E12"), Some(12));
+    }
+
+    #[test]
+    fn empty_episode_response_does_not_create_a_placeholder_episode() {
+        let season = season_from_episode_result(1, Ok(Vec::new())).unwrap();
+        assert!(season.episodes.is_empty());
+    }
+
+    #[test]
+    fn episode_fetch_failure_is_preserved_as_an_error() {
+        assert!(matches!(
+            season_from_episode_result(1, Err(DramachiError::NotFound)),
+            Err(DramachiError::NotFound)
+        ));
     }
 
     #[test]

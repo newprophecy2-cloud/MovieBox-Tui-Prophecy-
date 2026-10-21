@@ -33,6 +33,7 @@ const RELEASE_CACHE_TTL: Duration = Duration::from_secs(600);
 const PLAYBACK_CACHE_TTL: Duration = Duration::from_secs(120);
 const MOVIEBOX_PROVIDER_ENABLED: bool = false;
 const MAX_TRANSCODE_SESSIONS: usize = 2;
+const TRANSCODE_STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
 const PROVIDERS: [ProviderKind; 5] = [
     ProviderKind::FourKHdHub,
     ProviderKind::Dramachi,
@@ -46,6 +47,17 @@ fn provider_priority(provider: ProviderKind) -> usize {
         .iter()
         .position(|candidate| *candidate == provider)
         .unwrap_or(PROVIDERS.len())
+}
+
+fn suppress_dramachi_when_fourk_series_exists(items: &mut Vec<CatalogItem>) {
+    let has_usable_primary_series = items.iter().any(|item| {
+        item.id.provider == ProviderKind::FourKHdHub
+            && item.media_type == MediaType::Series
+            && item.season_count.is_some_and(|count| count > 0)
+    });
+    if has_usable_primary_series {
+        items.retain(|item| item.id.provider != ProviderKind::Dramachi);
+    }
 }
 
 #[derive(Clone)]
@@ -1215,6 +1227,7 @@ async fn search_all(
     }
     let mut seen = std::collections::HashSet::new();
     items.retain(|i| seen.insert((i.id.provider, i.id.value.clone())));
+    suppress_dramachi_when_fourk_series_exists(&mut items);
     if let Some(language) = requested_language {
         let mut matching = Vec::new();
         let mut other = Vec::new();
@@ -1938,6 +1951,124 @@ fn public_mirrors(
         .collect()
 }
 
+fn validate_transcode_url(raw: &str) -> Option<String> {
+    let url = reqwest::Url::parse(raw).ok()?;
+    let host = url.host_str()?.to_ascii_lowercase();
+    let path = url.path().to_ascii_lowercase();
+    let local_or_intermediate = host == "localhost"
+        || host.ends_with(".local")
+        || host.contains("hubcloud.")
+        || host.contains("hubdrive.")
+        || host.contains("greenmotors.")
+        || host.contains("greenmountmotors.")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| !is_public_transcode_ip(address));
+    if url.scheme() != "https"
+        || local_or_intermediate
+        || path.ends_with(".zip")
+        || path.contains("login.php")
+        || path.contains("logout")
+    {
+        return None;
+    }
+    Some(url.to_string())
+}
+
+fn is_public_transcode_ip(address: std::net::IpAddr) -> bool {
+    match address {
+        std::net::IpAddr::V4(address) => {
+            !(address.is_private()
+                || address.is_loopback()
+                || address.is_link_local()
+                || address.is_broadcast()
+                || address.is_documentation()
+                || address.is_unspecified())
+        }
+        std::net::IpAddr::V6(address) => {
+            !(address.is_loopback()
+                || address.is_unspecified()
+                || address.is_unique_local()
+                || address.is_unicast_link_local())
+        }
+    }
+}
+
+fn direct_transcode_playback_source(source: &Release) -> Option<PlaybackSource> {
+    if source.provider == ProviderKind::FourKHdHub {
+        return None;
+    }
+    let mirror = source.mirrors.iter().find(|mirror| mirror.direct_file)?;
+    Some(PlaybackSource {
+        provider: source.provider,
+        url: validate_transcode_url(&mirror.resolver_url)?,
+        headers: mirror.headers.clone(),
+        subtitle: None,
+        source_label: mirror.label.clone(),
+        max_height: source
+            .quality
+            .as_deref()
+            .and_then(|quality| quality.trim_end_matches('p').parse().ok()),
+    })
+}
+
+async fn resolve_transcode_playback_source(
+    source_id: &str,
+    source: &Release,
+    state: &ApiState,
+) -> Result<PlaybackSource, (&'static str, &'static str, u16)> {
+    if source.provider != ProviderKind::FourKHdHub {
+        return direct_transcode_playback_source(source).ok_or((
+            "TRANSCODE_UNAVAILABLE",
+            "This source has no validated direct media URL for transcoding.",
+            501,
+        ));
+    }
+
+    if let Some(entry) = state.playback_cache.lock().await.get(source_id).cloned()
+        && entry.stored_at.elapsed() < PLAYBACK_CACHE_TTL
+    {
+        return Ok(entry.playback);
+    }
+    let Some(client) = state.service.fourk_client.as_ref() else {
+        return Err(("UPSTREAM_UNAVAILABLE", "4KHDHub is unavailable.", 503));
+    };
+    let resolved = tokio::time::timeout(
+        OVERALL_TIMEOUT,
+        client.resolve_release(source, crate::providers::models::ResolutionIntent::Playback),
+    )
+    .await;
+    let playback = match resolved {
+        Ok(Ok(playback)) => playback,
+        Ok(Err(_)) => {
+            return Err((
+                "TRANSCODE_RESOLUTION_FAILED",
+                "4KHDHub could not resolve a playable media source for transcoding.",
+                502,
+            ));
+        }
+        Err(_) => {
+            return Err((
+                "TRANSCODE_RESOLUTION_TIMEOUT",
+                "4KHDHub media resolution timed out.",
+                504,
+            ));
+        }
+    };
+    let mut cache = state.playback_cache.lock().await;
+    if cache.len() >= 2048 {
+        cache.retain(|_, entry| entry.stored_at.elapsed() < PLAYBACK_CACHE_TTL);
+    }
+    cache.insert(
+        source_id.to_string(),
+        PlaybackCacheEntry {
+            stored_at: Instant::now(),
+            playback: playback.clone(),
+        },
+    );
+    Ok(playback)
+}
+
 async fn transcode_source(
     stream: &mut TcpStream,
     source_id: &str,
@@ -1953,30 +2084,28 @@ async fn transcode_source(
         );
         return write_raw_json(stream, status, &body, None).await;
     };
-    let Some(url) = source.direct_url() else {
-        let (status, body) = err(
-            "TRANSCODE_UNAVAILABLE",
-            "This source does not expose a direct media URL for transcoding.",
-            Some(source.provider),
-            501,
-        );
-        return write_raw_json(stream, status, &body, None).await;
+    let playback = match resolve_transcode_playback_source(source_id, source, state).await {
+        Ok(playback) => playback,
+        Err((code, message, status)) => {
+            let (status, body) = err(code, message, Some(source.provider), status);
+            return write_raw_json(stream, status, &body, None).await;
+        }
     };
     let mut command = Command::new("ffmpeg");
-    command.args(["-hide_banner", "-loglevel", "warning", "-nostdin"]);
-    if !source.mirrors.is_empty() {
-        let headers = source.mirrors[0]
-            .headers
-            .iter()
-            .map(|(name, value)| format!("{name}: {value}\r\n"))
-            .collect::<String>();
-        if !headers.is_empty() {
-            command.arg("-headers").arg(headers);
-        }
+    command.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
+    let headers = playback
+        .headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect::<String>();
+    if !headers.is_empty() {
+        command.arg("-headers").arg(headers);
     }
     command.args([
+        "-rw_timeout",
+        "15000000",
         "-i",
-        url,
+        playback.url.as_str(),
         "-map",
         "0:v:0",
         "-map",
@@ -2003,13 +2132,14 @@ async fn transcode_source(
     ]);
     command
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
             let (status, body) = err(
                 "TRANSCODE_UNAVAILABLE",
-                &format!("FFmpeg is not available: {error}"),
+                format!("FFmpeg is not available: {error}"),
                 Some(source.provider),
                 503,
             );
@@ -2026,7 +2156,47 @@ async fn transcode_source(
         );
         return write_raw_json(stream, status, &body, None).await;
     };
-    write_headers(
+    let mut stderr = child.stderr.take();
+    let stderr_task = tokio::spawn(async move {
+        if let Some(mut stderr) = stderr.take() {
+            let mut buffer = [0u8; 1024];
+            while stderr.read(&mut buffer).await.unwrap_or(0) > 0 {}
+        }
+    });
+    let mut first_chunk = vec![0u8; 32 * 1024];
+    let first_len = match tokio::time::timeout(
+        TRANSCODE_STARTUP_TIMEOUT,
+        stdout.read(&mut first_chunk),
+    )
+    .await
+    {
+        Ok(Ok(length)) if length > 0 => length,
+        Ok(_) => {
+            let _ = child.kill().await;
+            let _ = stderr_task.await;
+            drop(permit);
+            let (status, body) = err(
+                "TRANSCODE_FAILED",
+                "FFmpeg could not start a playable output stream.",
+                Some(source.provider),
+                502,
+            );
+            return write_raw_json(stream, status, &body, None).await;
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = stderr_task.await;
+            drop(permit);
+            let (status, body) = err(
+                "TRANSCODE_STARTUP_TIMEOUT",
+                "FFmpeg did not produce output before the startup timeout.",
+                Some(source.provider),
+                504,
+            );
+            return write_raw_json(stream, status, &body, None).await;
+        }
+    };
+    if let Err(error) = write_headers(
         stream,
         200,
         "video/mp2t",
@@ -2034,11 +2204,41 @@ async fn transcode_source(
             "X-Transcode: h264\r\nX-Source-Id: {source_id}\r\n"
         )),
     )
-    .await?;
+    .await
+    {
+        let _ = child.kill().await;
+        let _ = stderr_task.await;
+        drop(permit);
+        return Err(error);
+    }
+    if let Err(error) = stream.write_all(&first_chunk[..first_len]).await {
+        let _ = child.kill().await;
+        let _ = stderr_task.await;
+        drop(permit);
+        return Err(error);
+    }
     let result = tokio::io::copy(&mut stdout, stream).await;
-    let _ = child.kill().await;
+    let exit_status = if result.is_ok() {
+        match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
+            Ok(Ok(status)) => Some(status),
+            _ => {
+                let _ = child.kill().await;
+                None
+            }
+        }
+    } else {
+        let _ = child.kill().await;
+        None
+    };
+    let _ = stderr_task.await;
     drop(permit);
-    result.map(|_| ())
+    result?;
+    match exit_status {
+        Some(status) if status.success() => Ok(()),
+        _ => Err(std::io::Error::other(
+            "FFmpeg transcoding did not exit successfully",
+        )),
+    }
 }
 
 async fn write_headers(
@@ -2322,6 +2522,167 @@ mod tests {
     }
 
     #[test]
+    fn fourk_series_suppresses_dramachi_but_keeps_other_provider_results() {
+        let item = |provider, media_type, id: &str| CatalogItem {
+            id: ProviderMediaId {
+                provider,
+                value: id.to_string(),
+            },
+            title: id.to_string(),
+            media_type,
+            year: None,
+            poster_url: None,
+            season_count: None,
+        };
+        let mut items = vec![
+            item(ProviderKind::FourKHdHub, MediaType::Series, "fourk-series"),
+            item(ProviderKind::Dramachi, MediaType::Series, "drama-series"),
+            item(ProviderKind::Addons, MediaType::Series, "addon-series"),
+        ];
+        items[0].season_count = Some(1);
+        suppress_dramachi_when_fourk_series_exists(&mut items);
+        assert!(
+            items
+                .iter()
+                .any(|item| item.id.provider == ProviderKind::FourKHdHub)
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| item.id.provider == ProviderKind::Addons)
+        );
+        assert!(
+            !items
+                .iter()
+                .any(|item| item.id.provider == ProviderKind::Dramachi)
+        );
+    }
+
+    #[test]
+    fn dramachi_remains_available_when_primary_has_no_usable_series() {
+        let item = |provider, media_type, id: &str| CatalogItem {
+            id: ProviderMediaId {
+                provider,
+                value: id.to_string(),
+            },
+            title: id.to_string(),
+            media_type,
+            year: None,
+            poster_url: None,
+            season_count: None,
+        };
+        let mut items = vec![
+            item(ProviderKind::FourKHdHub, MediaType::Movie, "fourk-movie"),
+            item(ProviderKind::Dramachi, MediaType::Series, "drama-series"),
+        ];
+        suppress_dramachi_when_fourk_series_exists(&mut items);
+        assert!(
+            items
+                .iter()
+                .any(|item| item.id.provider == ProviderKind::Dramachi)
+        );
+
+        let mut unknown_primary = vec![
+            item(ProviderKind::FourKHdHub, MediaType::Series, "fourk-unknown"),
+            item(ProviderKind::Dramachi, MediaType::Series, "drama-series"),
+        ];
+        suppress_dramachi_when_fourk_series_exists(&mut unknown_primary);
+        assert!(
+            unknown_primary
+                .iter()
+                .any(|item| item.id.provider == ProviderKind::Dramachi)
+        );
+
+        let mut empty_primary = vec![item(
+            ProviderKind::Dramachi,
+            MediaType::Series,
+            "drama-only-series",
+        )];
+        suppress_dramachi_when_fourk_series_exists(&mut empty_primary);
+        assert_eq!(empty_primary.len(), 1);
+        assert_eq!(empty_primary[0].id.provider, ProviderKind::Dramachi);
+    }
+
+    #[test]
+    fn malformed_provider_response_remains_an_upstream_error() {
+        let (status, body) = provider_error(
+            ProviderError::Parsing("missing episode section".into()),
+            ProviderKind::FourKHdHub,
+        );
+        assert_eq!(status, 502);
+        assert!(body.contains("UPSTREAM_UNAVAILABLE"));
+    }
+
+    #[test]
+    fn provider_network_error_remains_retryable() {
+        let (status, body) = provider_error(
+            ProviderError::Network("timeout".into()),
+            ProviderKind::FourKHdHub,
+        );
+        assert_eq!(status, 503);
+        assert!(body.contains("UPSTREAM_UNAVAILABLE"));
+        assert!(body.contains("retryable\":true"));
+    }
+
+    #[test]
+    fn transcode_uses_only_validated_direct_media_mirrors() {
+        let source = Release {
+            provider: ProviderKind::Dramachi,
+            filename: "episode.mkv".into(),
+            quality: Some("1080p".into()),
+            codec: Some("H.265".into()),
+            language: None,
+            size_bytes: None,
+            season: Some(1),
+            episode: Some(1),
+            mirrors: vec![crate::providers::models::SourceMirror {
+                label: "Dramachi CDN".into(),
+                resolver_url: "https://cdn.example/video.mkv".into(),
+                headers: vec![("Referer".into(), "https://provider.example/".into())],
+                direct_file: true,
+            }],
+            resource_id: None,
+        };
+        let playback = direct_transcode_playback_source(&source).unwrap();
+        assert_eq!(playback.url, "https://cdn.example/video.mkv");
+        assert_eq!(playback.headers, source.mirrors[0].headers);
+
+        let mut intermediate = source.clone();
+        intermediate.mirrors[0].direct_file = false;
+        assert!(direct_transcode_playback_source(&intermediate).is_none());
+
+        let mut private = source.clone();
+        private.mirrors[0].resolver_url = "https://127.0.0.1/private.mkv".into();
+        assert!(direct_transcode_playback_source(&private).is_none());
+    }
+
+    #[test]
+    fn fourk_transcode_must_use_the_resolver_not_the_intermediate_mirror() {
+        let source = Release {
+            provider: ProviderKind::FourKHdHub,
+            filename: "episode.mkv".into(),
+            quality: Some("2160p".into()),
+            codec: Some("H.265".into()),
+            language: None,
+            size_bytes: None,
+            season: Some(1),
+            episode: Some(1),
+            mirrors: vec![crate::providers::models::SourceMirror {
+                label: "Download HubCloud".into(),
+                resolver_url: "https://hubcloud.example/drive/abc".into(),
+                headers: vec![],
+                direct_file: false,
+            }],
+            resource_id: None,
+        };
+        assert!(direct_transcode_playback_source(&source).is_none());
+        assert_eq!(
+            source.direct_url(),
+            Some("https://hubcloud.example/drive/abc")
+        );
+    }
+
+    #[test]
     fn addons_configuration_errors_are_specific_and_safe() {
         let (status, body) = provider_error(
             ProviderError::Unavailable("No enabled stream addon is configured.".into()),
@@ -2447,6 +2808,26 @@ mod tests {
         assert_eq!(decoded.p, ProviderKind::MovieBox);
         assert_eq!(decoded.v, "movie-123");
         assert_eq!(public.media_type, MediaType::Movie);
+    }
+
+    #[test]
+    fn provider_catalog_id_round_trip_preserves_fourk_series_identity() {
+        let item = CatalogItem {
+            id: ProviderMediaId {
+                provider: ProviderKind::FourKHdHub,
+                value: "/naruto-series-38/".into(),
+            },
+            title: "Naruto".into(),
+            media_type: MediaType::Series,
+            year: Some("2002".into()),
+            poster_url: None,
+            season_count: Some(8),
+        };
+        let public = catalog_item_response(&item);
+        let decoded = decode::<OpaqueRef>(&public.id).unwrap();
+        assert_eq!(decoded.p, ProviderKind::FourKHdHub);
+        assert_eq!(decoded.v, "/naruto-series-38/");
+        assert_eq!(public.media_type, MediaType::Series);
     }
 
     #[test]
