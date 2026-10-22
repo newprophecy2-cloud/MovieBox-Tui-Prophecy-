@@ -1789,7 +1789,16 @@ async fn eligible_search(
             if permit.is_err() {
                 return (item, SourceEligibility::CheckFailed);
             }
-            catalog_item_source_eligibility(&state, item).await
+            let item_fallback = item.clone();
+            match tokio::time::timeout(
+                SEARCH_SOURCE_CHECK_TIMEOUT,
+                catalog_item_source_eligibility(&state, item),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => (item_fallback, SourceEligibility::CheckFailed),
+            }
         });
     }
 
@@ -3918,6 +3927,12 @@ mod tests {
         assert!(!provider_error_means_no_source(&ProviderError::Parsing(
             "invalid response".into(),
         )));
+    }
+
+    #[test]
+    fn search_source_eligibility_has_a_bounded_per_item_budget() {
+        assert_eq!(SEARCH_SOURCE_CHECK_TIMEOUT, Duration::from_secs(45));
+        assert!(SEARCH_SOURCE_CHECK_TIMEOUT >= SOURCE_TIMEOUT);
     }
 
     #[test]
