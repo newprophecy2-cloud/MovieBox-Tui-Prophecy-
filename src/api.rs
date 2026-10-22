@@ -1194,34 +1194,77 @@ async fn direct_watch_route(stream: &mut TcpStream, query: &str, state: ApiState
     }
     let (items, _, _) = search_all(&state.service, &title).await;
     let title_normalized = title.trim().to_ascii_lowercase();
-    let Some(item) = items.into_iter()
+    let candidates: Vec<_> = items.into_iter()
         .filter(|item| item.media_type == MediaType::Series)
-        .find(|item| item.title.trim().eq_ignore_ascii_case(&title_normalized))
-    else {
+        .filter(|item| item.title.trim().eq_ignore_ascii_case(&title_normalized))
+        .collect();
+    if candidates.is_empty() {
         let (status, body) = err("ANIME_NOT_FOUND", "No exact series title match was found. Try the title returned by /api/v1/anime/search.", None, 404);
         return write_raw_json(stream, status, &body, None).await;
-    };
-    let anime_ref = OpaqueRef { p: item.id.provider, v: item.id.value.clone(), s: 0, e: 0 };
-    if anime_ref.p == ProviderKind::MovieBox && !MOVIEBOX_PROVIDER_ENABLED {
-        return moviebox_disabled(stream).await;
     }
-    let anime_id = encode(&anime_ref);
-    let anime_details = match state.service.details_typed(anime_ref.p, &anime_ref.v).await {
-        Ok(details) => details,
-        Err(error) => {
-            let (status, body) = provider_error(error, anime_ref.p);
-            return write_raw_json(stream, status, &body, None).await;
+
+    // Search all matching provider entries before declaring the episode missing.
+    // A provider may have incomplete season/episode metadata while another has it.
+    let mut last_provider = None;
+    let mut available = Vec::new();
+    for item in candidates {
+        let anime_ref = OpaqueRef {
+            p: item.id.provider,
+            v: item.id.value.clone(),
+            s: 0,
+            e: 0,
+        };
+        if anime_ref.p == ProviderKind::MovieBox && !MOVIEBOX_PROVIDER_ENABLED {
+            continue;
         }
-    };
-    let episode_exists = anime_details.seasons.iter().any(|s| {
-        s.number == season && s.episodes.iter().any(|e| e.number == episode)
-    });
-    if !episode_exists {
-        let (status, body) = err("EPISODE_NOT_FOUND", "The requested season/episode does not exist for this series.", Some(anime_ref.p), 404);
-        return write_raw_json(stream, status, &body, None).await;
+        let anime_details = match state.service.details_typed(anime_ref.p, &anime_ref.v).await {
+            Ok(details) => details,
+            Err(error) => {
+                log::warn!("direct watch details lookup failed for provider {}: {}", anime_ref.p.label(), error.user_message(anime_ref.p));
+                last_provider = Some(anime_ref.p);
+                continue;
+            }
+        };
+        last_provider = Some(anime_ref.p);
+        let episode_exists = anime_details.seasons.iter().any(|s| {
+            s.number == season && s.episodes.iter().any(|e| e.number == episode)
+        });
+        if episode_exists {
+            let anime_id = encode(&anime_ref);
+            let episode_id = provider_ref(&anime_details.id, season, episode);
+            return anime_episode_stream_route(
+                stream, &anime_id, &episode_id, anime_ref, anime_details, state, &audio,
+            ).await;
+        }
+        for available_season in &anime_details.seasons {
+            if !available_season.episodes.is_empty() {
+                let numbers = available_season.episodes.iter()
+                    .map(|e| e.number.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                available.push(format!(
+                    "{} S{} episodes [{}] ({})",
+                    item.title,
+                    available_season.number,
+                    numbers,
+                    item.id.provider.label(),
+                ));
+            }
+        }
     }
-    let episode_id = provider_ref(&anime_details.id, season, episode);
-    anime_episode_stream_route(stream, &anime_id, &episode_id, anime_ref, anime_details, state, &audio).await
+
+    let detail = if available.is_empty() {
+        "No matching provider returned a parseable episode list. Check provider availability and series details.".to_string()
+    } else {
+        format!(
+            "Season {} episode {} was not found in matching providers. Available episodes: {}",
+            season,
+            episode,
+            available.into_iter().take(6).collect::<Vec<_>>().join("; ")
+        )
+    };
+    let (status, body) = err("EPISODE_NOT_FOUND", &detail, last_provider, 404);
+    write_raw_json(stream, status, &body, None).await
 }
 
 async fn search_json(stream: &mut TcpStream, query: &str, state: ApiState) -> std::io::Result<()> {
