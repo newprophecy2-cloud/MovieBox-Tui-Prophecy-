@@ -2277,11 +2277,22 @@ async fn probe_media(url: &str, headers: &[(String, String)]) -> Result<ProbeOut
 }
 
 fn audio_tracks_confirm_language(tracks: &[serde_json::Value], language_code: &str) -> bool {
+    let matches_language = |value: &str| {
+        let normalized = value.trim().to_ascii_lowercase();
+        normalized.eq_ignore_ascii_case(language_code)
+            || (language_code.eq_ignore_ascii_case("hi")
+                && (normalized == "hin"
+                    || normalized.contains("hindi")
+                    || normalized.contains("हिन्दी")
+                    || normalized.contains("हिंदी")))
+    };
     tracks.iter().any(|track| {
-        track
-            .get("language")
-            .and_then(|value| value.as_str())
-            .is_some_and(|language| language.eq_ignore_ascii_case(language_code))
+        ["language", "raw_language", "label"].iter().any(|field| {
+            track
+                .get(*field)
+                .and_then(|value| value.as_str())
+                .is_some_and(matches_language)
+        })
     })
 }
 
@@ -3124,13 +3135,19 @@ mod tests {
             "language": "hi",
             "label": "Audio Track 1"
         })];
+        let track_title_metadata = vec![serde_json::json!({
+            "language": "und",
+            "label": "Hindi Audio",
+            "raw_language": null
+        })];
         let filename_only_hint = vec![serde_json::json!({
             "language": "und",
-            "label": "Naruto Shippuden Hindi Dub",
+            "label": "Audio Track 1",
             "raw_language": null
         })];
 
         assert!(audio_tracks_confirm_language(&identified_track, "hi"));
+        assert!(audio_tracks_confirm_language(&track_title_metadata, "hi"));
         assert!(!audio_tracks_confirm_language(&filename_only_hint, "hi"));
     }
 
@@ -3145,6 +3162,9 @@ mod tests {
             Some(ProviderKind::FourKHdHub)
         );
         assert!(parse_search_provider(Some("not-a-provider")).is_err());
+        let (status, body) = validate_search_provider(Some("not-a-provider")).unwrap_err();
+        assert_eq!(status, 400);
+        assert!(body.contains("UNKNOWN_PROVIDER"));
         assert_eq!(parse_search_provider(None).unwrap(), None);
     }
 
