@@ -2053,16 +2053,34 @@ fn normalized_language(raw: Option<&str>) -> (String, String, Option<String>) {
         return ("und".into(), "Unknown".into(), None);
     };
     let original = Some(raw.to_string());
-    match raw.to_ascii_lowercase().as_str() {
-        "hi" | "hin" => ("hi".into(), "Hindi".into(), original),
-        "en" | "eng" => ("en".into(), "English".into(), original),
-        "ja" | "jpn" => ("ja".into(), "Japanese".into(), original),
-        "ko" | "kor" => ("ko".into(), "Korean".into(), original),
-        "zh" | "zho" | "chi" => ("zh".into(), "Chinese".into(), original),
-        "es" | "spa" => ("es".into(), "Spanish".into(), original),
-        "fr" | "fra" | "fre" => ("fr".into(), "French".into(), original),
-        "de" | "deu" | "ger" => ("de".into(), "German".into(), original),
-        "und" => ("und".into(), "Unknown".into(), original),
+    // ffprobe normally reports ISO-639 codes, but some files use full language
+    // names or common aliases. Normalize known values while preserving the source tag.
+    match raw.to_ascii_lowercase().replace('_', "-").as_str() {
+        "hi" | "hin" | "hindi" => ("hi".into(), "Hindi".into(), original),
+        "en" | "eng" | "english" => ("en".into(), "English".into(), original),
+        "ja" | "jpn" | "japanese" | "日本語" => ("ja".into(), "Japanese".into(), original),
+        "ko" | "kor" | "korean" | "한국어" => ("ko".into(), "Korean".into(), original),
+        "zh" | "zho" | "chi" | "chinese" | "mandarin" => ("zh".into(), "Chinese".into(), original),
+        "es" | "spa" | "spanish" => ("es".into(), "Spanish".into(), original),
+        "fr" | "fra" | "fre" | "french" => ("fr".into(), "French".into(), original),
+        "de" | "deu" | "ger" | "german" => ("de".into(), "German".into(), original),
+        "pt" | "por" | "portuguese" => ("pt".into(), "Portuguese".into(), original),
+        "ru" | "rus" | "russian" => ("ru".into(), "Russian".into(), original),
+        "it" | "ita" | "italian" => ("it".into(), "Italian".into(), original),
+        "ar" | "ara" | "arabic" => ("ar".into(), "Arabic".into(), original),
+        "bn" | "ben" | "bengali" | "bangla" => ("bn".into(), "Bengali".into(), original),
+        "ta" | "tam" | "tamil" => ("ta".into(), "Tamil".into(), original),
+        "te" | "tel" | "telugu" => ("te".into(), "Telugu".into(), original),
+        "ur" | "urd" | "urdu" => ("ur".into(), "Urdu".into(), original),
+        "pa" | "pan" | "punjabi" => ("pa".into(), "Punjabi".into(), original),
+        "id" | "ind" | "indonesian" | "bahasa indonesia" => ("id".into(), "Indonesian".into(), original),
+        "ms" | "msa" | "may" | "malay" => ("ms".into(), "Malay".into(), original),
+        "th" | "tha" | "thai" => ("th".into(), "Thai".into(), original),
+        "tr" | "tur" | "turkish" => ("tr".into(), "Turkish".into(), original),
+        "vi" | "vie" | "vietnamese" => ("vi".into(), "Vietnamese".into(), original),
+        "fil" | "tgl" | "filipino" | "tagalog" => ("fil".into(), "Filipino".into(), original),
+        "fa" | "fas" | "per" | "persian" | "farsi" => ("fa".into(), "Persian".into(), original),
+        "und" | "unknown" => ("und".into(), "Unknown".into(), original),
         _ => (raw.to_ascii_lowercase(), raw.to_string(), original),
     }
 }
@@ -3272,6 +3290,22 @@ mod tests {
         assert_eq!(
             normalized_language(Some("jpn")),
             ("ja".into(), "Japanese".into(), Some("jpn".into()))
+        );
+        assert_eq!(
+            normalized_language(Some("Japanese")),
+            ("ja".into(), "Japanese".into(), Some("Japanese".into()))
+        );
+        assert_eq!(
+            normalized_language(Some("English")),
+            ("en".into(), "English".into(), Some("English".into()))
+        );
+        assert_eq!(
+            normalized_language(Some("Bengali")),
+            ("bn".into(), "Bengali".into(), Some("Bengali".into()))
+        );
+        assert_eq!(
+            normalized_language(Some("und")),
+            ("und".into(), "Unknown".into(), Some("und".into()))
         );
         assert_eq!(
             normalized_language(None),
