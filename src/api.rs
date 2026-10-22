@@ -39,10 +39,11 @@ const PLAYBACK_CACHE_TTL: Duration = Duration::from_secs(120);
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_API_CONNECTIONS: usize = 256;
-const MOVIEBOX_PROVIDER_ENABLED: bool = false;
+const MOVIEBOX_PROVIDER_ENABLED: bool = true;
 const MAX_TRANSCODE_SESSIONS: usize = 2;
 const TRANSCODE_STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
-const PROVIDERS: [ProviderKind; 5] = [
+const PROVIDERS: [ProviderKind; 6] = [
+    ProviderKind::MovieBox,
     ProviderKind::FourKHdHub,
     ProviderKind::Dramachi,
     ProviderKind::BdixCircleFtp,
@@ -50,9 +51,16 @@ const PROVIDERS: [ProviderKind; 5] = [
     ProviderKind::Addons,
 ];
 
+fn moviebox_provider_enabled() -> bool {
+    MOVIEBOX_PROVIDER_ENABLED && crate::config::load().moviebox_enabled
+}
+
 fn configured_search_providers() -> Vec<ProviderKind> {
     let config = crate::config::load();
     let mut providers = Vec::with_capacity(PROVIDERS.len());
+    if moviebox_provider_enabled() && config.moviebox_enabled {
+        providers.push(ProviderKind::MovieBox);
+    }
     if config.fourkhdhub_enabled { providers.push(ProviderKind::FourKHdHub); }
     if config.dramachi_enabled { providers.push(ProviderKind::Dramachi); }
     if config.bdix_circleftp_enabled { providers.push(ProviderKind::BdixCircleFtp); }
@@ -602,14 +610,14 @@ async fn route(stream: &mut TcpStream, target: &str, state: ApiState) -> std::io
         | "/api/v1/trending/anime" | "/api/v1/trending/movies"
         | "/api/v1/trending/k-dramas" | "/api/v1/popular"
         | "/api/v1/popular/anime" | "/api/v1/popular/movies"
-        | "/api/v1/popular/k-dramas" if !MOVIEBOX_PROVIDER_ENABLED => {
+        | "/api/v1/popular/k-dramas" if !moviebox_provider_enabled() => {
             moviebox_disabled(stream).await
         }
         "/api/v1/latest" => unsupported_catalog(stream, "Reliable release-date metadata is not exposed consistently by the available providers.").await,
-        "/api/v1/movies" | "/api/v1/k-dramas" | "/api/v1/categories" if !MOVIEBOX_PROVIDER_ENABLED => {
+        "/api/v1/movies" | "/api/v1/k-dramas" | "/api/v1/categories" if !moviebox_provider_enabled() => {
             moviebox_disabled(stream).await
         }
-        _ if path.starts_with("/api/v1/movies/") && !MOVIEBOX_PROVIDER_ENABLED => moviebox_disabled(stream).await,
+        _ if path.starts_with("/api/v1/movies/") && !moviebox_provider_enabled() => moviebox_disabled(stream).await,
         _ if path.starts_with("/api/v1/k-dramas/") => unsupported_catalog(stream, "K-Drama details require a verified item classification before lookup.").await,
         _ if path.starts_with("/api/v1/anime/") => anime_route(stream, path, query, state).await,
         _ if path.starts_with("/api/v1/episodes/") => episode_route(stream, path, state).await,
@@ -662,7 +670,7 @@ async fn diagnostics_route(stream: &mut TcpStream, state: ApiState) -> std::io::
                 "streaming_configured": built_in_streaming || enabled_stream_addons > 0,
                 "streaming_enabled": config.streaming_enabled,
                 "moviebox_configured": config.moviebox_enabled,
-                "moviebox_effective": MOVIEBOX_PROVIDER_ENABLED
+                "moviebox_effective": moviebox_provider_enabled()
             },
             "built_in_providers": built_in,
             "external_addons": {
@@ -1139,7 +1147,7 @@ async fn catalog_details_route(
     let Ok(reference) = decode::<OpaqueRef>(id) else {
         return unsupported_catalog(stream, "The catalog identifier is invalid.").await;
     };
-    if reference.p == ProviderKind::MovieBox && !MOVIEBOX_PROVIDER_ENABLED {
+    if reference.p == ProviderKind::MovieBox && !moviebox_provider_enabled() {
         return moviebox_disabled(stream).await;
     }
     match state.service.details_typed(reference.p, &reference.v).await {
@@ -1285,7 +1293,7 @@ async fn direct_watch_route(stream: &mut TcpStream, query: &str, state: ApiState
             s: 0,
             e: 0,
         };
-        if anime_ref.p == ProviderKind::MovieBox && !MOVIEBOX_PROVIDER_ENABLED {
+        if anime_ref.p == ProviderKind::MovieBox && !moviebox_provider_enabled() {
             continue;
         }
         let anime_details = match state.service.details_typed(anime_ref.p, &anime_ref.v).await {
@@ -1598,7 +1606,7 @@ async fn anime_route(stream: &mut TcpStream, path: &str, query: &str, state: Api
         let (s, b) = r.unwrap_err();
         return write_raw_json(stream, s, &b, None).await;
     };
-    if r.p == ProviderKind::MovieBox && !MOVIEBOX_PROVIDER_ENABLED {
+    if r.p == ProviderKind::MovieBox && !moviebox_provider_enabled() {
         return moviebox_disabled(stream).await;
     }
     let d = state.service.details_typed(r.p, &r.v).await;
@@ -2024,7 +2032,7 @@ async fn episode_route(stream: &mut TcpStream, path: &str, state: ApiState) -> s
         let (s, b) = r.unwrap_err();
         return write_raw_json(stream, s, &b, None).await;
     };
-    if r.p == ProviderKind::MovieBox && !MOVIEBOX_PROVIDER_ENABLED {
+    if r.p == ProviderKind::MovieBox && !moviebox_provider_enabled() {
         return moviebox_disabled(stream).await;
     }
     if parts.get(4) == Some(&"sources") {
@@ -2341,7 +2349,7 @@ async fn source_route(stream: &mut TcpStream, path: &str, state: ApiState) -> st
         let (s, b) = sr.unwrap_err();
         return write_raw_json(stream, s, &b, None).await;
     };
-    if sr.p == ProviderKind::MovieBox && !MOVIEBOX_PROVIDER_ENABLED {
+    if sr.p == ProviderKind::MovieBox && !moviebox_provider_enabled() {
         return moviebox_disabled(stream).await;
     }
     let r = OpaqueRef {
