@@ -590,9 +590,11 @@ async fn route(stream: &mut TcpStream, target: &str, state: ApiState) -> std::io
         "/" => write_json(stream, 200, &serde_json::json!({"name":"MovieBox API","version":"v1","docs":"/docs","health":"/health"}), None).await,
         "/health" => write_json(stream, 200, &serde_json::json!({"status":"ok"}), None).await,
         "/ready" => write_json(stream, 200, &serde_json::json!({"status":"ready","meaning":"The process and local service layer are initialized; upstream availability is request-specific."}), None).await,
+        "/ready" => write_json(stream, 200, &serde_json::json!({"status":"ready","meaning":"The process and local service layer are initialized; upstream availability is request-specific."}), None).await,
         "/api/v1" => write_json(stream, 200, &serde_json::json!({"version":"v1","resources":["anime","episodes","sources"]}), None).await,
         "/openapi.json" => write_json(stream, 200, &openapi(), None).await,
         "/docs" => write_text(stream, 200, "text/html; charset=utf-8", "<!doctype html><html><head><title>MovieBox API</title></head><body><h1>MovieBox API</h1><p>OpenAPI: <a href=\"/openapi.json\">/openapi.json</a></p><p>Swagger UI can load this document from a local or trusted client.</p></body></html>", None).await,
+        "/api/v1/diagnostics" => diagnostics_route(stream).await,
         "/api/v1/watch" => direct_watch_route(stream, query, state).await,
         "/api/v1/anime/search" => search_json(stream, query, state).await,
         "/api/v1/anime/search/stream" => search_sse(stream, query, state).await,
@@ -614,6 +616,46 @@ async fn route(stream: &mut TcpStream, target: &str, state: ApiState) -> std::io
         _ if path.starts_with("/api/v1/sources/") => source_route(stream, path, state).await,
         _ => { let (s,b) = err("INTERNAL_ERROR", "Route not found.", None, 404); write_raw_json(stream, s, &b, None).await }
     }
+}
+
+async fn diagnostics_route(stream: &mut TcpStream) -> std::io::Result<()> {
+    // Capture whether the config existed before load_addons() applies its local
+    // defaults. Never expose manifest URLs or other configuration values.
+    let addons_config_file_present = crate::config::addons_path()
+        .is_some_and(|path| path.is_file());
+    let addons = tokio::task::spawn_blocking(crate::config::load_addons)
+        .await
+        .unwrap_or_default();
+    let enabled_stream_addons = addons
+        .iter()
+        .filter(|addon| addon.enabled && addon.provides_stream)
+        .count();
+    let enabled_catalog_addons = addons
+        .iter()
+        .filter(|addon| addon.enabled && (addon.provides_catalog || addon.provides_meta))
+        .count();
+    let status = if enabled_stream_addons > 0 { "ok" } else { "degraded" };
+
+    write_json(
+        stream,
+        200,
+        &serde_json::json!({
+            "status": status,
+            "configuration": {
+                "addons_config_file_present_at_start_of_check": addons_config_file_present,
+                "enabled_stream_addons": enabled_stream_addons,
+                "enabled_catalog_or_metadata_addons": enabled_catalog_addons,
+                "streaming_configured": enabled_stream_addons > 0
+            },
+            "hint": if enabled_stream_addons == 0 {
+                Some("No stream-capable addon is enabled. Configure a supported provider before expecting stream requests to succeed.")
+            } else {
+                None
+            }
+        }),
+        None,
+    )
+    .await
 }
 
 fn catalog_item_response(item: &CatalogItem) -> CatalogItemResponse {
