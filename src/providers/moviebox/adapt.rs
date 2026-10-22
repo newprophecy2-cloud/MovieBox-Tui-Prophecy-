@@ -1517,6 +1517,7 @@ mod tests {
         let release_str = moviebox_resource_item_to_release(&item_str);
         assert_eq!(release_str.resource_id.as_deref(), Some("1234567890"));
     }
+
     #[test]
     fn test_moviebox_resource_item_filters_deprecation_notice_url() {
         let notice_item = json!({
@@ -1541,6 +1542,7 @@ mod tests {
         assert_eq!(releases.len(), 1);
         assert_eq!(releases[0].filename, "Valid Stream");
     }
+
     #[test]
     fn test_series_zero_season_sentinel_is_unknown() {
         let item = moviebox_subject_json_to_catalog_item(&json!({
@@ -1548,7 +1550,8 @@ mod tests {
             "title": "Example Series",
             "subjectType": 2,
             "season": 0
-        })).unwrap();
+        }))
+        .unwrap();
 
         assert_eq!(item.media_type, MediaType::Series);
         assert_eq!(item.season_count, None);
@@ -1562,7 +1565,8 @@ mod tests {
             "subjectType": 2,
             "seasonCount": "3",
             "season": 0
-        })).unwrap();
+        }))
+        .unwrap();
 
         assert_eq!(item.season_count, Some(3));
     }
@@ -1576,9 +1580,9 @@ mod tests {
             "seasonCount": 0,
             "season_count": "2",
             "season": 1
-        })).unwrap();
+        }))
+        .unwrap();
 
         assert_eq!(item.season_count, Some(2));
     }
-
 }
