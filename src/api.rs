@@ -3698,4 +3698,50 @@ mod tests {
         ]));
     }
 
+    #[test]
+    fn full_episode_response_exposes_anime_season_episode_and_sources_together() {
+        let selected_episode = ApiEpisode {
+            id: "episode-id".into(),
+            season: 1,
+            number: 6,
+            title: Some("Episode 6".into()),
+            overview: None,
+        };
+        let response = AnimeEpisodeFullResponse {
+            selected_season: ApiSeason {
+                number: 1,
+                episodes: vec![selected_episode.clone()],
+            },
+            selected_episode,
+            anime: ApiDetails {
+                id: "anime-id".into(),
+                title: "Example Anime".into(),
+                media_type: MediaType::Series,
+                year: None,
+                description: None,
+                tagline: None,
+                imdb_rating: None,
+                director: None,
+                stars: None,
+                prints: None,
+                audios: None,
+                poster_url: None,
+                duration: None,
+                genres: vec![],
+                seasons: vec![],
+                audio: vec![],
+            },
+            sources_status: "ok",
+            sources_partial: false,
+            sources: vec![],
+            source_error: None,
+        };
+        let json = serde_json::to_value(response).expect("serialize full episode response");
+        assert_eq!(json["anime"]["title"], "Example Anime");
+        assert_eq!(json["selected_season"]["number"], 1);
+        assert_eq!(json["selected_episode"]["number"], 6);
+        assert!(json["sources"].is_array());
+        assert_eq!(json["sources_status"], "ok");
+    }
+
 }
