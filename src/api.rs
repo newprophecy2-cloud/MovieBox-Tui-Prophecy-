@@ -645,8 +645,10 @@ async fn diagnostics_route(stream: &mut TcpStream, state: ApiState) -> std::io::
     let config = tokio::task::spawn_blocking(crate::config::load)
         .await
         .unwrap_or_default();
+    // Use the single loaded config snapshot for a consistent diagnostic response.
+    let moviebox_effective = MOVIEBOX_PROVIDER_ENABLED && config.moviebox_enabled;
     let built_in = serde_json::json!({
-        "moviebox": { "configured": moviebox_provider_enabled(), "initialized": true, "upstream": "not_checked" },
+        "moviebox": { "configured": moviebox_effective, "initialized": true, "upstream": "not_checked" },
         "fourkhdhub": { "configured": config.fourkhdhub_enabled, "initialized": state.service.fourk_client.is_some(), "upstream": "not_checked" },
         "dramachi": { "configured": config.dramachi_enabled, "initialized": true, "upstream": "not_checked" },
         "bdix_circleftp": { "configured": config.bdix_circleftp_enabled, "initialized": true, "upstream": "not_checked" },
@@ -655,7 +657,7 @@ async fn diagnostics_route(stream: &mut TcpStream, state: ApiState) -> std::io::
     // Configuration is not proof that an upstream provider is healthy. This
     // endpoint intentionally reports configuration separately from live status.
     let built_in_streaming_configured = config.streaming_enabled
-        && (moviebox_provider_enabled()
+        && (moviebox_effective
             || (config.fourkhdhub_enabled && state.service.fourk_client.is_some())
             || config.dramachi_enabled
             || config.bdix_circleftp_enabled
@@ -676,11 +678,11 @@ async fn diagnostics_route(stream: &mut TcpStream, state: ApiState) -> std::io::
                 "streaming_configured": streaming_configured,
                 "streaming_enabled": config.streaming_enabled,
                 "moviebox_configured": config.moviebox_enabled,
-                "moviebox_effective": moviebox_provider_enabled()
+                "moviebox_effective": moviebox_effective
             },
             "built_in_providers": built_in,
             "external_addons": {
-                "catalog_or_metadata": if enabled_catalog_addons > 0 { "configured" } else { "unavailable" },
+                "catalog_or_metadata": if enabled_catalog_addons > 0 { "configured" } else { "unconfigured" },
                 "streaming": if stream_addons_configured { "configured" } else { "unconfigured" }
             },
             "streaming": {
