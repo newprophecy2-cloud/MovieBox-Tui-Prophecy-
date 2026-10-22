@@ -1,5 +1,3 @@
-use crate::providers::models::CatalogItem;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestedLanguage {
     Hindi,
@@ -142,27 +140,10 @@ pub fn language_from_provider_text(text: &str) -> Option<RequestedLanguage> {
     .find(|language| language.aliases().iter().any(|alias| lower.contains(alias)))
 }
 
-pub fn normalize_title(text: &str) -> String {
-    crate::providers::moviebox::clean_moviebox_title(text)
-        .trim()
-        .to_string()
-}
-
-pub fn decorate_catalog_item(item: &mut CatalogItem, requested: Option<RequestedLanguage>) -> bool {
-    let Some(requested) = requested else {
-        return false;
-    };
-    let Some(found) = language_from_provider_text(&item.title) else {
-        return false;
-    };
-    let base = normalize_title(&item.title);
-    if found == requested {
-        item.title = format!("{} ({})", base, requested.result_label());
-        true
-    } else {
-        item.title = format!("{} (Other Languages)", base);
-        false
-    }
+/// Returns whether provider-supplied title text hints at the requested language.
+/// This is a title/filename hint only; it does not verify embedded audio tracks.
+pub fn title_language_hint_matches(title: &str, requested: RequestedLanguage) -> bool {
+    language_from_provider_text(title) == Some(requested)
 }
 
 #[cfg(test)]
@@ -198,6 +179,22 @@ mod tests {
         assert_eq!(parsed.title, "The English");
         assert_eq!(parsed.language, None);
         assert_eq!(parse_query("English").language, None);
+    }
+
+    #[test]
+    fn title_language_hints_are_not_audio_verification() {
+        assert!(title_language_hint_matches(
+            "Naruto Shippuden [Hindi Dub]",
+            RequestedLanguage::Hindi
+        ));
+        assert!(!title_language_hint_matches(
+            "Naruto Shippuden",
+            RequestedLanguage::Hindi
+        ));
+        assert!(!title_language_hint_matches(
+            "Naruto Shippuden [English Dub]",
+            RequestedLanguage::Hindi
+        ));
     }
 
     #[test]
