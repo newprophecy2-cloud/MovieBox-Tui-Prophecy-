@@ -104,8 +104,8 @@ impl MovieBoxService {
         if let Some(language) = intent.language {
             let mut matching = Vec::new();
             let mut other = Vec::new();
-            for mut item in items {
-                if crate::language::decorate_catalog_item(&mut item, Some(language)) {
+            for item in items {
+                if crate::language::title_language_hint_matches(&item.title, language) {
                     matching.push(item);
                 } else {
                     other.push(item);
