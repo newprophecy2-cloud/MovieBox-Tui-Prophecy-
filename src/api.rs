@@ -121,6 +121,7 @@ struct SearchQuery {
     q: Option<String>,
     limit: Option<usize>,
     cursor: Option<String>,
+    provider: Option<String>,
 }
 #[derive(Debug, Serialize)]
 struct ErrorBody {
@@ -142,8 +143,13 @@ struct SearchResponse {
     provider_status: HashMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     language_intent: Option<String>,
+    // Kept for response compatibility, but omitted unless audio is actually verified.
     #[serde(skip_serializing_if = "Option::is_none")]
     verified_language_matches: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title_language_hint_matches: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audio_language_verification: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<String>,
 }
@@ -151,6 +157,7 @@ struct SearchResponse {
 struct ApiCatalogItem {
     id: String,
     title: String,
+    provider: ProviderKind,
     media_type: crate::providers::models::MediaType,
     year: Option<String>,
     poster_url: Option<String>,
@@ -372,9 +379,12 @@ fn episode_ref(id: &ProviderMediaId, episode: &crate::providers::models::Episode
     })
 }
 fn catalog(item: CatalogItem) -> ApiCatalogItem {
+    let id = provider_ref(&item.id, 0, 0);
+    let provider = item.id.provider;
     ApiCatalogItem {
-        id: provider_ref(&item.id, 0, 0),
+        id,
         title: item.title,
+        provider,
         media_type: item.media_type,
         year: item.year,
         poster_url: item.poster_url,
@@ -1209,6 +1219,7 @@ fn parse_query(query: &str) -> SearchQuery {
         q: None,
         limit: None,
         cursor: None,
+        provider: None,
     };
     for item in query.split('&') {
         let Some((k, v)) = item.split_once('=') else {
@@ -1219,11 +1230,38 @@ fn parse_query(query: &str) -> SearchQuery {
             "q" => out.q = Some(v),
             "limit" => out.limit = v.parse().ok(),
             "cursor" => out.cursor = Some(v),
+            "provider" => out.provider = Some(v),
             _ => {}
         }
     }
     out
 }
+fn parse_search_provider(value: Option<&str>) -> Result<Option<ProviderKind>, ()> {
+    value
+        .map(|value| ProviderKind::parse(value).map(Some).ok_or(()))
+        .unwrap_or(Ok(None))
+}
+
+fn validate_search_provider(value: Option<&str>) -> Result<Option<ProviderKind>, (u16, String)> {
+    let provider = parse_search_provider(value)
+        .map_err(|_| err("UNKNOWN_PROVIDER", "The requested provider is not supported.", None, 400))?;
+    if let Some(provider) = provider
+        && !configured_search_providers().contains(&provider)
+    {
+        return Err(err(
+            "PROVIDER_DISABLED",
+            "The requested provider is not enabled in this backend configuration.",
+            Some(provider),
+            503,
+        ));
+    }
+    Ok(provider)
+}
+
+fn search_providers(requested: Option<ProviderKind>) -> Vec<ProviderKind> {
+    requested.map_or_else(configured_search_providers, |provider| vec![provider])
+}
+
 fn normalize_title(value: &str) -> String {
     value
         .chars()
@@ -1429,28 +1467,37 @@ async fn search_json(stream: &mut TcpStream, query: &str, state: ApiState) -> st
         let (s, b) = err("CURSOR_INVALID", "The cursor is invalid.", None, 400);
         return write_raw_json(stream, s, &b, None).await;
     }
-    let (items, failed, provider_status) = search_all(&state.service, &qv).await;
+    let requested_provider = match validate_search_provider(q.provider.as_deref()) {
+        Ok(provider) => provider,
+        Err((status, body)) => return write_raw_json(stream, status, &body, None).await,
+    };
+    let (items, failed, provider_status) =
+        search_all(&state.service, &qv, requested_provider).await;
     let offset = q
         .cursor
         .as_deref()
         .and_then(|cursor| decode::<usize>(cursor).ok())
         .unwrap_or_default();
     let language_intent = crate::language::parse_query(&qv).language;
-    let verified_language_matches = language_intent.map(|language| {
-        let label = format!("({})", language.result_label());
+    let title_language_hint_matches = language_intent.map(|language| {
         items
             .iter()
-            .filter(|item| item.title.ends_with(&label))
+            .filter(|item| crate::language::title_language_hint_matches(&item.title, language))
             .count()
     });
-    let message = language_intent
-        .filter(|_| verified_language_matches == Some(0))
-        .map(|language| {
+    let message = language_intent.map(|language| {
+        if title_language_hint_matches.unwrap_or_default() > 0 {
             format!(
-                "No verified {} version found. Try another provider or language.",
+                "Provider title hints suggest {}; embedded audio tracks remain unverified.",
                 language.name()
             )
-        });
+        } else {
+            format!(
+                "No provider title hint was found for {}; embedded audio tracks remain unverified.",
+                language.name()
+            )
+        }
+    });
     let total = items.len();
     let next_cursor =
         (offset.saturating_add(limit) < total).then(|| encode(&offset.saturating_add(limit)));
@@ -1466,7 +1513,10 @@ async fn search_json(stream: &mut TcpStream, query: &str, state: ApiState) -> st
         partial: failed,
         provider_status,
         language_intent: language_intent.map(|language| language.code().to_string()),
-        verified_language_matches,
+        // Search titles and provider labels are hints, not proof of embedded audio tracks.
+        verified_language_matches: None,
+        title_language_hint_matches,
+        audio_language_verification: language_intent.map(|_| "unverified"),
         message,
     };
     write_json(stream, 200, &body, None).await
@@ -1483,12 +1533,16 @@ async fn search_sse(stream: &mut TcpStream, query: &str, state: ApiState) -> std
         );
         return write_raw_json(stream, s, &b, None).await;
     };
+    let requested_provider = match validate_search_provider(q.provider.as_deref()) {
+        Ok(provider) => provider,
+        Err((status, body)) => return write_raw_json(stream, status, &body, None).await,
+    };
     let intent = crate::language::parse_query(&qv);
     let requested_language = intent.language;
     let normalized_query = intent.title;
     write_headers(stream, 200, "text/event-stream", None).await?;
     let mut tasks = JoinSet::new();
-    for p in configured_search_providers() {
+    for p in search_providers(requested_provider) {
         let svc = state.service.clone();
         let q = normalized_query.clone();
         tasks.spawn(async move {
@@ -1501,13 +1555,15 @@ async fn search_sse(stream: &mut TcpStream, query: &str, state: ApiState) -> std
         match joined {
             Ok((p, result)) => match result {
                 Ok(Ok(items)) => {
-                    for mut item in items {
-                        if let Some(language) = requested_language {
-                            crate::language::decorate_catalog_item(&mut item, Some(language));
-                        }
-                        let payload =
-                            serde_json::to_string(&serde_json::json!({"result":catalog(item)}))
-                                .unwrap();
+                    for item in items {
+                        let title_language_hint = crate::language::language_from_provider_text(&item.title)
+                            .map(|language| language.code());
+                        let payload = serde_json::to_string(&serde_json::json!({
+                            "result": catalog(item),
+                            "requested_language": requested_language.map(|language| language.code()),
+                            "title_language_hint": title_language_hint,
+                            "audio_language_verification": if requested_language.is_some() { "unverified" } else { "not_checked" }
+                        })).unwrap();
                         send_event(stream, "search_result", &payload).await?;
                     }
                 }
@@ -1536,7 +1592,11 @@ async fn search_sse(stream: &mut TcpStream, query: &str, state: ApiState) -> std
     send_event(
         stream,
         "search_complete",
-        &serde_json::json!({"partial":partial,"replay":false}).to_string(),
+        &serde_json::json!({
+            "partial": partial,
+            "replay": false,
+            "provider_filter": requested_provider.map(|provider| provider.cache_key())
+        }).to_string(),
     )
     .await
 }
@@ -1544,12 +1604,13 @@ async fn search_sse(stream: &mut TcpStream, query: &str, state: ApiState) -> std
 async fn search_all(
     service: &Arc<MovieBoxService>,
     query: &str,
+    requested_provider: Option<ProviderKind>,
 ) -> (Vec<CatalogItem>, bool, HashMap<String, String>) {
     let intent = crate::language::parse_query(query);
     let requested_language = intent.language;
     let normalized_query = intent.title;
     let mut tasks = JoinSet::new();
-    for p in configured_search_providers() {
+    for p in search_providers(requested_provider) {
         let svc = service.clone();
         let q = normalized_query.clone();
         tasks.spawn(async move {
@@ -1591,8 +1652,8 @@ async fn search_all(
     if let Some(language) = requested_language {
         let mut matching = Vec::new();
         let mut other = Vec::new();
-        for mut item in items {
-            if crate::language::decorate_catalog_item(&mut item, Some(language)) {
+        for item in items {
+            if crate::language::title_language_hint_matches(&item.title, language) {
                 matching.push(item);
             } else {
                 other.push(item);
@@ -1603,8 +1664,8 @@ async fn search_all(
     }
     items.sort_by(|a, b| {
         let language_order = requested_language.map_or(std::cmp::Ordering::Equal, |language| {
-            let label = format!("({})", language.result_label());
-            b.title.ends_with(&label).cmp(&a.title.ends_with(&label))
+            crate::language::title_language_hint_matches(&b.title, language)
+                .cmp(&crate::language::title_language_hint_matches(&a.title, language))
         });
         language_order
             .then_with(|| provider_priority(a.id.provider).cmp(&provider_priority(b.id.provider)))
@@ -2964,7 +3025,7 @@ fn openapi() -> serde_json::Value {
             "/ready": {"get": {"responses": {"200": {"description": "Readiness"}}}},
             "/openapi.json": {"get": {"responses": {"200": {"description": "OpenAPI document"}}}},
             "/docs": {"get": {"responses": {"200": {"description": "API documentation"}}}},
-            "/api/v1/anime/search": {"get": {"parameters": [{"name": "q", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 200}}, {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 100}}, {"name": "cursor", "in": "query", "schema": {"type": "string"}}], "responses": {"200": {"description": "Search results"}, "400": {"description": "Invalid query"}}}},
+            "/api/v1/anime/search": {"get": {"parameters": [{"name": "q", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 200}}, {"name": "provider", "in": "query", "required": false, "description": "Restrict search to exactly one configured provider; no cross-provider fallback. Omit for the existing multi-provider search.", "schema": {"type": "string", "enum": ["moviebox", "fourkhdhub", "dramachi", "bdix_circleftp", "bdix_dhakaflix", "addons"], "example": "fourkhdhub"}}, {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 100}}, {"name": "cursor", "in": "query", "schema": {"type": "string"}}], "responses": {"200": {"description": "Search results. requested language and title hints do not verify embedded audio tracks."}, "400": {"description": "Invalid query or unknown provider"}, "503": {"description": "Requested provider is disabled or unavailable"}}}},
             "/api/v1/home": {"get": {"parameters": [{"name": "page", "in": "query", "schema": {"type": "integer", "minimum": 1}}, {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 100}}], "responses": {"200": {"description": "MovieBox homepage sections"}, "503": {"description": "Provider unavailable"}}}},
             "/api/v1/home/featured": {"get": {"responses": {"200": {"description": "MovieBox homepage featured section"}}}},
             "/api/v1/latest": {"get": {"responses": {"501": {"description": "Reliable release-date metadata unavailable"}}}},
@@ -2981,7 +3042,7 @@ fn openapi() -> serde_json::Value {
             "/api/v1/k-dramas": {"get": {"responses": {"200": {"description": "Metadata-backed K-Drama catalogue"}}}},
             "/api/v1/k-dramas/{id}": {"get": {"responses": {"501": {"description": "Unsupported category"}}}},
             "/api/v1/categories": {"get": {"responses": {"200": {"description": "Supported content categories"}}}},
-            "/api/v1/anime/search/stream": {"get": {"responses": {"200": {"description": "SSE search_result, search_provider_error, search_complete events"}}}},
+            "/api/v1/anime/search/stream": {"get": {"parameters": [{"name": "q", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 200}}, {"name": "provider", "in": "query", "required": false, "description": "Restrict search to exactly one configured provider; omit for multi-provider search.", "schema": {"type": "string", "enum": ["moviebox", "fourkhdhub", "dramachi", "bdix_circleftp", "bdix_dhakaflix", "addons"]}}], "responses": {"200": {"description": "SSE search_result, search_provider_error, search_complete events; title language hints are not audio verification"}, "400": {"description": "Invalid query or unknown provider"}, "503": {"description": "Requested provider is disabled or unavailable"}}}},
             "/api/v1/anime/{anime_id}": {"get": {"responses": {"200": {"description": "Anime details"}}}},
             "/api/v1/anime/{anime_id}/seasons": {"get": {"responses": {"200": {"description": "Seasons"}}}},
             "/api/v1/anime/{anime_id}/episodes": {"get": {"responses": {"200": {"description": "Episodes"}}}},
@@ -3003,6 +3064,56 @@ fn openapi() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_filter_accepts_known_aliases_and_rejects_unknown_values() {
+        assert_eq!(
+            parse_search_provider(Some("4KHDHub")).unwrap(),
+            Some(ProviderKind::FourKHdHub)
+        );
+        assert_eq!(
+            parse_search_provider(Some("four_k_hd_hub")).unwrap(),
+            Some(ProviderKind::FourKHdHub)
+        );
+        assert!(parse_search_provider(Some("not-a-provider")).is_err());
+        assert_eq!(parse_search_provider(None).unwrap(), None);
+    }
+
+    #[test]
+    fn explicit_provider_search_never_falls_back_to_another_provider() {
+        assert_eq!(
+            search_providers(Some(ProviderKind::FourKHdHub)),
+            vec![ProviderKind::FourKHdHub]
+        );
+    }
+
+    #[test]
+    fn catalog_response_reports_provider_from_the_real_internal_id() {
+        let item = CatalogItem {
+            id: ProviderMediaId {
+                provider: ProviderKind::FourKHdHub,
+                value: "/naruto-shippuden-series-1/".into(),
+            },
+            title: "Naruto Shippuden".into(),
+            media_type: MediaType::Series,
+            year: None,
+            poster_url: None,
+            season_count: None,
+        };
+        let response = catalog(item);
+        assert_eq!(response.provider, ProviderKind::FourKHdHub);
+        assert_eq!(
+            decode::<OpaqueRef>(&response.id).unwrap().p,
+            ProviderKind::FourKHdHub
+        );
+    }
+
+    #[test]
+    fn parse_query_keeps_provider_filter_separate_from_search_text() {
+        let query = parse_query("q=Naruto+Shippuden+Hindi+Dub&provider=4khdhub");
+        assert_eq!(query.q.as_deref(), Some("Naruto Shippuden Hindi Dub"));
+        assert_eq!(query.provider.as_deref(), Some("4khdhub"));
+    }
 
     #[test]
     fn percent_decode_preserves_utf8_and_plus_spaces() {
