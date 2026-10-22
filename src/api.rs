@@ -204,7 +204,7 @@ struct ApiDetails {
     seasons: Vec<ApiSeason>,
     audio: Vec<crate::providers::models::AudioTrackOption>,
 }
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct ApiSeason {
     number: usize,
     episodes: Vec<ApiEpisode>,
@@ -219,11 +219,14 @@ struct ApiEpisode {
 }
 #[derive(Debug, Serialize)]
 struct AnimeEpisodeFullResponse {
-    anime: ApiDetails,
+    // Keep the selected season and episode at the top level so clients can render
+    // a single anime/season/episode view without scanning the full details tree.
+    selected_season: ApiSeason,
     selected_episode: ApiEpisode,
-    sources: Vec<ApiSource>,
+    anime: ApiDetails,
     sources_status: &'static str,
     sources_partial: bool,
+    sources: Vec<ApiSource>,
     source_error: Option<serde_json::Value>,
 }
 
@@ -1610,6 +1613,15 @@ async fn search_all(
     (items, failed, provider_status)
 }
 
+fn is_full_episode_route(parts: &[&str]) -> bool {
+    parts.len() == 7
+        && parts[0] == "api"
+        && parts[1] == "v1"
+        && parts[2] == "anime"
+        && parts[4] == "episodes"
+        && parts[6] == "full"
+}
+
 async fn anime_route(stream: &mut TcpStream, path: &str, query: &str, state: ApiState) -> std::io::Result<()> {
     let parts: Vec<_> = path.trim_matches('/').split('/').collect();
     if parts.len() < 4 {
@@ -1635,7 +1647,7 @@ async fn anime_route(stream: &mut TcpStream, path: &str, query: &str, state: Api
     if parts[4] == "seasons" {
         return write_json(stream, 200, &details(d).seasons, None).await;
     }
-    if parts.len() == 7 && parts[4] == "episodes" && parts[6] == "full" {
+    if is_full_episode_route(&parts) {
         return anime_episode_full_route(stream, parts[3], parts[5], r, d, state).await;
     }
     if parts.len() == 7 && parts[4] == "episodes" && parts[6] == "stream" {
@@ -1870,13 +1882,24 @@ async fn anime_episode_full_route(
         );
         return write_raw_json(stream, status, &body, None).await;
     }
-    let selected_episode = anime
+    let selected_season = anime
         .seasons
         .iter()
-        .flat_map(|season| season.episodes.iter())
-        .find(|episode| {
-            episode.season == episode_ref.s && episode.number == episode_ref.e
-        })
+        .find(|season| season.number == episode_ref.s)
+        .cloned();
+    let Some(selected_season) = selected_season else {
+        let (status, body) = err(
+            "EPISODE_NOT_FOUND",
+            "The requested season was not found in this anime.",
+            Some(anime_ref.p),
+            404,
+        );
+        return write_raw_json(stream, status, &body, None).await;
+    };
+    let selected_episode = selected_season
+        .episodes
+        .iter()
+        .find(|episode| episode.number == episode_ref.e)
         .cloned();
     let Some(selected_episode) = selected_episode else {
         let (status, body) = err(
@@ -1913,8 +1936,9 @@ async fn anime_episode_full_route(
         stream,
         200,
         &AnimeEpisodeFullResponse {
-            anime,
+            selected_season,
             selected_episode,
+            anime,
             sources,
             sources_status,
             sources_partial,
@@ -2983,7 +3007,7 @@ fn openapi() -> serde_json::Value {
             "/api/v1/anime/{anime_id}": {"get": {"responses": {"200": {"description": "Anime details"}}}},
             "/api/v1/anime/{anime_id}/seasons": {"get": {"responses": {"200": {"description": "Seasons"}}}},
             "/api/v1/anime/{anime_id}/episodes": {"get": {"responses": {"200": {"description": "Episodes"}}}},
-            "/api/v1/anime/{anime_id}/episodes/{episode_id}/full": {"get": {"responses": {"200": {"description": "Anime details, selected episode, and source candidates"}, "400": {"description": "Invalid anime or episode ID"}, "404": {"description": "Episode not found"}}}},
+            "/api/v1/anime/{anime_id}/episodes/{episode_id}/full": {"get": {"responses": {"200": {"description": "Anime details, selected season, selected episode, and source candidates"}, "400": {"description": "Invalid anime or episode ID"}, "404": {"description": "Episode not found"}}}},
             "/api/v1/episodes/{episode_id}/sources": {"get": {"responses": {"200": {"description": "Fresh source candidates"}}}},
             "/api/v1/episodes/{episode_id}/sources/stream": {"get": {"responses": {"200": {"description": "SSE source_result, source_error, source_complete events"}}}},
             "/api/v1/sources/{source_id}": {"get": {"responses": {"200": {"description": "Resolved source metadata"}}}},
@@ -3659,4 +3683,65 @@ mod tests {
             Classification::Anime
         ));
     }
+    #[test]
+    fn full_episode_route_matches_only_the_documented_path_shape() {
+        let parts = [
+            "api", "v1", "anime", "anime-id", "episodes", "episode-id", "full",
+        ];
+        assert!(is_full_episode_route(&parts));
+        assert!(!is_full_episode_route(&parts[..6]));
+        assert!(!is_full_episode_route(&[
+            "api", "v1", "anime", "anime-id", "episodes", "episode-id", "stream",
+        ]));
+        assert!(!is_full_episode_route(&[
+            "api", "v1", "episodes", "anime-id", "episodes", "episode-id", "full",
+        ]));
+    }
+
+    #[test]
+    fn full_episode_response_exposes_anime_season_episode_and_sources_together() {
+        let selected_episode = ApiEpisode {
+            id: "episode-id".into(),
+            season: 1,
+            number: 6,
+            title: Some("Episode 6".into()),
+            overview: None,
+        };
+        let response = AnimeEpisodeFullResponse {
+            selected_season: ApiSeason {
+                number: 1,
+                episodes: vec![selected_episode.clone()],
+            },
+            selected_episode,
+            anime: ApiDetails {
+                id: "anime-id".into(),
+                title: "Example Anime".into(),
+                media_type: MediaType::Series,
+                year: None,
+                description: None,
+                tagline: None,
+                imdb_rating: None,
+                director: None,
+                stars: None,
+                prints: None,
+                audios: None,
+                poster_url: None,
+                duration: None,
+                genres: vec![],
+                seasons: vec![],
+                audio: vec![],
+            },
+            sources_status: "ok",
+            sources_partial: false,
+            sources: vec![],
+            source_error: None,
+        };
+        let json = serde_json::to_value(response).expect("serialize full episode response");
+        assert_eq!(json["anime"]["title"], "Example Anime");
+        assert_eq!(json["selected_season"]["number"], 1);
+        assert_eq!(json["selected_episode"]["number"], 6);
+        assert!(json["sources"].is_array());
+        assert_eq!(json["sources_status"], "ok");
+    }
+
 }
