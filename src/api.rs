@@ -1815,7 +1815,7 @@ async fn anime_episode_stream_route(
     let mut candidates: Vec<&Release> = releases.iter().filter(|release| {
         release.language.as_deref().is_some_and(is_hindi) || is_hindi(&release.filename)
     }).collect();
-    let provider_language_hint_match = !candidates.is_empty();
+    // A release title/filename can be a useful hint, but it does not verify audio tracks.
     // Dual/multi-audio sources may have no language tag until the actual media is probed.
     if candidates.is_empty() {
         candidates = releases.iter().collect();
@@ -1825,6 +1825,8 @@ async fn anime_episode_stream_route(
         let (status, body) = err("NO_STREAM_SOURCE", "The provider returned no stream sources for this episode.", Some(episode_ref.p), 404);
         return write_raw_json(stream, status, &body, None).await;
     };
+    let provider_language_metadata_hint = release.language.as_deref().is_some_and(is_hindi);
+    let title_language_hint = is_hindi(&release.filename);
     let playback = if release.provider == ProviderKind::FourKHdHub {
         let Some(client) = state.service.fourk_client.as_ref() else {
             let (status, body) = err("UPSTREAM_UNAVAILABLE", "The playback provider is unavailable.", Some(release.provider), 503);
@@ -1890,15 +1892,25 @@ async fn anime_episode_stream_route(
             "language_match".into(),
             serde_json::json!(if verified_audio_language {
                 "verified_from_audio_track_metadata"
-            } else if provider_language_hint_match {
-                "provider_language_hint_unverified"
+            } else if provider_language_metadata_hint {
+                "provider_metadata_hint_unverified"
+            } else if title_language_hint {
+                "title_hint_unverified"
             } else {
                 "unverified"
             }),
         );
         object.insert(
-            "provider_language_hint".into(),
-            if provider_language_hint_match {
+            "provider_language_metadata_hint".into(),
+            if provider_language_metadata_hint {
+                serde_json::json!("hi")
+            } else {
+                serde_json::Value::Null
+            },
+        );
+        object.insert(
+            "title_language_hint".into(),
+            if title_language_hint {
                 serde_json::json!("hi")
             } else {
                 serde_json::Value::Null
