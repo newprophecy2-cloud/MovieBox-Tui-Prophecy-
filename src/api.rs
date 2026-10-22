@@ -204,7 +204,7 @@ struct ApiDetails {
     seasons: Vec<ApiSeason>,
     audio: Vec<crate::providers::models::AudioTrackOption>,
 }
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct ApiSeason {
     number: usize,
     episodes: Vec<ApiEpisode>,
@@ -219,8 +219,9 @@ struct ApiEpisode {
 }
 #[derive(Debug, Serialize)]
 struct AnimeEpisodeFullResponse {
-    // Put the selected episode first so this endpoint is visibly distinct from
-    // GET /api/v1/anime/{anime_id}, whose payload is nested under "anime".
+    // Keep the selected season and episode at the top level so clients can render
+    // a single anime/season/episode view without scanning the full details tree.
+    selected_season: ApiSeason,
     selected_episode: ApiEpisode,
     anime: ApiDetails,
     sources_status: &'static str,
@@ -1612,6 +1613,15 @@ async fn search_all(
     (items, failed, provider_status)
 }
 
+fn is_full_episode_route(parts: &[&str]) -> bool {
+    parts.len() == 7
+        && parts[0] == "api"
+        && parts[1] == "v1"
+        && parts[2] == "anime"
+        && parts[4] == "episodes"
+        && parts[6] == "full"
+}
+
 async fn anime_route(stream: &mut TcpStream, path: &str, query: &str, state: ApiState) -> std::io::Result<()> {
     let parts: Vec<_> = path.trim_matches('/').split('/').collect();
     if parts.len() < 4 {
@@ -1637,7 +1647,7 @@ async fn anime_route(stream: &mut TcpStream, path: &str, query: &str, state: Api
     if parts[4] == "seasons" {
         return write_json(stream, 200, &details(d).seasons, None).await;
     }
-    if parts.len() == 7 && parts[4] == "episodes" && parts[6] == "full" {
+    if is_full_episode_route(&parts) {
         return anime_episode_full_route(stream, parts[3], parts[5], r, d, state).await;
     }
     if parts.len() == 7 && parts[4] == "episodes" && parts[6] == "stream" {
@@ -1872,13 +1882,24 @@ async fn anime_episode_full_route(
         );
         return write_raw_json(stream, status, &body, None).await;
     }
-    let selected_episode = anime
+    let selected_season = anime
         .seasons
         .iter()
-        .flat_map(|season| season.episodes.iter())
-        .find(|episode| {
-            episode.season == episode_ref.s && episode.number == episode_ref.e
-        })
+        .find(|season| season.number == episode_ref.s)
+        .cloned();
+    let Some(selected_season) = selected_season else {
+        let (status, body) = err(
+            "EPISODE_NOT_FOUND",
+            "The requested season was not found in this anime.",
+            Some(anime_ref.p),
+            404,
+        );
+        return write_raw_json(stream, status, &body, None).await;
+    };
+    let selected_episode = selected_season
+        .episodes
+        .iter()
+        .find(|episode| episode.number == episode_ref.e)
         .cloned();
     let Some(selected_episode) = selected_episode else {
         let (status, body) = err(
@@ -1915,8 +1936,9 @@ async fn anime_episode_full_route(
         stream,
         200,
         &AnimeEpisodeFullResponse {
-            anime,
+            selected_season,
             selected_episode,
+            anime,
             sources,
             sources_status,
             sources_partial,
@@ -3661,4 +3683,19 @@ mod tests {
             Classification::Anime
         ));
     }
+    #[test]
+    fn full_episode_route_matches_only_the_documented_path_shape() {
+        let parts = [
+            "api", "v1", "anime", "anime-id", "episodes", "episode-id", "full",
+        ];
+        assert!(is_full_episode_route(&parts));
+        assert!(!is_full_episode_route(&parts[..6]));
+        assert!(!is_full_episode_route(&[
+            "api", "v1", "anime", "anime-id", "episodes", "episode-id", "stream",
+        ]));
+        assert!(!is_full_episode_route(&[
+            "api", "v1", "episodes", "anime-id", "episodes", "episode-id", "full",
+        ]));
+    }
+
 }
