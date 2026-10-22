@@ -1252,14 +1252,16 @@ async fn direct_watch_route(stream: &mut TcpStream, query: &str, state: ApiState
                         };
                         release.language.as_deref().is_some_and(is_hindi) || is_hindi(&release.filename)
                     });
-                    if has_hindi {
+                    if has_hindi || !releases.is_empty() {
+                        // Provider language labels are hints, not a hard gate. Official
+                        // MovieBox-Tui can expose dual/multi-audio streams without a Hindi tag.
                         let anime_id = encode(&anime_ref);
                         let episode_id = provider_ref(&anime_details.id, season, episode);
                         return anime_episode_stream_route(
                             stream, &anime_id, &episode_id, anime_ref, anime_details, state, &audio,
                         ).await;
                     }
-                    stream_failures.push(format!("{}: no Hindi-labelled source", anime_ref.p.label()));
+                    stream_failures.push(format!("{}: no stream sources returned", anime_ref.p.label()));
                 }
                 Ok(Err(error)) => {
                     stream_failures.push(format!("{}: {}", anime_ref.p.label(), error.user_message(anime_ref.p)));
@@ -1658,9 +1660,14 @@ async fn anime_episode_stream_route(
     let mut candidates: Vec<&Release> = releases.iter().filter(|release| {
         release.language.as_deref().is_some_and(is_hindi) || is_hindi(&release.filename)
     }).collect();
+    let language_metadata_match = !candidates.is_empty();
+    // Dual/multi-audio sources may have no language tag until the actual media is probed.
+    if candidates.is_empty() {
+        candidates = releases.iter().collect();
+    }
     candidates.sort_by_key(|release| std::cmp::Reverse(release.resolution_u64()));
     let Some(release) = candidates.first().copied() else {
-        let (status, body) = err("NO_LANGUAGE_SOURCE", "No source is labelled as Hindi for this episode. Hindi audio could not be confirmed.", Some(episode_ref.p), 404);
+        let (status, body) = err("NO_STREAM_SOURCE", "The provider returned no stream sources for this episode.", Some(episode_ref.p), 404);
         return write_raw_json(stream, status, &body, None).await;
     };
     let playback = if release.provider == ProviderKind::FourKHdHub {
@@ -1692,12 +1699,40 @@ async fn anime_episode_stream_route(
         let (status, body) = err("PLAYBACK_RESOLUTION_FAILED", "The Hindi source does not expose a playable URL.", Some(release.provider), 502);
         return write_raw_json(stream, status, &body, None).await;
     };
+    // Probe the resolved source for real audio tracks when possible. A failed probe
+    // must not block playback (some HLS/DASH providers prevent ffprobe access).
+    let audio_tracks = match probe_media(&playback.url, &playback.headers).await {
+        Ok(probe) => probe.streams.into_iter()
+            .filter(|track| track.codec_type.as_deref().is_some_and(|kind| kind.eq_ignore_ascii_case("audio")))
+            .map(|track| {
+                let raw_language = tag_value(track.tags.as_ref(), "language");
+                let (language, language_label, raw_tag) = normalized_language(raw_language);
+                let label = tag_value(track.tags.as_ref(), "title")
+                    .or_else(|| tag_value(track.tags.as_ref(), "handler_name"))
+                    .map(str::to_string)
+                    .unwrap_or(language_label);
+                serde_json::json!({
+                    "index": track.index,
+                    "language": language,
+                    "label": label,
+                    "codec": track.codec_name,
+                    "channels": track.channels,
+                    "default": track.disposition.as_ref().is_some_and(|d| d.default != 0),
+                    "raw_language": raw_tag
+                })
+            })
+            .collect::<Vec<_>>(),
+        Err(_) => Vec::new(),
+    };
     let mut body = playback_json(&playback);
     if let Some(object) = body.as_object_mut() {
         object.insert("anime_id".into(), serde_json::json!(anime_id));
         object.insert("episode_id".into(), serde_json::json!(episode_id));
         object.insert("audio_requested".into(), serde_json::json!(requested_audio));
-        object.insert("language_match".into(), serde_json::json!("provider_metadata"));
+        object.insert("audio_tracks".into(), serde_json::json!(audio_tracks));
+        object.insert("language_match".into(), serde_json::json!(
+            if language_metadata_match { "provider_metadata" } else { "unverified_media_tracks" }
+        ));
         object.insert("resolved".into(), serde_json::json!(true));
     }
     write_json(stream, 200, &body, None).await
