@@ -1207,6 +1207,8 @@ async fn direct_watch_route(stream: &mut TcpStream, query: &str, state: ApiState
     // A provider may have incomplete season/episode metadata while another has it.
     let mut last_provider = None;
     let mut available = Vec::new();
+    let mut episode_found = false;
+    let mut stream_failures: Vec<String> = Vec::new();
     for item in candidates {
         let anime_ref = OpaqueRef {
             p: item.id.provider,
@@ -1230,11 +1232,43 @@ async fn direct_watch_route(stream: &mut TcpStream, query: &str, state: ApiState
             s.number == season && s.episodes.iter().any(|e| e.number == episode)
         });
         if episode_exists {
-            let anime_id = encode(&anime_ref);
-            let episode_id = provider_ref(&anime_details.id, season, episode);
-            return anime_episode_stream_route(
-                stream, &anime_id, &episode_id, anime_ref, anime_details, state, &audio,
-            ).await;
+            episode_found = true;
+
+            // Preflight this provider's streams. If it has no Hindi-labelled source,
+            // keep searching the remaining providers instead of failing on the first match.
+            let episode_reference = OpaqueRef {
+                p: anime_ref.p,
+                v: anime_ref.v.clone(),
+                s: season,
+                e: episode,
+            };
+            match tokio::time::timeout(OVERALL_TIMEOUT, cached_releases(&state, &episode_reference)).await {
+                Ok(Ok(releases)) => {
+                    let has_hindi = releases.iter().any(|release| {
+                        let is_hindi = |value: &str| {
+                            let value = value.to_ascii_lowercase();
+                            value == "hi" || value == "hin" || value.contains("hindi")
+                                || value.contains("हिन्दी") || value.contains("हिंदी")
+                        };
+                        release.language.as_deref().is_some_and(is_hindi) || is_hindi(&release.filename)
+                    });
+                    if has_hindi {
+                        let anime_id = encode(&anime_ref);
+                        let episode_id = provider_ref(&anime_details.id, season, episode);
+                        return anime_episode_stream_route(
+                            stream, &anime_id, &episode_id, anime_ref, anime_details, state, &audio,
+                        ).await;
+                    }
+                    stream_failures.push(format!("{}: no Hindi-labelled source", anime_ref.p.label()));
+                }
+                Ok(Err(error)) => {
+                    stream_failures.push(format!("{}: {}", anime_ref.p.label(), error.user_message(anime_ref.p)));
+                }
+                Err(_) => {
+                    stream_failures.push(format!("{}: stream lookup timed out", anime_ref.p.label()));
+                }
+            }
+            continue;
         }
         for available_season in &anime_details.seasons {
             if !available_season.episodes.is_empty() {
@@ -1251,6 +1285,19 @@ async fn direct_watch_route(stream: &mut TcpStream, query: &str, state: ApiState
                 ));
             }
         }
+    }
+
+    if episode_found {
+        let detail = if stream_failures.is_empty() {
+            "The episode exists, but no matching provider returned a usable Hindi source.".to_string()
+        } else {
+            format!(
+                "The episode exists, but no provider returned a usable Hindi source. Provider results: {}",
+                stream_failures.into_iter().take(6).collect::<Vec<_>>().join("; ")
+            )
+        };
+        let (status, body) = err("NO_LANGUAGE_SOURCE", &detail, last_provider, 404);
+        return write_raw_json(stream, status, &body, None).await;
     }
 
     let detail = if available.is_empty() {
@@ -1444,7 +1491,7 @@ async fn search_all(
     }
     let mut seen = std::collections::HashSet::new();
     items.retain(|i| seen.insert((i.id.provider, i.id.value.clone())));
-    suppress_dramachi_when_fourk_series_exists(&mut items);
+    // Keep results from every provider so watch resolution can fail over across providers.
     if let Some(language) = requested_language {
         let mut matching = Vec::new();
         let mut other = Vec::new();
