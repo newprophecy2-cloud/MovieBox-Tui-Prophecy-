@@ -1815,7 +1815,7 @@ async fn anime_episode_stream_route(
     let mut candidates: Vec<&Release> = releases.iter().filter(|release| {
         release.language.as_deref().is_some_and(is_hindi) || is_hindi(&release.filename)
     }).collect();
-    let language_metadata_match = !candidates.is_empty();
+    let provider_language_hint_match = !candidates.is_empty();
     // Dual/multi-audio sources may have no language tag until the actual media is probed.
     if candidates.is_empty() {
         candidates = releases.iter().collect();
@@ -1879,15 +1879,47 @@ async fn anime_episode_stream_route(
             .collect::<Vec<_>>(),
         Err(_) => Vec::new(),
     };
+    let verified_audio_language = audio_tracks_confirm_language(&audio_tracks, "hi");
     let mut body = playback_json(&playback);
     if let Some(object) = body.as_object_mut() {
         object.insert("anime_id".into(), serde_json::json!(anime_id));
         object.insert("episode_id".into(), serde_json::json!(episode_id));
         object.insert("audio_requested".into(), serde_json::json!(requested_audio));
         object.insert("audio_tracks".into(), serde_json::json!(audio_tracks));
-        object.insert("language_match".into(), serde_json::json!(
-            if language_metadata_match { "provider_metadata" } else { "unverified_media_tracks" }
-        ));
+        object.insert(
+            "language_match".into(),
+            serde_json::json!(if verified_audio_language {
+                "verified_from_audio_track_metadata"
+            } else if provider_language_hint_match {
+                "provider_language_hint_unverified"
+            } else {
+                "unverified"
+            }),
+        );
+        object.insert(
+            "provider_language_hint".into(),
+            if provider_language_hint_match {
+                serde_json::json!("hi")
+            } else {
+                serde_json::Value::Null
+            },
+        );
+        object.insert(
+            "verified_audio_language".into(),
+            if verified_audio_language {
+                serde_json::json!("hi")
+            } else {
+                serde_json::Value::Null
+            },
+        );
+        object.insert(
+            "audio_language_verification".into(),
+            serde_json::json!(if verified_audio_language {
+                "verified_from_audio_track_metadata"
+            } else {
+                "unverified"
+            }),
+        );
         object.insert("resolved".into(), serde_json::json!(true));
     }
     write_json(stream, 200, &body, None).await
@@ -2230,6 +2262,15 @@ async fn probe_media(url: &str, headers: &[(String, String)]) -> Result<ProbeOut
     }
     serde_json::from_slice(&output.stdout)
         .map_err(|_| "The media probe returned malformed metadata.".to_string())
+}
+
+fn audio_tracks_confirm_language(tracks: &[serde_json::Value], language_code: &str) -> bool {
+    tracks.iter().any(|track| {
+        track
+            .get("language")
+            .and_then(|value| value.as_str())
+            .is_some_and(|language| language.eq_ignore_ascii_case(language_code))
+    })
 }
 
 fn tag_value<'a>(tags: Option<&'a HashMap<String, String>>, key: &str) -> Option<&'a str> {
@@ -3064,6 +3105,22 @@ fn openapi() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_language_is_verified_only_from_audio_track_metadata() {
+        let identified_track = vec![serde_json::json!({
+            "language": "hi",
+            "label": "Audio Track 1"
+        })];
+        let filename_only_hint = vec![serde_json::json!({
+            "language": "und",
+            "label": "Naruto Shippuden Hindi Dub",
+            "raw_language": null
+        })];
+
+        assert!(audio_tracks_confirm_language(&identified_track, "hi"));
+        assert!(!audio_tracks_confirm_language(&filename_only_hint, "hi"));
+    }
 
     #[test]
     fn provider_filter_accepts_known_aliases_and_rejects_unknown_values() {
