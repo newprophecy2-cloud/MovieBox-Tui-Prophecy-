@@ -2370,6 +2370,27 @@ fn api_sources(rs: &[Release], episode: &OpaqueRef) -> Vec<ApiSource> {
         })
         .collect()
 }
+
+fn api_episode_from_details(details: &MediaDetails, episode: &OpaqueRef) -> Option<ApiEpisode> {
+    details
+        .seasons
+        .iter()
+        .flat_map(|season| season.episodes.iter())
+        .find(|candidate| candidate.season == episode.s && candidate.number == episode.e)
+        .map(|candidate| ApiEpisode {
+            id: encode(&OpaqueRef {
+                p: episode.p,
+                v: episode.v.clone(),
+                s: candidate.season,
+                e: candidate.number,
+            }),
+            season: candidate.season,
+            number: candidate.number,
+            title: candidate.title.clone(),
+            overview: candidate.overview.clone(),
+        })
+}
+
 async fn episode_route(stream: &mut TcpStream, path: &str, state: ApiState) -> std::io::Result<()> {
     let parts: Vec<_> = path.trim_matches('/').split('/').collect();
     if parts.len() < 4 {
@@ -2388,6 +2409,37 @@ async fn episode_route(stream: &mut TcpStream, path: &str, state: ApiState) -> s
     };
     if r.p == ProviderKind::MovieBox && !moviebox_provider_enabled() {
         return moviebox_disabled(stream).await;
+    }
+    if parts.len() == 4 {
+        return match tokio::time::timeout(OVERALL_TIMEOUT, state.service.details_typed(r.p, &r.v))
+            .await
+        {
+            Ok(Ok(details)) => match api_episode_from_details(&details, &r) {
+                Some(episode) => write_json(stream, 200, &episode, None).await,
+                None => {
+                    let (s, b) = err(
+                        "EPISODE_NOT_FOUND",
+                        "The episode was not found in this anime.",
+                        Some(r.p),
+                        404,
+                    );
+                    write_raw_json(stream, s, &b, None).await
+                }
+            },
+            Ok(Err(error)) => {
+                let (s, b) = provider_error(error, r.p);
+                write_raw_json(stream, s, &b, None).await
+            }
+            Err(_) => {
+                let (s, b) = err(
+                    "REQUEST_DEADLINE_EXCEEDED",
+                    "The episode details request timed out.",
+                    Some(r.p),
+                    504,
+                );
+                write_raw_json(stream, s, &b, None).await
+            }
+        };
     }
     if parts.get(4) == Some(&"sources") {
         if parts.get(5) == Some(&"stream") {
@@ -3933,6 +3985,50 @@ mod tests {
     fn search_source_eligibility_has_a_bounded_per_item_budget() {
         assert_eq!(SEARCH_SOURCE_CHECK_TIMEOUT, Duration::from_secs(45));
         assert!(SEARCH_SOURCE_CHECK_TIMEOUT >= SOURCE_TIMEOUT);
+    }
+
+    #[test]
+    fn episode_reference_resolves_to_the_documented_episode_shape() {
+        let details = MediaDetails {
+            id: ProviderMediaId {
+                provider: ProviderKind::Dramachi,
+                value: "56914".into(),
+            },
+            title: "Naruto Shippuden".into(),
+            media_type: MediaType::Series,
+            year: Some("2007".into()),
+            description: None,
+            tagline: None,
+            imdb_rating: None,
+            director: None,
+            stars: None,
+            prints: None,
+            audios: None,
+            poster_url: None,
+            duration: None,
+            genres: vec![],
+            seasons: vec![Season {
+                number: 1,
+                episodes: vec![crate::providers::models::Episode {
+                    season: 1,
+                    number: 1,
+                    title: Some("Enter: Naruto Uzumaki!".into()),
+                    overview: None,
+                }],
+            }],
+            dubs: vec![],
+        };
+        let reference = OpaqueRef {
+            p: ProviderKind::Dramachi,
+            v: "56914".into(),
+            s: 1,
+            e: 1,
+        };
+        let episode = api_episode_from_details(&details, &reference).unwrap();
+        assert_eq!(episode.season, 1);
+        assert_eq!(episode.number, 1);
+        assert_eq!(episode.title.as_deref(), Some("Enter: Naruto Uzumaki!"));
+        assert_eq!(decode::<OpaqueRef>(&episode.id).unwrap().v, "56914");
     }
 
     #[test]
