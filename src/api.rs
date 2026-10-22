@@ -1323,7 +1323,7 @@ async fn direct_watch_route(stream: &mut TcpStream, query: &str, state: ApiState
         let (status, body) = err("UNSUPPORTED_AUDIO_LANGUAGE", "This direct watch route currently supports audio=hindi only.", None, 400);
         return write_raw_json(stream, status, &body, None).await;
     }
-    let (items, _, _) = search_all(&state.service, &title).await;
+    let (items, _, _) = search_all(&state.service, &title, None).await;
     let title_normalized = normalize_title(&title);
     let candidates: Vec<_> = items
         .into_iter()
