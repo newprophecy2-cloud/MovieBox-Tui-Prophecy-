@@ -27,7 +27,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "ci-hygiene"
-      - run: cargo fmt --check
+      - name: Check formatting
+        run: cargo fmt --all -- --check
       - name: Validate Unix installer syntax
         run: bash -n install.sh
       - name: Validate Windows installer syntax
@@ -40,6 +41,12 @@ jobs:
             $errors | Format-List
             exit 1
           }
+      - name: Requested locked dependency check
+        run: cargo check --locked
+      - name: Requested locked test suite
+        run: cargo test --locked
+      - name: Requested strict Clippy check
+        run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo check --all-targets --all-features --locked
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
       - name: Install musl compiler tools

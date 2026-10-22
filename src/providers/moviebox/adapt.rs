@@ -103,10 +103,21 @@ pub fn moviebox_subject_json_to_catalog_item(s: &serde_json::Value) -> Option<Ca
         .and_then(|u| u.as_str())
         .map(|u| u.to_string());
 
-    let season_count = s
-        .get("season")
-        .and_then(|sc| sc.as_u64())
-        .map(|sc| sc as usize);
+    // Prefer explicit count fields when present. Some upstream search results
+    // report `season: 0` for series even though details contain episodes; do not
+    // expose that sentinel as a confirmed season count.
+    // Try each supported field until a valid count is found. A present but
+    // null/invalid/zero sentinel must not prevent fallback to another field.
+    let season_count = ["seasonCount", "season_count", "season"]
+        .iter()
+        .filter_map(|key| s.get(*key))
+        .filter_map(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_str().and_then(|text| text.trim().parse::<u64>().ok()))
+        })
+        .filter_map(|count| usize::try_from(count).ok())
+        .find(|count| media_type != MediaType::Series || *count > 0);
 
     Some(CatalogItem {
         id: ProviderMediaId {
@@ -1506,6 +1517,7 @@ mod tests {
         let release_str = moviebox_resource_item_to_release(&item_str);
         assert_eq!(release_str.resource_id.as_deref(), Some("1234567890"));
     }
+
     #[test]
     fn test_moviebox_resource_item_filters_deprecation_notice_url() {
         let notice_item = json!({
@@ -1529,5 +1541,48 @@ mod tests {
         let releases = moviebox_resource_json_to_releases(&payload);
         assert_eq!(releases.len(), 1);
         assert_eq!(releases[0].filename, "Valid Stream");
+    }
+
+    #[test]
+    fn test_series_zero_season_sentinel_is_unknown() {
+        let item = moviebox_subject_json_to_catalog_item(&json!({
+            "subjectId": "series-1",
+            "title": "Example Series",
+            "subjectType": 2,
+            "season": 0
+        }))
+        .unwrap();
+
+        assert_eq!(item.media_type, MediaType::Series);
+        assert_eq!(item.season_count, None);
+    }
+
+    #[test]
+    fn test_series_explicit_string_season_count_is_parsed() {
+        let item = moviebox_subject_json_to_catalog_item(&json!({
+            "subjectId": "series-2",
+            "title": "Example Series",
+            "subjectType": 2,
+            "seasonCount": "3",
+            "season": 0
+        }))
+        .unwrap();
+
+        assert_eq!(item.season_count, Some(3));
+    }
+
+    #[test]
+    fn test_series_invalid_or_zero_count_falls_back_to_next_field() {
+        let item = moviebox_subject_json_to_catalog_item(&json!({
+            "subjectId": "series-3",
+            "title": "Example Series",
+            "subjectType": 2,
+            "seasonCount": 0,
+            "season_count": "2",
+            "season": 1
+        }))
+        .unwrap();
+
+        assert_eq!(item.season_count, Some(2));
     }
 }
