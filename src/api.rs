@@ -646,28 +646,34 @@ async fn diagnostics_route(stream: &mut TcpStream, state: ApiState) -> std::io::
         .await
         .unwrap_or_default();
     let built_in = serde_json::json!({
+        "moviebox": { "configured": moviebox_provider_enabled(), "initialized": true, "upstream": "not_checked" },
         "fourkhdhub": { "configured": config.fourkhdhub_enabled, "initialized": state.service.fourk_client.is_some(), "upstream": "not_checked" },
         "dramachi": { "configured": config.dramachi_enabled, "initialized": true, "upstream": "not_checked" },
         "bdix_circleftp": { "configured": config.bdix_circleftp_enabled, "initialized": true, "upstream": "not_checked" },
         "bdix_dhakaflix": { "configured": config.bdix_dhakaflix_enabled, "initialized": true, "upstream": "not_checked" }
     });
-    let built_in_streaming = config.streaming_enabled
-        && ((config.fourkhdhub_enabled && state.service.fourk_client.is_some())
+    // Configuration is not proof that an upstream provider is healthy. This
+    // endpoint intentionally reports configuration separately from live status.
+    let built_in_streaming_configured = config.streaming_enabled
+        && (moviebox_provider_enabled()
+            || (config.fourkhdhub_enabled && state.service.fourk_client.is_some())
             || config.dramachi_enabled
             || config.bdix_circleftp_enabled
             || config.bdix_dhakaflix_enabled);
+    let stream_addons_configured = config.streaming_enabled && enabled_stream_addons > 0;
+    let streaming_configured = built_in_streaming_configured || stream_addons_configured;
 
     write_json(
         stream,
         200,
         &serde_json::json!({
-            "status": if built_in_streaming || enabled_stream_addons > 0 { "ok" } else { "degraded" },
+            "status": "ok",
             "process": {"status": "ok"},
             "configuration": {
                 "addons_config_file_present_at_start_of_check": addons_config_file_present,
                 "enabled_stream_addons": enabled_stream_addons,
                 "enabled_catalog_or_metadata_addons": enabled_catalog_addons,
-                "streaming_configured": built_in_streaming || enabled_stream_addons > 0,
+                "streaming_configured": streaming_configured,
                 "streaming_enabled": config.streaming_enabled,
                 "moviebox_configured": config.moviebox_enabled,
                 "moviebox_effective": moviebox_provider_enabled()
@@ -675,15 +681,15 @@ async fn diagnostics_route(stream: &mut TcpStream, state: ApiState) -> std::io::
             "built_in_providers": built_in,
             "external_addons": {
                 "catalog_or_metadata": if enabled_catalog_addons > 0 { "configured" } else { "unavailable" },
-                "streaming": if enabled_stream_addons > 0 { "configured" } else { "unconfigured" }
+                "streaming": if stream_addons_configured { "configured" } else { "unconfigured" }
             },
             "streaming": {
-                "status": if built_in_streaming || enabled_stream_addons > 0 { "available" } else { "unavailable" },
-                "basis": if built_in_streaming { "built_in_provider_initialized" } else if enabled_stream_addons > 0 { "stream_addon_configured" } else { "no_initialized_provider_or_stream_addon" },
+                "status": if !config.streaming_enabled { "disabled" } else if streaming_configured { "configured_unverified" } else { "unconfigured" },
+                "basis": if built_in_streaming_configured { "built_in_provider_configured" } else if stream_addons_configured { "stream_addon_configured" } else { "none_configured" },
                 "upstream_checks": "request_specific"
             },
             "hint": if enabled_stream_addons == 0 {
-                Some("No stream-capable addon is enabled; built-in provider streaming is independent and is checked per request.")
+                Some("No stream-capable addon is enabled. Built-in provider upstream health is not checked here; provider availability is request-specific.")
             } else {
                 None
             }
