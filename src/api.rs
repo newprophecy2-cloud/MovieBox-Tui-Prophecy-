@@ -2935,7 +2935,55 @@ async fn source_route(stream: &mut TcpStream, path: &str, state: ApiState) -> st
             }
         };
     }
-    write_json(stream,200,&serde_json::json!({"source":api_sources(std::slice::from_ref(rel),&r),"url":rel.direct_url(),"headers":rel.mirrors.first().map(|m| public_headers(&m.headers)),"sensitive_headers_redacted":true}),None).await
+    if sr.p == ProviderKind::FourKHdHub {
+        let Some(client) = state.service.fourk_client.as_ref() else {
+            let (s, b) = err(
+                "UPSTREAM_UNAVAILABLE",
+                "4KHDHub is unavailable.",
+                Some(sr.p),
+                503,
+            );
+            return write_raw_json(stream, s, &b, None).await;
+        };
+        let resolved = tokio::time::timeout(
+            OVERALL_TIMEOUT,
+            client.resolve_release(rel, crate::providers::models::ResolutionIntent::Playback),
+        )
+        .await;
+        return match resolved {
+            Ok(Ok(playback)) => write_json(stream, 200, &playback_json(&playback), None).await,
+            Ok(Err(error)) => {
+                let (s, b) = err(
+                    "PLAYBACK_RESOLUTION_FAILED",
+                    error.user_message(),
+                    Some(sr.p),
+                    502,
+                );
+                write_raw_json(stream, s, &b, None).await
+            }
+            Err(_) => {
+                let (s, b) = err(
+                    "PLAYBACK_RESOLUTION_TIMEOUT",
+                    "4KHDHub playback resolution timed out.",
+                    Some(sr.p),
+                    504,
+                );
+                write_raw_json(stream, s, &b, None).await
+            }
+        };
+    }
+    write_json(
+        stream,
+        200,
+        &serde_json::json!({
+            "source": api_sources(std::slice::from_ref(rel), &r),
+            "url": rel.direct_url(),
+            "headers": rel.mirrors.first().map(|m| public_headers(&m.headers)),
+            "sensitive_headers_redacted": true
+        }),
+        None,
+    )
+    .await
 }
 fn watch_url(raw: &str) -> String {
     let Ok(mut url) = reqwest::Url::parse(raw) else {
