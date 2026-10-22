@@ -1243,8 +1243,14 @@ fn parse_search_provider(value: Option<&str>) -> Result<Option<ProviderKind>, ()
 }
 
 fn validate_search_provider(value: Option<&str>) -> Result<Option<ProviderKind>, (u16, String)> {
-    let provider = parse_search_provider(value)
-        .map_err(|_| err("UNKNOWN_PROVIDER", "The requested provider is not supported.", None, 400))?;
+    let provider = parse_search_provider(value).map_err(|_| {
+        err(
+            "UNKNOWN_PROVIDER",
+            "The requested provider is not supported.",
+            None,
+            400,
+        )
+    })?;
     if let Some(provider) = provider
         && !configured_search_providers().contains(&provider)
     {
@@ -1482,7 +1488,9 @@ async fn search_json(stream: &mut TcpStream, query: &str, state: ApiState) -> st
     let title_language_hint_matches = language_intent.map(|language| {
         items
             .iter()
-            .filter(|item| crate::language::title_language_hint_matches(&item.title, language))
+            .filter(|item| {
+                crate::language::title_language_hint_matches(&item.title, language)
+            })
             .count()
     });
     let message = language_intent.map(|language| {
@@ -1556,14 +1564,20 @@ async fn search_sse(stream: &mut TcpStream, query: &str, state: ApiState) -> std
             Ok((p, result)) => match result {
                 Ok(Ok(items)) => {
                     for item in items {
-                        let title_language_hint = crate::language::language_from_provider_text(&item.title)
-                            .map(|language| language.code());
+                        let title_language_hint =
+                            crate::language::language_from_provider_text(&item.title)
+                                .map(|language| language.code());
                         let payload = serde_json::to_string(&serde_json::json!({
                             "result": catalog(item),
                             "requested_language": requested_language.map(|language| language.code()),
                             "title_language_hint": title_language_hint,
-                            "audio_language_verification": if requested_language.is_some() { "unverified" } else { "not_checked" }
-                        })).unwrap();
+                            "audio_language_verification": if requested_language.is_some() {
+                                "unverified"
+                            } else {
+                                "not_checked"
+                            }
+                        }))
+                        .unwrap();
                         send_event(stream, "search_result", &payload).await?;
                     }
                 }
@@ -2291,7 +2305,7 @@ fn audio_tracks_confirm_language(tracks: &[serde_json::Value], language_code: &s
             track
                 .get(*field)
                 .and_then(|value| value.as_str())
-                .is_some_and(matches_language)
+                .is_some_and(|value| matches_language(value))
         })
     })
 }
@@ -3174,6 +3188,11 @@ mod tests {
             search_providers(Some(ProviderKind::FourKHdHub)),
             vec![ProviderKind::FourKHdHub]
         );
+    }
+
+    #[test]
+    fn unfiltered_search_keeps_all_configured_providers() {
+        assert_eq!(search_providers(None), configured_search_providers());
     }
 
     #[test]
