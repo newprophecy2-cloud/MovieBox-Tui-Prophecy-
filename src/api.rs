@@ -1216,6 +1216,14 @@ fn parse_query(query: &str) -> SearchQuery {
     }
     out
 }
+fn normalize_title(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 fn percent_decode(v: &str) -> String {
     let bytes = v.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
@@ -1270,13 +1278,14 @@ async fn direct_watch_route(stream: &mut TcpStream, query: &str, state: ApiState
         return write_raw_json(stream, status, &body, None).await;
     }
     let (items, _, _) = search_all(&state.service, &title).await;
-    let title_normalized = title.trim().to_ascii_lowercase();
-    let candidates: Vec<_> = items.into_iter()
+    let title_normalized = normalize_title(&title);
+    let candidates: Vec<_> = items
+        .into_iter()
         .filter(|item| item.media_type == MediaType::Series)
-        .filter(|item| item.title.trim().eq_ignore_ascii_case(&title_normalized))
+        .filter(|item| normalize_title(&item.title) == title_normalized)
         .collect();
     if candidates.is_empty() {
-        let (status, body) = err("ANIME_NOT_FOUND", "No exact series title match was found. Try the title returned by /api/v1/anime/search.", None, 404);
+        let (status, body) = err("ANIME_NOT_FOUND", "No matching series title was found. Try a title returned by /api/v1/anime/search.", None, 404);
         return write_raw_json(stream, status, &body, None).await;
     }
 
@@ -3210,11 +3219,12 @@ mod tests {
         assert!(providers.contains(&ProviderKind::Addons));
         assert!(!providers.contains(&ProviderKind::BdixCircleFtp));
         assert!(!providers.contains(&ProviderKind::BdixDhakaFlix));
-        assert!(!providers.contains(&ProviderKind::MovieBox));
+        assert!(providers.contains(&ProviderKind::MovieBox));
     }
 
     #[test]
     fn provider_priority_matches_configured_order() {
+        assert!(provider_priority(ProviderKind::MovieBox) < provider_priority(ProviderKind::FourKHdHub));
         assert!(
             provider_priority(ProviderKind::FourKHdHub) < provider_priority(ProviderKind::Dramachi)
         );
@@ -3222,7 +3232,15 @@ mod tests {
             provider_priority(ProviderKind::Dramachi)
                 < provider_priority(ProviderKind::BdixCircleFtp)
         );
-        assert_eq!(provider_priority(ProviderKind::MovieBox), PROVIDERS.len());
+        assert_eq!(provider_priority(ProviderKind::MovieBox), 0);
+    }
+
+    #[test]
+    fn title_normalization_ignores_spacing_punctuation_and_case() {
+        assert_eq!(normalize_title("Dan Da Dan"), normalize_title("Dandadan"));
+        assert_eq!(normalize_title("My Hero Academia"), normalize_title("my-hero_academia!"));
+        assert_eq!(normalize_title("Naruto Shippuden"), normalize_title("NARUTO-SHIPPUDEN"));
+        assert_ne!(normalize_title("Naruto"), normalize_title("Naruto Shippuden"));
     }
 
     #[test]
