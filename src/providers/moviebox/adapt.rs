@@ -106,17 +106,18 @@ pub fn moviebox_subject_json_to_catalog_item(s: &serde_json::Value) -> Option<Ca
     // Prefer explicit count fields when present. Some upstream search results
     // report `season: 0` for series even though details contain episodes; do not
     // expose that sentinel as a confirmed season count.
-    let season_count = s
-        .get("seasonCount")
-        .or_else(|| s.get("season_count"))
-        .or_else(|| s.get("season"))
-        .and_then(|value| {
+    // Try each supported field until a valid count is found. A present but
+    // null/invalid/zero sentinel must not prevent fallback to another field.
+    let season_count = ["seasonCount", "season_count", "season"]
+        .iter()
+        .filter_map(|key| s.get(*key))
+        .filter_map(|value| {
             value
                 .as_u64()
-                .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
+                .or_else(|| value.as_str().and_then(|text| text.trim().parse::<u64>().ok()))
         })
-        .map(|count| count as usize)
-        .filter(|count| media_type != MediaType::Series || *count > 0);
+        .filter_map(|count| usize::try_from(count).ok())
+        .find(|count| media_type != MediaType::Series || *count > 0);
 
     Some(CatalogItem {
         id: ProviderMediaId {
@@ -1564,6 +1565,20 @@ mod tests {
         })).unwrap();
 
         assert_eq!(item.season_count, Some(3));
+    }
+
+    #[test]
+    fn test_series_invalid_or_zero_count_falls_back_to_next_field() {
+        let item = moviebox_subject_json_to_catalog_item(&json!({
+            "subjectId": "series-3",
+            "title": "Example Series",
+            "subjectType": 2,
+            "seasonCount": 0,
+            "season_count": "2",
+            "season": 1
+        })).unwrap();
+
+        assert_eq!(item.season_count, Some(2));
     }
 
 }
