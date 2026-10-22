@@ -219,11 +219,13 @@ struct ApiEpisode {
 }
 #[derive(Debug, Serialize)]
 struct AnimeEpisodeFullResponse {
-    anime: ApiDetails,
+    // Put the selected episode first so this endpoint is visibly distinct from
+    // GET /api/v1/anime/{anime_id}, whose payload is nested under "anime".
     selected_episode: ApiEpisode,
-    sources: Vec<ApiSource>,
+    anime: ApiDetails,
     sources_status: &'static str,
     sources_partial: bool,
+    sources: Vec<ApiSource>,
     source_error: Option<serde_json::Value>,
 }
 
