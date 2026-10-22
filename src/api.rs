@@ -608,7 +608,7 @@ async fn route(stream: &mut TcpStream, target: &str, state: ApiState) -> std::io
         }
         _ if path.starts_with("/api/v1/movies/") && !MOVIEBOX_PROVIDER_ENABLED => moviebox_disabled(stream).await,
         _ if path.starts_with("/api/v1/k-dramas/") => unsupported_catalog(stream, "K-Drama details require a verified item classification before lookup.").await,
-        _ if path.starts_with("/api/v1/anime/") => anime_route(stream, path, state).await,
+        _ if path.starts_with("/api/v1/anime/") => anime_route(stream, path, query, state).await,
         _ if path.starts_with("/api/v1/episodes/") => episode_route(stream, path, state).await,
         _ if path.starts_with("/api/v1/sources/") => source_route(stream, path, state).await,
         _ => { let (s,b) = err("INTERNAL_ERROR", "Route not found.", None, 404); write_raw_json(stream, s, &b, None).await }
@@ -1361,7 +1361,7 @@ async fn search_all(
     (items, failed, provider_status)
 }
 
-async fn anime_route(stream: &mut TcpStream, path: &str, state: ApiState) -> std::io::Result<()> {
+async fn anime_route(stream: &mut TcpStream, path: &str, query: &str, state: ApiState) -> std::io::Result<()> {
     let parts: Vec<_> = path.trim_matches('/').split('/').collect();
     if parts.len() < 4 {
         let (s, b) = err("INVALID_ID", "An anime identifier is required.", None, 400);
@@ -1388,6 +1388,17 @@ async fn anime_route(stream: &mut TcpStream, path: &str, state: ApiState) -> std
     }
     if parts.len() == 7 && parts[4] == "episodes" && parts[6] == "full" {
         return anime_episode_full_route(stream, parts[3], parts[5], r, d, state).await;
+    }
+    if parts.len() == 7 && parts[4] == "episodes" && parts[6] == "stream" {
+        let audio = query.split('&').find_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            (key == "audio").then(|| percent_decode(value).trim().to_ascii_lowercase())
+        }).unwrap_or_else(|| "hindi".to_string());
+        if !matches!(audio.as_str(), "hindi" | "hi" | "hin") {
+            let (status, body) = err("UNSUPPORTED_AUDIO_LANGUAGE", "This stream route currently supports audio=hindi only.", Some(r.p), 400);
+            return write_raw_json(stream, status, &body, None).await;
+        }
+        return anime_episode_stream_route(stream, parts[3], parts[5], r, d, state, &audio).await;
     }
     if parts[4] == "episodes" {
         if parts.len() == 5 {
@@ -1440,6 +1451,101 @@ async fn anime_route(stream: &mut TcpStream, path: &str, state: ApiState) -> std
     }
     let (s, b) = err("INTERNAL_ERROR", "Unsupported anime route.", None, 404);
     write_raw_json(stream, s, &b, None).await
+}
+
+async fn anime_episode_stream_route(
+    stream: &mut TcpStream,
+    anime_id: &str,
+    episode_id: &str,
+    anime_ref: OpaqueRef,
+    anime_details: MediaDetails,
+    state: ApiState,
+    requested_audio: &str,
+) -> std::io::Result<()> {
+    let episode_ref = match decode::<OpaqueRef>(episode_id) {
+        Ok(reference) => reference,
+        Err(_) => {
+            let (status, body) = err("INVALID_ID", "The episode identifier is invalid.", None, 400);
+            return write_raw_json(stream, status, &body, None).await;
+        }
+    };
+    if episode_ref.p != anime_ref.p || episode_ref.v != anime_ref.v || anime_details.id.value != anime_ref.v {
+        let (status, body) = err("INVALID_ID", "The episode does not belong to the requested anime.", Some(anime_ref.p), 400);
+        return write_raw_json(stream, status, &body, None).await;
+    }
+    if anime_details.id.provider != anime_ref.p || encode(&anime_ref) != anime_id {
+        let (status, body) = err("INVALID_ID", "The anime identifier does not match the requested item.", Some(anime_ref.p), 400);
+        return write_raw_json(stream, status, &body, None).await;
+    }
+    let episode_exists = anime_details.seasons.iter().any(|season| {
+        season.number == episode_ref.s && season.episodes.iter().any(|episode| episode.number == episode_ref.e)
+    });
+    if !episode_exists {
+        let (status, body) = err("EPISODE_NOT_FOUND", "The episode was not found in this anime.", Some(anime_ref.p), 404);
+        return write_raw_json(stream, status, &body, None).await;
+    }
+    let releases = match tokio::time::timeout(OVERALL_TIMEOUT, cached_releases(&state, &episode_ref)).await {
+        Ok(Ok(releases)) => releases,
+        Ok(Err(error)) => {
+            let (status, body) = provider_error(error, episode_ref.p);
+            return write_raw_json(stream, status, &body, None).await;
+        }
+        Err(_) => {
+            let (status, body) = err("REQUEST_DEADLINE_EXCEEDED", "The stream source request timed out.", Some(episode_ref.p), 504);
+            return write_raw_json(stream, status, &body, None).await;
+        }
+    };
+    let is_hindi = |value: &str| {
+        let normalized = value.to_ascii_lowercase();
+        normalized == "hi" || normalized == "hin" || normalized.contains("hindi")
+            || normalized.contains("हिन्दी") || normalized.contains("हिंदी")
+    };
+    let mut candidates: Vec<&Release> = releases.iter().filter(|release| {
+        release.language.as_deref().is_some_and(is_hindi) || is_hindi(&release.filename)
+    }).collect();
+    candidates.sort_by_key(|release| std::cmp::Reverse(release.resolution_u64()));
+    let Some(release) = candidates.first().copied() else {
+        let (status, body) = err("NO_LANGUAGE_SOURCE", "No source is labelled as Hindi for this episode. Hindi audio could not be confirmed.", Some(episode_ref.p), 404);
+        return write_raw_json(stream, status, &body, None).await;
+    };
+    let playback = if release.provider == ProviderKind::FourKHdHub {
+        let Some(client) = state.service.fourk_client.as_ref() else {
+            let (status, body) = err("UPSTREAM_UNAVAILABLE", "The playback provider is unavailable.", Some(release.provider), 503);
+            return write_raw_json(stream, status, &body, None).await;
+        };
+        match tokio::time::timeout(OVERALL_TIMEOUT, client.resolve_release(release, crate::providers::models::ResolutionIntent::Playback)).await {
+            Ok(Ok(playback)) => playback,
+            Ok(Err(error)) => {
+                let (status, body) = err("PLAYBACK_RESOLUTION_FAILED", error.user_message(), Some(release.provider), 502);
+                return write_raw_json(stream, status, &body, None).await;
+            }
+            Err(_) => {
+                let (status, body) = err("PLAYBACK_RESOLUTION_TIMEOUT", "Hindi stream resolution timed out.", Some(release.provider), 504);
+                return write_raw_json(stream, status, &body, None).await;
+            }
+        }
+    } else if let Some(url) = release.direct_url() {
+        crate::providers::models::PlaybackSource {
+            provider: release.provider,
+            url: url.to_string(),
+            headers: release.mirrors.first().map(|mirror| mirror.headers.clone()).unwrap_or_default(),
+            subtitle: None,
+            source_label: release.source_label().to_string(),
+            max_height: release.quality.as_deref().and_then(|quality| quality.trim_end_matches('p').parse().ok()),
+        }
+    } else {
+        let (status, body) = err("PLAYBACK_RESOLUTION_FAILED", "The Hindi source does not expose a playable URL.", Some(release.provider), 502);
+        return write_raw_json(stream, status, &body, None).await;
+    };
+    let mut body = playback_json(&playback);
+    if let Some(object) = body.as_object_mut() {
+        object.insert("anime_id".into(), serde_json::json!(anime_id));
+        object.insert("episode_id".into(), serde_json::json!(episode_id));
+        object.insert("audio_requested".into(), serde_json::json!(requested_audio));
+        object.insert("language_match".into(), serde_json::json!("provider_metadata"));
+        object.insert("resolved".into(), serde_json::json!(true));
+    }
+    write_json(stream, 200, &body, None).await
 }
 
 async fn anime_episode_full_route(
