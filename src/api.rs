@@ -593,6 +593,7 @@ async fn route(stream: &mut TcpStream, target: &str, state: ApiState) -> std::io
         "/api/v1" => write_json(stream, 200, &serde_json::json!({"version":"v1","resources":["anime","episodes","sources"]}), None).await,
         "/openapi.json" => write_json(stream, 200, &openapi(), None).await,
         "/docs" => write_text(stream, 200, "text/html; charset=utf-8", "<!doctype html><html><head><title>MovieBox API</title></head><body><h1>MovieBox API</h1><p>OpenAPI: <a href=\"/openapi.json\">/openapi.json</a></p><p>Swagger UI can load this document from a local or trusted client.</p></body></html>", None).await,
+        "/api/v1/watch" => direct_watch_route(stream, query, state).await,
         "/api/v1/anime/search" => search_json(stream, query, state).await,
         "/api/v1/anime/search/stream" => search_sse(stream, query, state).await,
         "/api/v1/home" | "/api/v1/home/featured" | "/api/v1/trending"
@@ -1157,6 +1158,70 @@ fn percent_decode(v: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&decoded).into_owned()
+}
+
+async fn direct_watch_route(stream: &mut TcpStream, query: &str, state: ApiState) -> std::io::Result<()> {
+    let mut title = None;
+    let mut season = None;
+    let mut episode = None;
+    let mut audio = "hindi".to_string();
+    for pair in query.split('&') {
+        let Some((key, value)) = pair.split_once('=') else { continue };
+        let value = percent_decode(value);
+        match key {
+            "title" => title = Some(value),
+            "season" => season = value.parse::<usize>().ok(),
+            "episode" => episode = value.parse::<usize>().ok(),
+            "audio" => audio = value.trim().to_ascii_lowercase(),
+            _ => {}
+        }
+    }
+    let Some(title) = title.filter(|v| !v.trim().is_empty() && v.chars().count() <= MAX_QUERY) else {
+        let (status, body) = err("INVALID_QUERY", "title is required (example: /api/v1/watch?title=Lookism&season=1&episode=13&audio=hindi).", None, 400);
+        return write_raw_json(stream, status, &body, None).await;
+    };
+    let (Some(season), Some(episode)) = (season, episode) else {
+        let (status, body) = err("INVALID_QUERY", "season and episode must be positive integers.", None, 400);
+        return write_raw_json(stream, status, &body, None).await;
+    };
+    if season == 0 || episode == 0 {
+        let (status, body) = err("INVALID_QUERY", "season and episode must be positive integers.", None, 400);
+        return write_raw_json(stream, status, &body, None).await;
+    }
+    if !matches!(audio.as_str(), "hindi" | "hi" | "hin") {
+        let (status, body) = err("UNSUPPORTED_AUDIO_LANGUAGE", "This direct watch route currently supports audio=hindi only.", None, 400);
+        return write_raw_json(stream, status, &body, None).await;
+    }
+    let (items, _, _) = search_all(&state.service, &title).await;
+    let title_normalized = title.trim().to_ascii_lowercase();
+    let Some(item) = items.into_iter()
+        .filter(|item| item.media_type == MediaType::Series)
+        .find(|item| item.title.trim().eq_ignore_ascii_case(&title_normalized))
+    else {
+        let (status, body) = err("ANIME_NOT_FOUND", "No exact series title match was found. Try the title returned by /api/v1/anime/search.", None, 404);
+        return write_raw_json(stream, status, &body, None).await;
+    };
+    let anime_ref = OpaqueRef { p: item.id.provider, v: item.id.value.clone(), s: 0, e: 0 };
+    if anime_ref.p == ProviderKind::MovieBox && !MOVIEBOX_PROVIDER_ENABLED {
+        return moviebox_disabled(stream).await;
+    }
+    let anime_id = encode(&anime_ref);
+    let anime_details = match state.service.details_typed(anime_ref.p, &anime_ref.v).await {
+        Ok(details) => details,
+        Err(error) => {
+            let (status, body) = provider_error(error, anime_ref.p);
+            return write_raw_json(stream, status, &body, None).await;
+        }
+    };
+    let episode_exists = anime_details.seasons.iter().any(|s| {
+        s.number == season && s.episodes.iter().any(|e| e.number == episode)
+    });
+    if !episode_exists {
+        let (status, body) = err("EPISODE_NOT_FOUND", "The requested season/episode does not exist for this series.", Some(anime_ref.p), 404);
+        return write_raw_json(stream, status, &body, None).await;
+    }
+    let episode_id = provider_ref(&anime_details.id, season, episode);
+    anime_episode_stream_route(stream, &anime_id, &episode_id, anime_ref, anime_details, state, &audio).await
 }
 
 async fn search_json(stream: &mut TcpStream, query: &str, state: ApiState) -> std::io::Result<()> {
