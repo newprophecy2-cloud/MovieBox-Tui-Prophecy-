@@ -298,6 +298,16 @@ cargo test --test live_stream_verification -- --ignored
 
 Live tests may fail when a provider is rate-limited, unavailable, changes its HTML, or returns expired mirrors. Such failures should be diagnosed separately from deterministic regressions.
 
+### Live resolver verification
+
+The repository includes a safe live resolver check for GreenMotors/HubCloud-backed FourKHDHub sources. It follows the explicit playback route, rejects intermediate resolver hosts, and uses `ffprobe` to confirm final media metadata without printing signed URLs:
+
+```bash
+python3 scripts/live_resolver_test.py --base-url https://moviebox-tui-prophecy.onrender.com --timeout 180
+```
+
+The script reports source count, provider label, final host, and detected media tracks. A provider may be slow or temporarily unavailable; rerun with a longer timeout rather than treating a single upstream timeout as a code regression.
+
 ## Deployment
 
 The repository includes `render.yaml` for an HTTP service deployment. The service should:
