@@ -50,22 +50,23 @@ const PROVIDERS: [ProviderKind; 5] = [
     ProviderKind::Addons,
 ];
 
+fn configured_search_providers() -> Vec<ProviderKind> {
+    let config = crate::config::load();
+    let mut providers = Vec::with_capacity(PROVIDERS.len());
+    if config.fourkhdhub_enabled { providers.push(ProviderKind::FourKHdHub); }
+    if config.dramachi_enabled { providers.push(ProviderKind::Dramachi); }
+    if config.bdix_circleftp_enabled { providers.push(ProviderKind::BdixCircleFtp); }
+    if config.bdix_dhakaflix_enabled { providers.push(ProviderKind::BdixDhakaFlix); }
+    // Catalog/metadata addons remain useful without stream-capable addons.
+    providers.push(ProviderKind::Addons);
+    providers
+}
+
 fn provider_priority(provider: ProviderKind) -> usize {
     PROVIDERS
         .iter()
         .position(|candidate| *candidate == provider)
         .unwrap_or(PROVIDERS.len())
-}
-
-fn suppress_dramachi_when_fourk_series_exists(items: &mut Vec<CatalogItem>) {
-    let has_usable_primary_series = items.iter().any(|item| {
-        item.id.provider == ProviderKind::FourKHdHub
-            && item.media_type == MediaType::Series
-            && item.season_count.is_some_and(|count| count > 0)
-    });
-    if has_usable_primary_series {
-        items.retain(|item| item.id.provider != ProviderKind::Dramachi);
-    }
 }
 
 #[derive(Clone)]
@@ -593,7 +594,7 @@ async fn route(stream: &mut TcpStream, target: &str, state: ApiState) -> std::io
         "/api/v1" => write_json(stream, 200, &serde_json::json!({"version":"v1","resources":["anime","episodes","sources"]}), None).await,
         "/openapi.json" => write_json(stream, 200, &openapi(), None).await,
         "/docs" => write_text(stream, 200, "text/html; charset=utf-8", "<!doctype html><html><head><title>MovieBox API</title></head><body><h1>MovieBox API</h1><p>OpenAPI: <a href=\"/openapi.json\">/openapi.json</a></p><p>Swagger UI can load this document from a local or trusted client.</p></body></html>", None).await,
-        "/api/v1/diagnostics" => diagnostics_route(stream).await,
+        "/api/v1/diagnostics" => diagnostics_route(stream, state).await,
         "/api/v1/watch" => direct_watch_route(stream, query, state).await,
         "/api/v1/anime/search" => search_json(stream, query, state).await,
         "/api/v1/anime/search/stream" => search_sse(stream, query, state).await,
@@ -617,7 +618,7 @@ async fn route(stream: &mut TcpStream, target: &str, state: ApiState) -> std::io
     }
 }
 
-async fn diagnostics_route(stream: &mut TcpStream) -> std::io::Result<()> {
+async fn diagnostics_route(stream: &mut TcpStream, state: ApiState) -> std::io::Result<()> {
     // Capture whether the config existed before load_addons() applies its local
     // defaults. Never expose manifest URLs or other configuration values.
     let addons_config_file_present = crate::config::addons_path()
@@ -633,21 +634,48 @@ async fn diagnostics_route(stream: &mut TcpStream) -> std::io::Result<()> {
         .iter()
         .filter(|addon| addon.enabled && (addon.provides_catalog || addon.provides_meta))
         .count();
-    let status = if enabled_stream_addons > 0 { "ok" } else { "degraded" };
+    let config = tokio::task::spawn_blocking(crate::config::load)
+        .await
+        .unwrap_or_default();
+    let built_in = serde_json::json!({
+        "fourkhdhub": { "configured": config.fourkhdhub_enabled, "initialized": state.service.fourk_client.is_some(), "upstream": "not_checked" },
+        "dramachi": { "configured": config.dramachi_enabled, "initialized": true, "upstream": "not_checked" },
+        "bdix_circleftp": { "configured": config.bdix_circleftp_enabled, "initialized": true, "upstream": "not_checked" },
+        "bdix_dhakaflix": { "configured": config.bdix_dhakaflix_enabled, "initialized": true, "upstream": "not_checked" }
+    });
+    let built_in_streaming = config.streaming_enabled
+        && ((config.fourkhdhub_enabled && state.service.fourk_client.is_some())
+            || config.dramachi_enabled
+            || config.bdix_circleftp_enabled
+            || config.bdix_dhakaflix_enabled);
 
     write_json(
         stream,
         200,
         &serde_json::json!({
-            "status": status,
+            "status": if built_in_streaming || enabled_stream_addons > 0 { "ok" } else { "degraded" },
+            "process": {"status": "ok"},
             "configuration": {
                 "addons_config_file_present_at_start_of_check": addons_config_file_present,
                 "enabled_stream_addons": enabled_stream_addons,
                 "enabled_catalog_or_metadata_addons": enabled_catalog_addons,
-                "streaming_configured": enabled_stream_addons > 0
+                "streaming_configured": built_in_streaming || enabled_stream_addons > 0,
+                "streaming_enabled": config.streaming_enabled,
+                "moviebox_configured": config.moviebox_enabled,
+                "moviebox_effective": MOVIEBOX_PROVIDER_ENABLED
+            },
+            "built_in_providers": built_in,
+            "external_addons": {
+                "catalog_or_metadata": if enabled_catalog_addons > 0 { "configured" } else { "unavailable" },
+                "streaming": if enabled_stream_addons > 0 { "configured" } else { "unconfigured" }
+            },
+            "streaming": {
+                "status": if built_in_streaming || enabled_stream_addons > 0 { "available" } else { "unavailable" },
+                "basis": if built_in_streaming { "built_in_provider_initialized" } else if enabled_stream_addons > 0 { "stream_addon_configured" } else { "no_initialized_provider_or_stream_addon" },
+                "upstream_checks": "request_specific"
             },
             "hint": if enabled_stream_addons == 0 {
-                Some("No stream-capable addon is enabled. Configure a supported provider before expecting stream requests to succeed.")
+                Some("No stream-capable addon is enabled; built-in provider streaming is independent and is checked per request.")
             } else {
                 None
             }
@@ -1332,14 +1360,14 @@ async fn direct_watch_route(stream: &mut TcpStream, query: &str, state: ApiState
 
     if episode_found {
         let detail = if stream_failures.is_empty() {
-            "The episode exists, but no matching provider returned a usable Hindi source.".to_string()
+            "The episode exists, but no matching provider returned a playable source.".to_string()
         } else {
             format!(
-                "The episode exists, but no provider returned a usable Hindi source. Provider results: {}",
+                "The episode exists, but no provider returned a playable source. Provider results: {}",
                 stream_failures.into_iter().take(6).collect::<Vec<_>>().join("; ")
             )
         };
-        let (status, body) = err("NO_LANGUAGE_SOURCE", &detail, last_provider, 404);
+        let (status, body) = err("NO_PLAYABLE_SOURCE", &detail, last_provider, 404);
         return write_raw_json(stream, status, &body, None).await;
     }
 
@@ -1435,7 +1463,7 @@ async fn search_sse(stream: &mut TcpStream, query: &str, state: ApiState) -> std
     let normalized_query = intent.title;
     write_headers(stream, 200, "text/event-stream", None).await?;
     let mut tasks = JoinSet::new();
-    for p in PROVIDERS {
+    for p in configured_search_providers() {
         let svc = state.service.clone();
         let q = normalized_query.clone();
         tasks.spawn(async move {
@@ -1496,7 +1524,7 @@ async fn search_all(
     let requested_language = intent.language;
     let normalized_query = intent.title;
     let mut tasks = JoinSet::new();
-    for p in PROVIDERS {
+    for p in configured_search_providers() {
         let svc = service.clone();
         let q = normalized_query.clone();
         tasks.spawn(async move {
@@ -3167,6 +3195,17 @@ mod tests {
     }
 
     #[test]
+    fn configured_search_providers_keep_builtins_and_exclude_disabled_bdix() {
+        let providers = configured_search_providers();
+        assert!(providers.contains(&ProviderKind::FourKHdHub));
+        assert!(providers.contains(&ProviderKind::Dramachi));
+        assert!(providers.contains(&ProviderKind::Addons));
+        assert!(!providers.contains(&ProviderKind::BdixCircleFtp));
+        assert!(!providers.contains(&ProviderKind::BdixDhakaFlix));
+        assert!(!providers.contains(&ProviderKind::MovieBox));
+    }
+
+    #[test]
     fn provider_priority_matches_configured_order() {
         assert!(
             provider_priority(ProviderKind::FourKHdHub) < provider_priority(ProviderKind::Dramachi)
@@ -3179,7 +3218,7 @@ mod tests {
     }
 
     #[test]
-    fn fourk_series_suppresses_dramachi_but_keeps_other_provider_results() {
+    fn fourk_series_keeps_dramachi_for_fallback() {
         let item = |provider, media_type, id: &str| CatalogItem {
             id: ProviderMediaId {
                 provider,
@@ -3191,13 +3230,12 @@ mod tests {
             poster_url: None,
             season_count: None,
         };
-        let mut items = vec![
+        let mut items = [
             item(ProviderKind::FourKHdHub, MediaType::Series, "fourk-series"),
             item(ProviderKind::Dramachi, MediaType::Series, "drama-series"),
             item(ProviderKind::Addons, MediaType::Series, "addon-series"),
         ];
         items[0].season_count = Some(1);
-        suppress_dramachi_when_fourk_series_exists(&mut items);
         assert!(
             items
                 .iter()
@@ -3209,7 +3247,7 @@ mod tests {
                 .any(|item| item.id.provider == ProviderKind::Addons)
         );
         assert!(
-            !items
+            items
                 .iter()
                 .any(|item| item.id.provider == ProviderKind::Dramachi)
         );
@@ -3228,34 +3266,31 @@ mod tests {
             poster_url: None,
             season_count: None,
         };
-        let mut items = vec![
+        let items = [
             item(ProviderKind::FourKHdHub, MediaType::Movie, "fourk-movie"),
             item(ProviderKind::Dramachi, MediaType::Series, "drama-series"),
         ];
-        suppress_dramachi_when_fourk_series_exists(&mut items);
         assert!(
             items
                 .iter()
                 .any(|item| item.id.provider == ProviderKind::Dramachi)
         );
 
-        let mut unknown_primary = vec![
+        let unknown_primary = [
             item(ProviderKind::FourKHdHub, MediaType::Series, "fourk-unknown"),
             item(ProviderKind::Dramachi, MediaType::Series, "drama-series"),
         ];
-        suppress_dramachi_when_fourk_series_exists(&mut unknown_primary);
         assert!(
             unknown_primary
                 .iter()
                 .any(|item| item.id.provider == ProviderKind::Dramachi)
         );
 
-        let mut empty_primary = vec![item(
+        let empty_primary = [item(
             ProviderKind::Dramachi,
             MediaType::Series,
             "drama-only-series",
         )];
-        suppress_dramachi_when_fourk_series_exists(&mut empty_primary);
         assert_eq!(empty_primary.len(), 1);
         assert_eq!(empty_primary[0].id.provider, ProviderKind::Dramachi);
     }

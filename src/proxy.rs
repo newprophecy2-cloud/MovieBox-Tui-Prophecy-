@@ -884,11 +884,6 @@ where
     Ok(bytes.len())
 }
 
-fn parse_content_range_total(header_val: &str) -> Option<usize> {
-    let (_, total_str) = header_val.trim().split_once('/')?;
-    total_str.trim().parse::<usize>().ok()
-}
-
 fn parse_byte_range_request(header_val: &str, total: usize) -> Option<(usize, usize)> {
     if total == 0 {
         return None;
