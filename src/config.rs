@@ -282,7 +282,21 @@ pub fn save(config: &Config) {
 }
 
 pub fn load_addons() -> Vec<InstalledAddon> {
-    let mut list = if let Some(path) = addons_path() {
+    // Render/container deployments may not have a durable writable home directory.
+    // Permit an explicit JSON array of InstalledAddon objects via environment.
+    let env_configured = std::env::var("MOVIEBOX_ADDONS_JSON")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+
+    let mut list = if let Some(raw) = env_configured.as_deref() {
+        match serde_json::from_str::<Vec<InstalledAddon>>(raw) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                log::error!("MOVIEBOX_ADDONS_JSON is invalid JSON: {error}");
+                Vec::new()
+            }
+        }
+    } else if let Some(path) = addons_path() {
         if path.exists() {
             match std::fs::read_to_string(&path) {
                 Ok(content) => match serde_json::from_str::<Vec<InstalledAddon>>(&content) {
@@ -309,7 +323,9 @@ pub fn load_addons() -> Vec<InstalledAddon> {
 
     if !list.iter().any(|a| a.is_core()) {
         list.insert(0, InstalledAddon::cinemeta_default());
-        save_addons(&list);
+        if env_configured.is_none() {
+            save_addons(&list);
+        }
     } else {
         for a in &mut list {
             if a.is_core() {
