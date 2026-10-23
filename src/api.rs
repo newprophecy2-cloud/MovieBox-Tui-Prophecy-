@@ -95,6 +95,7 @@ pub struct ApiState {
     pub service: Arc<MovieBoxService>,
     release_cache: Arc<Mutex<HashMap<String, ReleaseCacheEntry>>>,
     playback_cache: Arc<Mutex<HashMap<String, PlaybackCacheEntry>>>,
+    search_source_check_slots: Arc<Semaphore>,
     transcode_slots: Arc<Semaphore>,
     connection_slots: Arc<Semaphore>,
 }
@@ -175,10 +176,22 @@ struct EligibleSearch {
 }
 
 fn release_has_usable_source(release: &Release) -> bool {
-    release.mirrors.iter().any(|mirror| {
-        !mirror.resolver_url.trim().is_empty()
-            && crate::net::validate_url_syntax(&mirror.resolver_url, true).is_ok()
-    })
+    is_verified_h264_codec(release.codec.as_deref())
+        && release.mirrors.iter().any(|mirror| {
+            !mirror.resolver_url.trim().is_empty()
+                && crate::net::validate_url_syntax(&mirror.resolver_url, true).is_ok()
+        })
+}
+
+fn is_verified_h264_codec(codec: Option<&str>) -> bool {
+    let Some(codec) = codec.map(str::trim).filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    let normalized = codec.to_ascii_lowercase().replace(['.', '-', '_', ' '], "");
+    matches!(
+        normalized.as_str(),
+        "h264" | "avc" | "avc1" | "avc3" | "x264"
+    )
 }
 
 fn releases_have_usable_source(releases: &[Release]) -> bool {
@@ -560,6 +573,7 @@ pub async fn run() -> std::io::Result<()> {
         service: Arc::new(MovieBoxService::new()),
         release_cache: Arc::new(Mutex::new(HashMap::new())),
         playback_cache: Arc::new(Mutex::new(HashMap::new())),
+        search_source_check_slots: Arc::new(Semaphore::new(SEARCH_SOURCE_CHECK_CONCURRENCY)),
         transcode_slots: Arc::new(Semaphore::new(MAX_TRANSCODE_SESSIONS)),
         connection_slots: Arc::new(Semaphore::new(MAX_API_CONNECTIONS)),
     };
@@ -1779,11 +1793,10 @@ async fn eligible_search(
     mut failed: bool,
     mut provider_status: HashMap<String, String>,
 ) -> EligibleSearch {
-    let semaphore = Arc::new(Semaphore::new(SEARCH_SOURCE_CHECK_CONCURRENCY));
     let mut tasks = JoinSet::new();
     for item in items {
         let state = state.clone();
-        let semaphore = Arc::clone(&semaphore);
+        let semaphore = Arc::clone(&state.search_source_check_slots);
         tasks.spawn(async move {
             let permit = semaphore.acquire_owned().await;
             if permit.is_err() {
@@ -4008,8 +4021,26 @@ mod tests {
             });
         assert!(!release_has_usable_source(&release));
         release.mirrors[0].resolver_url = "https://cdn.example/episode.mkv".into();
+        assert!(!release_has_usable_source(&release));
+        release.codec = Some("H.264".into());
         assert!(release_has_usable_source(&release));
         assert!(releases_have_usable_source(&[release]));
+    }
+
+    #[test]
+    fn search_source_eligibility_rejects_incompatible_and_unknown_codecs() {
+        for codec in [Some("HEVC"), Some("H.265"), Some("x265"), Some("AV1"), None] {
+            assert!(
+                !is_verified_h264_codec(codec),
+                "codec should be rejected: {codec:?}"
+            );
+        }
+        for codec in [Some("H.264"), Some("AVC"), Some("avc1"), Some("x264")] {
+            assert!(
+                is_verified_h264_codec(codec),
+                "codec should be accepted: {codec:?}"
+            );
+        }
     }
 
     #[test]

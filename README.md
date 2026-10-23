@@ -22,6 +22,7 @@ The backend is designed for clients that need a stable API while provider-specif
 
 - **Anime and media search:** Concurrent provider search across MovieBox, 4KHDHub, Dramachi, and configured addon sources.
 - **Verified source eligibility:** Search results are filtered using provider source checks while distinguishing confirmed absence from upstream failure.
+- **Strict playback compatibility:** Search eligibility accepts only sources with confirmed H.264/AVC/x264 metadata; unknown, HEVC/H.265/x265, and AV1 sources are not advertised as verified Android-compatible results.
 - **Bounded search work:** Each catalog item has a bounded source-eligibility budget so large series cannot make search latency grow without limit.
 - **Episode metadata:** Fresh anime details, season lists, episode lists, and individual episode lookups.
 - **Source discovery:** Fresh source candidates with quality, codec, language, size, downloadability, and opaque source IDs.
@@ -138,6 +139,8 @@ curl --get 'http://127.0.0.1:8080/api/v1/anime/search' \
 ```
 
 Search responses include `results`, `partial`, optional `next_cursor`, and provider status information. A partial response means one or more providers were unavailable or source checks could not complete; it does not mean the returned results are fabricated.
+
+The verified search set is intentionally conservative: a source must have a valid public mirror and explicit H.264/AVC-compatible codec metadata. Unknown or incompatible codecs remain available through provider/source metadata where applicable, but are not presented as verified search results for the strict Android playback policy.
 
 ### Stream search events
 
@@ -268,6 +271,8 @@ export MOVIEBOX_DATA_DIR="$HOME/.local/share/moviebox-tui"
 
 The application keeps user configuration, history, favorites, and cache data locally. Do not commit provider credentials, addon secrets, signed URLs, cookies, or local configuration files.
 
+Expensive source-eligibility checks use a process-wide concurrency limit in addition to each item's deadline, so concurrent API clients cannot multiply upstream verification work without bound.
+
 ## Security behavior
 
 - Public IDs are opaque and must be treated as API values.
@@ -313,7 +318,7 @@ The script reports source count, provider label, final host, and detected media 
 The repository includes `render.yaml` for an HTTP service deployment. The service should:
 
 - Build with `cargo build --release --locked`.
-- Start the `moviebox-tui` binary.
+- Start the prebuilt `./target/release/moviebox-tui` binary rather than invoking Cargo again at service startup.
 - Listen on Render's `$PORT`.
 - Use `/health` for the health check.
 - Keep provider configuration and secrets outside the repository.
