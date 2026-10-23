@@ -176,22 +176,19 @@ struct EligibleSearch {
 }
 
 fn release_has_usable_source(release: &Release) -> bool {
-    is_verified_h264_codec(release.codec.as_deref())
+    !is_blocked_h265_codec(release.codec.as_deref())
         && release.mirrors.iter().any(|mirror| {
             !mirror.resolver_url.trim().is_empty()
                 && crate::net::validate_url_syntax(&mirror.resolver_url, true).is_ok()
         })
 }
 
-fn is_verified_h264_codec(codec: Option<&str>) -> bool {
+fn is_blocked_h265_codec(codec: Option<&str>) -> bool {
     let Some(codec) = codec.map(str::trim).filter(|value| !value.is_empty()) else {
         return false;
     };
     let normalized = codec.to_ascii_lowercase().replace(['.', '-', '_', ' '], "");
-    matches!(
-        normalized.as_str(),
-        "h264" | "avc" | "avc1" | "avc3" | "x264"
-    )
+    matches!(normalized.as_str(), "h265" | "hevc" | "x265")
 }
 
 fn releases_have_usable_source(releases: &[Release]) -> bool {
@@ -4021,23 +4018,21 @@ mod tests {
             });
         assert!(!release_has_usable_source(&release));
         release.mirrors[0].resolver_url = "https://cdn.example/episode.mkv".into();
-        assert!(!release_has_usable_source(&release));
-        release.codec = Some("H.264".into());
         assert!(release_has_usable_source(&release));
         assert!(releases_have_usable_source(&[release]));
     }
 
     #[test]
-    fn search_source_eligibility_rejects_incompatible_and_unknown_codecs() {
-        for codec in [Some("HEVC"), Some("H.265"), Some("x265"), Some("AV1"), None] {
+    fn search_source_eligibility_blocks_only_h265_family_codecs() {
+        for codec in [Some("HEVC"), Some("H.265"), Some("x265")] {
             assert!(
-                !is_verified_h264_codec(codec),
+                is_blocked_h265_codec(codec),
                 "codec should be rejected: {codec:?}"
             );
         }
-        for codec in [Some("H.264"), Some("AVC"), Some("avc1"), Some("x264")] {
+        for codec in [Some("H.264"), Some("AVC"), Some("AV1"), None] {
             assert!(
-                is_verified_h264_codec(codec),
+                !is_blocked_h265_codec(codec),
                 "codec should be accepted: {codec:?}"
             );
         }

@@ -22,7 +22,7 @@ The backend is designed for clients that need a stable API while provider-specif
 
 - **Anime and media search:** Concurrent provider search across MovieBox, 4KHDHub, Dramachi, and configured addon sources.
 - **Verified source eligibility:** Search results are filtered using provider source checks while distinguishing confirmed absence from upstream failure.
-- **Strict playback compatibility:** Search eligibility accepts only sources with confirmed H.264/AVC/x264 metadata; unknown, HEVC/H.265/x265, and AV1 sources are not advertised as verified Android-compatible results.
+- **H.265 protection:** Search eligibility accepts every valid public source URL unless the source is explicitly labelled HEVC/H.265/x265; only that codec family is blocked by policy.
 - **Bounded search work:** Each catalog item has a bounded source-eligibility budget so large series cannot make search latency grow without limit.
 - **Episode metadata:** Fresh anime details, season lists, episode lists, and individual episode lookups.
 - **Source discovery:** Fresh source candidates with quality, codec, language, size, downloadability, and opaque source IDs.
@@ -140,7 +140,7 @@ curl --get 'http://127.0.0.1:8080/api/v1/anime/search' \
 
 Search responses include `results`, `partial`, optional `next_cursor`, and provider status information. A partial response means one or more providers were unavailable or source checks could not complete; it does not mean the returned results are fabricated.
 
-The verified search set is intentionally conservative: a source must have a valid public mirror and explicit H.264/AVC-compatible codec metadata. Unknown or incompatible codecs remain available through provider/source metadata where applicable, but are not presented as verified search results for the strict Android playback policy.
+Search accepts every source with a valid public mirror URL, including unknown, H.264, AV1, and other codec metadata. The only codec-family exclusion is explicit HEVC/H.265/x265, which is blocked by policy.
 
 ### Stream search events
 

@@ -13,20 +13,17 @@ The repaired branch is suitable for code review and deployment validation, but p
 
 ## Implemented repairs
 
-### 1. Strict codec-aware search eligibility
+### 1. H.265-only codec blocking
 
-`src/api.rs` now requires explicit H.264-compatible metadata (`H.264`, `AVC`, `AVC1`, `AVC3`, or `x264`) in addition to a valid public mirror URL before a release is counted as a verified search source.
+`src/api.rs` accepts every source with a valid public mirror URL, regardless of missing or otherwise unknown codec metadata.
 
-The following are rejected from the verified search set:
+The following are blocked from the search eligibility set:
 
-- Missing or blank codec metadata.
 - HEVC/H.265/x265.
-- AV1.
-- Other unknown codec labels.
 
-The change does not rewrite provider source metadata and does not claim that an incompatible source is absent. It only prevents unverified or incompatible sources from being advertised as verified search results under the strict Android playback policy.
+H.264, AV1, unknown, and other non-H.265 codec labels remain accepted when the mirror URL is valid. The change does not rewrite provider source metadata.
 
-Regression coverage now proves that valid URLs with unknown codecs are rejected, H.264 is accepted, and HEVC/H.265/x265/AV1 are rejected.
+Regression coverage now proves that valid URLs with unknown codecs are accepted and only HEVC/H.265/x265 labels are blocked.
 
 ### 2. Process-wide source-check concurrency limit
 
@@ -98,7 +95,7 @@ The two successful cases demonstrate automatic resolver traversal through the pu
 ## Acceptance decision
 
 - **Build/test quality:** PASS.
-- **Strict codec policy:** PASS for deterministic metadata eligibility tests.
+- **H.265-only blocking policy:** PASS for deterministic metadata eligibility tests.
 - **Global source-check concurrency:** PASS by code inspection and compilation; a dedicated load test remains a follow-up.
 - **Render startup configuration:** PASS in repository configuration; deployment runtime still needs rebuild verification.
 - **Live resolver:** PARTIAL, 2/3 cases passed; one upstream disconnect remains unresolved.
