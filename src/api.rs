@@ -191,6 +191,16 @@ fn is_blocked_h265_codec(codec: Option<&str>) -> bool {
     matches!(normalized.as_str(), "h265" | "hevc" | "x265")
 }
 
+fn is_verified_h264_codec(codec: Option<&str>) -> bool {
+    let Some(codec) = codec.map(str::trim).filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    let normalized = codec
+        .to_ascii_lowercase()
+        .replace(['.', '-', '_', ' ', '/'], "");
+    matches!(normalized.as_str(), "h264" | "avc" | "x264" | "avc1")
+}
+
 fn releases_have_usable_source(releases: &[Release]) -> bool {
     releases.iter().any(release_has_usable_source)
 }
@@ -3197,6 +3207,7 @@ async fn transcode_source(
         );
         return write_raw_json(stream, status, &body, None).await;
     };
+    let stream_copy = is_verified_h264_codec(source.codec.as_deref());
     let mut command = Command::new("ffmpeg");
     command.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
     let headers = playback
@@ -3216,26 +3227,30 @@ async fn transcode_source(
         "0:v:0",
         "-map",
         "0:a?",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-profile:v",
-        "main",
-        "-pix_fmt",
-        "yuv420p",
-        "-crf",
-        "23",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        "-ac",
-        "2",
-        "-f",
-        "mpegts",
-        "pipe:1",
     ]);
+    if stream_copy {
+        command.args(["-c", "copy"]);
+    } else {
+        command.args([
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-profile:v",
+            "main",
+            "-pix_fmt",
+            "yuv420p",
+            "-crf",
+            "23",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-ac",
+            "2",
+        ]);
+    }
+    command.args(["-f", "mpegts", "pipe:1"]);
     command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -3307,7 +3322,8 @@ async fn transcode_source(
         200,
         "video/mp2t",
         Some(&format!(
-            "X-Transcode: h264\r\nX-Source-Id: {source_id}\r\n"
+            "X-Media-Mode: {}\r\nX-Source-Id: {source_id}\r\n",
+            if stream_copy { "remux" } else { "transcode" }
         )),
     )
     .await
@@ -4035,6 +4051,16 @@ mod tests {
                 !is_blocked_h265_codec(codec),
                 "codec should be accepted: {codec:?}"
             );
+        }
+    }
+
+    #[test]
+    fn transcode_route_selects_stream_copy_only_for_verified_h264() {
+        for codec in [Some("H.264"), Some("AVC"), Some("x264"), Some("avc1")] {
+            assert!(is_verified_h264_codec(codec));
+        }
+        for codec in [Some("HEVC"), Some("AV1"), Some("VP9"), None] {
+            assert!(!is_verified_h264_codec(codec));
         }
     }
 
