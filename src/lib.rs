@@ -6,6 +6,7 @@ pub mod config;
 pub mod download;
 pub mod favorites;
 pub mod history;
+pub mod hls;
 pub mod language;
 pub mod logging;
 pub mod models;

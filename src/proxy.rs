@@ -338,10 +338,7 @@ async fn handle_connection(
         )
         .await
         .map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "proxy request line timed out",
-            )
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "proxy request line timed out")
         })??;
         if n == 0 {
             return Ok(());
@@ -966,7 +963,10 @@ async fn read_response_limited(
     response: reqwest::Response,
     limit: usize,
 ) -> Result<Vec<u8>, String> {
-    if response.content_length().is_some_and(|length| length > limit as u64) {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
         return Err(format!("upstream segment exceeds the {limit}-byte limit"));
     }
     let mut stream = response.bytes_stream();
@@ -1041,7 +1041,11 @@ async fn fetch_m4s_chunked(
         return Err("upstream range length did not match Content-Range".to_string());
     }
     if total == first_chunk.len() {
-        return Ok((reqwest::StatusCode::OK, content_type, Arc::from(first_chunk)));
+        return Ok((
+            reqwest::StatusCode::OK,
+            content_type,
+            Arc::from(first_chunk),
+        ));
     }
 
     let mut assembled = Vec::with_capacity(total);
@@ -1381,7 +1385,10 @@ mod tests {
     #[test]
     fn parses_only_well_formed_content_ranges() {
         assert_eq!(parse_content_range("bytes 0-99/200"), Some((0, 99, 200)));
-        assert_eq!(parse_content_range("bytes 100-199/200"), Some((100, 199, 200)));
+        assert_eq!(
+            parse_content_range("bytes 100-199/200"),
+            Some((100, 199, 200))
+        );
         assert_eq!(parse_content_range("bytes */200"), None);
         assert_eq!(parse_content_range("bytes 0-200/200"), None);
         assert_eq!(parse_content_range("bytes 10-2/200"), None);

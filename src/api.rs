@@ -53,10 +53,21 @@ const PROVIDERS: [ProviderKind; 5] = [
 fn configured_search_providers() -> Vec<ProviderKind> {
     let config = crate::config::load();
     let mut providers = Vec::with_capacity(PROVIDERS.len());
-    if config.fourkhdhub_enabled { providers.push(ProviderKind::FourKHdHub); }
-    if config.dramachi_enabled { providers.push(ProviderKind::Dramachi); }
-    if config.bdix_circleftp_enabled { providers.push(ProviderKind::BdixCircleFtp); }
-    if config.bdix_dhakaflix_enabled { providers.push(ProviderKind::BdixDhakaFlix); }
+    if config.fourkhdhub_enabled {
+        providers.push(ProviderKind::FourKHdHub);
+    }
+    if config.dramachi_enabled {
+        providers.push(ProviderKind::Dramachi);
+    }
+    if config.bdix_circleftp_enabled {
+        providers.push(ProviderKind::BdixCircleFtp);
+    }
+    if config.bdix_dhakaflix_enabled {
+        providers.push(ProviderKind::BdixDhakaFlix);
+    }
+    if MOVIEBOX_PROVIDER_ENABLED && config.moviebox_enabled {
+        providers.push(ProviderKind::MovieBox);
+    }
     // Catalog/metadata addons remain useful without stream-capable addons.
     providers.push(ProviderKind::Addons);
     providers
@@ -72,6 +83,7 @@ fn provider_priority(provider: ProviderKind) -> usize {
 #[derive(Clone)]
 pub struct ApiState {
     pub service: Arc<MovieBoxService>,
+    hls: crate::hls::HlsManager,
     release_cache: Arc<Mutex<HashMap<String, ReleaseCacheEntry>>>,
     playback_cache: Arc<Mutex<HashMap<String, PlaybackCacheEntry>>>,
     transcode_slots: Arc<Semaphore>,
@@ -490,6 +502,21 @@ fn parse_source(value: &str) -> Result<OpaqueSource, (u16, String)> {
     decode(value).map_err(|_| err("INVALID_ID", "The source identifier is invalid.", None, 400))
 }
 
+fn matches_requested_title(requested: &str, candidate: &str) -> bool {
+    let requested = requested.trim().to_ascii_lowercase();
+    let candidate = candidate.trim().to_ascii_lowercase();
+    if candidate == requested {
+        return true;
+    }
+    let Some(suffix) = candidate.strip_prefix(&format!("{requested} ")) else {
+        return false;
+    };
+    let Some(close_bracket) = suffix.find(']') else {
+        return false;
+    };
+    suffix.starts_with('[') && close_bracket > 1
+}
+
 pub async fn run() -> std::io::Result<()> {
     let port = std::env::var("PORT")
         .unwrap_or_else(|_| "8080".into())
@@ -498,6 +525,7 @@ pub async fn run() -> std::io::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     let state = ApiState {
         service: Arc::new(MovieBoxService::new()),
+        hls: crate::hls::HlsManager::new(),
         release_cache: Arc::new(Mutex::new(HashMap::new())),
         playback_cache: Arc::new(Mutex::new(HashMap::new())),
         transcode_slots: Arc::new(Semaphore::new(MAX_TRANSCODE_SESSIONS)),
@@ -613,6 +641,7 @@ async fn route(stream: &mut TcpStream, target: &str, state: ApiState) -> std::io
         _ if path.starts_with("/api/v1/k-dramas/") => unsupported_catalog(stream, "K-Drama details require a verified item classification before lookup.").await,
         _ if path.starts_with("/api/v1/anime/") => anime_route(stream, path, query, state).await,
         _ if path.starts_with("/api/v1/episodes/") => episode_route(stream, path, state).await,
+        _ if path.starts_with("/api/v1/hls/") => hls_route(stream, path, state).await,
         _ if path.starts_with("/api/v1/sources/") => source_route(stream, path, state).await,
         _ => { let (s,b) = err("INTERNAL_ERROR", "Route not found.", None, 404); write_raw_json(stream, s, &b, None).await }
     }
@@ -621,8 +650,8 @@ async fn route(stream: &mut TcpStream, target: &str, state: ApiState) -> std::io
 async fn diagnostics_route(stream: &mut TcpStream, state: ApiState) -> std::io::Result<()> {
     // Capture whether the config existed before load_addons() applies its local
     // defaults. Never expose manifest URLs or other configuration values.
-    let addons_config_file_present = crate::config::addons_path()
-        .is_some_and(|path| path.is_file());
+    let addons_config_file_present =
+        crate::config::addons_path().is_some_and(|path| path.is_file());
     let addons = tokio::task::spawn_blocking(crate::config::load_addons)
         .await
         .unwrap_or_default();
@@ -845,7 +874,10 @@ fn is_classified(
         Classification::KDrama => {
             item.media_type == MediaType::Series
                 && (normalized_contains(category, &["k-drama", "korean drama", "kdrama"])
-                    || normalized_matches(country, &["south korea", "korea", "korean", "kr", "kor"])
+                    || normalized_matches(
+                        country,
+                        &["south korea", "korea", "korean", "kr", "kor"],
+                    )
                     || normalized_matches(language, &["korean", "ko", "kor", "한국어"]))
         }
     }
@@ -1229,13 +1261,19 @@ fn percent_decode(v: &str) -> String {
     String::from_utf8_lossy(&decoded).into_owned()
 }
 
-async fn direct_watch_route(stream: &mut TcpStream, query: &str, state: ApiState) -> std::io::Result<()> {
+async fn direct_watch_route(
+    stream: &mut TcpStream,
+    query: &str,
+    state: ApiState,
+) -> std::io::Result<()> {
     let mut title = None;
     let mut season = None;
     let mut episode = None;
     let mut audio = "hindi".to_string();
     for pair in query.split('&') {
-        let Some((key, value)) = pair.split_once('=') else { continue };
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
         let value = percent_decode(value);
         match key {
             "title" => title = Some(value),
@@ -1245,30 +1283,57 @@ async fn direct_watch_route(stream: &mut TcpStream, query: &str, state: ApiState
             _ => {}
         }
     }
-    let Some(title) = title.filter(|v| !v.trim().is_empty() && v.chars().count() <= MAX_QUERY) else {
-        let (status, body) = err("INVALID_QUERY", "title is required (example: /api/v1/watch?title=Lookism&season=1&episode=13&audio=hindi).", None, 400);
+    let Some(title) = title.filter(|v| !v.trim().is_empty() && v.chars().count() <= MAX_QUERY)
+    else {
+        let (status, body) = err(
+            "INVALID_QUERY",
+            "title is required (example: /api/v1/watch?title=Lookism&season=1&episode=13&audio=hindi).",
+            None,
+            400,
+        );
         return write_raw_json(stream, status, &body, None).await;
     };
     let (Some(season), Some(episode)) = (season, episode) else {
-        let (status, body) = err("INVALID_QUERY", "season and episode must be positive integers.", None, 400);
+        let (status, body) = err(
+            "INVALID_QUERY",
+            "season and episode must be positive integers.",
+            None,
+            400,
+        );
         return write_raw_json(stream, status, &body, None).await;
     };
     if season == 0 || episode == 0 {
-        let (status, body) = err("INVALID_QUERY", "season and episode must be positive integers.", None, 400);
+        let (status, body) = err(
+            "INVALID_QUERY",
+            "season and episode must be positive integers.",
+            None,
+            400,
+        );
         return write_raw_json(stream, status, &body, None).await;
     }
     if !matches!(audio.as_str(), "hindi" | "hi" | "hin") {
-        let (status, body) = err("UNSUPPORTED_AUDIO_LANGUAGE", "This direct watch route currently supports audio=hindi only.", None, 400);
+        let (status, body) = err(
+            "UNSUPPORTED_AUDIO_LANGUAGE",
+            "This direct watch route currently supports audio=hindi only.",
+            None,
+            400,
+        );
         return write_raw_json(stream, status, &body, None).await;
     }
     let (items, _, _) = search_all(&state.service, &title).await;
     let title_normalized = title.trim().to_ascii_lowercase();
-    let candidates: Vec<_> = items.into_iter()
+    let candidates: Vec<_> = items
+        .into_iter()
         .filter(|item| item.media_type == MediaType::Series)
-        .filter(|item| item.title.trim().eq_ignore_ascii_case(&title_normalized))
+        .filter(|item| matches_requested_title(&title_normalized, &item.title))
         .collect();
     if candidates.is_empty() {
-        let (status, body) = err("ANIME_NOT_FOUND", "No exact series title match was found. Try the title returned by /api/v1/anime/search.", None, 404);
+        let (status, body) = err(
+            "ANIME_NOT_FOUND",
+            "No exact series title match was found. Try the title returned by /api/v1/anime/search.",
+            None,
+            404,
+        );
         return write_raw_json(stream, status, &body, None).await;
     }
 
@@ -1291,15 +1356,20 @@ async fn direct_watch_route(stream: &mut TcpStream, query: &str, state: ApiState
         let anime_details = match state.service.details_typed(anime_ref.p, &anime_ref.v).await {
             Ok(details) => details,
             Err(error) => {
-                log::warn!("direct watch details lookup failed for provider {}: {}", anime_ref.p.label(), error.user_message(anime_ref.p));
+                log::warn!(
+                    "direct watch details lookup failed for provider {}: {}",
+                    anime_ref.p.label(),
+                    error.user_message(anime_ref.p)
+                );
                 last_provider = Some(anime_ref.p);
                 continue;
             }
         };
         last_provider = Some(anime_ref.p);
-        let episode_exists = anime_details.seasons.iter().any(|s| {
-            s.number == season && s.episodes.iter().any(|e| e.number == episode)
-        });
+        let episode_exists = anime_details
+            .seasons
+            .iter()
+            .any(|s| s.number == season && s.episodes.iter().any(|e| e.number == episode));
         if episode_exists {
             episode_found = true;
 
@@ -1311,15 +1381,21 @@ async fn direct_watch_route(stream: &mut TcpStream, query: &str, state: ApiState
                 s: season,
                 e: episode,
             };
-            match tokio::time::timeout(OVERALL_TIMEOUT, cached_releases(&state, &episode_reference)).await {
+            match tokio::time::timeout(OVERALL_TIMEOUT, cached_releases(&state, &episode_reference))
+                .await
+            {
                 Ok(Ok(releases)) => {
                     let has_hindi = releases.iter().any(|release| {
                         let is_hindi = |value: &str| {
                             let value = value.to_ascii_lowercase();
-                            value == "hi" || value == "hin" || value.contains("hindi")
-                                || value.contains("हिन्दी") || value.contains("हिंदी")
+                            value == "hi"
+                                || value == "hin"
+                                || value.contains("hindi")
+                                || value.contains("हिन्दी")
+                                || value.contains("हिंदी")
                         };
-                        release.language.as_deref().is_some_and(is_hindi) || is_hindi(&release.filename)
+                        release.language.as_deref().is_some_and(is_hindi)
+                            || is_hindi(&release.filename)
                     });
                     if has_hindi || !releases.is_empty() {
                         // Provider language labels are hints, not a hard gate. Official
@@ -1327,23 +1403,40 @@ async fn direct_watch_route(stream: &mut TcpStream, query: &str, state: ApiState
                         let anime_id = encode(&anime_ref);
                         let episode_id = provider_ref(&anime_details.id, season, episode);
                         return anime_episode_stream_route(
-                            stream, &anime_id, &episode_id, anime_ref, anime_details, state, &audio,
-                        ).await;
+                            stream,
+                            &anime_id,
+                            &episode_id,
+                            anime_ref,
+                            anime_details,
+                            state,
+                            &audio,
+                        )
+                        .await;
                     }
-                    stream_failures.push(format!("{}: no stream sources returned", anime_ref.p.label()));
+                    stream_failures.push(format!(
+                        "{}: no stream sources returned",
+                        anime_ref.p.label()
+                    ));
                 }
                 Ok(Err(error)) => {
-                    stream_failures.push(format!("{}: {}", anime_ref.p.label(), error.user_message(anime_ref.p)));
+                    stream_failures.push(format!(
+                        "{}: {}",
+                        anime_ref.p.label(),
+                        error.user_message(anime_ref.p)
+                    ));
                 }
                 Err(_) => {
-                    stream_failures.push(format!("{}: stream lookup timed out", anime_ref.p.label()));
+                    stream_failures
+                        .push(format!("{}: stream lookup timed out", anime_ref.p.label()));
                 }
             }
             continue;
         }
         for available_season in &anime_details.seasons {
             if !available_season.episodes.is_empty() {
-                let numbers = available_season.episodes.iter()
+                let numbers = available_season
+                    .episodes
+                    .iter()
                     .map(|e| e.number.to_string())
                     .collect::<Vec<_>>()
                     .join(",");
@@ -1364,7 +1457,11 @@ async fn direct_watch_route(stream: &mut TcpStream, query: &str, state: ApiState
         } else {
             format!(
                 "The episode exists, but no provider returned a playable source. Provider results: {}",
-                stream_failures.into_iter().take(6).collect::<Vec<_>>().join("; ")
+                stream_failures
+                    .into_iter()
+                    .take(6)
+                    .collect::<Vec<_>>()
+                    .join("; ")
             )
         };
         let (status, body) = err("NO_PLAYABLE_SOURCE", &detail, last_provider, 404);
@@ -1387,7 +1484,9 @@ async fn direct_watch_route(stream: &mut TcpStream, query: &str, state: ApiState
 
 async fn search_json(stream: &mut TcpStream, query: &str, state: ApiState) -> std::io::Result<()> {
     let q = parse_query(query);
-    let Some(qv) = q.q.filter(|v| !v.trim().is_empty() && v.chars().count() <= MAX_QUERY) else {
+    let Some(qv) =
+        q.q.filter(|v| !v.trim().is_empty() && v.chars().count() <= MAX_QUERY)
+    else {
         let (s, b) = err(
             "INVALID_QUERY",
             "q is required and must be 1-200 characters.",
@@ -1449,7 +1548,9 @@ async fn search_json(stream: &mut TcpStream, query: &str, state: ApiState) -> st
 
 async fn search_sse(stream: &mut TcpStream, query: &str, state: ApiState) -> std::io::Result<()> {
     let q = parse_query(query);
-    let Some(qv) = q.q.filter(|v| !v.trim().is_empty() && v.chars().count() <= MAX_QUERY) else {
+    let Some(qv) =
+        q.q.filter(|v| !v.trim().is_empty() && v.chars().count() <= MAX_QUERY)
+    else {
         let (s, b) = err(
             "INVALID_QUERY",
             "q is required and must be 1-200 characters.",
@@ -1500,10 +1601,11 @@ async fn search_sse(stream: &mut TcpStream, query: &str, state: ApiState) -> std
             Err(join_error) => {
                 partial = true;
                 log::error!("search provider task failed: {join_error}");
-                let payload=serde_json::json!({
+                let payload = serde_json::json!({
                     "code":"PROVIDER_TASK_FAILED",
                     "message":"A provider task ended unexpectedly."
-                }).to_string();
+                })
+                .to_string();
                 send_event(stream, "search_provider_error", &payload).await?;
             }
         }
@@ -1555,7 +1657,10 @@ async fn search_all(
             },
             Err(error) => {
                 log::error!("search provider task failed: {error}");
-                provider_status.insert("provider_task".to_string(), "task failed unexpectedly".to_string());
+                provider_status.insert(
+                    "provider_task".to_string(),
+                    "task failed unexpectedly".to_string(),
+                );
                 failed = true;
             }
         }
@@ -1587,7 +1692,12 @@ async fn search_all(
     (items, failed, provider_status)
 }
 
-async fn anime_route(stream: &mut TcpStream, path: &str, query: &str, state: ApiState) -> std::io::Result<()> {
+async fn anime_route(
+    stream: &mut TcpStream,
+    path: &str,
+    query: &str,
+    state: ApiState,
+) -> std::io::Result<()> {
     let parts: Vec<_> = path.trim_matches('/').split('/').collect();
     if parts.len() < 4 {
         let (s, b) = err("INVALID_ID", "An anime identifier is required.", None, 400);
@@ -1616,12 +1726,20 @@ async fn anime_route(stream: &mut TcpStream, path: &str, query: &str, state: Api
         return anime_episode_full_route(stream, parts[3], parts[5], r, d, state).await;
     }
     if parts.len() == 7 && parts[4] == "episodes" && parts[6] == "stream" {
-        let audio = query.split('&').find_map(|pair| {
-            let (key, value) = pair.split_once('=')?;
-            (key == "audio").then(|| percent_decode(value).trim().to_ascii_lowercase())
-        }).unwrap_or_else(|| "hindi".to_string());
+        let audio = query
+            .split('&')
+            .find_map(|pair| {
+                let (key, value) = pair.split_once('=')?;
+                (key == "audio").then(|| percent_decode(value).trim().to_ascii_lowercase())
+            })
+            .unwrap_or_else(|| "hindi".to_string());
         if !matches!(audio.as_str(), "hindi" | "hi" | "hin") {
-            let (status, body) = err("UNSUPPORTED_AUDIO_LANGUAGE", "This stream route currently supports audio=hindi only.", Some(r.p), 400);
+            let (status, body) = err(
+                "UNSUPPORTED_AUDIO_LANGUAGE",
+                "This stream route currently supports audio=hindi only.",
+                Some(r.p),
+                400,
+            );
             return write_raw_json(stream, status, &body, None).await;
         }
         return anime_episode_stream_route(stream, parts[3], parts[5], r, d, state, &audio).await;
@@ -1691,44 +1809,83 @@ async fn anime_episode_stream_route(
     let episode_ref = match decode::<OpaqueRef>(episode_id) {
         Ok(reference) => reference,
         Err(_) => {
-            let (status, body) = err("INVALID_ID", "The episode identifier is invalid.", None, 400);
+            let (status, body) = err(
+                "INVALID_ID",
+                "The episode identifier is invalid.",
+                None,
+                400,
+            );
             return write_raw_json(stream, status, &body, None).await;
         }
     };
-    if episode_ref.p != anime_ref.p || episode_ref.v != anime_ref.v || anime_details.id.value != anime_ref.v {
-        let (status, body) = err("INVALID_ID", "The episode does not belong to the requested anime.", Some(anime_ref.p), 400);
+    if episode_ref.p != anime_ref.p
+        || episode_ref.v != anime_ref.v
+        || anime_details.id.value != anime_ref.v
+    {
+        let (status, body) = err(
+            "INVALID_ID",
+            "The episode does not belong to the requested anime.",
+            Some(anime_ref.p),
+            400,
+        );
         return write_raw_json(stream, status, &body, None).await;
     }
     if anime_details.id.provider != anime_ref.p || encode(&anime_ref) != anime_id {
-        let (status, body) = err("INVALID_ID", "The anime identifier does not match the requested item.", Some(anime_ref.p), 400);
+        let (status, body) = err(
+            "INVALID_ID",
+            "The anime identifier does not match the requested item.",
+            Some(anime_ref.p),
+            400,
+        );
         return write_raw_json(stream, status, &body, None).await;
     }
     let episode_exists = anime_details.seasons.iter().any(|season| {
-        season.number == episode_ref.s && season.episodes.iter().any(|episode| episode.number == episode_ref.e)
+        season.number == episode_ref.s
+            && season
+                .episodes
+                .iter()
+                .any(|episode| episode.number == episode_ref.e)
     });
     if !episode_exists {
-        let (status, body) = err("EPISODE_NOT_FOUND", "The episode was not found in this anime.", Some(anime_ref.p), 404);
+        let (status, body) = err(
+            "EPISODE_NOT_FOUND",
+            "The episode was not found in this anime.",
+            Some(anime_ref.p),
+            404,
+        );
         return write_raw_json(stream, status, &body, None).await;
     }
-    let releases = match tokio::time::timeout(OVERALL_TIMEOUT, cached_releases(&state, &episode_ref)).await {
-        Ok(Ok(releases)) => releases,
-        Ok(Err(error)) => {
-            let (status, body) = provider_error(error, episode_ref.p);
-            return write_raw_json(stream, status, &body, None).await;
-        }
-        Err(_) => {
-            let (status, body) = err("REQUEST_DEADLINE_EXCEEDED", "The stream source request timed out.", Some(episode_ref.p), 504);
-            return write_raw_json(stream, status, &body, None).await;
-        }
-    };
+    let releases =
+        match tokio::time::timeout(OVERALL_TIMEOUT, cached_releases(&state, &episode_ref)).await {
+            Ok(Ok(releases)) => releases,
+            Ok(Err(error)) => {
+                let (status, body) = provider_error(error, episode_ref.p);
+                return write_raw_json(stream, status, &body, None).await;
+            }
+            Err(_) => {
+                let (status, body) = err(
+                    "REQUEST_DEADLINE_EXCEEDED",
+                    "The stream source request timed out.",
+                    Some(episode_ref.p),
+                    504,
+                );
+                return write_raw_json(stream, status, &body, None).await;
+            }
+        };
     let is_hindi = |value: &str| {
         let normalized = value.to_ascii_lowercase();
-        normalized == "hi" || normalized == "hin" || normalized.contains("hindi")
-            || normalized.contains("हिन्दी") || normalized.contains("हिंदी")
+        normalized == "hi"
+            || normalized == "hin"
+            || normalized.contains("hindi")
+            || normalized.contains("हिन्दी")
+            || normalized.contains("हिंदी")
     };
-    let mut candidates: Vec<&Release> = releases.iter().filter(|release| {
-        release.language.as_deref().is_some_and(is_hindi) || is_hindi(&release.filename)
-    }).collect();
+    let mut candidates: Vec<&Release> = releases
+        .iter()
+        .filter(|release| {
+            release.language.as_deref().is_some_and(is_hindi) || is_hindi(&release.filename)
+        })
+        .collect();
     let language_metadata_match = !candidates.is_empty();
     // Dual/multi-audio sources may have no language tag until the actual media is probed.
     if candidates.is_empty() {
@@ -1736,22 +1893,50 @@ async fn anime_episode_stream_route(
     }
     candidates.sort_by_key(|release| std::cmp::Reverse(release.resolution_u64()));
     let Some(release) = candidates.first().copied() else {
-        let (status, body) = err("NO_STREAM_SOURCE", "The provider returned no stream sources for this episode.", Some(episode_ref.p), 404);
+        let (status, body) = err(
+            "NO_STREAM_SOURCE",
+            "The provider returned no stream sources for this episode.",
+            Some(episode_ref.p),
+            404,
+        );
         return write_raw_json(stream, status, &body, None).await;
     };
     let playback = if release.provider == ProviderKind::FourKHdHub {
         let Some(client) = state.service.fourk_client.as_ref() else {
-            let (status, body) = err("UPSTREAM_UNAVAILABLE", "The playback provider is unavailable.", Some(release.provider), 503);
+            let (status, body) = err(
+                "UPSTREAM_UNAVAILABLE",
+                "The playback provider is unavailable.",
+                Some(release.provider),
+                503,
+            );
             return write_raw_json(stream, status, &body, None).await;
         };
-        match tokio::time::timeout(OVERALL_TIMEOUT, client.resolve_release(release, crate::providers::models::ResolutionIntent::Playback)).await {
+        match tokio::time::timeout(
+            OVERALL_TIMEOUT,
+            client.resolve_release(
+                release,
+                crate::providers::models::ResolutionIntent::Playback,
+            ),
+        )
+        .await
+        {
             Ok(Ok(playback)) => playback,
             Ok(Err(error)) => {
-                let (status, body) = err("PLAYBACK_RESOLUTION_FAILED", error.user_message(), Some(release.provider), 502);
+                let (status, body) = err(
+                    "PLAYBACK_RESOLUTION_FAILED",
+                    error.user_message(),
+                    Some(release.provider),
+                    502,
+                );
                 return write_raw_json(stream, status, &body, None).await;
             }
             Err(_) => {
-                let (status, body) = err("PLAYBACK_RESOLUTION_TIMEOUT", "Hindi stream resolution timed out.", Some(release.provider), 504);
+                let (status, body) = err(
+                    "PLAYBACK_RESOLUTION_TIMEOUT",
+                    "Hindi stream resolution timed out.",
+                    Some(release.provider),
+                    504,
+                );
                 return write_raw_json(stream, status, &body, None).await;
             }
         }
@@ -1759,20 +1944,39 @@ async fn anime_episode_stream_route(
         crate::providers::models::PlaybackSource {
             provider: release.provider,
             url: url.to_string(),
-            headers: release.mirrors.first().map(|mirror| mirror.headers.clone()).unwrap_or_default(),
+            headers: release
+                .mirrors
+                .first()
+                .map(|mirror| mirror.headers.clone())
+                .unwrap_or_default(),
             subtitle: None,
             source_label: release.source_label().to_string(),
-            max_height: release.quality.as_deref().and_then(|quality| quality.trim_end_matches('p').parse().ok()),
+            max_height: release
+                .quality
+                .as_deref()
+                .and_then(|quality| quality.trim_end_matches('p').parse().ok()),
         }
     } else {
-        let (status, body) = err("PLAYBACK_RESOLUTION_FAILED", "The Hindi source does not expose a playable URL.", Some(release.provider), 502);
+        let (status, body) = err(
+            "PLAYBACK_RESOLUTION_FAILED",
+            "The Hindi source does not expose a playable URL.",
+            Some(release.provider),
+            502,
+        );
         return write_raw_json(stream, status, &body, None).await;
     };
     // Probe the resolved source for real audio tracks when possible. A failed probe
     // must not block playback (some HLS/DASH providers prevent ffprobe access).
     let audio_tracks = match probe_media(&playback.url, &playback.headers).await {
-        Ok(probe) => probe.streams.into_iter()
-            .filter(|track| track.codec_type.as_deref().is_some_and(|kind| kind.eq_ignore_ascii_case("audio")))
+        Ok(probe) => probe
+            .streams
+            .into_iter()
+            .filter(|track| {
+                track
+                    .codec_type
+                    .as_deref()
+                    .is_some_and(|kind| kind.eq_ignore_ascii_case("audio"))
+            })
             .map(|track| {
                 let raw_language = tag_value(track.tags.as_ref(), "language");
                 let (language, language_label, raw_tag) = normalized_language(raw_language);
@@ -1799,9 +2003,14 @@ async fn anime_episode_stream_route(
         object.insert("episode_id".into(), serde_json::json!(episode_id));
         object.insert("audio_requested".into(), serde_json::json!(requested_audio));
         object.insert("audio_tracks".into(), serde_json::json!(audio_tracks));
-        object.insert("language_match".into(), serde_json::json!(
-            if language_metadata_match { "provider_metadata" } else { "unverified_media_tracks" }
-        ));
+        object.insert(
+            "language_match".into(),
+            serde_json::json!(if language_metadata_match {
+                "provider_metadata"
+            } else {
+                "unverified_media_tracks"
+            }),
+        );
         object.insert("resolved".into(), serde_json::json!(true));
     }
     write_json(stream, 200, &body, None).await
@@ -1851,9 +2060,7 @@ async fn anime_episode_full_route(
         .seasons
         .iter()
         .flat_map(|season| season.episodes.iter())
-        .find(|episode| {
-            episode.season == episode_ref.s && episode.number == episode_ref.e
-        })
+        .find(|episode| episode.season == episode_ref.s && episode.number == episode_ref.e)
         .cloned();
     let Some(selected_episode) = selected_episode else {
         let (status, body) = err(
@@ -2177,7 +2384,9 @@ fn normalized_language(raw: Option<&str>) -> (String, String, Option<String>) {
         "te" | "tel" | "telugu" => ("te".into(), "Telugu".into(), original),
         "ur" | "urd" | "urdu" => ("ur".into(), "Urdu".into(), original),
         "pa" | "pan" | "punjabi" => ("pa".into(), "Punjabi".into(), original),
-        "id" | "ind" | "indonesian" | "bahasa indonesia" => ("id".into(), "Indonesian".into(), original),
+        "id" | "ind" | "indonesian" | "bahasa indonesia" => {
+            ("id".into(), "Indonesian".into(), original)
+        }
         "ms" | "msa" | "may" | "malay" => ("ms".into(), "Malay".into(), original),
         "th" | "tha" | "thai" => ("th".into(), "Thai".into(), original),
         "tr" | "tur" | "turkish" => ("tr".into(), "Turkish".into(), original),
@@ -2406,6 +2615,9 @@ async fn source_route(stream: &mut TcpStream, path: &str, state: ApiState) -> st
         );
         return write_raw_json(stream, s, &b, None).await;
     };
+    if parts.get(4) == Some(&"hls.m3u8") {
+        return hls_source(stream, id, rel, &state).await;
+    }
     if matches!(parts.get(4), Some(&"audio") | Some(&"audio-tracks")) {
         return write_track_response(stream, id, sr.p, rel, &state, false).await;
     }
@@ -2521,6 +2733,97 @@ async fn source_route(stream: &mut TcpStream, path: &str, state: ApiState) -> st
     }
     write_json(stream,200,&serde_json::json!({"source":api_sources(std::slice::from_ref(rel),&r),"url":rel.direct_url(),"headers":rel.mirrors.first().map(|m| public_headers(&m.headers)),"sensitive_headers_redacted":true}),None).await
 }
+
+async fn hls_source(
+    stream: &mut TcpStream,
+    source_id: &str,
+    source: &Release,
+    state: &ApiState,
+) -> std::io::Result<()> {
+    if !crate::hls::is_allowed_codec(source.codec.as_deref()) {
+        let (s, b) = err(
+            "UNSUPPORTED_CODEC",
+            "Generated HLS requires a confirmed H.264/AVC source; HEVC, AV1, and unknown codecs are rejected.",
+            Some(source.provider),
+            415,
+        );
+        return write_raw_json(stream, s, &b, None).await;
+    }
+    let playback = match resolve_transcode_playback_source(source_id, source, state).await {
+        Ok(value) => value,
+        Err((code, message, status)) => {
+            let (s, b) = err(code, message, Some(source.provider), status);
+            return write_raw_json(stream, s, &b, None).await;
+        }
+    };
+    let Some(url) = validate_transcode_destination(&playback.url).await else {
+        let (s, b) = err(
+            "HLS_UNAVAILABLE",
+            "The media destination is not a permitted public HTTPS source.",
+            Some(source.provider),
+            502,
+        );
+        return write_raw_json(stream, s, &b, None).await;
+    };
+    match state.hls.start(url.as_str(), &playback.headers).await {
+        Ok(session) => write_redirect(stream, &format!("/api/v1/hls/{session}/index.m3u8")).await,
+        Err(message) => {
+            let (s, b) = err("HLS_UNAVAILABLE", message, Some(source.provider), 503);
+            write_raw_json(stream, s, &b, None).await
+        }
+    }
+}
+
+async fn hls_route(stream: &mut TcpStream, path: &str, state: ApiState) -> std::io::Result<()> {
+    let parts: Vec<_> = path.trim_matches('/').split('/').collect();
+    let (Some(session), Some(name)) = (parts.get(3), parts.get(4)) else {
+        let (s, b) = err(
+            "INVALID_HLS_PATH",
+            "An HLS session and file are required.",
+            None,
+            400,
+        );
+        return write_raw_json(stream, s, &b, None).await;
+    };
+    if *name == "index.m3u8" {
+        return match state.hls.manifest(session).await {
+            Ok(manifest) => {
+                write_text(
+                    stream,
+                    200,
+                    "application/vnd.apple.mpegurl",
+                    &manifest,
+                    Some("Access-Control-Allow-Origin: *\r\n"),
+                )
+                .await
+            }
+            Err(message) => {
+                let (s, b) = err("HLS_MANIFEST_UNAVAILABLE", message, None, 404);
+                write_raw_json(stream, s, &b, None).await
+            }
+        };
+    }
+    match state.hls.segment(session, name).await {
+        Ok((content_type, data)) => {
+            write_headers(
+                stream,
+                200,
+                &content_type,
+                Some(&format!(
+                    "Content-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n",
+                    data.len()
+                )),
+            )
+            .await?;
+            stream.write_all(&data).await
+        }
+        Err(message) => {
+            let (s, b) = err("HLS_SEGMENT_UNAVAILABLE", message, None, 404);
+            write_raw_json(stream, s, &b, None).await
+        }
+    }
+}
+
 fn watch_url(raw: &str) -> String {
     let Ok(mut url) = reqwest::Url::parse(raw) else {
         return raw.to_string();
@@ -2895,6 +3198,11 @@ async fn write_headers(
     h.push_str("\r\n");
     stream.write_all(h.as_bytes()).await
 }
+async fn write_redirect(stream: &mut TcpStream, location: &str) -> std::io::Result<()> {
+    stream
+        .write_all(format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nCache-Control: no-cache\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").as_bytes())
+        .await
+}
 async fn write_json<T: Serialize>(
     stream: &mut TcpStream,
     status: u16,
@@ -2969,6 +3277,9 @@ fn openapi() -> serde_json::Value {
             "/api/v1/sources/{source_id}/subtitles": {"get": {"responses": {"200": {"description": "Confirmed embedded subtitle tracks"}, "503": {"description": "Track discovery unavailable"}}}},
             "/api/v1/sources/{source_id}/subtitle-tracks": {"get": {"responses": {"200": {"description": "Confirmed embedded subtitle tracks"}, "503": {"description": "Track discovery unavailable"}}}},
             "/api/v1/sources/{source_id}/playback": {"get": {"responses": {"200": {"description": "Server-resolved playable 4KHDHub URL"}, "502": {"description": "Playback resolution failed"}, "504": {"description": "Playback resolution timed out"}}}},
+            "/api/v1/sources/{source_id}/hls.m3u8": {"get": {"responses": {"302": {"description": "Redirect to a backend-generated HLS session"}, "415": {"description": "Unsupported or unknown source codec"}}}},
+            "/api/v1/hls/{session_id}/index.m3u8": {"get": {"responses": {"200": {"description": "Backend-generated HLS manifest"}}}},
+            "/api/v1/hls/{session_id}/{segment_name}": {"get": {"responses": {"200": {"description": "Backend-generated HLS segment"}}}},
             "/api/v1/sources/{source_id}/watch": {"get": {"responses": {"200": {"description": "Server-resolved watch URL with inline media disposition"}, "502": {"description": "Watch resolution failed"}, "504": {"description": "Watch resolution timed out"}}}},
             "/api/v1/sources/{source_id}/download": {"get": {"responses": {"200": {"description": "Download metadata"}, "501": {"description": "Unsupported"}}}}
         }
@@ -2981,9 +3292,26 @@ mod tests {
 
     #[test]
     fn percent_decode_preserves_utf8_and_plus_spaces() {
-        assert_eq!(percent_decode("%E0%A6%AC%E0%A6%BE%E0%A6%82%E0%A6%B2%E0%A6%BE"), "বাংলা");
+        assert_eq!(
+            percent_decode("%E0%A6%AC%E0%A6%BE%E0%A6%82%E0%A6%B2%E0%A6%BE"),
+            "বাংলা"
+        );
         assert_eq!(percent_decode("hello+world"), "hello world");
-        assert_eq!(percent_decode("%E0%A4%B9%E0%A4%BF%E0%A4%A8%E0%A5%8D%E0%A4%A6%E0%A5%80"), "हिन्दी");
+        assert_eq!(
+            percent_decode("%E0%A4%B9%E0%A4%BF%E0%A4%A8%E0%A5%8D%E0%A4%A6%E0%A5%80"),
+            "हिन्दी"
+        );
+    }
+
+    #[test]
+    fn annotated_provider_title_matches_requested_identity() {
+        assert!(matches_requested_title(
+            "Dandadan",
+            "Dandadan [Hindi] S1-S2"
+        ));
+        assert!(matches_requested_title("dandadan", "DANDADAN"));
+        assert!(!matches_requested_title("Dandadan", "Dan Da Dan: Evil Eye"));
+        assert!(!matches_requested_title("Dandadan", "Dandadan Returns"));
     }
 
     #[test]
