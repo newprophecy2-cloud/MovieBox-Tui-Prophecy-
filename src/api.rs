@@ -47,6 +47,7 @@ const MAX_API_CONNECTIONS: usize = 256;
 const MOVIEBOX_PROVIDER_ENABLED: bool = true;
 const MAX_TRANSCODE_SESSIONS: usize = 2;
 const TRANSCODE_STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
+const REMUX_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(20);
 const PROVIDERS: [ProviderKind; 6] = [
     ProviderKind::MovieBox,
     ProviderKind::FourKHdHub,
@@ -191,14 +192,18 @@ fn is_blocked_h265_codec(codec: Option<&str>) -> bool {
     matches!(normalized.as_str(), "h265" | "hevc" | "x265")
 }
 
-fn is_verified_h264_codec(codec: Option<&str>) -> bool {
-    let Some(codec) = codec.map(str::trim).filter(|value| !value.is_empty()) else {
-        return false;
-    };
-    let normalized = codec
-        .to_ascii_lowercase()
-        .replace(['.', '-', '_', ' ', '/'], "");
-    matches!(normalized.as_str(), "h264" | "avc" | "x264" | "avc1")
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaMode {
+    Remux,
+    Transcode,
+}
+
+fn media_mode_after_remux_preflight(preflight_validated: bool) -> MediaMode {
+    if preflight_validated {
+        MediaMode::Remux
+    } else {
+        MediaMode::Transcode
+    }
 }
 
 fn releases_have_usable_source(releases: &[Release]) -> bool {
@@ -2569,6 +2574,7 @@ async fn probe_media(url: &str, headers: &[(String, String)]) -> Result<ProbeOut
         command.arg("-headers").arg(header_text);
     }
     command.arg(url);
+    command.kill_on_drop(true);
     let output = tokio::time::timeout(TRACK_PROBE_TIMEOUT, command.output())
         .await
         .map_err(|_| "Media track probing timed out.".to_string())?
@@ -3105,7 +3111,9 @@ fn direct_transcode_playback_source(source: &Release) -> Option<PlaybackSource> 
     if source.provider == ProviderKind::FourKHdHub {
         return None;
     }
-    let mirror = source.mirrors.iter().find(|mirror| mirror.direct_file)?;
+    let mirror = source.mirrors.iter().find(|mirror| {
+        mirror.direct_file && validate_transcode_url(&mirror.resolver_url).is_some()
+    })?;
     Some(PlaybackSource {
         provider: source.provider,
         url: validate_transcode_url(&mirror.resolver_url)?,
@@ -3176,6 +3184,103 @@ async fn resolve_transcode_playback_source(
     Ok(playback)
 }
 
+async fn validated_remux_preflight(url: &str, headers: &[(String, String)]) -> bool {
+    // Provider codec labels are often incomplete or inferred. Try a short real stream-copy
+    // into the target MPEG-TS container, then verify that FFmpeg produced non-empty media and
+    // that FFprobe can read a video stream from it before advertising remux mode.
+    let Ok(source_probe) =
+        tokio::time::timeout(REMUX_PREFLIGHT_TIMEOUT, probe_media(url, headers)).await
+    else {
+        // Metadata inspection is best-effort; unknown metadata does not itself rule out remux.
+        return remux_preflight_output_valid(url, headers).await;
+    };
+    if let Ok(probe) = source_probe
+        && !probe
+            .streams
+            .iter()
+            .any(|stream| stream.codec_type.as_deref() == Some("video"))
+    {
+        return false;
+    }
+    remux_preflight_output_valid(url, headers).await
+}
+
+async fn remux_preflight_output_valid(url: &str, headers: &[(String, String)]) -> bool {
+    let Ok(output_file) = tempfile::Builder::new().suffix(".ts").tempfile() else {
+        return false;
+    };
+    let mut command = Command::new("ffmpeg");
+    command.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
+    let header_text = headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect::<String>();
+    if !header_text.is_empty() {
+        command.arg("-headers").arg(header_text);
+    }
+    command.args([
+        "-rw_timeout",
+        "15000000",
+        "-i",
+        url,
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
+        "-c",
+        "copy",
+        "-t",
+        "2",
+        "-f",
+        "mpegts",
+        "-y",
+    ]);
+    command
+        .arg(output_file.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let status = tokio::time::timeout(REMUX_PREFLIGHT_TIMEOUT, command.status()).await;
+    if !matches!(status, Ok(Ok(status)) if status.success()) {
+        return false;
+    }
+    let Ok(metadata) = tokio::fs::metadata(output_file.path()).await else {
+        return false;
+    };
+    if metadata.len() == 0 {
+        return false;
+    }
+
+    let mut probe = Command::new("ffprobe");
+    probe
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=index,codec_name,codec_type",
+            "-of",
+            "json",
+        ])
+        .arg(output_file.path())
+        .kill_on_drop(true);
+    let Ok(output) = tokio::time::timeout(REMUX_PREFLIGHT_TIMEOUT, probe.output()).await else {
+        return false;
+    };
+    let Ok(output) = output else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    serde_json::from_slice::<ProbeOutput>(&output.stdout).is_ok_and(|probe| {
+        probe
+            .streams
+            .iter()
+            .any(|stream| stream.codec_type.as_deref() == Some("video"))
+    })
+}
+
 async fn transcode_source(
     stream: &mut TcpStream,
     source_id: &str,
@@ -3185,7 +3290,7 @@ async fn transcode_source(
     let Some(permit) = state.transcode_slots.clone().try_acquire_owned().ok() else {
         let (status, body) = err(
             "TRANSCODE_BUSY",
-            "All H.264 transcoding slots are currently busy. Try again later.",
+            "All media-processing slots are currently busy. Try again later.",
             Some(source.provider),
             429,
         );
@@ -3207,7 +3312,9 @@ async fn transcode_source(
         );
         return write_raw_json(stream, status, &body, None).await;
     };
-    let stream_copy = is_verified_h264_codec(source.codec.as_deref());
+    let stream_copy = media_mode_after_remux_preflight(
+        validated_remux_preflight(&validated_url, &playback.headers).await,
+    ) == MediaMode::Remux;
     let mut command = Command::new("ffmpeg");
     command.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
     let headers = playback
@@ -3882,6 +3989,23 @@ mod tests {
         assert_eq!(playback.url, "https://cdn.example/video.mkv");
         assert_eq!(playback.headers, source.mirrors[0].headers);
 
+        let mut with_invalid_first_mirror = source.clone();
+        with_invalid_first_mirror.mirrors.insert(
+            0,
+            crate::providers::models::SourceMirror {
+                label: "invalid first candidate".into(),
+                resolver_url: "http://cdn.example/untrusted.mkv".into(),
+                headers: vec![],
+                direct_file: true,
+            },
+        );
+        assert_eq!(
+            direct_transcode_playback_source(&with_invalid_first_mirror)
+                .unwrap()
+                .url,
+            "https://cdn.example/video.mkv"
+        );
+
         let mut intermediate = source.clone();
         intermediate.mirrors[0].direct_file = false;
         assert!(direct_transcode_playback_source(&intermediate).is_none());
@@ -4055,13 +4179,16 @@ mod tests {
     }
 
     #[test]
-    fn transcode_route_selects_stream_copy_only_for_verified_h264() {
-        for codec in [Some("H.264"), Some("AVC"), Some("x264"), Some("avc1")] {
-            assert!(is_verified_h264_codec(codec));
+    fn remux_mode_depends_on_validated_output_not_provider_codec_label() {
+        // Codec metadata is a provider hint only. A successful real remux preflight is
+        // authoritative even when the hint is absent or names a different codec family.
+        for _codec in [None, Some("HEVC"), Some("AV1"), Some("unknown")] {
+            assert_eq!(media_mode_after_remux_preflight(true), MediaMode::Remux);
         }
-        for codec in [Some("HEVC"), Some("AV1"), Some("VP9"), None] {
-            assert!(!is_verified_h264_codec(codec));
-        }
+        assert_eq!(
+            media_mode_after_remux_preflight(false),
+            MediaMode::Transcode
+        );
     }
 
     #[test]
