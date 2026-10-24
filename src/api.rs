@@ -96,6 +96,7 @@ pub struct ApiState {
     playback_cache: Arc<Mutex<HashMap<String, PlaybackCacheEntry>>>,
     playback_inflight: Arc<Mutex<HashMap<String, SharedPlaybackFuture>>>,
     search_cache: Arc<Mutex<HashMap<String, SearchCacheEntry>>>,
+    redis_search: Option<redis::aio::MultiplexedConnection>,
     search_source_check_slots: Arc<Semaphore>,
     transcode_slots: Arc<Semaphore>,
     connection_slots: Arc<Semaphore>,
@@ -177,7 +178,7 @@ enum SourceEligibility {
     CheckFailed,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct EligibleSearch {
     items: Vec<CatalogItem>,
     failed: bool,
@@ -583,12 +584,45 @@ fn parse_source(value: &str) -> Result<OpaqueSource, (u16, String)> {
     decode(value).map_err(|_| err("INVALID_ID", "The source identifier is invalid.", None, 400))
 }
 
+async fn init_redis_search_cache() -> Option<redis::aio::MultiplexedConnection> {
+    let url = std::env::var("REDIS_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())?;
+    let client = match redis::Client::open(url) {
+        Ok(client) => client,
+        Err(error) => {
+            log::warn!("REDIS_URL is invalid; using in-memory search cache: {error}");
+            return None;
+        }
+    };
+    match tokio::time::timeout(
+        Duration::from_secs(2),
+        client.get_multiplexed_async_connection(),
+    )
+    .await
+    {
+        Ok(Ok(connection)) => {
+            log::info!("Redis search cache enabled");
+            Some(connection)
+        }
+        Ok(Err(error)) => {
+            log::warn!("Redis search cache unavailable; using in-memory cache: {error}");
+            None
+        }
+        Err(_) => {
+            log::warn!("Redis search cache connection timed out; using in-memory cache");
+            None
+        }
+    }
+}
+
 pub async fn run() -> std::io::Result<()> {
     let port = std::env::var("PORT")
         .unwrap_or_else(|_| "8080".into())
         .parse::<u16>()
         .unwrap_or(8080);
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
+    let redis_search = init_redis_search_cache().await;
     let state = ApiState {
         service: Arc::new(MovieBoxService::new()),
         release_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -596,6 +630,7 @@ pub async fn run() -> std::io::Result<()> {
         playback_cache: Arc::new(Mutex::new(HashMap::new())),
         playback_inflight: Arc::new(Mutex::new(HashMap::new())),
         search_cache: Arc::new(Mutex::new(HashMap::new())),
+        redis_search,
         search_source_check_slots: Arc::new(Semaphore::new(SEARCH_SOURCE_CHECK_CONCURRENCY)),
         transcode_slots: Arc::new(Semaphore::new(MAX_TRANSCODE_SESSIONS)),
         connection_slots: Arc::new(Semaphore::new(MAX_API_CONNECTIONS)),
@@ -1721,6 +1756,29 @@ async fn cached_search(state: &ApiState, query: &str) -> EligibleSearch {
         }
     }
 
+    if let Some(connection) = state.redis_search.as_ref() {
+        let mut connection = connection.clone();
+        let redis_key = format!("moviebox:search:v1:{key}");
+        let cached: Option<Vec<u8>> = redis::cmd("GET")
+            .arg(redis_key)
+            .query_async(&mut connection)
+            .await
+            .unwrap_or_default();
+        if let Some(payload) = cached {
+            if let Ok(result) = serde_json::from_slice::<EligibleSearch>(&payload) {
+                let mut memory = state.search_cache.lock().await;
+                memory.insert(
+                    key.clone(),
+                    SearchCacheEntry {
+                        stored_at: Instant::now(),
+                        result: result.clone(),
+                    },
+                );
+                return result;
+            }
+        }
+    }
+
     let (items, failed, provider_status) = search_all(&state.service, query).await;
     let result = eligible_search(state, items, failed, provider_status).await;
     let mut cache = state.search_cache.lock().await;
@@ -1731,12 +1789,24 @@ async fn cached_search(state: &ApiState, query: &str) -> EligibleSearch {
         }
     }
     cache.insert(
-        key,
+        key.clone(),
         SearchCacheEntry {
             stored_at: Instant::now(),
             result: result.clone(),
         },
     );
+    if let Some(connection) = state.redis_search.as_ref() {
+        if let Ok(payload) = serde_json::to_vec(&result) {
+            let mut connection = connection.clone();
+            let redis_key = format!("moviebox:search:v1:{key}");
+            let _: Result<(), _> = redis::cmd("SETEX")
+                .arg(redis_key)
+                .arg(SEARCH_CACHE_TTL.as_secs())
+                .arg(payload)
+                .query_async(&mut connection)
+                .await;
+        }
+    }
     result
 }
 
@@ -2795,12 +2865,7 @@ async fn write_track_response(
         match cached_playback_source(source_id, release, state).await {
             Ok(playback) => (watch_url(&playback.url), playback.headers),
             Err(message) => {
-                let (s, b) = err(
-                    "TRACK_DISCOVERY_UNAVAILABLE",
-                    message,
-                    Some(provider),
-                    503,
-                );
+                let (s, b) = err("TRACK_DISCOVERY_UNAVAILABLE", message, Some(provider), 503);
                 return write_raw_json(stream, s, &b, None).await;
             }
         }

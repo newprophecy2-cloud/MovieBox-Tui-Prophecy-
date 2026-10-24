@@ -10,3 +10,7 @@ services:
         value: info
       - key: PORT
         value: 10000
+      # Set this in the Render dashboard to enable shared Redis caching.
+      # Without it, the backend safely falls back to its in-memory cache.
+      - key: REDIS_URL
+        sync: false
