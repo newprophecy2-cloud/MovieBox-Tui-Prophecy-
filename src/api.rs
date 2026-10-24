@@ -909,6 +909,12 @@ async fn route(
         "/api/v1/admin/catalog/titles/upsert" if method == "POST" => admin_catalog_upsert_route(stream, state, request_headers, body).await,
         "/api/v1/admin/catalog/inspect" if method == "GET" => admin_catalog_inspect_route(stream, query, state, request_headers).await,
         _ if path.starts_with("/api/v1/admin/catalog/jobs/") && method == "GET" => admin_catalog_job_route(stream, path, state, request_headers).await,
+        "/api/v1/home" if state.catalog.is_some() => catalog_home_route(stream, query, state).await,
+        "/api/v1/trending" if state.catalog.is_some() => catalog_listing_route(stream, query, state, None, "trending").await,
+        "/api/v1/popular" if state.catalog.is_some() => catalog_listing_route(stream, query, state, None, "popular").await,
+        "/api/v1/latest" if state.catalog.is_some() => catalog_listing_route(stream, query, state, None, "latest").await,
+        "/api/v1/movies" if state.catalog.is_some() => catalog_listing_route(stream, query, state, Some("movie"), "movies").await,
+        "/api/v1/k-dramas" if state.catalog.is_some() => catalog_listing_route(stream, query, state, Some("k_drama"), "k-dramas").await,
         "/api/v1/diagnostics" => diagnostics_route(stream, state).await,
         "/api/stream-proxy" => stream_proxy_route(stream, query, request_headers, head_only).await,
         "/api/media-info" => media_info_route(stream, query, request_headers).await,
@@ -1024,9 +1030,55 @@ async fn catalog_search_route(
         return write_json(stream, 400, &serde_json::json!({"success":false,"error":{"code":"INVALID_REQUEST","message":"q is required.","retryable":false}}), None).await;
     };
     match catalog.search(&q, query_number(query, "limit", 20), query_number(query, "offset", 0)).await {
-        Ok(items) => write_json(stream, 200, &serde_json::json!({"success":true,"data":{"items":items},"meta":{"request_id":request_id()}}), None).await,
+        Ok(items) if items.is_empty() => {
+            if catalog.enqueue_pending_import(&q).await.is_err() {
+                return write_json(stream, 503, &serde_json::json!({"success":false,"error":{"code":"QUEUE_UNAVAILABLE","message":"The missing-title request could not be queued.","retryable":true},"meta":{"request_id":request_id()}}), None).await;
+            }
+            write_json(stream, 200, &serde_json::json!({"success":true,"data":{"items":[],"pending_import":true},"meta":{"request_id":request_id()}}), None).await
+        }
+        Ok(items) => write_json(stream, 200, &serde_json::json!({"success":true,"data":{"items":items,"pending_import":false},"meta":{"request_id":request_id()}}), None).await,
         Err(crate::catalog::CatalogError::Validation(message)) => write_json(stream, 400, &serde_json::json!({"success":false,"error":{"code":"VALIDATION_FAILED","message":message,"retryable":false},"meta":{"request_id":request_id()}}), None).await,
         Err(_) => write_json(stream, 503, &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","message":"The catalog database is unavailable.","retryable":true},"meta":{"request_id":request_id()}}), None).await,
+    }
+}
+
+async fn catalog_home_route(
+    stream: &mut TcpStream,
+    query: &str,
+    state: ApiState,
+) -> std::io::Result<()> {
+    let Some(catalog) = state.catalog else {
+        return catalog_search_route(stream, query, state).await;
+    };
+    let limit = query_number(query, "limit", 20);
+    let mut sections = Vec::new();
+    for (key, content_type) in [
+        ("featured", None),
+        ("anime", Some("anime")),
+        ("movies", Some("movie")),
+        ("k_dramas", Some("k_drama")),
+    ] {
+        match catalog.list_titles(content_type, limit, query_number(query, "offset", 0)).await {
+            Ok(items) => sections.push(serde_json::json!({"key":key,"items":items})),
+            Err(_) => return write_json(stream, 503, &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","message":"The catalog database is unavailable.","retryable":true}}), None).await,
+        }
+    }
+    write_json(stream, 200, &serde_json::json!({"success":true,"data":{"sections":sections,"source":"postgresql_catalog"},"meta":{"request_id":request_id()}}), None).await
+}
+
+async fn catalog_listing_route(
+    stream: &mut TcpStream,
+    query: &str,
+    state: ApiState,
+    content_type: Option<&str>,
+    section: &str,
+) -> std::io::Result<()> {
+    let Some(catalog) = state.catalog else {
+        return write_json(stream, 503, &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","message":"The catalog database is not configured.","retryable":true}}), None).await;
+    };
+    match catalog.list_titles(content_type, query_number(query, "limit", 20), query_number(query, "offset", 0)).await {
+        Ok(items) => write_json(stream, 200, &serde_json::json!({"success":true,"data":{"section":section,"items":items,"source":"postgresql_catalog"},"meta":{"request_id":request_id()}}), None).await,
+        Err(_) => write_json(stream, 503, &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","message":"The catalog database is unavailable.","retryable":true}}), None).await,
     }
 }
 

@@ -1,6 +1,6 @@
 # Prophecy Verse API: Current Behavior and Compatibility Notes
 
-This document describes the Rust API implementation in this repository, not a proposed or future contract. The current API is provider-backed: it does not use PostgreSQL as a catalog store. The MovieBox provider is enabled in code and enabled by default, but routes that depend on it return `503 PROVIDER_DISABLED` when the local configuration disables it. Redis is optional and used only for search-result caching; without Redis, the API falls back to process memory.
+This document describes the Rust API implementation in this repository, not a proposed or future contract. The new catalog routes use PostgreSQL when `DATABASE_URL` is configured; Redis remains optional and is used only for search-result caching. The legacy APK-compatible provider routes remain provider-backed and are intentionally preserved during migration.
 
 ## Catalog and search routes
 
@@ -10,6 +10,9 @@ This document describes the Rust API implementation in this repository, not a pr
 - `GET /api/v1/k-dramas` returns series classified using provider metadata, not title-only guesses. `GET /api/v1/categories` returns supported categories and provider capabilities. K-Drama details (`/api/v1/k-dramas/{id}`) are not implemented and return `501 UNSUPPORTED_CATEGORY`.
 - `GET /api/v1/latest` returns `501 UNSUPPORTED_CATEGORY` because available providers do not expose reliable release-date metadata consistently.
 - `GET /api/v1/anime/search` and `/api/v1/anime/search/stream` perform live provider search (JSON and SSE). They are not database-backed catalog searches.
+- `GET /api/v1/search?q=...` is the new PostgreSQL-only catalog search. It never performs live provider discovery. An empty result creates or increments a durable `pending_import_requests` record.
+- `GET /api/v1/home`, `/api/v1/trending`, `/api/v1/popular`, `/api/v1/latest`, `/api/v1/movies`, and `/api/v1/k-dramas` use PostgreSQL catalog listings when `DATABASE_URL` is configured; without the database they preserve the legacy provider/compatibility behavior.
+- Protected manual catalog operations are available under `/api/v1/admin/catalog/*` and require `ADMIN_TOKEN`.
 - `GET /api/v1/watch` is a compatibility route that searches providers and resolves a playable source at request time.
 
 Listing routes that accept `page` and `limit` bound the requested limit in code. Provider failures return structured errors rather than fabricated catalog entries.
@@ -30,4 +33,4 @@ Remux endpoints `/api/v1/sources/{source_id}/transcode`, `/remux`, and remux-mod
 
 Existing `/api/v1/anime/*`, `/api/v1/episodes/*`, `/api/v1/sources/*`, `/api/v1/watch`, and legacy root aliases remain in place. Opaque identifiers must be passed back unchanged; clients must not construct IDs themselves.
 
-The following requested capabilities are not implemented in this branch: a PostgreSQL schema or migrations, database-backed public catalog/search, manual authenticated import/update jobs, durable pending-import state, admin routes, separate Web and Android playback APIs, stored-source-only playback, source-session coordination, and measured production load/performance results. Current search and some playback flows still contact providers. No PostgreSQL, Render, Redis service, or Hostinger VPS deployment is implied by this code or documentation.
+The following requested capabilities remain incomplete: real MAL-based 700+ catalog import, provider-to-PostgreSQL episode/source population, Redis catalog invalidation and distributed coordination, fully functional Web remux sessions, Android direct-play source lookup, source-session sharing, tested database backup/restore, and measured production load/performance results. The legacy `/api/v1/anime/search` and playback routes still contact providers for APK compatibility; the new `/api/v1/search` and new Web/Android contract families do not perform provider discovery. No PostgreSQL, Render, Redis service, or Hostinger VPS deployment is implied by this code or documentation.

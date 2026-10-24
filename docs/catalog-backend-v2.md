@@ -12,7 +12,7 @@ Protected manual routes require `ADMIN_TOKEN` via `X-Admin-Token` or `Authorizat
 - `POST /api/v1/admin/catalog/import` with `{ "titles": [...] }` and a maximum batch size of 500
 - `POST /api/v1/admin/catalog/update-all`
 - `GET /api/v1/admin/catalog/inspect`
-- `GET /api/v1/admin/catalog/jobs/{job_id}` (status lookup remains to be connected to the repository)
+- `GET /api/v1/admin/catalog/jobs/{job_id}`
 
 Explicit Web and Android playback contract families are registered. They intentionally do not fall back to live provider discovery; until a verified stored source mapping is available they return `NO_COMPATIBLE_SOURCE` or `DATABASE_UNAVAILABLE`.
 
@@ -24,4 +24,4 @@ The current migration creates canonical titles, alternative titles, genres, prov
 
 ## Important limitations
 
-This change does not claim that the full 700+ MAL import is complete, that all providers are mapped into PostgreSQL, or that Web remux session sharing is production-ready. The legacy provider routes are retained for compatibility. A future phase must populate the catalog from real authorized metadata, wire job history, add database-backed episode/source selection, complete Web session management, and add PostgreSQL/Redis integration tests against controlled fixtures.
+This change does not claim that the full 700+ MAL import is complete, that all providers are mapped into PostgreSQL, or that Web remux session sharing is production-ready. The legacy provider routes are retained for compatibility. A future phase must populate the catalog from real authorized metadata, add database-backed episode/source selection, complete Web session management, and add PostgreSQL/Redis integration tests against controlled fixtures.

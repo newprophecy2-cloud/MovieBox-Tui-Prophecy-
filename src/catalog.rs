@@ -107,6 +107,39 @@ impl CatalogStore {
         Ok(rows.iter().map(title_from_row).collect())
     }
 
+    pub async fn enqueue_pending_import(&self, query: &str) -> Result<(), CatalogError> {
+        let normalized_query = normalize(query);
+        if normalized_query.is_empty() {
+            return Err(CatalogError::Validation("query must not be empty".into()));
+        }
+        self.client.lock().await.execute(
+            "INSERT INTO pending_import_requests (normalized_query, candidate_title) VALUES ($1,$2) ON CONFLICT (normalized_query) DO UPDATE SET request_count = pending_import_requests.request_count + 1, last_requested_at = now(), status = CASE WHEN pending_import_requests.status = 'processed' THEN 'pending' ELSE pending_import_requests.status END",
+            &[&normalized_query, &query.trim()],
+        ).await?;
+        Ok(())
+    }
+
+    pub async fn list_titles(
+        &self,
+        content_type: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<CatalogTitle>, CatalogError> {
+        let limit = limit.clamp(1, 100);
+        let offset = offset.max(0);
+        let rows = match content_type {
+            Some(content_type) => self.client.lock().await.query(
+                "SELECT id::text, mal_id, canonical_title, normalized_title, content_type, synopsis, release_year, poster_url, catalog_status FROM catalog_titles WHERE content_type=$1 AND catalog_status='active' ORDER BY updated_at DESC LIMIT $2 OFFSET $3",
+                &[&content_type, &limit, &offset],
+            ).await?,
+            None => self.client.lock().await.query(
+                "SELECT id::text, mal_id, canonical_title, normalized_title, content_type, synopsis, release_year, poster_url, catalog_status FROM catalog_titles WHERE catalog_status='active' ORDER BY updated_at DESC LIMIT $1 OFFSET $2",
+                &[&limit, &offset],
+            ).await?,
+        };
+        Ok(rows.iter().map(title_from_row).collect())
+    }
+
     pub async fn upsert(&self, input: TitleUpsert) -> Result<(CatalogTitle, bool), CatalogError> {
         validate_title(&input)?;
         let normalized = normalize(&input.canonical_title);
