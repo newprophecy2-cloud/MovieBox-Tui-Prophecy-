@@ -3937,16 +3937,39 @@ async fn remux_media_url(
             while stderr.read(&mut buffer).await.unwrap_or(0) > 0 {}
         }
     });
-    let mut first = vec![0u8; 32 * 1024];
-    let first_len = match tokio::time::timeout(REMUX_STARTUP_TIMEOUT, stdout.read(&mut first))
-        .await
-    {
-        Ok(Ok(length)) if length > 0 => length,
+    // FFmpeg writes the fragmented-MP4 init segment (ftyp/moov) before the
+    // first media fragment. Do not expose that incomplete prefix to browsers:
+    // some MediaSource implementations classify an init-only response as a
+    // format error instead of waiting for the first moof/mdat pair.
+    let startup = tokio::time::timeout(REMUX_STARTUP_TIMEOUT, async {
+        let mut buffered = Vec::with_capacity(128 * 1024);
+        let mut chunk = [0u8; 32 * 1024];
+        loop {
+            let length = stdout.read(&mut chunk).await?;
+            if length == 0 {
+                return Err(std::io::Error::other(
+                    "FFmpeg ended before the first media fragment",
+                ));
+            }
+            buffered.extend_from_slice(&chunk[..length]);
+            if buffered.windows(4).any(|atom| atom == b"moof") {
+                return Ok(buffered);
+            }
+            if buffered.len() > 4 * 1024 * 1024 {
+                return Err(std::io::Error::other(
+                    "FFmpeg did not produce a fragmented MP4 startup segment",
+                ));
+            }
+        }
+    })
+    .await;
+    let first = match startup {
+        Ok(Ok(buffered)) => buffered,
         _ => {
             let _ = child.kill().await;
             let _ = stderr_task.await;
             drop(permit);
-            return write_raw_json(stream, 502, r#"{"error":{"code":"REMUX_FAILED","message":"FFmpeg did not produce remux output."}}"#, None).await;
+            return write_raw_json(stream, 502, r#"{"error":{"code":"REMUX_FAILED","message":"FFmpeg did not produce a playable media fragment."}}"#, None).await;
         }
     };
     write_headers(
@@ -3956,7 +3979,7 @@ async fn remux_media_url(
         Some("Accept-Ranges: none\r\nX-Media-Mode: remux\r\n"),
     )
     .await?;
-    if let Err(error) = stream.write_all(&first[..first_len]).await {
+    if let Err(error) = stream.write_all(&first).await {
         let _ = child.kill().await;
         let _ = stderr_task.await;
         drop(permit);
