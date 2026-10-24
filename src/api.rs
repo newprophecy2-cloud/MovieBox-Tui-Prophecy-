@@ -3528,10 +3528,7 @@ fn browser_mp4_streams_compatible(streams: &[ProbeStream]) -> bool {
     streams.iter().any(|stream| {
         stream.codec_type.as_deref() == Some("video")
             && stream.codec_name.as_deref() == Some("h264")
-    }) && streams
-        .iter()
-        .filter(|stream| stream.codec_type.as_deref() == Some("audio"))
-        .all(|stream| stream.codec_name.as_deref() == Some("aac"))
+    })
 }
 
 async fn transcode_source(
@@ -3595,12 +3592,25 @@ async fn transcode_source(
         "-map",
         "0:v:0",
         "-map",
-        "0:a?",
+        "0:a:0?",
+        "-c:v",
+        "copy",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-ac",
+        "2",
+        "-sn",
+        "-dn",
+        "-max_interleave_delta",
+        "0",
     ]);
-    command.args(["-c", "copy"]);
     command.args([
         "-movflags",
-        "frag_keyframe+empty_moov+default_base_moof",
+        "+frag_keyframe+empty_moov+default_base_moof",
+        "-flush_packets",
+        "1",
         "-f",
         "mp4",
         "pipe:1",
@@ -3872,11 +3882,26 @@ async fn remux_media_url(
         "-map",
         "0:v:0",
         "-map",
-        "0:a?",
-        "-c",
+        "0:a:0?",
+        // Keep the video bitstream untouched for speed, but normalize the first
+        // audio track to AAC because DTS/E-AC3 tracks inside MP4 are rejected by
+        // common browser MediaSource implementations.
+        "-c:v",
         "copy",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-ac",
+        "2",
+        "-sn",
+        "-dn",
+        "-max_interleave_delta",
+        "0",
         "-movflags",
-        "frag_keyframe+empty_moov+default_base_moof",
+        "+frag_keyframe+empty_moov+default_base_moof",
+        "-flush_packets",
+        "1",
         "-f",
         "mp4",
         "pipe:1",
