@@ -18,16 +18,18 @@ MovieBox-TUI is a Rust media-discovery and playback project. The current binary 
 
 The backend is designed for clients that need a stable API while provider-specific details remain behind opaque IDs. Clients should pass IDs returned by the API back unchanged rather than decoding or constructing them.
 
+The current API is provider-backed and does not use PostgreSQL as a catalog store. Redis is optional and is used only for search-result caching; if it is unavailable, the API falls back to in-process memory.
+
 ## Current capabilities
 
 - **Anime and media search:** Concurrent provider search across MovieBox, 4KHDHub, Dramachi, and configured addon sources.
-- **Verified source eligibility:** Search results are filtered using provider source checks while distinguishing confirmed absence from upstream failure.
-- **H.265 protection:** Search eligibility accepts every valid public source URL unless the source is explicitly labelled HEVC/H.265/x265; only that codec family is blocked by policy.
+- **Verified source eligibility:** Search and playback candidates require a valid public mirror and a recognized video-codec label; absent or unknown codec metadata is not treated as playable.
+- **Codec policy:** HEVC/H.265/x265 is blocked across search eligibility, public source lists, direct playback, and remux routes. H.265-to-H.264 transcoding is not performed.
 - **Bounded search work:** Each catalog item has a bounded source-eligibility budget so large series cannot make search latency grow without limit.
 - **Episode metadata:** Fresh anime details, season lists, episode lists, and individual episode lookups.
 - **Source discovery:** Fresh source candidates with quality, codec, language, size, downloadability, and opaque source IDs.
 - **Automatic playback resolution:** FourKHDHub mirrors, including GreenMotors, HubCloud, and HubDrive chains, are resolved and preflighted to final playable streams.
-- **Playback validation:** Candidate mirrors are checked for public HTTPS destinations, non-HTML media responses, and seekable range support where available.
+- **Playback validation:** Candidate mirrors are checked for public HTTPS destinations and media compatibility. Remux output is streamed through bounded in-memory pipes and is never cached to disk; byte-range seeking on remux routes returns `501 SEEK_UNAVAILABLE`.
 - **SSE responses:** Incremental search and source events for responsive clients.
 - **Audio and subtitles:** Provider-backed embedded audio/subtitle discovery where the resolved media exposes those tracks.
 - **Download metadata:** Direct-download capability is reported only when a provider source advertises an authorized direct file.
