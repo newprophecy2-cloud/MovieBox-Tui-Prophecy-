@@ -3881,7 +3881,20 @@ async fn remux_media_url(
         };
     eprintln!("[remux:{debug_id}] semaphore_acquired elapsed_ms={}", started_at.elapsed().as_millis());
     let mut command = Command::new("ffmpeg");
-    command.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
+    command.args([
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        // The source is a very large MKV. Limit probing so Render can receive
+        // the first fragmented-MP4 keyframe before its request deadline.
+        "-probesize",
+        "5M",
+        "-analyzeduration",
+        "5M",
+        "-fflags",
+        "+nobuffer",
+    ]);
     let upstream_headers = referer
         .map(|value| format!("Referer: {value}\r\nUser-Agent: Mozilla/5.0\r\n"))
         .unwrap_or_else(|| "User-Agent: Mozilla/5.0\r\n".to_string());
