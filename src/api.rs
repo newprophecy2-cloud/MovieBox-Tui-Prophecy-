@@ -709,9 +709,7 @@ async fn route(
         || path.starts_with("/home/")
         || path.starts_with("/trending/")
         || path.starts_with("/popular/")
-    {
-        Some(format!("/api/v1{path}"))
-    } else if path.starts_with("/anime/")
+        || path.starts_with("/anime/")
         || path.starts_with("/episodes/")
         || path.starts_with("/sources/")
         || path.starts_with("/movies/")
@@ -735,6 +733,7 @@ async fn route(
         "/api/subtitles/extract" => subtitle_extract_route(stream, query, request_headers).await,
         "/api/pretranscode/start" => pretranscode_unavailable(stream, 501).await,
         "/api/pretranscode/status" => pretranscode_unavailable(stream, 501).await,
+        _ if path.starts_with("/api/subtitles/assemblyai/") => assemblyai_unavailable(stream).await,
         _ if path.starts_with("/api/subtitles/") => pretranscode_unavailable(stream, 404).await,
         "/api/v1/watch" => direct_watch_route(stream, query, state).await,
         "/api/v1/anime/search" => search_json(stream, query, state).await,
@@ -3912,6 +3911,21 @@ async fn collect_limited(response: reqwest::Response, limit: usize) -> Result<Ve
     Ok(bytes)
 }
 
+async fn assemblyai_unavailable(stream: &mut TcpStream) -> std::io::Result<()> {
+    write_json(
+        stream,
+        501,
+        &serde_json::json!({
+            "error": {
+                "code": "ASSEMBLYAI_UNAVAILABLE",
+                "message": "AssemblyAI subtitle retrieval is not configured on this backend."
+            }
+        }),
+        None,
+    )
+    .await
+}
+
 async fn pretranscode_unavailable(stream: &mut TcpStream, status: u16) -> std::io::Result<()> {
     let (code, message) = if status == 501 {
         (
@@ -4043,7 +4057,13 @@ fn openapi() -> serde_json::Value {
             "/api/v1/sources/{source_id}/transcode": {"get": {"responses": {"200": {"description": "Transcoded media stream"}, "502": {"description": "Transcoding failed"}}}},
             "/api/v1/sources/{source_id}/playback": {"get": {"responses": {"200": {"description": "Server-resolved playable 4KHDHub URL"}, "502": {"description": "Playback resolution failed"}, "504": {"description": "Playback resolution timed out"}}}},
             "/api/v1/sources/{source_id}/watch": {"get": {"responses": {"200": {"description": "Server-resolved watch URL with inline media disposition"}, "502": {"description": "Watch resolution failed"}, "504": {"description": "Watch resolution timed out"}}}},
-            "/api/v1/sources/{source_id}/download": {"get": {"responses": {"200": {"description": "Download metadata"}, "501": {"description": "Unsupported"}}}}
+            "/api/v1/sources/{source_id}/download": {"get": {"responses": {"200": {"description": "Download metadata"}, "501": {"description": "Unsupported"}}}},
+            "/api/stream-proxy": {"get": {"responses": {"200": {"description": "Proxied media stream"}, "206": {"description": "Partial media stream"}, "400": {"description": "Missing or invalid media URL"}, "403": {"description": "Unsafe destination rejected"}}}, "head": {"responses": {"200": {"description": "Media headers"}, "206": {"description": "Partial media headers"}}}},
+            "/api/media-info": {"get": {"responses": {"200": {"description": "FFprobe media metadata including duration"}, "400": {"description": "Missing or invalid media URL"}, "502": {"description": "Media inspection failed"}, "504": {"description": "Media inspection timed out"}}}},
+            "/api/subtitles/extract": {"get": {"responses": {"200": {"description": "Retrieved external subtitle body"}, "400": {"description": "Missing or invalid subtitle URL"}, "404": {"description": "Subtitle not found"}}}},
+            "/api/subtitles/assemblyai/{transcript_id}": {"get": {"responses": {"501": {"description": "AssemblyAI subtitle retrieval is not configured"}}}},
+            "/api/pretranscode/start": {"post": {"responses": {"501": {"description": "Background pretranscoding is not enabled"}}}},
+            "/api/pretranscode/status": {"get": {"responses": {"501": {"description": "Background pretranscoding is not enabled"}}}}
         }
     })
 }
@@ -4755,6 +4775,12 @@ mod tests {
             "/api/v1/movies/{movie_id}",
             "/api/v1/k-dramas",
             "/api/v1/categories",
+            "/api/stream-proxy",
+            "/api/media-info",
+            "/api/subtitles/extract",
+            "/api/subtitles/assemblyai/{transcript_id}",
+            "/api/pretranscode/start",
+            "/api/pretranscode/status",
         ] {
             assert!(paths.get(route).is_some(), "missing {route}");
         }
