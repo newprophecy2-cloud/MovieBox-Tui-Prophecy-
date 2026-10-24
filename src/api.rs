@@ -26,6 +26,7 @@ use tokio::{
     sync::{Mutex, Semaphore},
     task::JoinSet,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{
     providers::models::{
@@ -57,6 +58,7 @@ const REMUX_STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
 const REMUX_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(20);
 static REMUX_LIMITER: std::sync::LazyLock<Arc<Semaphore>> =
     std::sync::LazyLock::new(|| Arc::new(Semaphore::new(MAX_REMUX_SESSIONS)));
+static REMUX_DEBUG_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const PROVIDERS: [ProviderKind; 6] = [
     ProviderKind::MovieBox,
     ProviderKind::FourKHdHub,
@@ -3856,17 +3858,28 @@ async fn remux_media_url(
     url: &reqwest::Url,
     referer: Option<&str>,
 ) -> std::io::Result<()> {
+    let debug_id = REMUX_DEBUG_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let upstream_host = url.host_str().unwrap_or("unknown-host");
+    let started_at = Instant::now();
+    eprintln!(
+        "[remux:{debug_id}] start upstream_host={upstream_host} referer_present={} ",
+        referer.is_some()
+    );
     let permit =
         match REMUX_LIMITER.clone().try_acquire_owned() {
             Ok(permit) => permit,
-            Err(_) => return write_raw_json(
-                stream,
-                429,
-                r#"{"error":{"code":"REMUX_BUSY","message":"Remux capacity is busy."}}"#,
-                None,
-            )
-            .await,
+            Err(_) => {
+                eprintln!("[remux:{debug_id}] rejected reason=capacity_busy");
+                return write_raw_json(
+                    stream,
+                    429,
+                    r#"{"error":{"code":"REMUX_BUSY","message":"Remux capacity is busy."}}"#,
+                    None,
+                )
+                .await;
+            }
         };
+    eprintln!("[remux:{debug_id}] semaphore_acquired elapsed_ms={}", started_at.elapsed().as_millis());
     let mut command = Command::new("ffmpeg");
     command.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
     let upstream_headers = referer
@@ -3909,17 +3922,23 @@ async fn remux_media_url(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    let mut child =
-        match command.spawn() {
-            Ok(child) => child,
-            Err(_) => return write_raw_json(
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            eprintln!("[remux:{debug_id}] ffmpeg_spawn_failed error={error}");
+            return write_raw_json(
                 stream,
                 503,
                 r#"{"error":{"code":"REMUX_UNAVAILABLE","message":"FFmpeg is unavailable."}}"#,
                 None,
             )
-            .await,
+            .await;
         };
+    eprintln!(
+        "[remux:{debug_id}] ffmpeg_spawned pid={} elapsed_ms={}",
+        child.id().unwrap_or_default(),
+        started_at.elapsed().as_millis()
+    );
     let Some(mut stdout) = child.stdout.take() else {
         let _ = child.kill().await;
         return write_raw_json(
@@ -3931,10 +3950,18 @@ async fn remux_media_url(
         .await;
     };
     let mut stderr = child.stderr.take();
+    let stderr_debug_id = debug_id;
     let stderr_task = tokio::spawn(async move {
         if let Some(mut stderr) = stderr.take() {
             let mut buffer = [0u8; 1024];
-            while stderr.read(&mut buffer).await.unwrap_or(0) > 0 {}
+            loop {
+                let length = stderr.read(&mut buffer).await.unwrap_or(0);
+                if length == 0 {
+                    break;
+                }
+                let message = String::from_utf8_lossy(&buffer[..length]);
+                eprintln!("[remux:{stderr_debug_id}] ffmpeg_stderr {}", message.trim());
+            }
         }
     });
     // FFmpeg writes the fragmented-MP4 init segment (ftyp/moov) before the
@@ -3944,15 +3971,35 @@ async fn remux_media_url(
     let startup = tokio::time::timeout(REMUX_STARTUP_TIMEOUT, async {
         let mut buffered = Vec::with_capacity(128 * 1024);
         let mut chunk = [0u8; 32 * 1024];
+        let mut total_read = 0usize;
         loop {
             let length = stdout.read(&mut chunk).await?;
             if length == 0 {
+                eprintln!(
+                    "[remux:{debug_id}] stdout_eof_before_moof total_bytes={} elapsed_ms={}",
+                    total_read,
+                    started_at.elapsed().as_millis()
+                );
                 return Err(std::io::Error::other(
                     "FFmpeg ended before the first media fragment",
                 ));
             }
+            total_read += length;
             buffered.extend_from_slice(&chunk[..length]);
-            if buffered.windows(4).any(|atom| atom == b"moof") {
+            let has_moof = buffered.windows(4).any(|atom| atom == b"moof");
+            eprintln!(
+                "[remux:{debug_id}] stdout_chunk phase=startup bytes={} total_bytes={} moof={} elapsed_ms={}",
+                length,
+                total_read,
+                has_moof,
+                started_at.elapsed().as_millis()
+            );
+            if has_moof {
+                eprintln!(
+                    "[remux:{debug_id}] first_moof_ready buffered_bytes={} elapsed_ms={}",
+                    buffered.len(),
+                    started_at.elapsed().as_millis()
+                );
                 return Ok(buffered);
             }
             if buffered.len() > 4 * 1024 * 1024 {
@@ -3965,7 +4012,12 @@ async fn remux_media_url(
     .await;
     let first = match startup {
         Ok(Ok(buffered)) => buffered,
-        _ => {
+        result => {
+            eprintln!(
+                "[remux:{debug_id}] startup_failed result={:?} elapsed_ms={}",
+                result.as_ref().err(),
+                started_at.elapsed().as_millis()
+            );
             let _ = child.kill().await;
             let _ = stderr_task.await;
             drop(permit);
@@ -3979,13 +4031,46 @@ async fn remux_media_url(
         Some("Accept-Ranges: none\r\nX-Media-Mode: remux\r\n"),
     )
     .await?;
+    eprintln!(
+        "[remux:{debug_id}] response_headers_sent initial_bytes={} elapsed_ms={}",
+        first.len(),
+        started_at.elapsed().as_millis()
+    );
     if let Err(error) = stream.write_all(&first).await {
+        eprintln!("[remux:{debug_id}] client_write_failed phase=initial error={error}");
         let _ = child.kill().await;
         let _ = stderr_task.await;
         drop(permit);
         return Err(error);
     }
-    let result = tokio::io::copy(&mut stdout, stream).await;
+    let mut streamed_bytes = first.len();
+    let result = async {
+        let mut chunk = [0u8; 64 * 1024];
+        loop {
+            let length = stdout.read(&mut chunk).await?;
+            if length == 0 {
+                eprintln!(
+                    "[remux:{debug_id}] stdout_eof_after_start total_bytes={} elapsed_ms={}",
+                    streamed_bytes,
+                    started_at.elapsed().as_millis()
+                );
+                break;
+            }
+            streamed_bytes += length;
+            eprintln!(
+                "[remux:{debug_id}] stdout_chunk phase=stream bytes={} total_bytes={} elapsed_ms={}",
+                length,
+                streamed_bytes,
+                started_at.elapsed().as_millis()
+            );
+            stream.write_all(&chunk[..length]).await.map_err(|error| {
+                eprintln!("[remux:{debug_id}] client_write_failed phase=stream error={error}");
+                error
+            })?;
+        }
+        Ok::<(), std::io::Error>(())
+    }
+    .await;
     if result.is_err() {
         let _ = child.kill().await;
     }
@@ -3993,6 +4078,12 @@ async fn remux_media_url(
     let _ = stderr_task.await;
     drop(permit);
     result?;
+    eprintln!(
+        "[remux:{debug_id}] complete total_bytes={} elapsed_ms={} ffmpeg_status={:?}",
+        streamed_bytes,
+        started_at.elapsed().as_millis(),
+        status
+    );
     if matches!(status, Ok(Ok(status)) if status.success()) {
         Ok(())
     } else {
