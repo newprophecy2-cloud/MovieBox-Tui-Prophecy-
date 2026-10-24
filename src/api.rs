@@ -46,6 +46,8 @@ const SEARCH_SOURCE_CHECK_CONCURRENCY: usize = 8;
 const TRACK_PROBE_TIMEOUT: Duration = Duration::from_secs(45);
 const RELEASE_CACHE_TTL: Duration = Duration::from_secs(600);
 const PLAYBACK_CACHE_TTL: Duration = Duration::from_secs(120);
+const SEARCH_CACHE_TTL: Duration = Duration::from_secs(60);
+const SEARCH_CACHE_MAX_ENTRIES: usize = 256;
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_API_CONNECTIONS: usize = 256;
@@ -105,6 +107,7 @@ pub struct ApiState {
     release_inflight: Arc<Mutex<HashMap<String, SharedReleaseFuture>>>,
     playback_cache: Arc<Mutex<HashMap<String, PlaybackCacheEntry>>>,
     playback_inflight: Arc<Mutex<HashMap<String, SharedPlaybackFuture>>>,
+    search_cache: Arc<Mutex<HashMap<String, SearchCacheEntry>>>,
     search_source_check_slots: Arc<Semaphore>,
     transcode_slots: Arc<Semaphore>,
     connection_slots: Arc<Semaphore>,
@@ -123,6 +126,12 @@ struct PlaybackCacheEntry {
 }
 type SharedReleaseFuture = Shared<BoxFuture<'static, Result<Vec<Release>, ProviderError>>>;
 type SharedPlaybackFuture = Shared<BoxFuture<'static, Result<PlaybackSource, String>>>;
+
+#[derive(Clone)]
+struct SearchCacheEntry {
+    stored_at: Instant,
+    result: EligibleSearch,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OpaqueRef {
@@ -180,7 +189,7 @@ enum SourceEligibility {
     CheckFailed,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct EligibleSearch {
     items: Vec<CatalogItem>,
     failed: bool,
@@ -598,6 +607,7 @@ pub async fn run() -> std::io::Result<()> {
         release_inflight: Arc::new(Mutex::new(HashMap::new())),
         playback_cache: Arc::new(Mutex::new(HashMap::new())),
         playback_inflight: Arc::new(Mutex::new(HashMap::new())),
+        search_cache: Arc::new(Mutex::new(HashMap::new())),
         search_source_check_slots: Arc::new(Semaphore::new(SEARCH_SOURCE_CHECK_CONCURRENCY)),
         transcode_slots: Arc::new(Semaphore::new(MAX_TRANSCODE_SESSIONS)),
         connection_slots: Arc::new(Semaphore::new(MAX_API_CONNECTIONS)),
@@ -1666,8 +1676,7 @@ async fn search_json(stream: &mut TcpStream, query: &str, state: ApiState) -> st
         let (s, b) = err("CURSOR_INVALID", "The cursor is invalid.", None, 400);
         return write_raw_json(stream, s, &b, None).await;
     }
-    let (items, failed, provider_status) = search_all(&state.service, &qv).await;
-    let eligible = eligible_search(&state, items, failed, provider_status).await;
+    let eligible = cached_search(&state, &qv).await;
     let items = eligible.items;
     let failed = eligible.failed;
     let provider_status = eligible.provider_status;
@@ -1713,6 +1722,36 @@ async fn search_json(stream: &mut TcpStream, query: &str, state: ApiState) -> st
     write_json(stream, 200, &body, None).await
 }
 
+async fn cached_search(state: &ApiState, query: &str) -> EligibleSearch {
+    let key = query.trim().to_ascii_lowercase();
+    {
+        let cache = state.search_cache.lock().await;
+        if let Some(entry) = cache.get(&key) {
+            if entry.stored_at.elapsed() < SEARCH_CACHE_TTL {
+                return entry.result.clone();
+            }
+        }
+    }
+
+    let (items, failed, provider_status) = search_all(&state.service, query).await;
+    let result = eligible_search(state, items, failed, provider_status).await;
+    let mut cache = state.search_cache.lock().await;
+    if cache.len() >= SEARCH_CACHE_MAX_ENTRIES {
+        cache.retain(|_, entry| entry.stored_at.elapsed() < SEARCH_CACHE_TTL);
+        if cache.len() >= SEARCH_CACHE_MAX_ENTRIES {
+            cache.clear();
+        }
+    }
+    cache.insert(
+        key,
+        SearchCacheEntry {
+            stored_at: Instant::now(),
+            result: result.clone(),
+        },
+    );
+    result
+}
+
 async fn search_sse(stream: &mut TcpStream, query: &str, state: ApiState) -> std::io::Result<()> {
     let q = parse_query(query);
     let Some(qv) =
@@ -1726,8 +1765,7 @@ async fn search_sse(stream: &mut TcpStream, query: &str, state: ApiState) -> std
         );
         return write_raw_json(stream, s, &b, None).await;
     };
-    let (items, failed, provider_status) = search_all(&state.service, &qv).await;
-    let eligible = eligible_search(&state, items, failed, provider_status).await;
+    let eligible = cached_search(&state, &qv).await;
     write_headers(stream, 200, "text/event-stream", None).await?;
     for item in eligible.items {
         let payload = serde_json::to_string(&serde_json::json!({"result":catalog(item)})).unwrap();
