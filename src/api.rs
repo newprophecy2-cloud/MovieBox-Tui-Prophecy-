@@ -771,7 +771,7 @@ async fn route(
         "/" => write_json(stream, 200, &serde_json::json!({"name":"MovieBox API","version":"v1","docs":"/docs","health":"/health"}), None).await,
         "/health" => write_json(stream, 200, &serde_json::json!({"status":"ok"}), None).await,
         "/ready" => write_json(stream, 200, &serde_json::json!({"status":"ready","meaning":"The process and local service layer are initialized; upstream availability is request-specific."}), None).await,
-        "/api/v1" => write_json(stream, 200, &serde_json::json!({"version":"v1","resources":["anime","episodes","sources"]}), None).await,
+        "/api/v1" => write_json(stream, 200, &serde_json::json!({"version":"v1","resources":["anime","movies","episodes","sources"]}), None).await,
         "/openapi.json" => write_json(stream, 200, &openapi(), None).await,
         "/docs" => write_text(stream, 200, "text/html; charset=utf-8", "<!doctype html><html><head><title>MovieBox API</title></head><body><h1>MovieBox API</h1><p>OpenAPI: <a href=\"/openapi.json\">/openapi.json</a></p><p>Swagger UI can load this document from a local or trusted client.</p></body></html>", None).await,
         "/api/v1/diagnostics" => diagnostics_route(stream, state).await,
@@ -791,10 +791,14 @@ async fn route(
         | "/api/v1/popular/anime" | "/api/v1/popular/movies"
         | "/api/v1/popular/k-dramas" => home_compat_route(stream, path, query, state).await,
         "/api/v1/latest" => unsupported_catalog(stream, "Reliable release-date metadata is not exposed consistently by the available providers.").await,
+        "/api/v1/movies" if moviebox_provider_enabled() => {
+            catalog_list_route(stream, query, state, MediaType::Movie).await
+        }
         "/api/v1/movies" | "/api/v1/k-dramas" | "/api/v1/categories" if !moviebox_provider_enabled() => {
             moviebox_disabled(stream).await
         }
         _ if path.starts_with("/api/v1/movies/") && !moviebox_provider_enabled() => moviebox_disabled(stream).await,
+        _ if path.starts_with("/api/v1/movies/") => movie_route(stream, path, query, state).await,
         _ if path.starts_with("/api/v1/k-dramas/") => unsupported_catalog(stream, "K-Drama details require a verified item classification before lookup.").await,
         _ if path.starts_with("/api/v1/anime/") => anime_route(stream, path, query, state).await,
         _ if path.starts_with("/api/v1/episodes/") => episode_route(stream, path, state).await,
@@ -2061,6 +2065,80 @@ async fn eligible_search(
     }
 }
 
+async fn movie_route(
+    stream: &mut TcpStream,
+    path: &str,
+    _query: &str,
+    state: ApiState,
+) -> std::io::Result<()> {
+    let parts: Vec<_> = path.trim_matches('/').split('/').collect();
+    if parts.len() < 4 {
+        let (s, b) = err("INVALID_ID", "A movie identifier is required.", None, 400);
+        return write_raw_json(stream, s, &b, None).await;
+    }
+    let r = parse_ref(parts[3]);
+    let Ok(r) = r else {
+        let (s, b) = r.unwrap_err();
+        return write_raw_json(stream, s, &b, None).await;
+    };
+    if r.p == ProviderKind::MovieBox && !moviebox_provider_enabled() {
+        return moviebox_disabled(stream).await;
+    }
+    let details_result = match tokio::time::timeout(OVERALL_TIMEOUT, state.service.details_typed(r.p, &r.v)).await {
+        Ok(Ok(details)) => details,
+        Ok(Err(error)) => {
+            let (s, b) = provider_error(error, r.p);
+            return write_raw_json(stream, s, &b, None).await;
+        }
+        Err(_) => {
+            let (s, b) = err("REQUEST_DEADLINE_EXCEEDED", "The movie details request timed out.", Some(r.p), 504);
+            return write_raw_json(stream, s, &b, None).await;
+        }
+    };
+    if details_result.media_type != MediaType::Movie {
+        let (s, b) = err("NOT_A_MOVIE", "The requested item is not a movie.", Some(r.p), 400);
+        return write_raw_json(stream, s, &b, None).await;
+    }
+    if parts.len() == 4 {
+        return write_json(stream, 200, &details(details_result), None).await;
+    }
+    let movie_ref = OpaqueRef { p: r.p, v: r.v.clone(), s: 0, e: 0 };
+    match parts.get(4).copied() {
+        Some("sources") => {
+            match tokio::time::timeout(OVERALL_TIMEOUT, cached_releases(&state, &movie_ref)).await {
+                Ok(Ok(releases)) => write_json(stream, 200, &SourcesResponse { sources: api_sources(&releases, &movie_ref), partial: false }, None).await,
+                Ok(Err(error)) => { let (s, b) = provider_error(error, r.p); write_raw_json(stream, s, &b, None).await }
+                Err(_) => { let (s, b) = err("REQUEST_DEADLINE_EXCEEDED", "The movie source request timed out.", Some(r.p), 504); write_raw_json(stream, s, &b, None).await }
+            }
+        }
+        Some("stream") | Some("playback") => {
+            // Reuse the tested episode playback path with the provider's movie sentinel (s=0,e=0).
+            let mut playable_details = details_result;
+            playable_details.seasons = vec![Season {
+                number: 0,
+                episodes: vec![crate::providers::models::Episode {
+                    season: 0,
+                    number: 0,
+                    title: Some(playable_details.title.clone()),
+                    overview: playable_details.description.clone(),
+                }],
+            }];
+            let encoded_movie = encode(&movie_ref);
+            anime_episode_stream_route(
+                stream,
+                &encoded_movie,
+                &encoded_movie,
+                movie_ref,
+                playable_details,
+                state,
+                "auto",
+            )
+            .await
+        }
+        _ => { let (s, b) = err("INTERNAL_ERROR", "Unsupported movie route.", None, 404); write_raw_json(stream, s, &b, None).await }
+    }
+}
+
 async fn anime_route(
     stream: &mut TcpStream,
     path: &str,
@@ -3037,7 +3115,7 @@ async fn source_route(stream: &mut TcpStream, path: &str, state: ApiState) -> st
     if matches!(parts.get(4), Some(&"audio") | Some(&"audio-tracks")) {
         return write_track_response(stream, id, sr.p, rel, &state, false).await;
     }
-    if parts.get(4) == Some(&"transcode") {
+    if matches!(parts.get(4), Some(&"transcode") | Some(&"remux")) {
         return transcode_source(stream, id, rel, &state).await;
     }
     if matches!(parts.get(4), Some(&"subtitles") | Some(&"subtitle-tracks")) {
@@ -4117,6 +4195,9 @@ fn openapi() -> serde_json::Value {
             "/api/v1/popular/k-dramas": {"get": {"responses": {"200": {"description": "Metadata-backed popular K-Dramas"}}}},
             "/api/v1/movies": {"get": {"responses": {"200": {"description": "MovieBox movie catalogue"}}}},
             "/api/v1/movies/{movie_id}": {"get": {"responses": {"200": {"description": "Movie details"}}}},
+            "/api/v1/movies/{movie_id}/sources": {"get": {"responses": {"200": {"description": "Movie source candidates"}, "502": {"description": "Movie source resolution failed"}}}},
+            "/api/v1/movies/{movie_id}/stream": {"get": {"responses": {"200": {"description": "Resolved movie playback source using stream-copy remux when needed"}, "502": {"description": "Movie playback resolution failed"}, "504": {"description": "Movie playback resolution timed out"}}}},
+            "/api/v1/movies/{movie_id}/playback": {"get": {"responses": {"200": {"description": "Alias for movie stream playback"}}}},
             "/api/v1/k-dramas": {"get": {"responses": {"200": {"description": "Metadata-backed K-Drama catalogue"}}}},
             "/api/v1/k-dramas/{id}": {"get": {"responses": {"501": {"description": "Unsupported category"}}}},
             "/api/v1/categories": {"get": {"responses": {"200": {"description": "Supported content categories"}}}},
@@ -4134,7 +4215,8 @@ fn openapi() -> serde_json::Value {
             "/api/v1/sources/{source_id}/audio-tracks": {"get": {"responses": {"200": {"description": "Confirmed embedded audio tracks"}, "503": {"description": "Track discovery unavailable"}}}},
             "/api/v1/sources/{source_id}/subtitles": {"get": {"responses": {"200": {"description": "Confirmed embedded subtitle tracks"}, "503": {"description": "Track discovery unavailable"}}}},
             "/api/v1/sources/{source_id}/subtitle-tracks": {"get": {"responses": {"200": {"description": "Confirmed embedded subtitle tracks"}, "503": {"description": "Track discovery unavailable"}}}},
-            "/api/v1/sources/{source_id}/transcode": {"get": {"responses": {"200": {"description": "Transcoded media stream"}, "502": {"description": "Transcoding failed"}}}},
+            "/api/v1/sources/{source_id}/transcode": {"get": {"responses": {"200": {"description": "Legacy-compatible stream-copy remux media stream"}, "502": {"description": "Remux failed"}}}},
+            "/api/v1/sources/{source_id}/remux": {"get": {"responses": {"200": {"description": "Stream-copy remux media stream"}, "502": {"description": "Remux failed"}}}},
             "/api/v1/sources/{source_id}/playback": {"get": {"responses": {"200": {"description": "Server-resolved playable 4KHDHub URL"}, "502": {"description": "Playback resolution failed"}, "504": {"description": "Playback resolution timed out"}}}},
             "/api/v1/sources/{source_id}/watch": {"get": {"responses": {"200": {"description": "Server-resolved watch URL with inline media disposition"}, "502": {"description": "Watch resolution failed"}, "504": {"description": "Watch resolution timed out"}}}},
             "/api/v1/sources/{source_id}/download": {"get": {"responses": {"200": {"description": "Download metadata"}, "501": {"description": "Unsupported"}}}},
@@ -4864,12 +4946,16 @@ mod tests {
             "/api/v1/sources/{source_id}/audio-tracks",
             "/api/v1/sources/{source_id}/subtitle-tracks",
             "/api/v1/sources/{source_id}/transcode",
+            "/api/v1/sources/{source_id}/remux",
             "/api/v1/home",
             "/api/v1/home/featured",
             "/api/v1/trending",
             "/api/v1/popular",
             "/api/v1/movies",
             "/api/v1/movies/{movie_id}",
+            "/api/v1/movies/{movie_id}/sources",
+            "/api/v1/movies/{movie_id}/stream",
+            "/api/v1/movies/{movie_id}/playback",
             "/api/v1/k-dramas",
             "/api/v1/categories",
             "/api/stream-proxy",
