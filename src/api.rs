@@ -71,26 +71,14 @@ fn moviebox_provider_enabled() -> bool {
 }
 
 fn configured_search_providers() -> Vec<ProviderKind> {
-    let config = crate::config::load();
-    let mut providers = Vec::with_capacity(PROVIDERS.len());
-    if moviebox_provider_enabled() && config.moviebox_enabled {
-        providers.push(ProviderKind::MovieBox);
+    // The HTTP anime API intentionally uses one deterministic provider.
+    // Keep the configuration fields for the desktop/TUI clients, but do not
+    // fan out web requests to providers that are not part of this deployment.
+    if crate::config::load().fourkhdhub_enabled {
+        vec![ProviderKind::FourKHdHub]
+    } else {
+        Vec::new()
     }
-    if config.fourkhdhub_enabled {
-        providers.push(ProviderKind::FourKHdHub);
-    }
-    if config.dramachi_enabled {
-        providers.push(ProviderKind::Dramachi);
-    }
-    if config.bdix_circleftp_enabled {
-        providers.push(ProviderKind::BdixCircleFtp);
-    }
-    if config.bdix_dhakaflix_enabled {
-        providers.push(ProviderKind::BdixDhakaFlix);
-    }
-    // Catalog/metadata addons remain useful without stream-capable addons.
-    providers.push(ProviderKind::Addons);
-    providers
 }
 
 fn provider_priority(provider: ProviderKind) -> usize {
@@ -4368,14 +4356,9 @@ mod tests {
     }
 
     #[test]
-    fn configured_search_providers_keep_builtins_and_exclude_disabled_bdix() {
+    fn configured_search_providers_use_only_fourkhdhub() {
         let providers = configured_search_providers();
-        assert!(providers.contains(&ProviderKind::FourKHdHub));
-        assert!(providers.contains(&ProviderKind::Dramachi));
-        assert!(providers.contains(&ProviderKind::Addons));
-        assert!(!providers.contains(&ProviderKind::BdixCircleFtp));
-        assert!(!providers.contains(&ProviderKind::BdixDhakaFlix));
-        assert!(providers.contains(&ProviderKind::MovieBox));
+        assert_eq!(providers, vec![ProviderKind::FourKHdHub]);
     }
 
     #[test]
