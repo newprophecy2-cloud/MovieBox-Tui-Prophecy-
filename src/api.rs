@@ -695,6 +695,33 @@ async fn route(
     head_only: bool,
 ) -> std::io::Result<()> {
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    let normalized_path = if path == "/diagnostics" {
+        Some("/api/v1/diagnostics".to_string())
+    } else if path == "/watch" {
+        Some("/api/v1/watch".to_string())
+    } else if path == "/home"
+        || path == "/trending"
+        || path == "/popular"
+        || path == "/latest"
+        || path == "/categories"
+        || path == "/movies"
+        || path == "/k-dramas"
+        || path.starts_with("/home/")
+        || path.starts_with("/trending/")
+        || path.starts_with("/popular/")
+    {
+        Some(format!("/api/v1{path}"))
+    } else if path.starts_with("/anime/")
+        || path.starts_with("/episodes/")
+        || path.starts_with("/sources/")
+        || path.starts_with("/movies/")
+        || path.starts_with("/k-dramas/")
+    {
+        Some(format!("/api/v1{path}"))
+    } else {
+        None
+    };
+    let path = normalized_path.as_deref().unwrap_or(path);
     match path {
         "/" => write_json(stream, 200, &serde_json::json!({"name":"MovieBox API","version":"v1","docs":"/docs","health":"/health"}), None).await,
         "/health" => write_json(stream, 200, &serde_json::json!({"status":"ok"}), None).await,
