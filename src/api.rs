@@ -3586,7 +3586,7 @@ async fn transcode_source(
     }
     command.args([
         "-rw_timeout",
-        "15000000",
+        "120000000",
         "-i",
         validated_url.as_str(),
         "-map",
@@ -3869,14 +3869,13 @@ async fn remux_media_url(
         };
     let mut command = Command::new("ffmpeg");
     command.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
-    if let Some(referer) = referer {
-        command
-            .arg("-headers")
-            .arg(format!("Referer: {referer}\r\n"));
-    }
+    let upstream_headers = referer
+        .map(|value| format!("Referer: {value}\r\nUser-Agent: Mozilla/5.0\r\n"))
+        .unwrap_or_else(|| "User-Agent: Mozilla/5.0\r\n".to_string());
+    command.arg("-headers").arg(upstream_headers);
     command.args([
         "-rw_timeout",
-        "15000000",
+        "120000000",
         "-i",
         url.as_str(),
         "-map",
