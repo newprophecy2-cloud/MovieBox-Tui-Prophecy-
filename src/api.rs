@@ -52,11 +52,11 @@ const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_API_CONNECTIONS: usize = 256;
 const MOVIEBOX_PROVIDER_ENABLED: bool = true;
-const MAX_TRANSCODE_SESSIONS: usize = 2;
-const TRANSCODE_STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
+const MAX_REMUX_SESSIONS: usize = 2;
+const REMUX_STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
 const REMUX_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(20);
-static TRANSCODE_LIMITER: std::sync::LazyLock<Arc<Semaphore>> =
-    std::sync::LazyLock::new(|| Arc::new(Semaphore::new(MAX_TRANSCODE_SESSIONS)));
+static REMUX_LIMITER: std::sync::LazyLock<Arc<Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(Semaphore::new(MAX_REMUX_SESSIONS)));
 const PROVIDERS: [ProviderKind; 6] = [
     ProviderKind::MovieBox,
     ProviderKind::FourKHdHub,
@@ -98,7 +98,7 @@ pub struct ApiState {
     search_cache: Arc<Mutex<HashMap<String, SearchCacheEntry>>>,
     redis_search: Option<redis::aio::MultiplexedConnection>,
     search_source_check_slots: Arc<Semaphore>,
-    transcode_slots: Arc<Semaphore>,
+    remux_slots: Arc<Semaphore>,
     connection_slots: Arc<Semaphore>,
 }
 
@@ -204,15 +204,10 @@ fn is_blocked_h265_codec(codec: Option<&str>) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MediaMode {
     Remux,
-    Transcode,
 }
 
-fn media_mode_after_remux_preflight(preflight_validated: bool) -> MediaMode {
-    if preflight_validated {
-        MediaMode::Remux
-    } else {
-        MediaMode::Transcode
-    }
+fn media_mode_after_remux_preflight(preflight_validated: bool) -> Option<MediaMode> {
+    preflight_validated.then_some(MediaMode::Remux)
 }
 
 fn releases_have_usable_source(releases: &[Release]) -> bool {
@@ -632,7 +627,7 @@ pub async fn run() -> std::io::Result<()> {
         search_cache: Arc::new(Mutex::new(HashMap::new())),
         redis_search,
         search_source_check_slots: Arc::new(Semaphore::new(SEARCH_SOURCE_CHECK_CONCURRENCY)),
-        transcode_slots: Arc::new(Semaphore::new(MAX_TRANSCODE_SESSIONS)),
+        remux_slots: Arc::new(Semaphore::new(MAX_REMUX_SESSIONS)),
         connection_slots: Arc::new(Semaphore::new(MAX_API_CONNECTIONS)),
     };
     log::info!("MovieBox API listening on 0.0.0.0:{port}");
@@ -3467,9 +3462,9 @@ async fn transcode_source(
     source: &crate::providers::models::Release,
     state: &ApiState,
 ) -> std::io::Result<()> {
-    let Some(permit) = state.transcode_slots.clone().try_acquire_owned().ok() else {
+    let Some(permit) = state.remux_slots.clone().try_acquire_owned().ok() else {
         let (status, body) = err(
-            "TRANSCODE_BUSY",
+            "REMUX_BUSY",
             "All media-processing slots are currently busy. Try again later.",
             Some(source.provider),
             429,
@@ -3494,7 +3489,16 @@ async fn transcode_source(
     };
     let stream_copy = media_mode_after_remux_preflight(
         validated_remux_preflight(&validated_url, &playback.headers).await,
-    ) == MediaMode::Remux;
+    ) == Some(MediaMode::Remux);
+    if !stream_copy {
+        let (status, body) = err(
+            "REMUX_UNAVAILABLE",
+            "This source is not browser-compatible for stream-copy remuxing.",
+            Some(source.provider),
+            415,
+        );
+        return write_raw_json(stream, status, &body, None).await;
+    }
     let mut command = Command::new("ffmpeg");
     command.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
     let headers = playback
@@ -3515,32 +3519,7 @@ async fn transcode_source(
         "-map",
         "0:a?",
     ]);
-    if stream_copy {
-        command.args(["-c", "copy"]);
-    } else {
-        command.args([
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-profile:v",
-            "main",
-            "-pix_fmt",
-            "yuv420p",
-            "-crf",
-            "23",
-            "-g",
-            "48",
-            "-sc_threshold",
-            "0",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "128k",
-            "-ac",
-            "2",
-        ]);
-    }
+    command.args(["-c", "copy"]);
     command.args([
         "-movflags",
         "frag_keyframe+empty_moov+default_base_moof",
@@ -3556,7 +3535,7 @@ async fn transcode_source(
         Ok(child) => child,
         Err(error) => {
             let (status, body) = err(
-                "TRANSCODE_UNAVAILABLE",
+                "REMUX_UNAVAILABLE",
                 format!("FFmpeg is not available: {error}"),
                 Some(source.provider),
                 503,
@@ -3567,7 +3546,7 @@ async fn transcode_source(
     let Some(mut stdout) = child.stdout.take() else {
         let _ = child.kill().await;
         let (status, body) = err(
-            "TRANSCODE_FAILED",
+            "REMUX_FAILED",
             "FFmpeg did not open an output stream.",
             Some(source.provider),
             502,
@@ -3583,7 +3562,7 @@ async fn transcode_source(
     });
     let mut first_chunk = vec![0u8; 32 * 1024];
     let first_len = match tokio::time::timeout(
-        TRANSCODE_STARTUP_TIMEOUT,
+        REMUX_STARTUP_TIMEOUT,
         stdout.read(&mut first_chunk),
     )
     .await
@@ -3594,7 +3573,7 @@ async fn transcode_source(
             let _ = stderr_task.await;
             drop(permit);
             let (status, body) = err(
-                "TRANSCODE_FAILED",
+                "REMUX_FAILED",
                 "FFmpeg could not start a playable output stream.",
                 Some(source.provider),
                 502,
@@ -3606,7 +3585,7 @@ async fn transcode_source(
             let _ = stderr_task.await;
             drop(permit);
             let (status, body) = err(
-                "TRANSCODE_STARTUP_TIMEOUT",
+                "REMUX_STARTUP_TIMEOUT",
                 "FFmpeg did not produce output before the startup timeout.",
                 Some(source.provider),
                 504,
@@ -3655,7 +3634,7 @@ async fn transcode_source(
     match exit_status {
         Some(status) if status.success() => Ok(()),
         _ => Err(std::io::Error::other(
-            "FFmpeg transcoding did not exit successfully",
+            "FFmpeg remux did not exit successfully",
         )),
     }
 }
@@ -3718,17 +3697,20 @@ async fn stream_proxy_route(
             .await;
         }
     };
-    if query_value(query, "transcode").is_some_and(|value| value.eq_ignore_ascii_case("true")) {
+    let remux_requested = query_value(query, "remux")
+        .or_else(|| query_value(query, "transcode"))
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+    if remux_requested {
         if head_only {
             return write_raw_json(
                 stream,
                 405,
-                r#"{"error":{"code":"METHOD_NOT_ALLOWED","message":"Transcoding requires GET."}}"#,
+                r#"{"error":{"code":"METHOD_NOT_ALLOWED","message":"Remuxing requires GET."}}"#,
                 None,
             )
             .await;
         }
-        return transcode_media_url(stream, &url, referer.as_deref()).await;
+        return remux_media_url(stream, &url, referer.as_deref()).await;
     }
     let client = media_request_client();
     let mut request = if head_only {
@@ -3781,18 +3763,18 @@ fn sanitize_error(error: &str) -> String {
     error.replace('"', "'").replace(['\r', '\n'], " ")
 }
 
-async fn transcode_media_url(
+async fn remux_media_url(
     stream: &mut TcpStream,
     url: &reqwest::Url,
     referer: Option<&str>,
 ) -> std::io::Result<()> {
     let permit =
-        match TRANSCODE_LIMITER.clone().try_acquire_owned() {
+        match REMUX_LIMITER.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => return write_raw_json(
                 stream,
                 429,
-                r#"{"error":{"code":"TRANSCODE_BUSY","message":"Transcoding capacity is busy."}}"#,
+                r#"{"error":{"code":"REMUX_BUSY","message":"Remux capacity is busy."}}"#,
                 None,
             )
             .await,
@@ -3813,22 +3795,8 @@ async fn transcode_media_url(
         "0:v:0",
         "-map",
         "0:a?",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-tune",
-        "zerolatency",
-        "-g",
-        "48",
-        "-sc_threshold",
-        "0",
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
+        "-c",
+        "copy",
         "-movflags",
         "frag_keyframe+empty_moov+default_base_moof",
         "-f",
@@ -3845,7 +3813,7 @@ async fn transcode_media_url(
             Err(_) => return write_raw_json(
                 stream,
                 503,
-                r#"{"error":{"code":"TRANSCODE_UNAVAILABLE","message":"FFmpeg is unavailable."}}"#,
+                r#"{"error":{"code":"REMUX_UNAVAILABLE","message":"FFmpeg is unavailable."}}"#,
                 None,
             )
             .await,
@@ -3855,7 +3823,7 @@ async fn transcode_media_url(
         return write_raw_json(
             stream,
             502,
-            r#"{"error":{"code":"TRANSCODE_FAILED","message":"FFmpeg did not open output."}}"#,
+            r#"{"error":{"code":"REMUX_FAILED","message":"FFmpeg did not open remux output."}}"#,
             None,
         )
         .await;
@@ -3868,7 +3836,7 @@ async fn transcode_media_url(
         }
     });
     let mut first = vec![0u8; 32 * 1024];
-    let first_len = match tokio::time::timeout(TRANSCODE_STARTUP_TIMEOUT, stdout.read(&mut first))
+    let first_len = match tokio::time::timeout(REMUX_STARTUP_TIMEOUT, stdout.read(&mut first))
         .await
     {
         Ok(Ok(length)) if length > 0 => length,
@@ -3876,10 +3844,16 @@ async fn transcode_media_url(
             let _ = child.kill().await;
             let _ = stderr_task.await;
             drop(permit);
-            return write_raw_json(stream, 502, r#"{"error":{"code":"TRANSCODE_FAILED","message":"FFmpeg did not produce output."}}"#, None).await;
+            return write_raw_json(stream, 502, r#"{"error":{"code":"REMUX_FAILED","message":"FFmpeg did not produce remux output."}}"#, None).await;
         }
     };
-    write_headers(stream, 200, "video/mp4", Some("Accept-Ranges: none\r\n")).await?;
+    write_headers(
+        stream,
+        200,
+        "video/mp4",
+        Some("Accept-Ranges: none\r\nX-Media-Mode: remux\r\n"),
+    )
+    .await?;
     if let Err(error) = stream.write_all(&first[..first_len]).await {
         let _ = child.kill().await;
         let _ = stderr_task.await;
@@ -3897,7 +3871,7 @@ async fn transcode_media_url(
     if matches!(status, Ok(Ok(status)) if status.success()) {
         Ok(())
     } else {
-        Err(std::io::Error::other("FFmpeg transcoding failed"))
+        Err(std::io::Error::other("FFmpeg remux failed"))
     }
 }
 
@@ -4776,10 +4750,7 @@ mod tests {
         for _codec in [None, Some("HEVC"), Some("AV1"), Some("unknown")] {
             assert_eq!(media_mode_after_remux_preflight(true), MediaMode::Remux);
         }
-        assert_eq!(
-            media_mode_after_remux_preflight(false),
-            MediaMode::Transcode
-        );
+        assert_eq!(media_mode_after_remux_preflight(false), None);
     }
 
     #[test]
