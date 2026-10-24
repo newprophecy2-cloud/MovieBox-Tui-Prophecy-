@@ -19,14 +19,14 @@ use base64::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     process::Command,
     sync::{Mutex, Semaphore},
     task::JoinSet,
 };
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{
     providers::models::{
@@ -56,6 +56,7 @@ const MOVIEBOX_PROVIDER_ENABLED: bool = true;
 const MAX_REMUX_SESSIONS: usize = 2;
 const REMUX_STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
 const REMUX_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(20);
+const REMUX_CACHE_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 static REMUX_LIMITER: std::sync::LazyLock<Arc<Semaphore>> =
     std::sync::LazyLock::new(|| Arc::new(Semaphore::new(MAX_REMUX_SESSIONS)));
 static REMUX_DEBUG_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -804,7 +805,9 @@ async fn route(
         _ if path.starts_with("/api/v1/k-dramas/") => unsupported_catalog(stream, "K-Drama details require a verified item classification before lookup.").await,
         _ if path.starts_with("/api/v1/anime/") => anime_route(stream, path, query, state).await,
         _ if path.starts_with("/api/v1/episodes/") => episode_route(stream, path, state).await,
-        _ if path.starts_with("/api/v1/sources/") => source_route(stream, path, state).await,
+        _ if path.starts_with("/api/v1/sources/") => {
+            source_route(stream, path, state, request_headers, head_only).await
+        }
         _ => { let (s,b) = err("INTERNAL_ERROR", "Route not found.", None, 404); write_raw_json(stream, s, &b, None).await }
     }
 }
@@ -2086,31 +2089,69 @@ async fn movie_route(
     if r.p == ProviderKind::MovieBox && !moviebox_provider_enabled() {
         return moviebox_disabled(stream).await;
     }
-    let details_result = match tokio::time::timeout(OVERALL_TIMEOUT, state.service.details_typed(r.p, &r.v)).await {
-        Ok(Ok(details)) => details,
-        Ok(Err(error)) => {
-            let (s, b) = provider_error(error, r.p);
-            return write_raw_json(stream, s, &b, None).await;
-        }
-        Err(_) => {
-            let (s, b) = err("REQUEST_DEADLINE_EXCEEDED", "The movie details request timed out.", Some(r.p), 504);
-            return write_raw_json(stream, s, &b, None).await;
-        }
-    };
+    let details_result =
+        match tokio::time::timeout(OVERALL_TIMEOUT, state.service.details_typed(r.p, &r.v)).await {
+            Ok(Ok(details)) => details,
+            Ok(Err(error)) => {
+                let (s, b) = provider_error(error, r.p);
+                return write_raw_json(stream, s, &b, None).await;
+            }
+            Err(_) => {
+                let (s, b) = err(
+                    "REQUEST_DEADLINE_EXCEEDED",
+                    "The movie details request timed out.",
+                    Some(r.p),
+                    504,
+                );
+                return write_raw_json(stream, s, &b, None).await;
+            }
+        };
     if details_result.media_type != MediaType::Movie {
-        let (s, b) = err("NOT_A_MOVIE", "The requested item is not a movie.", Some(r.p), 400);
+        let (s, b) = err(
+            "NOT_A_MOVIE",
+            "The requested item is not a movie.",
+            Some(r.p),
+            400,
+        );
         return write_raw_json(stream, s, &b, None).await;
     }
     if parts.len() == 4 {
         return write_json(stream, 200, &details(details_result), None).await;
     }
-    let movie_ref = OpaqueRef { p: r.p, v: r.v.clone(), s: 0, e: 0 };
+    let movie_ref = OpaqueRef {
+        p: r.p,
+        v: r.v.clone(),
+        s: 0,
+        e: 0,
+    };
     match parts.get(4).copied() {
         Some("sources") => {
             match tokio::time::timeout(OVERALL_TIMEOUT, cached_releases(&state, &movie_ref)).await {
-                Ok(Ok(releases)) => write_json(stream, 200, &SourcesResponse { sources: api_sources(&releases, &movie_ref), partial: false }, None).await,
-                Ok(Err(error)) => { let (s, b) = provider_error(error, r.p); write_raw_json(stream, s, &b, None).await }
-                Err(_) => { let (s, b) = err("REQUEST_DEADLINE_EXCEEDED", "The movie source request timed out.", Some(r.p), 504); write_raw_json(stream, s, &b, None).await }
+                Ok(Ok(releases)) => {
+                    write_json(
+                        stream,
+                        200,
+                        &SourcesResponse {
+                            sources: api_sources(&releases, &movie_ref),
+                            partial: false,
+                        },
+                        None,
+                    )
+                    .await
+                }
+                Ok(Err(error)) => {
+                    let (s, b) = provider_error(error, r.p);
+                    write_raw_json(stream, s, &b, None).await
+                }
+                Err(_) => {
+                    let (s, b) = err(
+                        "REQUEST_DEADLINE_EXCEEDED",
+                        "The movie source request timed out.",
+                        Some(r.p),
+                        504,
+                    );
+                    write_raw_json(stream, s, &b, None).await
+                }
             }
         }
         Some("stream") | Some("playback") => {
@@ -2137,7 +2178,10 @@ async fn movie_route(
             )
             .await
         }
-        _ => { let (s, b) = err("INTERNAL_ERROR", "Unsupported movie route.", None, 404); write_raw_json(stream, s, &b, None).await }
+        _ => {
+            let (s, b) = err("INTERNAL_ERROR", "Unsupported movie route.", None, 404);
+            write_raw_json(stream, s, &b, None).await
+        }
     }
 }
 
@@ -3038,7 +3082,13 @@ async fn write_track_response(
     .await
 }
 
-async fn source_route(stream: &mut TcpStream, path: &str, state: ApiState) -> std::io::Result<()> {
+async fn source_route(
+    stream: &mut TcpStream,
+    path: &str,
+    state: ApiState,
+    request_headers: &HashMap<String, String>,
+    head_only: bool,
+) -> std::io::Result<()> {
     let parts: Vec<_> = path.trim_matches('/').split('/').collect();
     let Some(id) = parts.get(3) else {
         let (s, b) = err("INVALID_ID", "A source identifier is required.", None, 400);
@@ -3051,6 +3101,24 @@ async fn source_route(stream: &mut TcpStream, path: &str, state: ApiState) -> st
     };
     if sr.p == ProviderKind::MovieBox && !moviebox_provider_enabled() {
         return moviebox_disabled(stream).await;
+    }
+    if matches!(parts.get(4), Some(&"transcode") | Some(&"remux")) {
+        let cache_key = crate::remux_cache::cache_key(&format!("source-id:{id}"), &[]);
+        if let Some(cached) = crate::remux_cache::lookup(&cache_key).await {
+            return serve_cached_remux(stream, cached, request_headers, head_only, Some(id)).await;
+        }
+        if crate::remux_cache::is_building(&cache_key).await
+            && (head_only || is_seeking_range(request_headers))
+        {
+            return wait_for_remux_cache_response(
+                stream,
+                &cache_key,
+                request_headers,
+                head_only,
+                Some(id),
+            )
+            .await;
+        }
     }
     let r = OpaqueRef {
         p: sr.p,
@@ -3118,7 +3186,7 @@ async fn source_route(stream: &mut TcpStream, path: &str, state: ApiState) -> st
         return write_track_response(stream, id, sr.p, rel, &state, false).await;
     }
     if matches!(parts.get(4), Some(&"transcode") | Some(&"remux")) {
-        return transcode_source(stream, id, rel, &state).await;
+        return transcode_source(stream, id, rel, &state, request_headers, head_only).await;
     }
     if matches!(parts.get(4), Some(&"subtitles") | Some(&"subtitle-tracks")) {
         return write_track_response(stream, id, sr.p, rel, &state, true).await;
@@ -3473,9 +3541,17 @@ async fn remux_preflight_output_valid(url: &str, headers: &[(String, String)]) -
         "-map",
         "0:v:0",
         "-map",
-        "0:a?",
-        "-c",
+        "0:a:0?",
+        "-c:v",
         "copy",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-ac",
+        "2",
+        "-sn",
+        "-dn",
         "-t",
         "2",
         "-movflags",
@@ -3527,10 +3603,14 @@ async fn remux_preflight_output_valid(url: &str, headers: &[(String, String)]) -
 }
 
 fn browser_mp4_streams_compatible(streams: &[ProbeStream]) -> bool {
-    streams.iter().any(|stream| {
-        stream.codec_type.as_deref() == Some("video")
-            && stream.codec_name.as_deref() == Some("h264")
-    })
+    let video = streams
+        .iter()
+        .find(|stream| stream.codec_type.as_deref() == Some("video"));
+    let audio = streams
+        .iter()
+        .find(|stream| stream.codec_type.as_deref() == Some("audio"));
+    video.is_some_and(|stream| stream.codec_name.as_deref() == Some("h264"))
+        && audio.is_none_or(|stream| stream.codec_name.as_deref() == Some("aac"))
 }
 
 async fn transcode_source(
@@ -3538,16 +3618,9 @@ async fn transcode_source(
     source_id: &str,
     source: &crate::providers::models::Release,
     state: &ApiState,
+    request_headers: &HashMap<String, String>,
+    head_only: bool,
 ) -> std::io::Result<()> {
-    let Some(permit) = state.remux_slots.clone().try_acquire_owned().ok() else {
-        let (status, body) = err(
-            "REMUX_BUSY",
-            "All media-processing slots are currently busy. Try again later.",
-            Some(source.provider),
-            429,
-        );
-        return write_raw_json(stream, status, &body, None).await;
-    };
     let playback = match resolve_transcode_playback_source(source_id, source, state).await {
         Ok(playback) => playback,
         Err((code, message, status)) => {
@@ -3564,10 +3637,79 @@ async fn transcode_source(
         );
         return write_raw_json(stream, status, &body, None).await;
     };
-    let stream_copy = media_mode_after_remux_preflight(
-        validated_remux_preflight(&validated_url, &playback.headers).await,
-    ) == Some(MediaMode::Remux);
-    if !stream_copy {
+    let cache_key = crate::remux_cache::cache_key(&format!("source-id:{source_id}"), &[]);
+    let range_requested = is_seeking_range(request_headers);
+    let mut cache_building = false;
+    let cache_writer = match crate::remux_cache::prepare(&cache_key).await {
+        crate::remux_cache::CacheState::Hit(cached) => {
+            return serve_cached_remux(stream, cached, request_headers, head_only, Some(source_id))
+                .await;
+        }
+        crate::remux_cache::CacheState::Building if head_only || range_requested => {
+            return wait_for_remux_cache_response(
+                stream,
+                &cache_key,
+                request_headers,
+                head_only,
+                Some(source_id),
+            )
+            .await;
+        }
+        crate::remux_cache::CacheState::Building => {
+            cache_building = true;
+            None
+        }
+        crate::remux_cache::CacheState::Build(writer) if !head_only => {
+            cache_building = true;
+            Some(*writer)
+        }
+        crate::remux_cache::CacheState::Build(writer) => {
+            (*writer).abort().await;
+            return write_raw_json(
+                stream,
+                405,
+                r#"{"error":{"code":"METHOD_NOT_ALLOWED","message":"A cache miss requires GET for remuxing."}}"#,
+                None,
+            )
+            .await;
+        }
+        crate::remux_cache::CacheState::Disabled if head_only => {
+            return write_raw_json(
+                stream,
+                405,
+                r#"{"error":{"code":"METHOD_NOT_ALLOWED","message":"Remuxing requires GET unless a seekable cache is ready."}}"#,
+                None,
+            )
+            .await;
+        }
+        crate::remux_cache::CacheState::Disabled if range_requested => {
+            return write_raw_json(
+                stream,
+                503,
+                r#"{"error":{"code":"REMUX_CACHE_UNAVAILABLE","message":"The seekable remux cache is unavailable, so this byte range cannot be served."}}"#,
+                Some("X-Remux-Cache-State: unavailable\r\n"),
+            )
+            .await;
+        }
+        crate::remux_cache::CacheState::Disabled => None,
+    };
+
+    let Some(permit) = state.remux_slots.clone().try_acquire_owned().ok() else {
+        if let Some(writer) = cache_writer {
+            writer.abort().await;
+        }
+        let (status, body) = err(
+            "REMUX_BUSY",
+            "All media-processing slots are currently busy. Try again later.",
+            Some(source.provider),
+            429,
+        );
+        return write_raw_json(stream, status, &body, None).await;
+    };
+    if !validated_remux_preflight(&validated_url, &playback.headers).await {
+        if let Some(writer) = cache_writer {
+            writer.abort().await;
+        }
         let (status, body) = err(
             "REMUX_UNAVAILABLE",
             "This source is not browser-compatible for stream-copy remuxing.",
@@ -3576,6 +3718,7 @@ async fn transcode_source(
         );
         return write_raw_json(stream, status, &body, None).await;
     }
+
     let mut command = Command::new("ffmpeg");
     command.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
     let headers = playback
@@ -3607,8 +3750,6 @@ async fn transcode_source(
         "-dn",
         "-max_interleave_delta",
         "0",
-    ]);
-    command.args([
         "-movflags",
         "+frag_keyframe+empty_moov+default_base_moof",
         "-flush_packets",
@@ -3621,9 +3762,13 @@ async fn transcode_source(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    let mut child = match command.spawn() {
+    let child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
+            drop(permit);
+            if let Some(writer) = cache_writer {
+                writer.abort().await;
+            }
             let (status, body) = err(
                 "REMUX_UNAVAILABLE",
                 format!("FFmpeg is not available: {error}"),
@@ -3633,99 +3778,51 @@ async fn transcode_source(
             return write_raw_json(stream, status, &body, None).await;
         }
     };
-    let Some(mut stdout) = child.stdout.take() else {
-        let _ = child.kill().await;
-        let (status, body) = err(
-            "REMUX_FAILED",
-            "FFmpeg did not open an output stream.",
-            Some(source.provider),
-            502,
-        );
-        return write_raw_json(stream, status, &body, None).await;
-    };
-    let mut stderr = child.stderr.take();
-    let stderr_task = tokio::spawn(async move {
-        if let Some(mut stderr) = stderr.take() {
-            let mut buffer = [0u8; 1024];
-            while stderr.read(&mut buffer).await.unwrap_or(0) > 0 {}
-        }
-    });
-    let mut first_chunk = vec![0u8; 32 * 1024];
-    let first_len = match tokio::time::timeout(
-        REMUX_STARTUP_TIMEOUT,
-        stdout.read(&mut first_chunk),
-    )
-    .await
-    {
-        Ok(Ok(length)) if length > 0 => length,
-        Ok(_) => {
-            let _ = child.kill().await;
-            let _ = stderr_task.await;
-            drop(permit);
-            let (status, body) = err(
-                "REMUX_FAILED",
-                "FFmpeg could not start a playable output stream.",
-                Some(source.provider),
-                502,
-            );
-            return write_raw_json(stream, status, &body, None).await;
-        }
-        Err(_) => {
-            let _ = child.kill().await;
-            let _ = stderr_task.await;
-            drop(permit);
-            let (status, body) = err(
-                "REMUX_STARTUP_TIMEOUT",
-                "FFmpeg did not produce output before the startup timeout.",
-                Some(source.provider),
-                504,
-            );
-            return write_raw_json(stream, status, &body, None).await;
-        }
-    };
-    if let Err(error) = write_headers(
-        stream,
-        200,
-        "video/mp4",
-        Some(&format!(
-            "X-Media-Mode: {}\r\nX-Source-Id: {source_id}\r\n",
-            if stream_copy { "remux" } else { "transcode" }
-        )),
-    )
-    .await
-    {
-        let _ = child.kill().await;
-        let _ = stderr_task.await;
-        drop(permit);
-        return Err(error);
-    }
-    if let Err(error) = stream.write_all(&first_chunk[..first_len]).await {
-        let _ = child.kill().await;
-        let _ = stderr_task.await;
-        drop(permit);
-        return Err(error);
-    }
-    let result = tokio::io::copy(&mut stdout, stream).await;
-    let exit_status = if result.is_ok() {
-        match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
-            Ok(Ok(status)) => Some(status),
-            _ => {
-                let _ = child.kill().await;
-                None
-            }
-        }
+    let debug_id = REMUX_DEBUG_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let cache_state = if cache_building {
+        "building"
     } else {
-        let _ = child.kill().await;
-        None
+        "unavailable"
     };
-    let _ = stderr_task.await;
+    let range_support = if cache_building { "bytes" } else { "none" };
+    let extra = format!(
+        "Accept-Ranges: {range_support}\r\nX-Media-Mode: remux\r\nX-Source-Id: {source_id}\r\nX-Remux-Cache-State: {cache_state}\r\n"
+    );
+    let result = stream_ffmpeg_remux(
+        stream,
+        child,
+        cache_writer,
+        range_requested,
+        &extra,
+        debug_id,
+    )
+    .await;
     drop(permit);
-    result?;
-    match exit_status {
-        Some(status) if status.success() => Ok(()),
-        _ => Err(std::io::Error::other(
-            "FFmpeg remux did not exit successfully",
-        )),
+    match result {
+        Ok(Some(cached)) => {
+            serve_cached_remux(stream, cached, request_headers, false, Some(source_id)).await
+        }
+        Ok(None) if range_requested => write_raw_json(
+            stream,
+            503,
+            r#"{"error":{"code":"REMUX_CACHE_UNAVAILABLE","message":"The seekable remux cache could not be created."}}"#,
+            Some("X-Remux-Cache-State: unavailable\r\n"),
+        )
+        .await,
+        Ok(None) => Ok(()),
+        Err(error) if range_requested => {
+            write_raw_json(
+                stream,
+                503,
+                &format!(
+                    r#"{{"error":{{"code":"REMUX_CACHE_FAILED","message":"{}"}}}}"#,
+                    sanitize_error(&error.to_string())
+                ),
+                Some("X-Remux-Cache-State: failed\r\n"),
+            )
+            .await
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -3767,6 +3864,33 @@ async fn stream_proxy_route(
     request_headers: &HashMap<String, String>,
     head_only: bool,
 ) -> std::io::Result<()> {
+    let remux_requested = query_value(query, "remux")
+        .or_else(|| query_value(query, "transcode"))
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+    if remux_requested
+        && let Some(raw_url) = query_value(query, "url")
+        && let Ok(cache_url) = reqwest::Url::parse(&raw_url)
+    {
+        let referer = query_value(query, "referer").and_then(|value| {
+            crate::net::validate_url_syntax(&value, true)
+                .ok()
+                .map(|url| url.to_string())
+        });
+        let mut headers = vec![("User-Agent".to_string(), "Mozilla/5.0".to_string())];
+        if let Some(referer) = referer.as_ref() {
+            headers.push(("Referer".to_string(), referer.clone()));
+        }
+        let key = crate::remux_cache::cache_key(cache_url.as_str(), &headers);
+        if let Some(cached) = crate::remux_cache::lookup(&key).await {
+            return serve_cached_remux(stream, cached, request_headers, head_only, None).await;
+        }
+        if crate::remux_cache::is_building(&key).await
+            && (head_only || is_seeking_range(request_headers))
+        {
+            return wait_for_remux_cache_response(stream, &key, request_headers, head_only, None)
+                .await;
+        }
+    }
     let (url, referer) = match validated_media_url(query).await {
         Ok(value) => value,
         Err((status, message)) => {
@@ -3787,20 +3911,8 @@ async fn stream_proxy_route(
             .await;
         }
     };
-    let remux_requested = query_value(query, "remux")
-        .or_else(|| query_value(query, "transcode"))
-        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
     if remux_requested {
-        if head_only {
-            return write_raw_json(
-                stream,
-                405,
-                r#"{"error":{"code":"METHOD_NOT_ALLOWED","message":"Remuxing requires GET."}}"#,
-                None,
-            )
-            .await;
-        }
-        return remux_media_url(stream, &url, referer.as_deref()).await;
+        return remux_media_url(stream, &url, referer.as_deref(), request_headers, head_only).await;
     }
     let client = media_request_client();
     let mut request = if head_only {
@@ -3853,41 +3965,445 @@ fn sanitize_error(error: &str) -> String {
     error.replace('"', "'").replace(['\r', '\n'], " ")
 }
 
+fn is_seeking_range(request_headers: &HashMap<String, String>) -> bool {
+    let Some(range) = request_headers.get("range") else {
+        return false;
+    };
+    let Some((unit, spec)) = range.trim().split_once('=') else {
+        return false;
+    };
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return false;
+    }
+    let Some((start, _)) = spec.split_once('-') else {
+        return false;
+    };
+    if start.is_empty() {
+        return true;
+    }
+    start.parse::<u64>().is_ok_and(|start| start > 0)
+}
+
+async fn serve_cached_remux(
+    stream: &mut TcpStream,
+    cached: crate::remux_cache::CachedRemux,
+    request_headers: &HashMap<String, String>,
+    head_only: bool,
+    source_id: Option<&str>,
+) -> std::io::Result<()> {
+    let total = cached.metadata.size_bytes;
+    let range = crate::remux_cache::parse_range_header(
+        request_headers.get("range").map(String::as_str),
+        total,
+    );
+    if range == crate::remux_cache::ByteRange::Unsatisfiable {
+        return write_headers(
+            stream,
+            416,
+            "video/mp4",
+            Some(&format!(
+                "Accept-Ranges: bytes\r\nContent-Range: bytes */{total}\r\nContent-Length: 0\r\nX-Remux-Cache-State: ready\r\n"
+            )),
+        )
+        .await;
+    }
+    let (status, start, end) = match range {
+        crate::remux_cache::ByteRange::Full => (200, 0, total.saturating_sub(1)),
+        crate::remux_cache::ByteRange::Partial { start, end } => (206, start, end),
+        crate::remux_cache::ByteRange::Unsatisfiable => unreachable!(),
+    };
+    let length = if total == 0 { 0 } else { end - start + 1 };
+    let mut extra = format!(
+        "Accept-Ranges: bytes\r\nContent-Length: {length}\r\nX-Media-Mode: remux\r\nX-Remux-Cache-State: ready\r\nX-Media-Duration: {:.3}\r\n",
+        cached.metadata.duration_seconds
+    );
+    if status == 206 {
+        extra.push_str(&format!("Content-Range: bytes {start}-{end}/{total}\r\n"));
+    }
+    if let Some(source_id) = source_id {
+        extra.push_str(&format!("X-Source-Id: {source_id}\r\n"));
+    }
+    write_headers(stream, status, "video/mp4", Some(&extra)).await?;
+    if head_only || length == 0 {
+        return Ok(());
+    }
+
+    let mut file = tokio::fs::File::open(&cached.path).await?;
+    file.seek(std::io::SeekFrom::Start(start)).await?;
+    let mut remaining = length;
+    let mut buffer = [0u8; 64 * 1024];
+    while remaining > 0 {
+        let chunk_size = remaining.min(buffer.len() as u64) as usize;
+        let read = file.read(&mut buffer[..chunk_size]).await?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "cached remux ended before the requested byte range",
+            ));
+        }
+        stream.write_all(&buffer[..read]).await?;
+        remaining -= read as u64;
+    }
+    Ok(())
+}
+
+async fn wait_for_remux_cache_response(
+    stream: &mut TcpStream,
+    key: &str,
+    request_headers: &HashMap<String, String>,
+    head_only: bool,
+    source_id: Option<&str>,
+) -> std::io::Result<()> {
+    if let Some(cached) = crate::remux_cache::wait_for(key, REMUX_CACHE_WAIT_TIMEOUT).await {
+        return serve_cached_remux(stream, cached, request_headers, head_only, source_id).await;
+    }
+    write_raw_json(
+        stream,
+        503,
+        r#"{"error":{"code":"REMUX_CACHE_BUILDING","message":"The seekable media cache is still being prepared. Retry shortly."}}"#,
+        Some("Retry-After: 3\r\nX-Remux-Cache-State: building\r\n"),
+    )
+    .await
+}
+
+async fn stream_ffmpeg_remux(
+    stream: &mut TcpStream,
+    mut child: tokio::process::Child,
+    cache_writer: Option<crate::remux_cache::CacheWriter>,
+    range_only: bool,
+    response_extra: &str,
+    debug_id: u64,
+) -> std::io::Result<Option<crate::remux_cache::CachedRemux>> {
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill().await;
+        if let Some(writer) = cache_writer {
+            writer.abort().await;
+        }
+        return Err(std::io::Error::other("FFmpeg did not open remux output"));
+    };
+    let stderr_task = child.stderr.take().map(|mut stderr| {
+        tokio::spawn(async move {
+            let mut buffer = [0u8; 1024];
+            while stderr.read(&mut buffer).await.unwrap_or(0) > 0 {}
+        })
+    });
+
+    let startup = tokio::time::timeout(REMUX_STARTUP_TIMEOUT, async {
+        let mut buffered = Vec::with_capacity(128 * 1024);
+        let mut chunk = [0u8; 32 * 1024];
+        loop {
+            let length = stdout.read(&mut chunk).await?;
+            if length == 0 {
+                return Err(std::io::Error::other(
+                    "FFmpeg ended before the first fragmented MP4 media atom",
+                ));
+            }
+            buffered.extend_from_slice(&chunk[..length]);
+            if buffered.windows(4).any(|atom| atom == b"moof") {
+                return Ok(buffered);
+            }
+            if buffered.len() > 4 * 1024 * 1024 {
+                return Err(std::io::Error::other(
+                    "FFmpeg did not produce a fragmented MP4 startup segment",
+                ));
+            }
+        }
+    })
+    .await;
+    let first = match startup {
+        Ok(Ok(buffered)) => buffered,
+        Ok(Err(error)) => {
+            let _ = child.kill().await;
+            if let Some(task) = stderr_task {
+                let _ = task.await;
+            }
+            if let Some(writer) = cache_writer {
+                writer.abort().await;
+            }
+            return Err(error);
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            if let Some(task) = stderr_task {
+                let _ = task.await;
+            }
+            if let Some(writer) = cache_writer {
+                writer.abort().await;
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "FFmpeg startup timed out before the first media fragment",
+            ));
+        }
+    };
+    if range_only && cache_writer.is_none() {
+        let _ = child.kill().await;
+        if let Some(task) = stderr_task {
+            let _ = task.await;
+        }
+        return Err(std::io::Error::other(
+            "cannot satisfy a byte range without a seekable remux cache",
+        ));
+    }
+
+    let (mut cache_tx, cache_task) = if let Some(writer) = cache_writer {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Option<Vec<u8>>>(8);
+        let task = tokio::spawn(async move {
+            let mut writer = writer;
+            while let Some(message) = rx.recv().await {
+                match message {
+                    Some(chunk) => {
+                        if writer.write_chunk(&chunk).await.is_err() {
+                            writer.abort().await;
+                            return None;
+                        }
+                    }
+                    None if range_only => return Some(writer),
+                    None => {
+                        match writer.finish().await {
+                            Ok(cached) => log::info!(
+                                "remux cache ready id={debug_id} bytes={} duration_seconds={:.3}",
+                                cached.metadata.size_bytes,
+                                cached.metadata.duration_seconds
+                            ),
+                            Err(error) => {
+                                log::warn!("remux cache finalization failed id={debug_id}: {error}")
+                            }
+                        }
+                        return None;
+                    }
+                }
+            }
+            writer.abort().await;
+            None
+        });
+        (Some(tx), Some(task))
+    } else {
+        (None, None)
+    };
+
+    if !range_only {
+        if let Err(error) = write_headers(stream, 200, "video/mp4", Some(response_extra)).await {
+            let _ = child.kill().await;
+            drop(cache_tx.take());
+            if let Some(task) = cache_task {
+                let _ = task.await;
+            }
+            if let Some(task) = stderr_task {
+                let _ = task.await;
+            }
+            return Err(error);
+        }
+    }
+
+    let mut client_connected = true;
+    let mut client_error = None;
+    if !range_only {
+        if let Err(error) = stream.write_all(&first).await {
+            client_connected = false;
+            client_error = Some(error);
+        }
+    }
+    if let Some(tx) = cache_tx.as_ref() {
+        let send_failed = if range_only {
+            tx.send(Some(first)).await.is_err()
+        } else {
+            tx.try_send(Some(first)).is_err()
+        };
+        if send_failed {
+            cache_tx = None;
+        }
+    }
+
+    let mut read_error = None;
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let length = match stdout.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(length) => length,
+            Err(error) => {
+                read_error = Some(error);
+                break;
+            }
+        };
+        if !range_only && client_connected {
+            if let Err(error) = stream.write_all(&chunk[..length]).await {
+                client_connected = false;
+                client_error = Some(error);
+            }
+        }
+        if let Some(tx) = cache_tx.as_ref() {
+            let data = Some(chunk[..length].to_vec());
+            let send_failed = if range_only {
+                tx.send(data).await.is_err()
+            } else {
+                tx.try_send(data).is_err()
+            };
+            if send_failed {
+                cache_tx = None;
+            }
+        }
+        if range_only && cache_tx.is_none() {
+            let _ = child.kill().await;
+            break;
+        }
+        if !client_connected && cache_tx.is_none() && !range_only {
+            break;
+        }
+    }
+    if read_error.is_some() || (!client_connected && cache_tx.is_none() && !range_only) {
+        let _ = child.kill().await;
+    }
+    let status = match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
+        Ok(Ok(status)) => Some(status),
+        _ => {
+            let _ = child.kill().await;
+            None
+        }
+    };
+    if let Some(task) = stderr_task {
+        let _ = task.await;
+    }
+    if !matches!(status, Some(status) if status.success()) || read_error.is_some() {
+        drop(cache_tx);
+        if range_only {
+            if let Some(task) = cache_task {
+                let _ = task.await;
+            }
+        }
+        return Err(read_error.unwrap_or_else(|| std::io::Error::other("FFmpeg remux failed")));
+    }
+    if let Some(error) = client_error
+        && cache_tx.is_none()
+    {
+        return Err(error);
+    }
+    let Some(tx) = cache_tx.take() else {
+        if range_only {
+            return Err(std::io::Error::other("remux cache could not be written"));
+        }
+        return Ok(None);
+    };
+
+    if range_only {
+        if tx.send(None).await.is_err() {
+            if let Some(task) = cache_task {
+                let _ = task.await;
+            }
+            return Err(std::io::Error::other("remux cache could not be completed"));
+        }
+        drop(tx);
+        let writer = match cache_task {
+            Some(task) => task.await.ok().flatten(),
+            None => None,
+        }
+        .ok_or_else(|| std::io::Error::other("remux cache could not be written"))?;
+        let cached = writer.finish().await?;
+        return Ok(Some(cached));
+    }
+    let _ = tx.send(None).await;
+    drop(tx);
+    drop(cache_task);
+    Ok(None)
+}
+
 async fn remux_media_url(
     stream: &mut TcpStream,
     url: &reqwest::Url,
     referer: Option<&str>,
+    request_headers: &HashMap<String, String>,
+    head_only: bool,
 ) -> std::io::Result<()> {
     let debug_id = REMUX_DEBUG_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let upstream_host = url.host_str().unwrap_or("unknown-host");
     let started_at = Instant::now();
-    eprintln!(
-        "[remux:{debug_id}] start upstream_host={upstream_host} referer_present={} ",
-        referer.is_some()
-    );
-    let permit =
-        match REMUX_LIMITER.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
-                eprintln!("[remux:{debug_id}] rejected reason=capacity_busy");
-                return write_raw_json(
-                    stream,
-                    429,
-                    r#"{"error":{"code":"REMUX_BUSY","message":"Remux capacity is busy."}}"#,
-                    None,
-                )
-                .await;
+    let mut upstream_headers = vec![("User-Agent".to_string(), "Mozilla/5.0".to_string())];
+    if let Some(referer) = referer {
+        upstream_headers.push(("Referer".to_string(), referer.to_string()));
+    }
+    let cache_key = crate::remux_cache::cache_key(url.as_str(), &upstream_headers);
+    let range_requested = is_seeking_range(request_headers);
+    let mut cache_building = false;
+    let cache_writer = match crate::remux_cache::prepare(&cache_key).await {
+        crate::remux_cache::CacheState::Hit(cached) => {
+            return serve_cached_remux(stream, cached, request_headers, head_only, None).await;
+        }
+        crate::remux_cache::CacheState::Building if head_only || range_requested => {
+            return wait_for_remux_cache_response(
+                stream,
+                &cache_key,
+                request_headers,
+                head_only,
+                None,
+            )
+            .await;
+        }
+        crate::remux_cache::CacheState::Building => {
+            cache_building = true;
+            None
+        }
+        crate::remux_cache::CacheState::Build(writer) if !head_only => {
+            cache_building = true;
+            Some(*writer)
+        }
+        crate::remux_cache::CacheState::Build(writer) => {
+            (*writer).abort().await;
+            return write_raw_json(
+                stream,
+                405,
+                r#"{"error":{"code":"METHOD_NOT_ALLOWED","message":"A cache miss requires GET for remuxing."}}"#,
+                None,
+            )
+            .await;
+        }
+        crate::remux_cache::CacheState::Disabled if head_only => {
+            return write_raw_json(
+                stream,
+                405,
+                r#"{"error":{"code":"METHOD_NOT_ALLOWED","message":"Remuxing requires GET unless a seekable cache is ready."}}"#,
+                None,
+            )
+            .await;
+        }
+        crate::remux_cache::CacheState::Disabled if range_requested => {
+            return write_raw_json(
+                stream,
+                503,
+                r#"{"error":{"code":"REMUX_CACHE_UNAVAILABLE","message":"The seekable remux cache is unavailable, so this byte range cannot be served."}}"#,
+                Some("X-Remux-Cache-State: unavailable\r\n"),
+            )
+            .await;
+        }
+        crate::remux_cache::CacheState::Disabled => None,
+    };
+
+    let permit = match REMUX_LIMITER.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            if let Some(writer) = cache_writer {
+                writer.abort().await;
             }
-        };
-    eprintln!("[remux:{debug_id}] semaphore_acquired elapsed_ms={}", started_at.elapsed().as_millis());
+            return write_raw_json(
+                stream,
+                429,
+                r#"{"error":{"code":"REMUX_BUSY","message":"Remux capacity is busy."}}"#,
+                None,
+            )
+            .await;
+        }
+    };
+
+    log::info!(
+        "remux start id={debug_id} upstream_host={upstream_host} referer_present={} cache_enabled={}",
+        referer.is_some(),
+        cache_writer.is_some()
+    );
     let mut command = Command::new("ffmpeg");
     command.args([
         "-hide_banner",
         "-loglevel",
         "error",
         "-nostdin",
-        // The source is a very large MKV. Limit probing so Render can receive
-        // the first fragmented-MP4 keyframe before its request deadline.
         "-probesize",
         "5M",
         "-analyzeduration",
@@ -3895,10 +4411,11 @@ async fn remux_media_url(
         "-fflags",
         "+nobuffer",
     ]);
-    let upstream_headers = referer
-        .map(|value| format!("Referer: {value}\r\nUser-Agent: Mozilla/5.0\r\n"))
-        .unwrap_or_else(|| "User-Agent: Mozilla/5.0\r\n".to_string());
-    command.arg("-headers").arg(upstream_headers);
+    let header_text = upstream_headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect::<String>();
+    command.arg("-headers").arg(header_text);
     command.args([
         "-rw_timeout",
         "120000000",
@@ -3908,9 +4425,6 @@ async fn remux_media_url(
         "0:v:0",
         "-map",
         "0:a:0?",
-        // Keep the video bitstream untouched for speed, but normalize the first
-        // audio track to AAC because DTS/E-AC3 tracks inside MP4 are rejected by
-        // common browser MediaSource implementations.
         "-c:v",
         "copy",
         "-c:a",
@@ -3935,10 +4449,14 @@ async fn remux_media_url(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    let mut child = match command.spawn() {
+    let child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            eprintln!("[remux:{debug_id}] ffmpeg_spawn_failed error={error}");
+            drop(permit);
+            if let Some(writer) = cache_writer {
+                writer.abort().await;
+            }
+            log::error!("remux ffmpeg spawn failed id={debug_id}: {error}");
             return write_raw_json(
                 stream,
                 503,
@@ -3948,160 +4466,52 @@ async fn remux_media_url(
             .await;
         }
     };
-    eprintln!(
-        "[remux:{debug_id}] ffmpeg_spawned pid={} elapsed_ms={}",
-        child.id().unwrap_or_default(),
-        started_at.elapsed().as_millis()
-    );
-    let Some(mut stdout) = child.stdout.take() else {
-        let _ = child.kill().await;
-        return write_raw_json(
-            stream,
-            502,
-            r#"{"error":{"code":"REMUX_FAILED","message":"FFmpeg did not open remux output."}}"#,
-            None,
-        )
-        .await;
-    };
-    let mut stderr = child.stderr.take();
-    let stderr_debug_id = debug_id;
-    let stderr_task = tokio::spawn(async move {
-        if let Some(mut stderr) = stderr.take() {
-            let mut buffer = [0u8; 1024];
-            loop {
-                let length = stderr.read(&mut buffer).await.unwrap_or(0);
-                if length == 0 {
-                    break;
-                }
-                let message = String::from_utf8_lossy(&buffer[..length]);
-                eprintln!("[remux:{stderr_debug_id}] ffmpeg_stderr {}", message.trim());
-            }
-        }
-    });
-    // FFmpeg writes the fragmented-MP4 init segment (ftyp/moov) before the
-    // first media fragment. Do not expose that incomplete prefix to browsers:
-    // some MediaSource implementations classify an init-only response as a
-    // format error instead of waiting for the first moof/mdat pair.
-    let startup = tokio::time::timeout(REMUX_STARTUP_TIMEOUT, async {
-        let mut buffered = Vec::with_capacity(128 * 1024);
-        let mut chunk = [0u8; 32 * 1024];
-        let mut total_read = 0usize;
-        loop {
-            let length = stdout.read(&mut chunk).await?;
-            if length == 0 {
-                eprintln!(
-                    "[remux:{debug_id}] stdout_eof_before_moof total_bytes={} elapsed_ms={}",
-                    total_read,
-                    started_at.elapsed().as_millis()
-                );
-                return Err(std::io::Error::other(
-                    "FFmpeg ended before the first media fragment",
-                ));
-            }
-            total_read += length;
-            buffered.extend_from_slice(&chunk[..length]);
-            let has_moof = buffered.windows(4).any(|atom| atom == b"moof");
-            eprintln!(
-                "[remux:{debug_id}] stdout_chunk phase=startup bytes={} total_bytes={} moof={} elapsed_ms={}",
-                length,
-                total_read,
-                has_moof,
-                started_at.elapsed().as_millis()
-            );
-            if has_moof {
-                eprintln!(
-                    "[remux:{debug_id}] first_moof_ready buffered_bytes={} elapsed_ms={}",
-                    buffered.len(),
-                    started_at.elapsed().as_millis()
-                );
-                return Ok(buffered);
-            }
-            if buffered.len() > 4 * 1024 * 1024 {
-                return Err(std::io::Error::other(
-                    "FFmpeg did not produce a fragmented MP4 startup segment",
-                ));
-            }
-        }
-    })
-    .await;
-    let first = match startup {
-        Ok(Ok(buffered)) => buffered,
-        result => {
-            eprintln!(
-                "[remux:{debug_id}] startup_failed result={:?} elapsed_ms={}",
-                result.as_ref().err(),
-                started_at.elapsed().as_millis()
-            );
-            let _ = child.kill().await;
-            let _ = stderr_task.await;
-            drop(permit);
-            return write_raw_json(stream, 502, r#"{"error":{"code":"REMUX_FAILED","message":"FFmpeg did not produce a playable media fragment."}}"#, None).await;
-        }
-    };
-    write_headers(
-        stream,
-        200,
-        "video/mp4",
-        Some("Accept-Ranges: none\r\nX-Media-Mode: remux\r\n"),
-    )
-    .await?;
-    eprintln!(
-        "[remux:{debug_id}] response_headers_sent initial_bytes={} elapsed_ms={}",
-        first.len(),
-        started_at.elapsed().as_millis()
-    );
-    if let Err(error) = stream.write_all(&first).await {
-        eprintln!("[remux:{debug_id}] client_write_failed phase=initial error={error}");
-        let _ = child.kill().await;
-        let _ = stderr_task.await;
-        drop(permit);
-        return Err(error);
-    }
-    let mut streamed_bytes = first.len();
-    let result = async {
-        let mut chunk = [0u8; 64 * 1024];
-        loop {
-            let length = stdout.read(&mut chunk).await?;
-            if length == 0 {
-                eprintln!(
-                    "[remux:{debug_id}] stdout_eof_after_start total_bytes={} elapsed_ms={}",
-                    streamed_bytes,
-                    started_at.elapsed().as_millis()
-                );
-                break;
-            }
-            streamed_bytes += length;
-            eprintln!(
-                "[remux:{debug_id}] stdout_chunk phase=stream bytes={} total_bytes={} elapsed_ms={}",
-                length,
-                streamed_bytes,
-                started_at.elapsed().as_millis()
-            );
-            stream.write_all(&chunk[..length]).await.map_err(|error| {
-                eprintln!("[remux:{debug_id}] client_write_failed phase=stream error={error}");
-                error
-            })?;
-        }
-        Ok::<(), std::io::Error>(())
-    }
-    .await;
-    if result.is_err() {
-        let _ = child.kill().await;
-    }
-    let status = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
-    let _ = stderr_task.await;
-    drop(permit);
-    result?;
-    eprintln!(
-        "[remux:{debug_id}] complete total_bytes={} elapsed_ms={} ffmpeg_status={:?}",
-        streamed_bytes,
-        started_at.elapsed().as_millis(),
-        status
-    );
-    if matches!(status, Ok(Ok(status)) if status.success()) {
-        Ok(())
+    let cache_state = if cache_building {
+        "building"
     } else {
-        Err(std::io::Error::other("FFmpeg remux failed"))
+        "unavailable"
+    };
+    let range_support = if cache_building { "bytes" } else { "none" };
+    let extra = format!(
+        "Accept-Ranges: {range_support}\r\nX-Media-Mode: remux\r\nX-Remux-Cache-State: {cache_state}\r\n"
+    );
+    let result = stream_ffmpeg_remux(
+        stream,
+        child,
+        cache_writer,
+        range_requested,
+        &extra,
+        debug_id,
+    )
+    .await;
+    drop(permit);
+    log::info!(
+        "remux response complete id={debug_id} elapsed_ms={}",
+        started_at.elapsed().as_millis()
+    );
+    match result {
+        Ok(Some(cached)) => {
+            serve_cached_remux(stream, cached, request_headers, false, None).await
+        }
+        Ok(None) if range_requested => write_raw_json(
+            stream,
+            503,
+            r#"{"error":{"code":"REMUX_CACHE_UNAVAILABLE","message":"The seekable remux cache could not be created."}}"#,
+            Some("X-Remux-Cache-State: unavailable\r\n"),
+        )
+        .await,
+        Ok(None) => Ok(()),
+        Err(error) if range_requested => {
+            log::warn!("range remux failed id={debug_id}: {error}");
+            write_raw_json(
+                stream,
+                503,
+                r#"{"error":{"code":"REMUX_CACHE_FAILED","message":"A seekable remux could not be prepared."}}"#,
+                Some("X-Remux-Cache-State: failed\r\n"),
+            )
+            .await
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -4270,6 +4680,7 @@ async fn write_headers(
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        416 => "Range Not Satisfiable",
         429 => "Too Many Requests",
         501 => "Not Implemented",
         502 => "Bad Gateway",
@@ -4278,7 +4689,7 @@ async fn write_headers(
         _ => "Error",
     };
     let mut h = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nCache-Control: no-cache\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, HEAD, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Accept, Content-Type, Authorization, Range, X-Requested-With\r\nAccess-Control-Expose-Headers: Content-Length, Content-Range, Accept-Ranges, Content-Type, X-Media-Mode, X-Source-Id\r\nAccess-Control-Max-Age: 86400\r\n"
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nCache-Control: no-cache\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, HEAD, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Accept, Content-Type, Authorization, Range, X-Requested-With\r\nAccess-Control-Expose-Headers: Content-Length, Content-Range, Accept-Ranges, Content-Type, X-Media-Mode, X-Source-Id, X-Media-Duration, X-Remux-Cache-State\r\nAccess-Control-Max-Age: 86400\r\n"
     );
     if let Some(x) = extra {
         h.push_str(x)
@@ -4385,6 +4796,20 @@ fn openapi() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initial_zero_byte_range_keeps_live_first_policy() {
+        let mut headers = HashMap::new();
+        assert!(!is_seeking_range(&headers));
+        for value in ["bytes=0-", "bytes=0-1048575", "Bytes=0-1"] {
+            headers.insert("range".to_string(), value.to_string());
+            assert!(!is_seeking_range(&headers), "{value}");
+        }
+        headers.insert("range".to_string(), "bytes=1-".to_string());
+        assert!(is_seeking_range(&headers));
+        headers.insert("range".to_string(), "bytes=-512".to_string());
+        assert!(is_seeking_range(&headers));
+    }
 
     #[test]
     fn percent_decode_preserves_utf8_and_plus_spaces() {
@@ -4982,7 +5407,10 @@ mod tests {
         // Codec metadata is a provider hint only. A successful real remux preflight is
         // authoritative even when the hint is absent or names a different codec family.
         for _codec in [None, Some("HEVC"), Some("AV1"), Some("unknown")] {
-            assert_eq!(media_mode_after_remux_preflight(true), MediaMode::Remux);
+            assert_eq!(
+                media_mode_after_remux_preflight(true),
+                Some(MediaMode::Remux)
+            );
         }
         assert_eq!(media_mode_after_remux_preflight(false), None);
     }

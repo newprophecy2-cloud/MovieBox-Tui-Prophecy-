@@ -13,6 +13,7 @@ pub mod net;
 pub mod player;
 pub mod providers;
 pub mod proxy;
+pub mod remux_cache;
 pub mod service;
 pub mod tui;
 pub mod updater;
