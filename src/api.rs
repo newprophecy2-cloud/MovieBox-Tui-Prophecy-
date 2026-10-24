@@ -3,7 +3,10 @@
     reason = "MovieBox catalog handlers remain compiled for a controlled future re-enable while the provider is intentionally disabled"
 )]
 
-use futures::StreamExt;
+use futures::{
+    FutureExt, StreamExt,
+    future::{BoxFuture, Shared},
+};
 use std::{
     collections::HashMap,
     sync::Arc,
@@ -98,6 +101,7 @@ fn provider_priority(provider: ProviderKind) -> usize {
 pub struct ApiState {
     pub service: Arc<MovieBoxService>,
     release_cache: Arc<Mutex<HashMap<String, ReleaseCacheEntry>>>,
+    release_inflight: Arc<Mutex<HashMap<String, SharedReleaseFuture>>>,
     playback_cache: Arc<Mutex<HashMap<String, PlaybackCacheEntry>>>,
     search_source_check_slots: Arc<Semaphore>,
     transcode_slots: Arc<Semaphore>,
@@ -115,8 +119,9 @@ struct PlaybackCacheEntry {
     stored_at: Instant,
     playback: PlaybackSource,
 }
+type SharedReleaseFuture = Shared<BoxFuture<'static, Result<Vec<Release>, ProviderError>>>;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct OpaqueRef {
     p: ProviderKind,
     v: String,
@@ -587,6 +592,7 @@ pub async fn run() -> std::io::Result<()> {
     let state = ApiState {
         service: Arc::new(MovieBoxService::new()),
         release_cache: Arc::new(Mutex::new(HashMap::new())),
+        release_inflight: Arc::new(Mutex::new(HashMap::new())),
         playback_cache: Arc::new(Mutex::new(HashMap::new())),
         search_source_check_slots: Arc::new(Semaphore::new(SEARCH_SOURCE_CHECK_CONCURRENCY)),
         transcode_slots: Arc::new(Semaphore::new(MAX_TRANSCODE_SESSIONS)),
@@ -2379,7 +2385,35 @@ async fn cached_releases(state: &ApiState, r: &OpaqueRef) -> Result<Vec<Release>
     {
         return Ok(entry.releases);
     }
-    let fetched = releases_uncached(state, r).await?;
+
+    // Keep one provider fetch in flight per episode. The task is spawned before
+    // callers await it, so a request timeout cannot leave a permanently pending
+    // future in the map or cancel the shared upstream operation.
+    let shared = {
+        let mut inflight = state.release_inflight.lock().await;
+        if let Some(existing) = inflight.get(&key) {
+            existing.clone()
+        } else {
+            let state = state.clone();
+            let episode = r.clone();
+            let task = tokio::spawn(async move { releases_uncached(&state, &episode).await });
+            let future = async move {
+                task.await.unwrap_or_else(|_| {
+                    Err(ProviderError::Unavailable(
+                        "source fetch task failed".into(),
+                    ))
+                })
+            }
+            .boxed()
+            .shared();
+            inflight.insert(key.clone(), future.clone());
+            future
+        }
+    };
+
+    let fetched = shared.await;
+    state.release_inflight.lock().await.remove(&key);
+    let fetched = fetched?;
     let mut cache = state.release_cache.lock().await;
     if cache.len() >= 2048 {
         cache.retain(|_, entry| entry.stored_at.elapsed() < RELEASE_CACHE_TTL);
