@@ -49,6 +49,13 @@ pub struct CatalogJob {
     pub failed_count: i64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct CatalogGenre {
+    pub id: String,
+    pub canonical_name: String,
+    pub normalized_name: String,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
     #[error("database error")]
@@ -138,6 +145,33 @@ impl CatalogStore {
             ).await?,
         };
         Ok(rows.iter().map(title_from_row).collect())
+    }
+
+    pub async fn get_title(&self, id: &str) -> Result<Option<CatalogTitle>, CatalogError> {
+        let row = self.client.lock().await.query_opt(
+            "SELECT id::text, mal_id, canonical_title, normalized_title, content_type, synopsis, release_year, poster_url, catalog_status FROM catalog_titles WHERE id::text=$1 AND catalog_status <> 'deleted'",
+            &[&id],
+        ).await?;
+        Ok(row.as_ref().map(title_from_row))
+    }
+
+    pub async fn list_genres(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<CatalogGenre>, CatalogError> {
+        let rows = self.client.lock().await.query(
+            "SELECT id::text, canonical_name, normalized_name FROM genres ORDER BY normalized_name LIMIT $1 OFFSET $2",
+            &[&limit.clamp(1, 100), &offset.max(0)],
+        ).await?;
+        Ok(rows
+            .iter()
+            .map(|row| CatalogGenre {
+                id: row.get("id"),
+                canonical_name: row.get("canonical_name"),
+                normalized_name: row.get("normalized_name"),
+            })
+            .collect())
     }
 
     pub async fn upsert(&self, input: TitleUpsert) -> Result<(CatalogTitle, bool), CatalogError> {

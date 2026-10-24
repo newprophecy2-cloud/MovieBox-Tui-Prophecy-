@@ -12,6 +12,7 @@ This document describes the Rust API implementation in this repository, not a pr
 - `GET /api/v1/anime/search` and `/api/v1/anime/search/stream` perform live provider search (JSON and SSE). They are not database-backed catalog searches.
 - `GET /api/v1/search?q=...` is the new PostgreSQL-only catalog search. It never performs live provider discovery. An empty result creates or increments a durable `pending_import_requests` record.
 - `GET /api/v1/home`, `/api/v1/trending`, `/api/v1/popular`, `/api/v1/latest`, `/api/v1/movies`, and `/api/v1/k-dramas` use PostgreSQL catalog listings when `DATABASE_URL` is configured; without the database they preserve the legacy provider/compatibility behavior.
+- `GET /api/v1/genres` and `GET /api/v1/catalog/titles/{title_id}` expose canonical PostgreSQL genre and title-detail records when the catalog is configured.
 - Protected manual catalog operations are available under `/api/v1/admin/catalog/*` and require `ADMIN_TOKEN`.
 - `GET /api/v1/watch` is a compatibility route that searches providers and resolves a playable source at request time.
 

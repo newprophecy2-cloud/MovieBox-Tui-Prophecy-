@@ -910,11 +910,13 @@ async fn route(
         "/api/v1/admin/catalog/inspect" if method == "GET" => admin_catalog_inspect_route(stream, query, state, request_headers).await,
         _ if path.starts_with("/api/v1/admin/catalog/jobs/") && method == "GET" => admin_catalog_job_route(stream, path, state, request_headers).await,
         "/api/v1/home" if state.catalog.is_some() => catalog_home_route(stream, query, state).await,
+        "/api/v1/genres" if state.catalog.is_some() => catalog_genres_route(stream, query, state).await,
         "/api/v1/trending" if state.catalog.is_some() => catalog_listing_route(stream, query, state, None, "trending").await,
         "/api/v1/popular" if state.catalog.is_some() => catalog_listing_route(stream, query, state, None, "popular").await,
         "/api/v1/latest" if state.catalog.is_some() => catalog_listing_route(stream, query, state, None, "latest").await,
         "/api/v1/movies" if state.catalog.is_some() => catalog_listing_route(stream, query, state, Some("movie"), "movies").await,
         "/api/v1/k-dramas" if state.catalog.is_some() => catalog_listing_route(stream, query, state, Some("k_drama"), "k-dramas").await,
+        _ if path.starts_with("/api/v1/catalog/titles/") && state.catalog.is_some() => catalog_title_detail_route(stream, path, state).await,
         "/api/v1/diagnostics" => diagnostics_route(stream, state).await,
         "/api/stream-proxy" => stream_proxy_route(stream, query, request_headers, head_only).await,
         "/api/media-info" => media_info_route(stream, query, request_headers).await,
@@ -1078,6 +1080,41 @@ async fn catalog_listing_route(
     };
     match catalog.list_titles(content_type, query_number(query, "limit", 20), query_number(query, "offset", 0)).await {
         Ok(items) => write_json(stream, 200, &serde_json::json!({"success":true,"data":{"section":section,"items":items,"source":"postgresql_catalog"},"meta":{"request_id":request_id()}}), None).await,
+        Err(_) => write_json(stream, 503, &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","message":"The catalog database is unavailable.","retryable":true}}), None).await,
+    }
+}
+
+async fn catalog_genres_route(
+    stream: &mut TcpStream,
+    query: &str,
+    state: ApiState,
+) -> std::io::Result<()> {
+    let Some(catalog) = state.catalog else {
+        return write_json(stream, 503, &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","message":"The catalog database is not configured.","retryable":true}}), None).await;
+    };
+    match catalog.list_genres(query_number(query, "limit", 100), query_number(query, "offset", 0)).await {
+        Ok(items) => write_json(stream, 200, &serde_json::json!({"success":true,"data":{"items":items,"source":"postgresql_catalog"},"meta":{"request_id":request_id()}}), None).await,
+        Err(_) => write_json(stream, 503, &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","message":"The catalog database is unavailable.","retryable":true}}), None).await,
+    }
+}
+
+async fn catalog_title_detail_route(
+    stream: &mut TcpStream,
+    path: &str,
+    state: ApiState,
+) -> std::io::Result<()> {
+    let Some(catalog) = state.catalog else {
+        return write_json(stream, 503, &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","message":"The catalog database is not configured.","retryable":true}}), None).await;
+    };
+    let Some(id) = path
+        .strip_prefix("/api/v1/catalog/titles/")
+        .filter(|value| !value.is_empty())
+    else {
+        return write_json(stream, 400, &serde_json::json!({"success":false,"error":{"code":"INVALID_REQUEST","message":"A catalog title ID is required.","retryable":false}}), None).await;
+    };
+    match catalog.get_title(id).await {
+        Ok(Some(title)) => write_json(stream, 200, &serde_json::json!({"success":true,"data":{"title":title},"meta":{"request_id":request_id()}}), None).await,
+        Ok(None) => write_json(stream, 404, &serde_json::json!({"success":false,"error":{"code":"TITLE_NOT_FOUND","message":"The title was not found in the catalog.","retryable":false}}), None).await,
         Err(_) => write_json(stream, 503, &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","message":"The catalog database is unavailable.","retryable":true}}), None).await,
     }
 }
@@ -4786,6 +4823,8 @@ fn openapi() -> serde_json::Value {
             "/api/v1/watch": {"get": {"responses": {"200": {"description": "Direct watch resolution"}, "400": {"description": "Invalid watch request"}, "415": {"description": "All discovered sources are blocked or have unverified codecs"}}}},
             "/api/v1/anime/search": {"get": {"parameters": [{"name": "q", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 200}}, {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 100}}, {"name": "cursor", "in": "query", "schema": {"type": "string"}}], "responses": {"200": {"description": "Search results"}, "400": {"description": "Invalid query"}}}},
             "/api/v1/search": {"get": {"description": "PostgreSQL-only catalog search; never performs live provider discovery.", "responses": {"200": {"description": "Catalog search results"}, "400": {"description": "Invalid query"}, "503": {"description": "Catalog database unavailable"}}}},
+            "/api/v1/genres": {"get": {"description": "PostgreSQL-backed canonical genre list.", "responses": {"200": {"description": "Genres"}, "503": {"description": "Catalog database unavailable"}}}},
+            "/api/v1/catalog/titles/{title_id}": {"get": {"description": "Canonical PostgreSQL catalog title detail.", "responses": {"200": {"description": "Title detail"}, "404": {"description": "Title not found"}, "503": {"description": "Catalog database unavailable"}}}},
             "/api/v1/admin/catalog/import": {"post": {"description": "Protected manual catalog import; accepts a bounded titles batch.", "responses": {"201": {"description": "Import job completed"}, "401": {"description": "Unauthorized"}, "413": {"description": "Batch too large"}, "503": {"description": "Database unavailable"}}}},
             "/api/v1/admin/catalog/update-all": {"post": {"description": "Protected manual catalog update job; never scheduled automatically.", "responses": {"202": {"description": "Update job accepted"}, "401": {"description": "Unauthorized"}}}},
             "/api/v1/admin/catalog/titles/upsert": {"post": {"description": "Protected idempotent catalog title upsert.", "responses": {"200": {"description": "Updated"}, "201": {"description": "Inserted"}, "401": {"description": "Unauthorized"}, "422": {"description": "Validation failed"}}}},
