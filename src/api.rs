@@ -682,6 +682,15 @@ async fn handle(mut stream: TcpStream, state: ApiState) -> std::io::Result<()> {
         .filter_map(|line| line.split_once(':'))
         .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
         .collect::<HashMap<_, _>>();
+    if method == "OPTIONS" {
+        return write_headers(
+            &mut stream,
+            204,
+            "text/plain; charset=utf-8",
+            Some("Content-Length: 0\r\n"),
+        )
+        .await;
+    }
     let allowed_method = matches!(method, "GET" | "HEAD")
         || (method == "POST" && target == "/api/pretranscode/start");
     if !allowed_method {
@@ -3659,7 +3668,7 @@ async fn stream_proxy_route(
         .get(reqwest::header::CONTENT_RANGE)
         .and_then(|value| value.to_str().ok());
     let extra = format!(
-        "Accept-Ranges: bytes\r\n{}{}Access-Control-Allow-Origin: *\r\n",
+        "Accept-Ranges: bytes\r\n{}{}",
         content_length.map_or(String::new(), |value| format!(
             "Content-Length: {value}\r\n"
         )),
@@ -3779,13 +3788,7 @@ async fn transcode_media_url(
             return write_raw_json(stream, 502, r#"{"error":{"code":"TRANSCODE_FAILED","message":"FFmpeg did not produce output."}}"#, None).await;
         }
     };
-    write_headers(
-        stream,
-        200,
-        "video/mp4",
-        Some("Accept-Ranges: none\r\nAccess-Control-Allow-Origin: *\r\n"),
-    )
-    .await?;
+    write_headers(stream, 200, "video/mp4", Some("Accept-Ranges: none\r\n")).await?;
     if let Err(error) = stream.write_all(&first[..first_len]).await {
         let _ = child.kill().await;
         let _ = stderr_task.await;
@@ -3899,13 +3902,7 @@ async fn subtitle_extract_route(
         Ok(bytes) => bytes,
         Err(_) => return write_raw_json(stream, 502, r#"{"error":{"code":"SUBTITLE_TOO_LARGE","message":"Subtitle exceeds the size limit."}}"#, None).await,
     };
-    write_headers(
-        stream,
-        200,
-        &content_type,
-        Some("Access-Control-Allow-Origin: *\r\n"),
-    )
-    .await?;
+    write_headers(stream, 200, &content_type, None).await?;
     stream.write_all(&bytes).await
 }
 
@@ -3971,6 +3968,7 @@ async fn write_headers(
     extra: Option<&str>,
 ) -> std::io::Result<()> {
     let reason = match status {
+        204 => "No Content",
         200 => "OK",
         206 => "Partial Content",
         400 => "Bad Request",
@@ -3985,7 +3983,7 @@ async fn write_headers(
         _ => "Error",
     };
     let mut h = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nCache-Control: no-cache\r\nConnection: close\r\n"
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nCache-Control: no-cache\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, HEAD, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Accept, Content-Type, Authorization, Range, X-Requested-With\r\nAccess-Control-Expose-Headers: Content-Length, Content-Range, Accept-Ranges, Content-Type, X-Media-Mode, X-Source-Id\r\nAccess-Control-Max-Age: 86400\r\n"
     );
     if let Some(x) = extra {
         h.push_str(x)
