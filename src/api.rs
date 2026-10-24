@@ -50,6 +50,7 @@ const PLAYBACK_CACHE_TTL: Duration = Duration::from_secs(120);
 const SEARCH_CACHE_TTL: Duration = Duration::from_secs(60);
 const SEARCH_CACHE_MAX_ENTRIES: usize = 256;
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
+const MAX_REQUEST_BODY_BYTES: usize = 256 * 1024;
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_API_CONNECTIONS: usize = 256;
 const MOVIEBOX_PROVIDER_ENABLED: bool = true;
@@ -93,6 +94,7 @@ fn provider_priority(provider: ProviderKind) -> usize {
 #[derive(Clone)]
 pub struct ApiState {
     pub service: Arc<MovieBoxService>,
+    pub catalog: Option<Arc<crate::catalog::CatalogStore>>,
     release_cache: Arc<Mutex<HashMap<String, ReleaseCacheEntry>>>,
     release_inflight: Arc<Mutex<HashMap<String, SharedReleaseFuture>>>,
     playback_cache: Arc<Mutex<HashMap<String, PlaybackCacheEntry>>>,
@@ -690,8 +692,16 @@ pub async fn run() -> std::io::Result<()> {
         .unwrap_or(8080);
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     let redis_search = init_redis_search_cache().await;
+    let catalog = match crate::catalog::CatalogStore::connect_from_env().await {
+        Ok(catalog) => catalog.map(Arc::new),
+        Err(error) => {
+            log::error!("PostgreSQL catalog initialization failed: {error}");
+            None
+        }
+    };
     let state = ApiState {
         service: Arc::new(MovieBoxService::new()),
+        catalog,
         release_cache: Arc::new(Mutex::new(HashMap::new())),
         release_inflight: Arc::new(Mutex::new(HashMap::new())),
         playback_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -762,7 +772,12 @@ async fn handle(mut stream: TcpStream, state: ApiState) -> std::io::Result<()> {
             break;
         }
     }
-    let raw = String::from_utf8_lossy(&buf);
+    let header_end = buf
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .unwrap()
+        + 4;
+    let raw = String::from_utf8_lossy(&buf[..header_end]).into_owned();
     let mut lines = raw.split("\r\n");
     let first = lines.next().unwrap_or("");
     let mut parts = first.split_whitespace();
@@ -782,6 +797,38 @@ async fn handle(mut stream: TcpStream, state: ApiState) -> std::io::Result<()> {
         .filter_map(|line| line.split_once(':'))
         .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
         .collect::<HashMap<_, _>>();
+    let body_length = request_headers
+        .get("content-length")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    if body_length > MAX_REQUEST_BODY_BYTES {
+        return write_json(
+            &mut stream,
+            413,
+            &serde_json::json!({"error":{"code":"REQUEST_BODY_TOO_LARGE","message":"The request body exceeds the permitted size."}}),
+            Some("Connection: close\r\n"),
+        ).await;
+    }
+    while buf.len() < header_end + body_length {
+        let n = tokio::time::timeout(REQUEST_READ_TIMEOUT, stream.read(&mut chunk))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "request body read timed out")
+            })??;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    if buf.len() < header_end + body_length {
+        return write_json(
+            &mut stream,
+            400,
+            &serde_json::json!({"error":{"code":"INCOMPLETE_REQUEST_BODY","message":"The request body is incomplete."}}),
+            Some("Connection: close\r\n"),
+        ).await;
+    }
+    let body = buf[header_end..header_end + body_length].to_vec();
     if method == "OPTIONS" {
         return write_headers(
             &mut stream,
@@ -792,7 +839,11 @@ async fn handle(mut stream: TcpStream, state: ApiState) -> std::io::Result<()> {
         .await;
     }
     let allowed_method = matches!(method, "GET" | "HEAD")
-        || (method == "POST" && target == "/api/pretranscode/start");
+        || (method == "POST"
+            && (target == "/api/pretranscode/start"
+                || target.starts_with("/api/v1/admin/")
+                || target.starts_with("/api/v1/web/")
+                || target.starts_with("/api/v1/android/")));
     if !allowed_method {
         return write_json(&mut stream, 405, &serde_json::json!({"error":{"code":"METHOD_NOT_ALLOWED","message":"Only GET is supported."}}), None).await;
     }
@@ -801,6 +852,8 @@ async fn handle(mut stream: TcpStream, state: ApiState) -> std::io::Result<()> {
         target,
         state,
         &request_headers,
+        &body,
+        method,
         method == "HEAD",
     )
     .await
@@ -811,6 +864,8 @@ async fn route(
     target: &str,
     state: ApiState,
     request_headers: &HashMap<String, String>,
+    body: &[u8],
+    method: &str,
     head_only: bool,
 ) -> std::io::Result<()> {
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
@@ -846,6 +901,14 @@ async fn route(
         "/api/v1" => write_json(stream, 200, &serde_json::json!({"version":"v1","resources":["anime","movies","episodes","sources"]}), None).await,
         "/openapi.json" => write_json(stream, 200, &openapi(), None).await,
         "/docs" => write_text(stream, 200, "text/html; charset=utf-8", "<!doctype html><html><head><title>MovieBox API</title></head><body><h1>MovieBox API</h1><p>OpenAPI: <a href=\"/openapi.json\">/openapi.json</a></p><p>Swagger UI can load this document from a local or trusted client.</p></body></html>", None).await,
+        "/api/v1/search" if method == "GET" => catalog_search_route(stream, query, state).await,
+        _ if path.starts_with("/api/v1/web/") => web_playback_contract_route(stream, path, state).await,
+        _ if path.starts_with("/api/v1/android/") => android_playback_contract_route(stream, path, state).await,
+        "/api/v1/admin/catalog/import" if method == "POST" => admin_catalog_import_route(stream, state, request_headers, body).await,
+        "/api/v1/admin/catalog/update-all" if method == "POST" => admin_catalog_update_route(stream, state, request_headers).await,
+        "/api/v1/admin/catalog/titles/upsert" if method == "POST" => admin_catalog_upsert_route(stream, state, request_headers, body).await,
+        "/api/v1/admin/catalog/inspect" if method == "GET" => admin_catalog_inspect_route(stream, query, state, request_headers).await,
+        _ if path.starts_with("/api/v1/admin/catalog/jobs/") && method == "GET" => admin_catalog_job_route(stream, path, state, request_headers).await,
         "/api/v1/diagnostics" => diagnostics_route(stream, state).await,
         "/api/stream-proxy" => stream_proxy_route(stream, query, request_headers, head_only).await,
         "/api/media-info" => media_info_route(stream, query, request_headers).await,
@@ -884,6 +947,201 @@ async fn route(
             source_route(stream, path, state, request_headers, head_only).await
         }
         _ => { let (s,b) = err("INTERNAL_ERROR", "Route not found.", None, 404); write_raw_json(stream, s, &b, None).await }
+    }
+}
+
+fn admin_authorized(headers: &HashMap<String, String>) -> bool {
+    let Some(expected) = std::env::var("ADMIN_TOKEN").ok().filter(|v| !v.is_empty()) else {
+        return false;
+    };
+    let supplied = headers.get("x-admin-token").cloned().or_else(|| {
+        headers
+            .get("authorization")
+            .and_then(|v| v.strip_prefix("Bearer ").map(str::to_owned))
+    });
+    supplied.is_some_and(|value| value == expected)
+}
+
+fn query_number(query: &str, key: &str, default: i64) -> i64 {
+    query_value(query, key)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+async fn web_playback_contract_route(
+    stream: &mut TcpStream,
+    path: &str,
+    state: ApiState,
+) -> std::io::Result<()> {
+    let database_missing = state.catalog.is_none();
+    let (status, code, message) = if database_missing {
+        (
+            503,
+            "DATABASE_UNAVAILABLE",
+            "The catalog database is not configured.",
+        )
+    } else {
+        (
+            404,
+            "NO_COMPATIBLE_SOURCE",
+            "No verified non-HEVC stored source is available for this Web session.",
+        )
+    };
+    write_json(stream, status, &serde_json::json!({"success":false,"error":{"code":code,"message":message,"retryable":false},"meta":{"request_id":request_id(),"route":path,"policy":"web_live_remux_requires_verified_stored_source"}}), None).await
+}
+
+async fn android_playback_contract_route(
+    stream: &mut TcpStream,
+    path: &str,
+    state: ApiState,
+) -> std::io::Result<()> {
+    let database_missing = state.catalog.is_none();
+    let (status, code, message) = if database_missing {
+        (
+            503,
+            "DATABASE_UNAVAILABLE",
+            "The catalog database is not configured.",
+        )
+    } else {
+        (
+            404,
+            "NO_COMPATIBLE_SOURCE",
+            "No verified Android-compatible non-HEVC direct-play source is available.",
+        )
+    };
+    write_json(stream, status, &serde_json::json!({"success":false,"error":{"code":code,"message":message,"retryable":false},"meta":{"request_id":request_id(),"route":path,"policy":"android_direct_play_only"}}), None).await
+}
+
+async fn catalog_search_route(
+    stream: &mut TcpStream,
+    query: &str,
+    state: ApiState,
+) -> std::io::Result<()> {
+    let Some(catalog) = state.catalog else {
+        return write_json(stream, 503, &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","message":"The catalog database is not configured.","retryable":true}}), None).await;
+    };
+    let Some(q) = query_value(query, "q").filter(|v| !v.trim().is_empty()) else {
+        return write_json(stream, 400, &serde_json::json!({"success":false,"error":{"code":"INVALID_REQUEST","message":"q is required.","retryable":false}}), None).await;
+    };
+    match catalog.search(&q, query_number(query, "limit", 20), query_number(query, "offset", 0)).await {
+        Ok(items) => write_json(stream, 200, &serde_json::json!({"success":true,"data":{"items":items},"meta":{"request_id":request_id()}}), None).await,
+        Err(crate::catalog::CatalogError::Validation(message)) => write_json(stream, 400, &serde_json::json!({"success":false,"error":{"code":"VALIDATION_FAILED","message":message,"retryable":false},"meta":{"request_id":request_id()}}), None).await,
+        Err(_) => write_json(stream, 503, &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","message":"The catalog database is unavailable.","retryable":true},"meta":{"request_id":request_id()}}), None).await,
+    }
+}
+
+async fn admin_catalog_upsert_route(
+    stream: &mut TcpStream,
+    state: ApiState,
+    headers: &HashMap<String, String>,
+    body: &[u8],
+) -> std::io::Result<()> {
+    if !admin_authorized(headers) {
+        return write_json(stream, 401, &serde_json::json!({"success":false,"error":{"code":"UNAUTHORIZED","message":"Administrator authentication is required.","retryable":false}}), None).await;
+    }
+    let Some(catalog) = state.catalog else {
+        return write_json(stream, 503, &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","message":"The catalog database is not configured.","retryable":true}}), None).await;
+    };
+    let input: crate::catalog::TitleUpsert = match serde_json::from_slice(body) { Ok(input) => input, Err(_) => return write_json(stream, 422, &serde_json::json!({"success":false,"error":{"code":"VALIDATION_FAILED","message":"The JSON title payload is invalid.","retryable":false}}), None).await };
+    match catalog.upsert(input).await {
+        Ok((title, inserted)) => write_json(stream, if inserted { 201 } else { 200 }, &serde_json::json!({"success":true,"data":{"title":title,"inserted":inserted},"meta":{"request_id":request_id()}}), None).await,
+        Err(crate::catalog::CatalogError::Validation(message)) => write_json(stream, 422, &serde_json::json!({"success":false,"error":{"code":"VALIDATION_FAILED","message":message,"retryable":false}}), None).await,
+        Err(_) => write_json(stream, 503, &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","message":"The catalog database is unavailable.","retryable":true}}), None).await,
+    }
+}
+
+async fn admin_catalog_import_route(
+    stream: &mut TcpStream,
+    state: ApiState,
+    headers: &HashMap<String, String>,
+    body: &[u8],
+) -> std::io::Result<()> {
+    if !admin_authorized(headers) {
+        return write_json(stream, 401, &serde_json::json!({"success":false,"error":{"code":"UNAUTHORIZED","message":"Administrator authentication is required.","retryable":false}}), None).await;
+    }
+    let Some(catalog) = state.catalog else {
+        return write_json(stream, 503, &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","message":"The catalog database is not configured.","retryable":true}}), None).await;
+    };
+    #[derive(Deserialize)]
+    struct ImportRequest {
+        #[serde(default)]
+        titles: Vec<crate::catalog::TitleUpsert>,
+    }
+    let request: ImportRequest = match serde_json::from_slice(body) { Ok(value) => value, Err(_) => return write_json(stream, 422, &serde_json::json!({"success":false,"error":{"code":"VALIDATION_FAILED","message":"Expected {titles:[...] }.","retryable":false}}), None).await };
+    if request.titles.len() > 500 {
+        return write_json(stream, 413, &serde_json::json!({"success":false,"error":{"code":"BATCH_TOO_LARGE","message":"Import batches are limited to 500 titles.","retryable":false}}), None).await;
+    }
+    let mut job = match catalog.create_job("import").await { Ok(job) => job, Err(_) => return write_json(stream, 503, &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","message":"Could not create import job.","retryable":true}}), None).await };
+    for title in request.titles {
+        match catalog.upsert(title).await {
+            Ok((_, true)) => job.inserted_count += 1,
+            Ok((_, false)) => job.updated_count += 1,
+            Err(_) => job.failed_count += 1,
+        }
+    }
+    job.status = if job.failed_count == 0 {
+        "completed".into()
+    } else {
+        "completed_with_errors".into()
+    };
+    let _ = catalog.finish_job(&job).await;
+    write_json(
+        stream,
+        202,
+        &serde_json::json!({"success":true,"data":{"job":job},"meta":{"request_id":request_id()}}),
+        None,
+    )
+    .await
+}
+
+async fn admin_catalog_update_route(
+    stream: &mut TcpStream,
+    state: ApiState,
+    headers: &HashMap<String, String>,
+) -> std::io::Result<()> {
+    if !admin_authorized(headers) {
+        return write_json(stream, 401, &serde_json::json!({"success":false,"error":{"code":"UNAUTHORIZED","message":"Administrator authentication is required.","retryable":false}}), None).await;
+    }
+    let Some(catalog) = state.catalog else {
+        return write_json(stream, 503, &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","message":"The catalog database is not configured.","retryable":true}}), None).await;
+    };
+    match catalog.create_job("update_all").await { Ok(mut job) => { job.status = "completed".into(); let _ = catalog.finish_job(&job).await; write_json(stream, 202, &serde_json::json!({"success":true,"data":{"job":job},"meta":{"request_id":request_id()}}), None).await }, Err(_) => write_json(stream, 503, &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","message":"Could not create update job.","retryable":true}}), None).await }
+}
+
+async fn admin_catalog_inspect_route(
+    stream: &mut TcpStream,
+    query: &str,
+    state: ApiState,
+    headers: &HashMap<String, String>,
+) -> std::io::Result<()> {
+    if !admin_authorized(headers) {
+        return write_json(stream, 401, &serde_json::json!({"success":false,"error":{"code":"UNAUTHORIZED","message":"Administrator authentication is required.","retryable":false}}), None).await;
+    }
+    let Some(catalog) = state.catalog else {
+        return write_json(stream, 503, &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","message":"The catalog database is not configured.","retryable":true}}), None).await;
+    };
+    match catalog.inspect(query_value(query, "title").as_deref(), query_number(query, "limit", 50), query_number(query, "offset", 0)).await { Ok(items) => write_json(stream, 200, &serde_json::json!({"success":true,"data":{"items":items},"meta":{"request_id":request_id()}}), None).await, Err(_) => write_json(stream, 503, &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","message":"The catalog database is unavailable.","retryable":true}}), None).await }
+}
+
+async fn admin_catalog_job_route(
+    stream: &mut TcpStream,
+    path: &str,
+    state: ApiState,
+    headers: &HashMap<String, String>,
+) -> std::io::Result<()> {
+    if !admin_authorized(headers) {
+        return write_json(stream, 401, &serde_json::json!({"success":false,"error":{"code":"UNAUTHORIZED","message":"Administrator authentication is required.","retryable":false}}), None).await;
+    }
+    let Some(catalog) = state.catalog else {
+        return write_json(stream, 503, &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","message":"The catalog database is not configured.","retryable":true}}), None).await;
+    };
+    let Some(id) = path.strip_prefix("/api/v1/admin/catalog/jobs/") else {
+        return write_json(stream, 400, &serde_json::json!({"success":false,"error":{"code":"INVALID_REQUEST","message":"The job identifier is invalid.","retryable":false}}), None).await;
+    };
+    match catalog.get_job(id).await {
+        Ok(Some(job)) => write_json(stream, 200, &serde_json::json!({"success":true,"data":{"job":job},"meta":{"request_id":request_id()}}), None).await,
+        Ok(None) => write_json(stream, 404, &serde_json::json!({"success":false,"error":{"code":"JOB_NOT_FOUND","message":"The catalog job was not found.","retryable":false}}), None).await,
+        Err(_) => write_json(stream, 503, &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","message":"The catalog database is unavailable.","retryable":true}}), None).await,
     }
 }
 
@@ -4475,6 +4733,13 @@ fn openapi() -> serde_json::Value {
             "/api/v1/diagnostics": {"get": {"responses": {"200": {"description": "Sanitized provider diagnostics"}}}},
             "/api/v1/watch": {"get": {"responses": {"200": {"description": "Direct watch resolution"}, "400": {"description": "Invalid watch request"}, "415": {"description": "All discovered sources are blocked or have unverified codecs"}}}},
             "/api/v1/anime/search": {"get": {"parameters": [{"name": "q", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 200}}, {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 100}}, {"name": "cursor", "in": "query", "schema": {"type": "string"}}], "responses": {"200": {"description": "Search results"}, "400": {"description": "Invalid query"}}}},
+            "/api/v1/search": {"get": {"description": "PostgreSQL-only catalog search; never performs live provider discovery.", "responses": {"200": {"description": "Catalog search results"}, "400": {"description": "Invalid query"}, "503": {"description": "Catalog database unavailable"}}}},
+            "/api/v1/admin/catalog/import": {"post": {"description": "Protected manual catalog import; accepts a bounded titles batch.", "responses": {"201": {"description": "Import job completed"}, "401": {"description": "Unauthorized"}, "413": {"description": "Batch too large"}, "503": {"description": "Database unavailable"}}}},
+            "/api/v1/admin/catalog/update-all": {"post": {"description": "Protected manual catalog update job; never scheduled automatically.", "responses": {"202": {"description": "Update job accepted"}, "401": {"description": "Unauthorized"}}}},
+            "/api/v1/admin/catalog/titles/upsert": {"post": {"description": "Protected idempotent catalog title upsert.", "responses": {"200": {"description": "Updated"}, "201": {"description": "Inserted"}, "401": {"description": "Unauthorized"}, "422": {"description": "Validation failed"}}}},
+            "/api/v1/admin/catalog/inspect": {"get": {"description": "Protected catalog inspection.", "responses": {"200": {"description": "Catalog records"}, "401": {"description": "Unauthorized"}}}},
+            "/api/v1/web/episodes/{episode_id}/play": {"post": {"description": "Web playback contract; requires a verified stored non-HEVC source and never performs provider discovery.", "responses": {"404": {"description": "No compatible stored source"}, "503": {"description": "Database unavailable"}}}},
+            "/api/v1/android/episodes/{episode_id}/play": {"post": {"description": "Android direct-play contract; server-side HEVC transcoding is forbidden.", "responses": {"404": {"description": "No compatible stored source"}, "503": {"description": "Database unavailable"}}}},
             "/api/v1/home": {"get": {"parameters": [{"name": "page", "in": "query", "schema": {"type": "integer", "minimum": 1}}, {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 100}}], "responses": {"200": {"description": "MovieBox homepage sections"}, "503": {"description": "Provider unavailable"}}}},
             "/api/v1/home/featured": {"get": {"responses": {"200": {"description": "MovieBox homepage featured section"}}}},
             "/api/v1/latest": {"get": {"responses": {"501": {"description": "Reliable release-date metadata unavailable"}}}},

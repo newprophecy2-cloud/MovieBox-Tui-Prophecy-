@@ -14,3 +14,7 @@ services:
       # Without it, the backend safely falls back to its in-memory cache.
       - key: REDIS_URL
         sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: ADMIN_TOKEN
+        sync: false
