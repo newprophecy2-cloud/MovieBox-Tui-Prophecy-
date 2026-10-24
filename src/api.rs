@@ -716,9 +716,7 @@ async fn route(
         | "/api/v1/trending/anime" | "/api/v1/trending/movies"
         | "/api/v1/trending/k-dramas" | "/api/v1/popular"
         | "/api/v1/popular/anime" | "/api/v1/popular/movies"
-        | "/api/v1/popular/k-dramas" if !moviebox_provider_enabled() => {
-            moviebox_disabled(stream).await
-        }
+        | "/api/v1/popular/k-dramas" => home_compat_route(stream, path, query, state).await,
         "/api/v1/latest" => unsupported_catalog(stream, "Reliable release-date metadata is not exposed consistently by the available providers.").await,
         "/api/v1/movies" | "/api/v1/k-dramas" | "/api/v1/categories" if !moviebox_provider_enabled() => {
             moviebox_disabled(stream).await
@@ -1103,6 +1101,33 @@ fn section_response(
         ranking_basis: basis,
         items: items.iter().map(catalog_item_response).collect(),
     }
+}
+
+async fn home_compat_route(
+    stream: &mut TcpStream,
+    path: &str,
+    query: &str,
+    state: ApiState,
+) -> std::io::Result<()> {
+    if !moviebox_provider_enabled() {
+        return moviebox_disabled(stream).await;
+    }
+    if path == "/api/v1/home" {
+        return home_route(stream, query, state).await;
+    }
+    let section = match path {
+        "/api/v1/home/featured" => "featured",
+        "/api/v1/trending" => "trending",
+        "/api/v1/trending/anime" => "anime",
+        "/api/v1/trending/movies" => "movies",
+        "/api/v1/trending/k-dramas" => "kdramas",
+        "/api/v1/popular" => "popular",
+        "/api/v1/popular/anime" => "anime",
+        "/api/v1/popular/movies" => "movies",
+        "/api/v1/popular/k-dramas" => "kdramas",
+        _ => "featured",
+    };
+    home_section_route(stream, query, state, section).await
 }
 
 async fn home_route(stream: &mut TcpStream, query: &str, state: ApiState) -> std::io::Result<()> {
