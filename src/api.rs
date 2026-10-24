@@ -40,6 +40,7 @@ const DEFAULT_LIMIT: usize = 20;
 const MAX_LIMIT: usize = 100;
 const SOURCE_TIMEOUT: Duration = Duration::from_secs(15);
 const OVERALL_TIMEOUT: Duration = Duration::from_secs(45);
+const PLAYBACK_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(20);
 const SEARCH_SOURCE_CHECK_TIMEOUT: Duration = Duration::from_secs(45);
 const SEARCH_SOURCE_CHECK_CONCURRENCY: usize = 8;
 const TRACK_PROBE_TIMEOUT: Duration = Duration::from_secs(45);
@@ -103,6 +104,7 @@ pub struct ApiState {
     release_cache: Arc<Mutex<HashMap<String, ReleaseCacheEntry>>>,
     release_inflight: Arc<Mutex<HashMap<String, SharedReleaseFuture>>>,
     playback_cache: Arc<Mutex<HashMap<String, PlaybackCacheEntry>>>,
+    playback_inflight: Arc<Mutex<HashMap<String, SharedPlaybackFuture>>>,
     search_source_check_slots: Arc<Semaphore>,
     transcode_slots: Arc<Semaphore>,
     connection_slots: Arc<Semaphore>,
@@ -120,6 +122,7 @@ struct PlaybackCacheEntry {
     playback: PlaybackSource,
 }
 type SharedReleaseFuture = Shared<BoxFuture<'static, Result<Vec<Release>, ProviderError>>>;
+type SharedPlaybackFuture = Shared<BoxFuture<'static, Result<PlaybackSource, String>>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OpaqueRef {
@@ -594,6 +597,7 @@ pub async fn run() -> std::io::Result<()> {
         release_cache: Arc::new(Mutex::new(HashMap::new())),
         release_inflight: Arc::new(Mutex::new(HashMap::new())),
         playback_cache: Arc::new(Mutex::new(HashMap::new())),
+        playback_inflight: Arc::new(Mutex::new(HashMap::new())),
         search_source_check_slots: Arc::new(Semaphore::new(SEARCH_SOURCE_CHECK_CONCURRENCY)),
         transcode_slots: Arc::new(Semaphore::new(MAX_TRANSCODE_SESSIONS)),
         connection_slots: Arc::new(Semaphore::new(MAX_API_CONNECTIONS)),
@@ -2753,38 +2757,12 @@ async fn write_track_response(
     subtitles: bool,
 ) -> std::io::Result<()> {
     let (url, headers) = if provider == ProviderKind::FourKHdHub {
-        let Some(client) = state.service.fourk_client.as_ref() else {
-            let (s, b) = err(
-                "UPSTREAM_UNAVAILABLE",
-                "4KHDHub is unavailable.",
-                Some(provider),
-                503,
-            );
-            return write_raw_json(stream, s, &b, None).await;
-        };
-        let resolved = tokio::time::timeout(
-            OVERALL_TIMEOUT,
-            client.resolve_release(
-                release,
-                crate::providers::models::ResolutionIntent::Playback,
-            ),
-        )
-        .await;
-        match resolved {
-            Ok(Ok(playback)) => (watch_url(&playback.url), playback.headers),
-            Ok(Err(e)) => {
+        match cached_playback_source(source_id, release, state).await {
+            Ok(playback) => (watch_url(&playback.url), playback.headers),
+            Err(message) => {
                 let (s, b) = err(
                     "TRACK_DISCOVERY_UNAVAILABLE",
-                    e.user_message(),
-                    Some(provider),
-                    503,
-                );
-                return write_raw_json(stream, s, &b, None).await;
-            }
-            Err(_) => {
-                let (s, b) = err(
-                    "TRACK_DISCOVERY_UNAVAILABLE",
-                    "Media resolution timed out.",
+                    message,
                     Some(provider),
                     503,
                 );
@@ -2993,119 +2971,38 @@ async fn source_route(stream: &mut TcpStream, path: &str, state: ApiState) -> st
         parts.get(4),
         Some(&"playback") | Some(&"play") | Some(&"watch")
     ) {
-        if sr.p == ProviderKind::FourKHdHub
-            && let Some(entry) = state.playback_cache.lock().await.get(*id).cloned()
-            && entry.stored_at.elapsed() < PLAYBACK_CACHE_TTL
-        {
-            return write_json(stream, 200, &playback_json(&entry.playback), None).await;
-        }
-        let resolved = if sr.p == ProviderKind::FourKHdHub {
-            let Some(client) = state.service.fourk_client.as_ref() else {
+        return match cached_playback_source(id, rel, &state).await {
+            Ok(playback) => write_json(stream, 200, &playback_json(&playback), None).await,
+            Err(message) => {
+                let timed_out = message.to_ascii_lowercase().contains("timed out");
                 let (s, b) = err(
-                    "UPSTREAM_UNAVAILABLE",
-                    "4KHDHub is unavailable.",
+                    if timed_out {
+                        "PLAYBACK_RESOLUTION_TIMEOUT"
+                    } else {
+                        "PLAYBACK_RESOLUTION_FAILED"
+                    },
+                    message,
                     Some(sr.p),
-                    503,
-                );
-                return write_raw_json(stream, s, &b, None).await;
-            };
-            tokio::time::timeout(
-                OVERALL_TIMEOUT,
-                client.resolve_release(rel, crate::providers::models::ResolutionIntent::Playback),
-            )
-            .await
-        } else if let Some(url) = rel.direct_url() {
-            Ok(Ok(crate::providers::models::PlaybackSource {
-                provider: sr.p,
-                url: url.to_string(),
-                headers: rel
-                    .mirrors
-                    .first()
-                    .map(|m| m.headers.clone())
-                    .unwrap_or_default(),
-                subtitle: None,
-                source_label: rel.source_label().to_string(),
-                max_height: rel
-                    .quality
-                    .as_deref()
-                    .and_then(|q| q.trim_end_matches('p').parse().ok()),
-            }))
-        } else {
-            Ok(Err(
-                crate::providers::fourkhdhub::FourKHdHubError::NoPlayableMirror(
-                    "source has no playable URL".into(),
-                ),
-            ))
-        };
-        return match resolved {
-            Ok(Ok(playback)) => {
-                if sr.p == ProviderKind::FourKHdHub {
-                    let mut cache = state.playback_cache.lock().await;
-                    if cache.len() >= 2048 {
-                        cache.retain(|_, entry| entry.stored_at.elapsed() < PLAYBACK_CACHE_TTL);
-                    }
-                    cache.insert(
-                        id.to_string(),
-                        PlaybackCacheEntry {
-                            stored_at: Instant::now(),
-                            playback: playback.clone(),
-                        },
-                    );
-                }
-                write_json(stream, 200, &playback_json(&playback), None).await
-            }
-            Ok(Err(e)) => {
-                let (s, b) = err(
-                    "PLAYBACK_RESOLUTION_FAILED",
-                    e.user_message(),
-                    Some(sr.p),
-                    502,
-                );
-                write_raw_json(stream, s, &b, None).await
-            }
-            Err(_) => {
-                let (s, b) = err(
-                    "PLAYBACK_RESOLUTION_TIMEOUT",
-                    "4KHDHub playback resolution timed out.",
-                    Some(sr.p),
-                    504,
+                    if timed_out { 504 } else { 502 },
                 );
                 write_raw_json(stream, s, &b, None).await
             }
         };
     }
     if sr.p == ProviderKind::FourKHdHub {
-        let Some(client) = state.service.fourk_client.as_ref() else {
-            let (s, b) = err(
-                "UPSTREAM_UNAVAILABLE",
-                "4KHDHub is unavailable.",
-                Some(sr.p),
-                503,
-            );
-            return write_raw_json(stream, s, &b, None).await;
-        };
-        let resolved = tokio::time::timeout(
-            OVERALL_TIMEOUT,
-            client.resolve_release(rel, crate::providers::models::ResolutionIntent::Playback),
-        )
-        .await;
-        return match resolved {
-            Ok(Ok(playback)) => write_json(stream, 200, &playback_json(&playback), None).await,
-            Ok(Err(error)) => {
+        return match cached_playback_source(id, rel, &state).await {
+            Ok(playback) => write_json(stream, 200, &playback_json(&playback), None).await,
+            Err(message) => {
+                let timed_out = message.to_ascii_lowercase().contains("timed out");
                 let (s, b) = err(
-                    "PLAYBACK_RESOLUTION_FAILED",
-                    error.user_message(),
+                    if timed_out {
+                        "PLAYBACK_RESOLUTION_TIMEOUT"
+                    } else {
+                        "PLAYBACK_RESOLUTION_FAILED"
+                    },
+                    message,
                     Some(sr.p),
-                    502,
-                );
-                write_raw_json(stream, s, &b, None).await
-            }
-            Err(_) => {
-                let (s, b) = err(
-                    "PLAYBACK_RESOLUTION_TIMEOUT",
-                    "4KHDHub playback resolution timed out.",
-                    Some(sr.p),
-                    504,
+                    if timed_out { 504 } else { 502 },
                 );
                 write_raw_json(stream, s, &b, None).await
             }
@@ -3148,6 +3045,93 @@ fn playback_json(playback: &PlaybackSource) -> serde_json::Value {
         "max_height": playback.max_height,
     })
 }
+
+async fn cached_playback_source(
+    source_id: &str,
+    release: &Release,
+    state: &ApiState,
+) -> Result<PlaybackSource, String> {
+    if let Some(entry) = state.playback_cache.lock().await.get(source_id).cloned()
+        && entry.stored_at.elapsed() < PLAYBACK_CACHE_TTL
+    {
+        return Ok(entry.playback);
+    }
+
+    let key = source_id.to_string();
+    let shared = {
+        let mut inflight = state.playback_inflight.lock().await;
+        if let Some(existing) = inflight.get(&key) {
+            existing.clone()
+        } else {
+            let state = state.clone();
+            let release = release.clone();
+            let task = tokio::spawn(async move {
+                if release.provider == ProviderKind::FourKHdHub {
+                    let Some(client) = state.service.fourk_client.as_ref() else {
+                        return Err("4KHDHub is unavailable.".to_string());
+                    };
+                    match tokio::time::timeout(
+                        PLAYBACK_RESOLUTION_TIMEOUT,
+                        client.resolve_release(
+                            &release,
+                            crate::providers::models::ResolutionIntent::Playback,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Ok(playback)) => Ok(playback),
+                        Ok(Err(error)) => Err(error.user_message().to_string()),
+                        Err(_) => Err("4KHDHub playback resolution timed out.".to_string()),
+                    }
+                } else if let Some(url) = release.direct_url() {
+                    Ok(PlaybackSource {
+                        provider: release.provider,
+                        url: url.to_string(),
+                        headers: release
+                            .mirrors
+                            .first()
+                            .map(|mirror| mirror.headers.clone())
+                            .unwrap_or_default(),
+                        subtitle: None,
+                        source_label: release.source_label().to_string(),
+                        max_height: release
+                            .quality
+                            .as_deref()
+                            .and_then(|quality| quality.trim_end_matches('p').parse().ok()),
+                    })
+                } else {
+                    Err("The source has no playable URL.".to_string())
+                }
+            });
+            let future = async move {
+                task.await
+                    .unwrap_or_else(|_| Err("Playback resolver task failed.".to_string()))
+            }
+            .boxed()
+            .shared();
+            inflight.insert(key.clone(), future.clone());
+            future
+        }
+    };
+
+    let resolved = shared.await;
+    state.playback_inflight.lock().await.remove(&key);
+    if let Ok(playback) = &resolved {
+        let mut cache = state.playback_cache.lock().await;
+        if cache.len() >= 2048 {
+            cache.retain(|_, entry| entry.stored_at.elapsed() < PLAYBACK_CACHE_TTL);
+        }
+        cache.insert(
+            key,
+            PlaybackCacheEntry {
+                stored_at: Instant::now(),
+                playback: playback.clone(),
+            },
+        );
+    }
+    resolved
+}
+
 fn public_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
     headers
         .iter()
@@ -3253,48 +3237,23 @@ async fn resolve_transcode_playback_source(
         ));
     }
 
-    if let Some(entry) = state.playback_cache.lock().await.get(source_id).cloned()
-        && entry.stored_at.elapsed() < PLAYBACK_CACHE_TTL
-    {
-        return Ok(entry.playback);
-    }
-    let Some(client) = state.service.fourk_client.as_ref() else {
-        return Err(("UPSTREAM_UNAVAILABLE", "4KHDHub is unavailable.", 503));
-    };
-    let resolved = tokio::time::timeout(
-        OVERALL_TIMEOUT,
-        client.resolve_release(source, crate::providers::models::ResolutionIntent::Playback),
-    )
-    .await;
-    let playback = match resolved {
-        Ok(Ok(playback)) => playback,
-        Ok(Err(_)) => {
-            return Err((
-                "TRANSCODE_RESOLUTION_FAILED",
-                "4KHDHub could not resolve a playable media source for transcoding.",
-                502,
-            ));
-        }
-        Err(_) => {
-            return Err((
-                "TRANSCODE_RESOLUTION_TIMEOUT",
-                "4KHDHub media resolution timed out.",
-                504,
-            ));
-        }
-    };
-    let mut cache = state.playback_cache.lock().await;
-    if cache.len() >= 2048 {
-        cache.retain(|_, entry| entry.stored_at.elapsed() < PLAYBACK_CACHE_TTL);
-    }
-    cache.insert(
-        source_id.to_string(),
-        PlaybackCacheEntry {
-            stored_at: Instant::now(),
-            playback: playback.clone(),
-        },
-    );
-    Ok(playback)
+    cached_playback_source(source_id, source, state)
+        .await
+        .map_err(|message| {
+            if message.to_ascii_lowercase().contains("timed out") {
+                (
+                    "TRANSCODE_RESOLUTION_TIMEOUT",
+                    "4KHDHub media resolution timed out.",
+                    504,
+                )
+            } else {
+                (
+                    "TRANSCODE_RESOLUTION_FAILED",
+                    "4KHDHub could not resolve a playable media source for transcoding.",
+                    502,
+                )
+            }
+        })
 }
 
 async fn validated_remux_preflight(url: &str, headers: &[(String, String)]) -> bool {
