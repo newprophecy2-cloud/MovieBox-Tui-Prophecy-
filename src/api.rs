@@ -3970,18 +3970,21 @@ fn is_seeking_range(request_headers: &HashMap<String, String>) -> bool {
         return false;
     };
     let Some((unit, spec)) = range.trim().split_once('=') else {
-        return false;
+        return true;
     };
     if !unit.eq_ignore_ascii_case("bytes") {
         return false;
     }
-    let Some((start, _)) = spec.split_once('-') else {
-        return false;
+    let Some((start, end)) = spec.split_once('-') else {
+        return true;
     };
     if start.is_empty() {
         return true;
     }
-    start.parse::<u64>().is_ok_and(|start| start > 0)
+    match start.parse::<u64>() {
+        Ok(0) => !end.is_empty(),
+        Ok(_) | Err(_) => true,
+    }
 }
 
 async fn serve_cached_remux(
@@ -4120,6 +4123,17 @@ async fn stream_ffmpeg_remux(
             if let Some(writer) = cache_writer {
                 writer.abort().await;
             }
+            if !range_only {
+                log::warn!("remux startup failed id={debug_id}: {error}");
+                write_raw_json(
+                    stream,
+                    502,
+                    r#"{"error":{"code":"REMUX_STARTUP_FAILED","message":"The media source could not be prepared for playback."}}"#,
+                    Some("X-Media-Mode: remux\r\nX-Remux-Cache-State: failed\r\n"),
+                )
+                .await?;
+                return Ok(None);
+            }
             return Err(error);
         }
         Err(_) => {
@@ -4130,10 +4144,22 @@ async fn stream_ffmpeg_remux(
             if let Some(writer) = cache_writer {
                 writer.abort().await;
             }
-            return Err(std::io::Error::new(
+            let error = std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "FFmpeg startup timed out before the first media fragment",
-            ));
+            );
+            if !range_only {
+                log::warn!("remux startup timed out id={debug_id}");
+                write_raw_json(
+                    stream,
+                    504,
+                    r#"{"error":{"code":"REMUX_STARTUP_TIMEOUT","message":"The media source took too long to start."}}"#,
+                    Some("X-Media-Mode: remux\r\nX-Remux-Cache-State: failed\r\n"),
+                )
+                .await?;
+                return Ok(None);
+            }
+            return Err(error);
         }
     };
     if range_only && cache_writer.is_none() {
@@ -4204,15 +4230,13 @@ async fn stream_ffmpeg_remux(
             client_error = Some(error);
         }
     }
-    if let Some(tx) = cache_tx.as_ref() {
-        let send_failed = if range_only {
-            tx.send(Some(first)).await.is_err()
-        } else {
-            tx.try_send(Some(first)).is_err()
-        };
-        if send_failed {
-            cache_tx = None;
-        }
+    let first_chunk_send_failed = if let Some(tx) = cache_tx.as_ref() {
+        tx.send(Some(first)).await.is_err()
+    } else {
+        false
+    };
+    if first_chunk_send_failed {
+        cache_tx = None;
     }
 
     let mut read_error = None;
@@ -4232,16 +4256,13 @@ async fn stream_ffmpeg_remux(
                 client_error = Some(error);
             }
         }
-        if let Some(tx) = cache_tx.as_ref() {
-            let data = Some(chunk[..length].to_vec());
-            let send_failed = if range_only {
-                tx.send(data).await.is_err()
-            } else {
-                tx.try_send(data).is_err()
-            };
-            if send_failed {
-                cache_tx = None;
-            }
+        let cache_chunk_send_failed = if let Some(tx) = cache_tx.as_ref() {
+            tx.send(Some(chunk[..length].to_vec())).await.is_err()
+        } else {
+            false
+        };
+        if cache_chunk_send_failed {
+            cache_tx = None;
         }
         if range_only && cache_tx.is_none() {
             let _ = child.kill().await;
@@ -4801,9 +4822,11 @@ mod tests {
     fn initial_zero_byte_range_keeps_live_first_policy() {
         let mut headers = HashMap::new();
         assert!(!is_seeking_range(&headers));
-        for value in ["bytes=0-", "bytes=0-1048575", "Bytes=0-1"] {
+        headers.insert("range".to_string(), "bytes=0-".to_string());
+        assert!(!is_seeking_range(&headers));
+        for value in ["bytes=0-0", "bytes=0-1048575", "Bytes=0-1"] {
             headers.insert("range".to_string(), value.to_string());
-            assert!(!is_seeking_range(&headers), "{value}");
+            assert!(is_seeking_range(&headers), "{value}");
         }
         headers.insert("range".to_string(), "bytes=1-".to_string());
         assert!(is_seeking_range(&headers));

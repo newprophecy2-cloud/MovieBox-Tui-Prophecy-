@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 use std::{
     fs::OpenOptions,
     io,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, LazyLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -16,7 +16,7 @@ use tokio::{
 };
 
 const CACHE_TTL: Duration = Duration::from_secs(2 * 60 * 60);
-const STALE_LOCK_TTL: Duration = Duration::from_secs(20 * 60);
+const STALE_LOCK_TTL: Duration = Duration::from_secs(3 * 60);
 const LOCK_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 const CACHE_WAIT_INTERVAL: Duration = Duration::from_millis(400);
 const FINALIZE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -498,6 +498,9 @@ async fn read_cached(paths: &CachePaths) -> Option<CachedRemux> {
 }
 
 async fn lock_is_stale(path: &PathBuf) -> bool {
+    if let Some(writer_alive) = partial_writer_is_alive(path).await {
+        return !writer_alive;
+    }
     let Ok(metadata) = async_fs::metadata(path).await else {
         return false;
     };
@@ -506,6 +509,47 @@ async fn lock_is_stale(path: &PathBuf) -> bool {
         .ok()
         .and_then(|modified| modified.elapsed().ok())
         .is_some_and(|elapsed| elapsed > STALE_LOCK_TTL)
+}
+
+async fn partial_writer_is_alive(lock_file: &Path) -> Option<bool> {
+    let key = lock_file.file_stem()?.to_str()?;
+    let prefix = format!("{key}.");
+    let mut entries = async_fs::read_dir(lock_file.parent()?).await.ok()?;
+    let mut found_owner = false;
+    while let Some(entry) = entries.next_entry().await.ok()? {
+        let filename = entry.file_name();
+        let Some(filename) = filename.to_str() else {
+            continue;
+        };
+        let Some(owner_and_stamp) = filename.strip_prefix(&prefix) else {
+            continue;
+        };
+        let Some(owner_and_stamp) = owner_and_stamp.strip_suffix(".fragmented.part") else {
+            continue;
+        };
+        let Some((pid, _stamp)) = owner_and_stamp.split_once('.') else {
+            continue;
+        };
+        let Ok(pid) = pid.parse::<u32>() else {
+            continue;
+        };
+        match process_is_alive(pid).await {
+            Some(true) => return Some(true),
+            Some(false) => found_owner = true,
+            None => return None,
+        }
+    }
+    found_owner.then_some(false)
+}
+
+#[cfg(target_os = "linux")]
+async fn process_is_alive(pid: u32) -> Option<bool> {
+    Some(async_fs::metadata(format!("/proc/{pid}")).await.is_ok())
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn process_is_alive(_pid: u32) -> Option<bool> {
+    None
 }
 
 async fn path_exists(path: &PathBuf) -> bool {
@@ -568,7 +612,7 @@ async fn prune_cache_dir(root: &PathBuf, protected_path: Option<&PathBuf>, max_b
 
 #[cfg(test)]
 mod tests {
-    use super::{ByteRange, cache_key, parse_range_header};
+    use super::{ByteRange, cache_key, lock_is_stale, parse_range_header};
 
     #[test]
     fn parses_full_open_ended_and_bounded_byte_ranges() {
@@ -637,5 +681,34 @@ mod tests {
             cache_key("https://cdn.example/video", &first),
             cache_key("https://cdn.example/video", &different)
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn stale_lock_recovers_when_partial_writer_process_is_dead() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = "a".repeat(64);
+        let lock = directory.path().join(format!("{key}.lock"));
+        std::fs::write(&lock, b"").unwrap();
+        let partial = directory
+            .path()
+            .join(format!("{key}.4294967295.1.fragmented.part"));
+        std::fs::write(partial, b"").unwrap();
+
+        assert!(lock_is_stale(&lock).await);
+    }
+
+    #[tokio::test]
+    async fn active_partial_writer_keeps_its_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = "b".repeat(64);
+        let lock = directory.path().join(format!("{key}.lock"));
+        std::fs::write(&lock, b"").unwrap();
+        let partial = directory
+            .path()
+            .join(format!("{key}.{}.1.fragmented.part", std::process::id()));
+        std::fs::write(partial, b"").unwrap();
+
+        assert!(!lock_is_stale(&lock).await);
     }
 }
