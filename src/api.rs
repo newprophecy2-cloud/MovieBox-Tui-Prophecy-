@@ -3946,7 +3946,8 @@ async fn remux_media_url(
                 None,
             )
             .await;
-        };
+        }
+    };
     eprintln!(
         "[remux:{debug_id}] ffmpeg_spawned pid={} elapsed_ms={}",
         child.id().unwrap_or_default(),
