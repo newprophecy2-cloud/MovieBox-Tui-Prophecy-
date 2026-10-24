@@ -3265,8 +3265,8 @@ async fn resolve_transcode_playback_source(
 
 async fn validated_remux_preflight(url: &str, headers: &[(String, String)]) -> bool {
     // Provider codec labels are often incomplete or inferred. Try a short real stream-copy
-    // into the target MPEG-TS container, then verify that FFmpeg produced non-empty media and
-    // that FFprobe can read a video stream from it before advertising remux mode.
+    // into browser-compatible fragmented MP4, then verify the resulting video/audio codecs
+    // before allowing stream-copy mode.
     let Ok(source_probe) =
         tokio::time::timeout(REMUX_PREFLIGHT_TIMEOUT, probe_media(url, headers)).await
     else {
@@ -3285,7 +3285,7 @@ async fn validated_remux_preflight(url: &str, headers: &[(String, String)]) -> b
 }
 
 async fn remux_preflight_output_valid(url: &str, headers: &[(String, String)]) -> bool {
-    let Ok(output_file) = tempfile::Builder::new().suffix(".ts").tempfile() else {
+    let Ok(output_file) = tempfile::Builder::new().suffix(".mp4").tempfile() else {
         return false;
     };
     let mut command = Command::new("ffmpeg");
@@ -3310,8 +3310,10 @@ async fn remux_preflight_output_valid(url: &str, headers: &[(String, String)]) -
         "copy",
         "-t",
         "2",
+        "-movflags",
+        "frag_keyframe+empty_moov+default_base_moof",
         "-f",
-        "mpegts",
+        "mp4",
         "-y",
     ]);
     command
@@ -3352,12 +3354,18 @@ async fn remux_preflight_output_valid(url: &str, headers: &[(String, String)]) -
     if !output.status.success() {
         return false;
     }
-    serde_json::from_slice::<ProbeOutput>(&output.stdout).is_ok_and(|probe| {
-        probe
-            .streams
-            .iter()
-            .any(|stream| stream.codec_type.as_deref() == Some("video"))
-    })
+    serde_json::from_slice::<ProbeOutput>(&output.stdout)
+        .is_ok_and(|probe| browser_mp4_streams_compatible(&probe.streams))
+}
+
+fn browser_mp4_streams_compatible(streams: &[ProbeStream]) -> bool {
+    streams.iter().any(|stream| {
+        stream.codec_type.as_deref() == Some("video")
+            && stream.codec_name.as_deref() == Some("h264")
+    }) && streams
+        .iter()
+        .filter(|stream| stream.codec_type.as_deref() == Some("audio"))
+        .all(|stream| stream.codec_name.as_deref() == Some("aac"))
 }
 
 async fn transcode_source(
@@ -3428,6 +3436,10 @@ async fn transcode_source(
             "yuv420p",
             "-crf",
             "23",
+            "-g",
+            "48",
+            "-sc_threshold",
+            "0",
             "-c:a",
             "aac",
             "-b:a",
@@ -3436,7 +3448,13 @@ async fn transcode_source(
             "2",
         ]);
     }
-    command.args(["-f", "mpegts", "pipe:1"]);
+    command.args([
+        "-movflags",
+        "frag_keyframe+empty_moov+default_base_moof",
+        "-f",
+        "mp4",
+        "pipe:1",
+    ]);
     command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -3506,7 +3524,7 @@ async fn transcode_source(
     if let Err(error) = write_headers(
         stream,
         200,
-        "video/mp2t",
+        "video/mp4",
         Some(&format!(
             "X-Media-Mode: {}\r\nX-Source-Id: {source_id}\r\n",
             if stream_copy { "remux" } else { "transcode" }
@@ -3708,14 +3726,20 @@ async fn transcode_media_url(
         "veryfast",
         "-tune",
         "zerolatency",
+        "-g",
+        "48",
+        "-sc_threshold",
+        "0",
         "-pix_fmt",
         "yuv420p",
         "-c:a",
         "aac",
         "-b:a",
         "128k",
+        "-movflags",
+        "frag_keyframe+empty_moov+default_base_moof",
         "-f",
-        "mpegts",
+        "mp4",
         "pipe:1",
     ]);
     command
@@ -3765,7 +3789,7 @@ async fn transcode_media_url(
     write_headers(
         stream,
         200,
-        "video/mp2t",
+        "video/mp4",
         Some("Accept-Ranges: none\r\nAccess-Control-Allow-Origin: *\r\n"),
     )
     .await?;
@@ -4679,6 +4703,31 @@ mod tests {
             media_mode_after_remux_preflight(false),
             MediaMode::Transcode
         );
+    }
+
+    #[test]
+    fn fragmented_mp4_remux_requires_browser_compatible_codecs() {
+        let stream = |codec_type: &str, codec_name: &str| ProbeStream {
+            index: None,
+            codec_name: Some(codec_name.to_string()),
+            codec_type: Some(codec_type.to_string()),
+            channels: None,
+            disposition: None,
+            tags: None,
+        };
+        assert!(browser_mp4_streams_compatible(&[
+            stream("video", "h264"),
+            stream("audio", "aac"),
+        ]));
+        assert!(browser_mp4_streams_compatible(&[stream("video", "h264")]));
+        assert!(!browser_mp4_streams_compatible(&[
+            stream("video", "hevc"),
+            stream("audio", "aac"),
+        ]));
+        assert!(!browser_mp4_streams_compatible(&[
+            stream("video", "h264"),
+            stream("audio", "ac3"),
+        ]));
     }
 
     #[test]
