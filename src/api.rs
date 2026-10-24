@@ -3,6 +3,7 @@
     reason = "MovieBox catalog handlers remain compiled for a controlled future re-enable while the provider is intentionally disabled"
 )]
 
+use futures::StreamExt;
 use std::{
     collections::HashMap,
     sync::Arc,
@@ -48,6 +49,8 @@ const MOVIEBOX_PROVIDER_ENABLED: bool = true;
 const MAX_TRANSCODE_SESSIONS: usize = 2;
 const TRANSCODE_STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
 const REMUX_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(20);
+static TRANSCODE_LIMITER: std::sync::LazyLock<Arc<Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(Semaphore::new(MAX_TRANSCODE_SESSIONS)));
 const PROVIDERS: [ProviderKind; 6] = [
     ProviderKind::MovieBox,
     ProviderKind::FourKHdHub,
@@ -665,13 +668,32 @@ async fn handle(mut stream: TcpStream, state: ApiState) -> std::io::Result<()> {
         )
         .await;
     }
-    if method != "GET" {
+    let request_headers = lines
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
+        .collect::<HashMap<_, _>>();
+    let allowed_method = matches!(method, "GET" | "HEAD")
+        || (method == "POST" && target == "/api/pretranscode/start");
+    if !allowed_method {
         return write_json(&mut stream, 405, &serde_json::json!({"error":{"code":"METHOD_NOT_ALLOWED","message":"Only GET is supported."}}), None).await;
     }
-    route(&mut stream, target, state).await
+    route(
+        &mut stream,
+        target,
+        state,
+        &request_headers,
+        method == "HEAD",
+    )
+    .await
 }
 
-async fn route(stream: &mut TcpStream, target: &str, state: ApiState) -> std::io::Result<()> {
+async fn route(
+    stream: &mut TcpStream,
+    target: &str,
+    state: ApiState,
+    request_headers: &HashMap<String, String>,
+    head_only: bool,
+) -> std::io::Result<()> {
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     match path {
         "/" => write_json(stream, 200, &serde_json::json!({"name":"MovieBox API","version":"v1","docs":"/docs","health":"/health"}), None).await,
@@ -681,6 +703,12 @@ async fn route(stream: &mut TcpStream, target: &str, state: ApiState) -> std::io
         "/openapi.json" => write_json(stream, 200, &openapi(), None).await,
         "/docs" => write_text(stream, 200, "text/html; charset=utf-8", "<!doctype html><html><head><title>MovieBox API</title></head><body><h1>MovieBox API</h1><p>OpenAPI: <a href=\"/openapi.json\">/openapi.json</a></p><p>Swagger UI can load this document from a local or trusted client.</p></body></html>", None).await,
         "/api/v1/diagnostics" => diagnostics_route(stream, state).await,
+        "/api/stream-proxy" => stream_proxy_route(stream, query, request_headers, head_only).await,
+        "/api/media-info" => media_info_route(stream, query, request_headers).await,
+        "/api/subtitles/extract" => subtitle_extract_route(stream, query, request_headers).await,
+        "/api/pretranscode/start" => pretranscode_unavailable(stream, 501).await,
+        "/api/pretranscode/status" => pretranscode_unavailable(stream, 501).await,
+        _ if path.starts_with("/api/subtitles/") => pretranscode_unavailable(stream, 404).await,
         "/api/v1/watch" => direct_watch_route(stream, query, state).await,
         "/api/v1/anime/search" => search_json(stream, query, state).await,
         "/api/v1/anime/search/stream" => search_sse(stream, query, state).await,
@@ -3470,6 +3498,389 @@ async fn transcode_source(
     }
 }
 
+const MEDIA_BODY_LIMIT: usize = 8 * 1024 * 1024;
+
+fn query_value(query: &str, key: &str) -> Option<String> {
+    url::form_urlencoded::parse(query.as_bytes())
+        .find_map(|(name, value)| (name == key).then(|| value.into_owned()))
+}
+
+async fn validated_media_url(query: &str) -> Result<(reqwest::Url, Option<String>), (u16, String)> {
+    let raw =
+        query_value(query, "url").ok_or((400, "The url query parameter is required.".into()))?;
+    let url = crate::net::validate_public_url(&raw, true)
+        .await
+        .map_err(|_| {
+            (
+                403,
+                "The requested media URL is not an allowed public destination.".into(),
+            )
+        })?;
+    let referer = query_value(query, "referer").and_then(|value| {
+        crate::net::validate_url_syntax(&value, true)
+            .ok()
+            .map(|url| url.to_string())
+    });
+    Ok((url, referer))
+}
+
+fn media_request_client() -> reqwest::Client {
+    crate::net::http_client_builder()
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+async fn stream_proxy_route(
+    stream: &mut TcpStream,
+    query: &str,
+    request_headers: &HashMap<String, String>,
+    head_only: bool,
+) -> std::io::Result<()> {
+    let (url, referer) = match validated_media_url(query).await {
+        Ok(value) => value,
+        Err((status, message)) => {
+            return write_raw_json(
+                stream,
+                status,
+                &format!(
+                    r#"{{"error":{{"code":"{}","message":"{}"}}}}"#,
+                    if status == 403 {
+                        "SSRF_BLOCKED"
+                    } else {
+                        "INVALID_MEDIA_URL"
+                    },
+                    message
+                ),
+                None,
+            )
+            .await;
+        }
+    };
+    if query_value(query, "transcode").is_some_and(|value| value.eq_ignore_ascii_case("true")) {
+        if head_only {
+            return write_raw_json(
+                stream,
+                405,
+                r#"{"error":{"code":"METHOD_NOT_ALLOWED","message":"Transcoding requires GET."}}"#,
+                None,
+            )
+            .await;
+        }
+        return transcode_media_url(stream, &url, referer.as_deref()).await;
+    }
+    let client = media_request_client();
+    let mut request = if head_only {
+        client.head(url.clone())
+    } else {
+        client.get(url.clone())
+    };
+    if let Some(range) = request_headers.get("range") {
+        request = request.header(reqwest::header::RANGE, range);
+    }
+    if let Some(referer) = referer.as_deref() {
+        request = request.header(reqwest::header::REFERER, referer);
+    }
+    let response = match tokio::time::timeout(Duration::from_secs(60), request.send()).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => return write_raw_json(stream, 502, &format!(r#"{{"error":{{"code":"UPSTREAM_FAILED","message":"{}"}}}}"#, sanitize_error(&error.to_string())), None).await,
+        Err(_) => return write_raw_json(stream, 504, r#"{"error":{"code":"UPSTREAM_TIMEOUT","message":"The upstream media request timed out."}}"#, None).await,
+    };
+    let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    let content_length = response.content_length();
+    let content_range = response
+        .headers()
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok());
+    let extra = format!(
+        "Accept-Ranges: bytes\r\n{}{}Access-Control-Allow-Origin: *\r\n",
+        content_length.map_or(String::new(), |value| format!(
+            "Content-Length: {value}\r\n"
+        )),
+        content_range.map_or(String::new(), |value| format!("Content-Range: {value}\r\n")),
+    );
+    write_headers(stream, status, content_type, Some(&extra)).await?;
+    if head_only {
+        return Ok(());
+    }
+    let mut body = response.bytes_stream();
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|error| std::io::Error::other(error.to_string()))?;
+        stream.write_all(&chunk).await?;
+    }
+    Ok(())
+}
+
+fn sanitize_error(error: &str) -> String {
+    error.replace('"', "'").replace(['\r', '\n'], " ")
+}
+
+async fn transcode_media_url(
+    stream: &mut TcpStream,
+    url: &reqwest::Url,
+    referer: Option<&str>,
+) -> std::io::Result<()> {
+    let permit =
+        match TRANSCODE_LIMITER.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => return write_raw_json(
+                stream,
+                429,
+                r#"{"error":{"code":"TRANSCODE_BUSY","message":"Transcoding capacity is busy."}}"#,
+                None,
+            )
+            .await,
+        };
+    let mut command = Command::new("ffmpeg");
+    command.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
+    if let Some(referer) = referer {
+        command
+            .arg("-headers")
+            .arg(format!("Referer: {referer}\r\n"));
+    }
+    command.args([
+        "-rw_timeout",
+        "15000000",
+        "-i",
+        url.as_str(),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-tune",
+        "zerolatency",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-f",
+        "mpegts",
+        "pipe:1",
+    ]);
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut child =
+        match command.spawn() {
+            Ok(child) => child,
+            Err(_) => return write_raw_json(
+                stream,
+                503,
+                r#"{"error":{"code":"TRANSCODE_UNAVAILABLE","message":"FFmpeg is unavailable."}}"#,
+                None,
+            )
+            .await,
+        };
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill().await;
+        return write_raw_json(
+            stream,
+            502,
+            r#"{"error":{"code":"TRANSCODE_FAILED","message":"FFmpeg did not open output."}}"#,
+            None,
+        )
+        .await;
+    };
+    let mut stderr = child.stderr.take();
+    let stderr_task = tokio::spawn(async move {
+        if let Some(mut stderr) = stderr.take() {
+            let mut buffer = [0u8; 1024];
+            while stderr.read(&mut buffer).await.unwrap_or(0) > 0 {}
+        }
+    });
+    let mut first = vec![0u8; 32 * 1024];
+    let first_len = match tokio::time::timeout(TRANSCODE_STARTUP_TIMEOUT, stdout.read(&mut first))
+        .await
+    {
+        Ok(Ok(length)) if length > 0 => length,
+        _ => {
+            let _ = child.kill().await;
+            let _ = stderr_task.await;
+            drop(permit);
+            return write_raw_json(stream, 502, r#"{"error":{"code":"TRANSCODE_FAILED","message":"FFmpeg did not produce output."}}"#, None).await;
+        }
+    };
+    write_headers(
+        stream,
+        200,
+        "video/mp2t",
+        Some("Accept-Ranges: none\r\nAccess-Control-Allow-Origin: *\r\n"),
+    )
+    .await?;
+    if let Err(error) = stream.write_all(&first[..first_len]).await {
+        let _ = child.kill().await;
+        let _ = stderr_task.await;
+        drop(permit);
+        return Err(error);
+    }
+    let result = tokio::io::copy(&mut stdout, stream).await;
+    if result.is_err() {
+        let _ = child.kill().await;
+    }
+    let status = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+    let _ = stderr_task.await;
+    drop(permit);
+    result?;
+    if matches!(status, Ok(Ok(status)) if status.success()) {
+        Ok(())
+    } else {
+        Err(std::io::Error::other("FFmpeg transcoding failed"))
+    }
+}
+
+async fn media_info_route(
+    stream: &mut TcpStream,
+    query: &str,
+    _request_headers: &HashMap<String, String>,
+) -> std::io::Result<()> {
+    let (url, referer) = match validated_media_url(query).await {
+        Ok(value) => value,
+        Err((status, message)) => {
+            return write_raw_json(
+                stream,
+                status,
+                &format!(
+                    r#"{{"error":{{"code":"SSRF_BLOCKED","message":"{}"}}}}"#,
+                    message
+                ),
+                None,
+            )
+            .await;
+        }
+    };
+    let mut command = Command::new("ffprobe");
+    command.args(["-v", "error", "-rw_timeout", "15000000"]);
+    if let Some(referer) = referer {
+        command
+            .arg("-headers")
+            .arg(format!("Referer: {referer}\r\n"));
+    }
+    command.args(["-show_streams", "-show_format", "-of", "json", url.as_str()]);
+    let output = match tokio::time::timeout(Duration::from_secs(45), command.output()).await {
+        Ok(Ok(output)) if output.status.success() && output.stdout.len() <= MEDIA_BODY_LIMIT => output,
+        Ok(Ok(_)) => return write_raw_json(stream, 502, r#"{"error":{"code":"MEDIA_INFO_FAILED","message":"FFprobe could not inspect the media."}}"#, None).await,
+        _ => return write_raw_json(stream, 504, r#"{"error":{"code":"MEDIA_INFO_TIMEOUT","message":"Media inspection timed out."}}"#, None).await,
+    };
+    write_headers(stream, 200, "application/json", None).await?;
+    stream.write_all(&output.stdout).await
+}
+
+async fn subtitle_extract_route(
+    stream: &mut TcpStream,
+    query: &str,
+    _request_headers: &HashMap<String, String>,
+) -> std::io::Result<()> {
+    let (url, _) = match validated_media_url(query).await {
+        Ok(value) => value,
+        Err((status, message)) => {
+            return write_raw_json(
+                stream,
+                status,
+                &format!(
+                    r#"{{"error":{{"code":"SSRF_BLOCKED","message":"{}"}}}}"#,
+                    message
+                ),
+                None,
+            )
+            .await;
+        }
+    };
+    let response =
+        match tokio::time::timeout(
+            Duration::from_secs(30),
+            media_request_client().get(url).send(),
+        )
+        .await
+        {
+            Ok(Ok(response)) => response,
+            _ => return write_raw_json(
+                stream,
+                502,
+                r#"{"error":{"code":"SUBTITLE_FAILED","message":"Subtitle retrieval failed."}}"#,
+                None,
+            )
+            .await,
+        };
+    if !response.status().is_success() {
+        return write_raw_json(
+            stream,
+            404,
+            r#"{"error":{"code":"SUBTITLE_NOT_FOUND","message":"Subtitle was not available."}}"#,
+            None,
+        )
+        .await;
+    }
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("text/vtt")
+        .to_string();
+    let bytes = match collect_limited(response, MEDIA_BODY_LIMIT).await {
+        Ok(bytes) => bytes,
+        Err(_) => return write_raw_json(stream, 502, r#"{"error":{"code":"SUBTITLE_TOO_LARGE","message":"Subtitle exceeds the size limit."}}"#, None).await,
+    };
+    write_headers(
+        stream,
+        200,
+        &content_type,
+        Some("Access-Control-Allow-Origin: *\r\n"),
+    )
+    .await?;
+    stream.write_all(&bytes).await
+}
+
+async fn collect_limited(response: reqwest::Response, limit: usize) -> Result<Vec<u8>, ()> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(());
+    }
+    let mut body = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|_| ())?;
+        if bytes.len().saturating_add(chunk.len()) > limit {
+            return Err(());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+async fn pretranscode_unavailable(stream: &mut TcpStream, status: u16) -> std::io::Result<()> {
+    let (code, message) = if status == 501 {
+        (
+            "PRETRANSCODE_UNAVAILABLE",
+            "Background pretranscoding is not enabled; use live stream-proxy transcoding.",
+        )
+    } else {
+        (
+            "SUBTITLE_UNAVAILABLE",
+            "This subtitle route is not supported by the backend.",
+        )
+    };
+    write_json(
+        stream,
+        status,
+        &serde_json::json!({"error":{"code":code,"message":message}}),
+        None,
+    )
+    .await
+}
+
 async fn write_headers(
     stream: &mut TcpStream,
     status: u16,
@@ -3478,9 +3889,16 @@ async fn write_headers(
 ) -> std::io::Result<()> {
     let reason = match status {
         200 => "OK",
+        206 => "Partial Content",
+        400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         429 => "Too Many Requests",
+        501 => "Not Implemented",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
         _ => "Error",
     };
     let mut h = format!(

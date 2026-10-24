@@ -1,9 +1,9 @@
 services:
   - type: web
     name: moviebox-api
-    runtime: rust
-    buildCommand: cargo build --release --locked
-    startCommand: ./target/release/moviebox-tui
+    runtime: docker
+    dockerfilePath: ./Dockerfile.backend
+    dockerContext: .
     healthCheckPath: /health
     envVars:
       - key: RUST_LOG
