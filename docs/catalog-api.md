@@ -34,7 +34,7 @@ Remux endpoints `/api/v1/sources/{source_id}/transcode`, `/remux`, and remux-mod
 
 Existing `/api/v1/anime/*`, `/api/v1/episodes/*`, `/api/v1/sources/*`, `/api/v1/watch`, and legacy root aliases remain in place. Opaque identifiers must be passed back unchanged; clients must not construct IDs themselves.
 
-The following requested capabilities remain incomplete: real MAL-based 700+ catalog import, provider-to-PostgreSQL episode/source population, Redis catalog invalidation and distributed coordination, fully functional Web remux sessions, Android direct-play source lookup, source-session sharing, tested database backup/restore, and measured production load/performance results. The legacy `/api/v1/anime/search` and playback routes still contact providers for APK compatibility; the new `/api/v1/search` and new Web/Android contract families do not perform provider discovery. No PostgreSQL, Render, Redis service, or Hostinger VPS deployment is implied by this code or documentation.
+The following requested capabilities remain incomplete: real MAL-based 700+ catalog import, Redis catalog invalidation and distributed coordination, fully functional Web remux sessions, Android direct-play source lookup, source-session sharing, tested database backup/restore, and measured production load/performance results. The legacy `/api/v1/anime/search` and playback routes still contact providers for APK compatibility; the new `/api/v1/search` and new Web/Android contract families do not perform provider discovery. No PostgreSQL, Render, Redis service, or Hostinger VPS deployment is implied by this code or documentation.
 
 ## PostgreSQL catalog import contract
 
@@ -93,6 +93,20 @@ Import responses include `inserted_count`, `updated_count`, `skipped_count`, `fa
 
 When provider episode mappings are supplied on a canonical episode instead of under `providers[].episodes`, each mapping must include `provider_key`; `display_name` is optional. This explicit identity is required to attach the episode mapping, sources, and tracks to the correct provider. Mappings without it fail that title transaction rather than being silently ignored.
 
+### Import an anime by name
+
+`POST /api/v1/admin/catalog/import-by-name` searches FourKHDHub and imports one exact-match series. It requires `X-Admin-Token` or `Authorization: Bearer <ADMIN_TOKEN>`. The JSON body is `{"anime_name":"Lookism"}`; `name` is accepted as an alias. The optional `provider` currently accepts `fourkhdhub`/`4khdhub`. If the provider returns multiple exact matches, the endpoint responds `409` with candidates; retry with `provider_title_id` from that response. It does not silently choose a fuzzy match.
+
+The import stores canonical title, synopsis, year, poster, genres, the complete provider detail object (including rating, tagline, cast/crew, formats and audio options), season and episode titles/overviews, provider episode IDs, and up to three eligible provider source candidates per episode. Repeating the same import updates the existing catalog title using provider identity rather than creating a duplicate. A provider outage for an individual episode's source list does not discard the title/episode metadata; the response reports those episodes in `source_candidates.warnings`.
+
+Provider source IDs are stable opaque references. Signed/final media URLs are not stored. Imported provider-reported codec labels remain `unverified`; the catalog source list exposes eligible non-HEVC candidates, while `/play` re-resolves the current stream through the provider and the `/remux` route uses the existing live remux safeguards. This import step collects source candidates; it does not claim that every candidate has already passed an FFprobe inspection.
+
+```bash
+curl -X POST "$BASE_URL/api/v1/admin/catalog/import-by-name" \
+  -H "X-Admin-Token: $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"anime_name":"Lookism"}'
+```
+
 ## Catalog UUID route family
 
 `GET /api/v1/search?q=...` searches PostgreSQL and returns records with `id_type: "catalog_title"`. These UUIDs are for the catalog route family and must not be passed to the legacy provider route family.
@@ -101,9 +115,10 @@ When provider episode mappings are supplied on a canonical episode instead of un
 - `GET /api/v1/catalog/titles/{title_id}/seasons`: seasons.
 - `GET /api/v1/catalog/titles/{title_id}/seasons/{season}/episodes`: episodes.
 - `GET /api/v1/catalog/episodes/{episode_id}`: one episode.
-- `GET /api/v1/catalog/episodes/{episode_id}/sources`: eligible, unexpired, verified non-HEVC sources.
+- `GET /api/v1/catalog/episodes/{episode_id}/sources`: eligible, unexpired verified sources plus recognized non-HEVC FourKHDHub candidates marked `unverified` until resolved.
 - `GET /api/v1/catalog/sources/{source_id}`: stored source metadata.
 - `GET /api/v1/catalog/sources/{source_id}/tracks`: audio and subtitle tracks.
-- `GET /api/v1/catalog/sources/{source_id}/play`: stored playback resolution.
+- `GET /api/v1/catalog/sources/{source_id}/play`: provider-backed source IDs are re-resolved at request time; signed URLs are not stored.
+- `GET /api/v1/catalog/sources/{source_id}/remux`: live source remux using the existing FFmpeg safeguards.
 
-The existing `/api/v1/anime/...`, `/api/v1/episodes/...`, and `/api/v1/sources/...` routes remain opaque provider-ID routes for APK compatibility. Catalog playback rejects blocked HEVC/H.265/x265, unverified, unknown, or expired sources. Provider live lookup is not silently used by the catalog route family.
+The existing `/api/v1/anime/...`, `/api/v1/episodes/...`, and `/api/v1/sources/...` routes remain opaque provider-ID routes for APK compatibility. Catalog playback rejects blocked HEVC/H.265/x265, unknown-codec, blocked, invalid, or expired sources. Live provider resolution occurs only for catalog sources explicitly imported with an opaque provider source ID; the catalog route never stores or reuses an expiring signed media URL.

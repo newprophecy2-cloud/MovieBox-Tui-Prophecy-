@@ -73,6 +73,8 @@ pub struct ProviderTitleInput {
     pub provider_title: Option<String>,
     pub provider_url: Option<String>,
     #[serde(default)]
+    pub metadata: Value,
+    #[serde(default)]
     pub episodes: Vec<ProviderEpisodeInput>,
 }
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -98,6 +100,7 @@ pub struct SeasonInput {
 pub struct EpisodeInput {
     pub episode_number: i32,
     pub episode_title: Option<String>,
+    pub overview: Option<String>,
     pub release_date: Option<String>,
     pub thumbnail_url: Option<String>,
     #[serde(default)]
@@ -251,13 +254,24 @@ impl CatalogStore {
         let r=self.client.lock().await.query_opt("SELECT id::text,mal_id,canonical_title,normalized_title,content_type,synopsis,release_year,poster_url,catalog_status FROM catalog_titles WHERE id::text=$1 AND catalog_status <> 'deleted'",&[&id]).await?;
         Ok(r.as_ref().map(title_from_row))
     }
+    pub async fn find_title_by_provider(
+        &self,
+        provider_key: &str,
+        provider_title_id: &str,
+    ) -> Result<Option<CatalogTitle>, CatalogError> {
+        let r = self.client.lock().await.query_opt(
+            "SELECT ct.id::text,ct.mal_id,ct.canonical_title,ct.normalized_title,ct.content_type,ct.synopsis,ct.release_year,ct.poster_url,ct.catalog_status FROM catalog_titles ct JOIN provider_titles pt ON pt.title_id=ct.id JOIN provider_registry pr ON pr.id=pt.provider_id WHERE pr.provider_key=$1 AND pt.provider_title_id=$2 AND ct.catalog_status <> 'deleted' LIMIT 1",
+            &[&provider_key, &provider_title_id],
+        ).await?;
+        Ok(r.as_ref().map(title_from_row))
+    }
     pub async fn get_title_detail(&self, id: &str) -> Result<Option<CatalogDetail>, CatalogError> {
         let c = self.client.lock().await;
         let Some(r)=c.query_opt("SELECT id::text,mal_id,canonical_title,normalized_title,content_type,synopsis,release_year,poster_url,catalog_status FROM catalog_titles WHERE id::text=$1 AND catalog_status <> 'deleted'",&[&id]).await? else{return Ok(None)};
         let tid: String = r.get("id");
         let alternatives=c.query("SELECT id::text AS id,title,language,title_type,source FROM title_alternative_titles WHERE title_id=$1::text::uuid ORDER BY title", &[&tid]).await?.iter().map(row_json).collect();
         let genres=c.query("SELECT g.id::text AS id,g.canonical_name,g.normalized_name,tg.source FROM genres g JOIN title_genres tg ON tg.genre_id=g.id WHERE tg.title_id=$1::text::uuid ORDER BY g.normalized_name", &[&tid]).await?.iter().map(row_json).collect();
-        let providers=c.query("SELECT pt.id::text AS id,pr.provider_key,pr.display_name,pt.provider_title_id,pt.provider_title,pt.provider_url,pt.match_status,pt.match_confidence FROM provider_titles pt JOIN provider_registry pr ON pr.id=pt.provider_id WHERE pt.title_id=$1::text::uuid ORDER BY pr.provider_key", &[&tid]).await?.iter().map(row_json).collect();
+        let providers=c.query("SELECT pt.id::text AS id,pr.provider_key,pr.display_name,pt.provider_title_id,pt.provider_title,pt.provider_url,pt.metadata,pt.match_status,pt.match_confidence FROM provider_titles pt JOIN provider_registry pr ON pr.id=pt.provider_id WHERE pt.title_id=$1::text::uuid ORDER BY pr.provider_key", &[&tid]).await?.iter().map(row_json).collect();
         let seasons=c.query("SELECT id::text AS id,season_number,canonical_label,episode_count_reported FROM seasons WHERE title_id=$1::text::uuid ORDER BY season_number", &[&tid]).await?.iter().map(row_json).collect();
         Ok(Some(CatalogDetail {
             title: title_from_row(&r),
@@ -290,16 +304,33 @@ impl CatalogStore {
         title_id: &str,
         season: i32,
     ) -> Result<Vec<Value>, CatalogError> {
-        let r=self.client.lock().await.query("SELECT e.id::text AS id,e.episode_number,e.episode_title,e.release_date::text AS release_date,e.thumbnail_url,s.season_number FROM episodes e JOIN seasons s ON s.id=e.season_id WHERE e.title_id=$1::text::uuid AND s.season_number=$2 ORDER BY e.episode_number",&[&title_id,&season]).await?;
+        let r=self.client.lock().await.query("SELECT e.id::text AS id,e.episode_number,e.episode_title,e.overview,e.release_date::text AS release_date,e.thumbnail_url,s.season_number FROM episodes e JOIN seasons s ON s.id=e.season_id WHERE e.title_id=$1::text::uuid AND s.season_number=$2 ORDER BY e.episode_number",&[&title_id,&season]).await?;
         Ok(r.iter().map(row_json).collect())
     }
     pub async fn get_episode(&self, id: &str) -> Result<Option<Value>, CatalogError> {
-        let r=self.client.lock().await.query_opt("SELECT e.id::text AS id,e.title_id::text AS title_id,e.season_id::text AS season_id,e.episode_number,e.episode_title,e.release_date::text AS release_date,e.thumbnail_url,s.season_number FROM episodes e JOIN seasons s ON s.id=e.season_id WHERE e.id::text=$1", &[&id]).await?;
+        let r=self.client.lock().await.query_opt("SELECT e.id::text AS id,e.title_id::text AS title_id,e.season_id::text AS season_id,e.episode_number,e.episode_title,e.overview,e.release_date::text AS release_date,e.thumbnail_url,s.season_number FROM episodes e JOIN seasons s ON s.id=e.season_id WHERE e.id::text=$1", &[&id]).await?;
         Ok(r.as_ref().map(row_json))
     }
     pub async fn list_sources(&self, id: &str) -> Result<Vec<Value>, CatalogError> {
-        let r=self.client.lock().await.query("SELECT ps.id::text AS id,ps.episode_id::text AS episode_id,ps.provider_source_id,pr.provider_key,ps.source_reference,ps.quality_label,ps.video_codec,ps.audio_codec,ps.container_format,ps.resolution_width,ps.resolution_height,ps.source_status,ps.codec_verification_status,ps.expires_at::text AS expires_at FROM provider_sources ps JOIN provider_registry pr ON pr.id=ps.provider_id WHERE ps.episode_id=$1::text::uuid AND ps.source_status NOT IN('blocked','invalid') AND ps.codec_verification_status='verified' AND lower(coalesce(ps.video_codec,'')) NOT LIKE '%hevc%' AND lower(coalesce(ps.video_codec,'')) NOT LIKE '%h265%' AND lower(coalesce(ps.video_codec,'')) NOT LIKE '%x265%' AND (ps.expires_at IS NULL OR ps.expires_at>now()) ORDER BY ps.resolution_height DESC NULLS LAST", &[&id]).await?;
-        Ok(r.iter().map(row_json).collect())
+        let r=self.client.lock().await.query("SELECT ps.id::text AS id,ps.episode_id::text AS episode_id,ps.provider_source_id,pr.provider_key,ps.source_reference,ps.quality_label,ps.video_codec,ps.audio_codec,ps.container_format,ps.resolution_width,ps.resolution_height,ps.source_status,ps.codec_verification_status,ps.expires_at::text AS expires_at FROM provider_sources ps JOIN provider_registry pr ON pr.id=ps.provider_id WHERE ps.episode_id=$1::text::uuid AND ps.source_status NOT IN('blocked','invalid') AND (ps.expires_at IS NULL OR ps.expires_at>now()) ORDER BY ps.resolution_height DESC NULLS LAST", &[&id]).await?;
+        Ok(r.iter()
+            .map(row_json)
+            .filter(|source| {
+                let provider = source
+                    .get("provider_key")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let verified = source
+                    .get("codec_verification_status")
+                    .and_then(Value::as_str)
+                    == Some("verified");
+                let codec = source
+                    .get("video_codec")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                verified || (provider == "fourkhdhub" && source_codec_is_known_non_hevc(codec))
+            })
+            .collect())
     }
     pub async fn get_source(&self, id: &str) -> Result<Option<Value>, CatalogError> {
         let r=self.client.lock().await.query_opt("SELECT ps.id::text AS id,ps.episode_id::text AS episode_id,ps.provider_source_id,pr.provider_key,ps.source_reference,ps.quality_label,ps.video_codec,ps.audio_codec,ps.container_format,ps.resolution_width,ps.resolution_height,ps.source_status,ps.codec_verification_status,ps.expires_at::text AS expires_at,(ps.source_status NOT IN('blocked','invalid') AND (ps.expires_at IS NULL OR ps.expires_at>now())) AS playback_eligible FROM provider_sources ps JOIN provider_registry pr ON pr.id=ps.provider_id WHERE ps.id::text=$1", &[&id]).await?;
@@ -403,19 +434,42 @@ async fn upsert_title(c: &Client, i: &TitleUpsert) -> Result<(CatalogTitle, bool
     Ok((title_from_row(&r), r.get("inserted")))
 }
 async fn import_in_tx(c: &Client, i: &ImportTitle) -> Result<ImportSummary, CatalogError> {
-    let (t, ins) = upsert_title(
-        c,
-        &TitleUpsert {
-            mal_id: i.mal_id,
-            canonical_title: i.canonical_title.clone(),
-            content_type: i.content_type.clone(),
-            synopsis: i.synopsis.clone(),
-            release_year: i.release_year,
-            poster_url: i.poster_url.clone(),
-            catalog_status: i.catalog_status.clone(),
-        },
-    )
-    .await?;
+    let existing_provider_title = if i.mal_id.is_none() {
+        if let Some(provider) = i.providers.first() {
+            c.query_opt(
+                "SELECT pt.title_id::text AS id FROM provider_titles pt JOIN provider_registry pr ON pr.id=pt.provider_id WHERE pr.provider_key=$1 AND pt.provider_title_id=$2",
+                &[&provider.provider_key, &provider.provider_title_id],
+            ).await?
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let (t, ins) = if let Some(existing) = existing_provider_title {
+        let id: String = existing.get("id");
+        let normalized = normalize(&i.canonical_title);
+        let status = i.catalog_status.clone().unwrap_or_else(|| "active".into());
+        let updated = c.query_one(
+            "UPDATE catalog_titles SET canonical_title=$2,normalized_title=$3,content_type=$4,synopsis=$5,release_year=$6,poster_url=$7,catalog_status=$8,metadata_source='import',metadata_updated_at=now(),updated_at=now() WHERE id=$1::text::uuid RETURNING id::text,mal_id,canonical_title,normalized_title,content_type,synopsis,release_year,poster_url,catalog_status",
+            &[&id,&i.canonical_title,&normalized,&i.content_type,&i.synopsis,&i.release_year,&i.poster_url,&status],
+        ).await?;
+        (title_from_row(&updated), false)
+    } else {
+        upsert_title(
+            c,
+            &TitleUpsert {
+                mal_id: i.mal_id,
+                canonical_title: i.canonical_title.clone(),
+                content_type: i.content_type.clone(),
+                synopsis: i.synopsis.clone(),
+                release_year: i.release_year,
+                poster_url: i.poster_url.clone(),
+                catalog_status: i.catalog_status.clone(),
+            },
+        )
+        .await?
+    };
     let title_uuid = parse_uuid(&t.id)?;
     let mut s = ImportSummary {
         inserted: ins as i64,
@@ -442,7 +496,7 @@ async fn import_in_tx(c: &Client, i: &ImportTitle) -> Result<ImportSummary, Cata
         let sid_uuid = parse_uuid(&sid)?;
         s.seasons += 1;
         for e in &season.episodes {
-            let er=c.query_one("INSERT INTO episodes(title_id,season_id,episode_number,episode_title,release_date,thumbnail_url) VALUES($1,$2,$3,$4,$5::text::date,$6) ON CONFLICT(title_id,season_id,episode_number) DO UPDATE SET episode_title=EXCLUDED.episode_title,release_date=EXCLUDED.release_date,thumbnail_url=EXCLUDED.thumbnail_url,updated_at=now() RETURNING id::text",&[&title_uuid,&sid_uuid,&e.episode_number,&e.episode_title,&e.release_date,&e.thumbnail_url]).await?;
+            let er=c.query_one("INSERT INTO episodes(title_id,season_id,episode_number,episode_title,overview,release_date,thumbnail_url) VALUES($1,$2,$3,$4,$5,$6::text::date,$7) ON CONFLICT(title_id,season_id,episode_number) DO UPDATE SET episode_title=EXCLUDED.episode_title,overview=EXCLUDED.overview,release_date=EXCLUDED.release_date,thumbnail_url=EXCLUDED.thumbnail_url,updated_at=now() RETURNING id::text",&[&title_uuid,&sid_uuid,&e.episode_number,&e.episode_title,&e.overview,&e.release_date,&e.thumbnail_url]).await?;
             let eid: String = er.get(0);
             s.episodes += 1;
             for pe in &e.provider_episode_ids {
@@ -467,7 +521,12 @@ async fn import_in_tx(c: &Client, i: &ImportTitle) -> Result<ImportSummary, Cata
         let pr=c.query_one("INSERT INTO provider_registry(provider_key,display_name,enabled) VALUES($1,$2,true) ON CONFLICT(provider_key) DO UPDATE SET display_name=EXCLUDED.display_name,updated_at=now() RETURNING id::text",&[&p.provider_key,&p.display_name.clone().unwrap_or_else(||p.provider_key.clone())]).await?;
         let pid: String = pr.get(0);
         let pid_uuid = parse_uuid(&pid)?;
-        c.execute("INSERT INTO provider_titles(title_id,provider_id,provider_title_id,provider_title,provider_url,match_status,last_checked_at) VALUES($1,$2,$3,$4,$5,'verified',now()) ON CONFLICT(provider_id,provider_title_id) DO UPDATE SET title_id=EXCLUDED.title_id,provider_title=EXCLUDED.provider_title,provider_url=EXCLUDED.provider_url,match_status='verified',updated_at=now()",&[&title_uuid,&pid_uuid,&p.provider_title_id,&p.provider_title,&p.provider_url]).await?;
+        let metadata = if p.metadata.is_null() {
+            Value::Object(Default::default())
+        } else {
+            p.metadata.clone()
+        };
+        c.execute("INSERT INTO provider_titles(title_id,provider_id,provider_title_id,provider_title,provider_url,metadata,match_status,last_checked_at) VALUES($1,$2,$3,$4,$5,$6,'verified',now()) ON CONFLICT(provider_id,provider_title_id) DO UPDATE SET title_id=EXCLUDED.title_id,provider_title=EXCLUDED.provider_title,provider_url=EXCLUDED.provider_url,metadata=EXCLUDED.metadata,match_status='verified',updated_at=now()",&[&title_uuid,&pid_uuid,&p.provider_title_id,&p.provider_title,&p.provider_url,&metadata]).await?;
         for pe in &p.episodes {
             let season = pe.season_number.unwrap_or(1);
             let ep = pe.provider_episode_number.unwrap_or(1);
@@ -493,10 +552,15 @@ async fn map_episode(
     };
     let eid = parse_uuid(eid)?;
     c.execute("INSERT INTO episode_provider_mappings(episode_id,provider_id,provider_episode_id,provider_episode_number) VALUES($1,$2,$3,$4) ON CONFLICT(provider_id,provider_episode_id) DO UPDATE SET episode_id=EXCLUDED.episode_id,provider_episode_number=EXCLUDED.provider_episode_number",&[&eid,&pid,&pe.provider_episode_id,&pe.provider_episode_number]).await?;
+    if !pe.sources.is_empty() {
+        c.execute("UPDATE provider_sources SET source_status='invalid',updated_at=now() WHERE episode_id=$1 AND provider_id=$2", &[&eid, &pid]).await?;
+    }
     for src in &pe.sources {
         let r=c.query_one("INSERT INTO provider_sources(episode_id,provider_id,provider_source_id,source_reference,quality_label,video_codec,audio_codec,container_format,resolution_width,resolution_height,source_status,codec_verification_status,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::text::timestamptz) ON CONFLICT(provider_id,provider_source_id) DO UPDATE SET episode_id=EXCLUDED.episode_id,source_reference=EXCLUDED.source_reference,quality_label=EXCLUDED.quality_label,video_codec=EXCLUDED.video_codec,audio_codec=EXCLUDED.audio_codec,container_format=EXCLUDED.container_format,resolution_width=EXCLUDED.resolution_width,resolution_height=EXCLUDED.resolution_height,source_status=EXCLUDED.source_status,codec_verification_status=EXCLUDED.codec_verification_status,expires_at=EXCLUDED.expires_at,updated_at=now() RETURNING id::text",&[&eid,&pid,&src.provider_source_id,&src.source_reference,&src.quality,&src.codec,&src.audio_codec,&src.container,&src.resolution_width,&src.resolution_height,&src.source_status.clone().unwrap_or_else(||"unverified".into()),&src.codec_verification_status.clone().unwrap_or_else(||"unverified".into()),&src.expires_at]).await?;
         let sid: String = r.get(0);
         let sid = parse_uuid(&sid)?;
+        c.execute("DELETE FROM source_tracks WHERE source_id=$1", &[&sid])
+            .await?;
         for (kind, tracks) in [
             ("audio", &src.audio_tracks),
             ("subtitle", &src.subtitle_tracks),
@@ -579,6 +643,38 @@ fn episode_provider_key(input: &ProviderEpisodeInput) -> Result<&str, CatalogErr
             )
         })
 }
+fn source_codec_is_known_non_hevc(codec: &str) -> bool {
+    let normalized = codec
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect::<String>();
+    if ["hevc", "h265", "x265", "hvc1", "hev1"]
+        .iter()
+        .any(|family| normalized.contains(family))
+    {
+        return false;
+    }
+    [
+        "h264",
+        "avc",
+        "x264",
+        "av1",
+        "vp8",
+        "vp9",
+        "vp09",
+        "mpeg2video",
+        "mpeg4",
+        "vc1",
+        "theora",
+        "prores",
+        "xvid",
+        "divx",
+    ]
+    .iter()
+    .any(|family| normalized.contains(family))
+}
 fn normalize(v: &str) -> String {
     v.trim()
         .to_lowercase()
@@ -597,12 +693,22 @@ fn new_id() -> String {
 }
 #[cfg(test)]
 mod tests {
-    use super::{ProviderEpisodeInput, episode_provider_key, normalize};
+    use super::{
+        ProviderEpisodeInput, episode_provider_key, normalize, source_codec_is_known_non_hevc,
+    };
     use serde_json::json;
 
     #[test]
     fn normalizes_search_text() {
         assert_eq!(normalize("  One   Piece "), "one piece");
+    }
+
+    #[test]
+    fn provider_source_candidates_fail_closed_for_hevc_and_unknown_codecs() {
+        assert!(source_codec_is_known_non_hevc("H.264 / AVC"));
+        assert!(source_codec_is_known_non_hevc("AV1"));
+        assert!(!source_codec_is_known_non_hevc("H.265 / HEVC"));
+        assert!(!source_codec_is_known_non_hevc("mystery-codec"));
     }
 
     #[test]

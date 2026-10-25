@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS provider_registry (
 CREATE TABLE IF NOT EXISTS provider_titles (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(), title_id UUID NOT NULL REFERENCES catalog_titles(id) ON DELETE CASCADE, provider_id UUID NOT NULL REFERENCES provider_registry(id) ON DELETE CASCADE, provider_title_id TEXT NOT NULL, provider_title TEXT, provider_url TEXT, match_status TEXT NOT NULL DEFAULT 'unverified', match_confidence REAL, last_checked_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(provider_id, provider_title_id)
 );
+ALTER TABLE provider_titles ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb;
 
 CREATE TABLE IF NOT EXISTS seasons (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(), title_id UUID NOT NULL REFERENCES catalog_titles(id) ON DELETE CASCADE, season_number INTEGER NOT NULL, canonical_label TEXT, episode_count_reported INTEGER, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(title_id, season_number)
@@ -47,6 +48,7 @@ CREATE TABLE IF NOT EXISTS seasons (
 CREATE TABLE IF NOT EXISTS episodes (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(), title_id UUID NOT NULL REFERENCES catalog_titles(id) ON DELETE CASCADE, season_id UUID REFERENCES seasons(id) ON DELETE CASCADE, episode_number INTEGER NOT NULL, episode_title TEXT, release_date DATE, thumbnail_url TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(title_id, season_id, episode_number)
 );
+ALTER TABLE episodes ADD COLUMN IF NOT EXISTS overview TEXT;
 CREATE TABLE IF NOT EXISTS episode_provider_mappings (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(), episode_id UUID NOT NULL REFERENCES episodes(id) ON DELETE CASCADE, provider_id UUID NOT NULL REFERENCES provider_registry(id) ON DELETE CASCADE, provider_episode_id TEXT NOT NULL, provider_episode_number INTEGER, UNIQUE(provider_id, provider_episode_id)
 );

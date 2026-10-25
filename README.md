@@ -166,7 +166,7 @@ curl "http://127.0.0.1:8080/api/v1/anime/$ANIME_ID/seasons"
 curl "http://127.0.0.1:8080/api/v1/anime/$ANIME_ID/episodes"
 ```
 
-For the persistent PostgreSQL catalog flow, configure `DATABASE_URL` and `ADMIN_TOKEN`, then import and follow the catalog routes. See [the catalog API contract](docs/catalog-api.md) for the import payload and exact response shapes. The sequence is `POST /api/v1/admin/catalog/import` → `GET /api/v1/search` → title/seasons/episodes → episode sources → source playback.
+For name-driven anime import, configure `DATABASE_URL` and `ADMIN_TOKEN`, then call `POST /api/v1/admin/catalog/import-by-name` with `{"anime_name":"Lookism"}`. The route imports matched details and episode/source references; follow the returned catalog title/episode/source IDs, then call catalog source `/play` or `/remux` for live resolution. See [the catalog API contract](docs/catalog-api.md) for exact response shapes and safeguards.
 
 Episode IDs are also opaque. A valid episode reference can be read directly:
 
@@ -234,11 +234,13 @@ Audio and subtitle responses are only confirmed when the resolved media can be i
 | `GET` | `/api/v1/anime/search/stream` | Incremental SSE provider search |
 | `GET` | `/api/v1/search` | PostgreSQL catalog search |
 | `POST` | `/api/v1/admin/catalog/import` | Admin-authenticated anime/catalog import (requires `ADMIN_TOKEN`) |
+| `POST` | `/api/v1/admin/catalog/import-by-name` | Import exact-match anime details, episodes, and provider source candidates (requires `ADMIN_TOKEN`) |
 | `GET` | `/api/v1/catalog/titles/{title_id}` | Stored catalog title details |
 | `GET` | `/api/v1/catalog/titles/{title_id}/seasons` | Stored catalog seasons |
 | `GET` | `/api/v1/catalog/titles/{title_id}/seasons/{season}/episodes` | Stored catalog episodes |
-| `GET` | `/api/v1/catalog/episodes/{episode_id}/sources` | Eligible verified catalog sources |
-| `GET` | `/api/v1/catalog/sources/{source_id}/play` | Stored playback metadata |
+| `GET` | `/api/v1/catalog/episodes/{episode_id}/sources` | Verified sources and supported live provider candidates |
+| `GET` | `/api/v1/catalog/sources/{source_id}/play` | Re-resolve provider playback at request time |
+| `GET` | `/api/v1/catalog/sources/{source_id}/remux` | Live FFmpeg remux for imported provider source candidates |
 | `GET` | `/api/v1/anime/{anime_id}` | Anime details |
 | `GET` | `/api/v1/anime/{anime_id}/seasons` | Season list |
 | `GET` | `/api/v1/anime/{anime_id}/episodes` | Episode list |

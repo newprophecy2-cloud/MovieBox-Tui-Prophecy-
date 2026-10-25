@@ -918,6 +918,7 @@ async fn route(
         _ if path.starts_with("/api/v1/web/") => web_playback_contract_route(stream, path, state).await,
         _ if path.starts_with("/api/v1/android/") => android_playback_contract_route(stream, path, state).await,
         "/api/v1/admin/catalog/import" if method == "POST" => admin_catalog_import_route(stream, state, request_headers, body).await,
+        "/api/v1/admin/catalog/import-by-name" if method == "POST" => admin_catalog_import_by_name_route(stream, state, request_headers, body).await,
         "/api/v1/admin/catalog/update-all" if method == "POST" => admin_catalog_update_route(stream, state, request_headers).await,
         "/api/v1/admin/catalog/titles/upsert" if method == "POST" => admin_catalog_upsert_route(stream, state, request_headers, body).await,
         "/api/v1/admin/catalog/inspect" if method == "GET" => admin_catalog_inspect_route(stream, query, state, request_headers).await,
@@ -934,7 +935,8 @@ async fn route(
         _ if path.starts_with("/api/v1/catalog/episodes/") && path.ends_with("/sources") => catalog_episode_sources_route(stream, path, state).await,
         _ if path.starts_with("/api/v1/catalog/episodes/") => catalog_episode_route(stream, path, state).await,
         _ if path.starts_with("/api/v1/catalog/sources/") && path.ends_with("/tracks") => catalog_source_tracks_route(stream, path, state).await,
-        _ if path.starts_with("/api/v1/catalog/sources/") && path.ends_with("/play") => catalog_source_play_route(stream, path, state).await,
+        _ if path.starts_with("/api/v1/catalog/sources/") && path.ends_with("/remux") => catalog_source_remux_route(stream, path, state, request_headers, head_only).await,
+        _ if path.starts_with("/api/v1/catalog/sources/") && path.ends_with("/play") => catalog_source_play_route(stream, path, state, request_headers, head_only).await,
         _ if path.starts_with("/api/v1/catalog/sources/") => catalog_source_route(stream, path, state).await,
         _ if path.starts_with("/api/v1/catalog/titles/") => catalog_title_detail_route(stream, path, state).await,
         "/api/v1/diagnostics" => diagnostics_route(stream, state).await,
@@ -1260,12 +1262,101 @@ async fn catalog_source_tracks_route(
         .trim_end_matches("/tracks");
     catalog_id_route(stream, c.list_tracks(id).await).await
 }
+
+fn catalog_live_source_path(
+    source: &serde_json::Value,
+    action: &str,
+) -> Result<Option<String>, (u16, String)> {
+    if source
+        .get("provider_key")
+        .and_then(serde_json::Value::as_str)
+        != Some("fourkhdhub")
+    {
+        return Ok(None);
+    }
+    let codec = source
+        .get("video_codec")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    match source_codec_eligibility(Some(codec)) {
+        SourceCodecEligibility::Verified => {}
+        SourceCodecEligibility::BlockedH265 => {
+            return Err(err(
+                "SOURCE_CODEC_BLOCKED",
+                "H.265/HEVC sources are blocked by playback policy.",
+                Some(ProviderKind::FourKHdHub),
+                415,
+            ));
+        }
+        SourceCodecEligibility::Unverified => {
+            return Err(err(
+                "CODEC_UNVERIFIED",
+                "The provider source has no recognized non-HEVC codec.",
+                Some(ProviderKind::FourKHdHub),
+                415,
+            ));
+        }
+    }
+    let Some(id) = source
+        .get("provider_source_id")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Err(err(
+            "INVALID_SOURCE_MAPPING",
+            "The stored provider source mapping is missing.",
+            Some(ProviderKind::FourKHdHub),
+            400,
+        ));
+    };
+    match parse_source(id) {
+        Ok(reference) if reference.p == ProviderKind::FourKHdHub => {
+            Ok(Some(format!("/api/v1/sources/{id}/{action}")))
+        }
+        _ => Err(err(
+            "INVALID_SOURCE_MAPPING",
+            "The stored provider source mapping is invalid.",
+            Some(ProviderKind::FourKHdHub),
+            400,
+        )),
+    }
+}
+
+async fn catalog_source_remux_route(
+    stream: &mut TcpStream,
+    path: &str,
+    state: ApiState,
+    request_headers: &HashMap<String, String>,
+    head_only: bool,
+) -> std::io::Result<()> {
+    let Some(catalog) = state.catalog.clone() else {
+        return write_json(stream, 503, &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","retryable":true}}), None).await;
+    };
+    let id = path
+        .strip_prefix("/api/v1/catalog/sources/")
+        .unwrap_or("")
+        .trim_end_matches("/remux");
+    match catalog.get_source(id).await {
+        Ok(Some(source)) if source.get("playback_eligible").and_then(serde_json::Value::as_bool).unwrap_or(false) => {
+            match catalog_live_source_path(&source, "remux") {
+                Ok(Some(live_path)) => source_route(stream, &live_path, state, request_headers, head_only).await,
+                Ok(None) => write_json(stream, 501, &serde_json::json!({"success":false,"error":{"code":"UNSUPPORTED_OPERATION","message":"This source has no live provider remux mapping.","retryable":false}}), None).await,
+                Err((status, body)) => write_raw_json(stream, status, &body, None).await,
+            }
+        }
+        Ok(Some(_)) => write_json(stream, 404, &serde_json::json!({"success":false,"error":{"code":"SOURCE_UNAVAILABLE","message":"The source is blocked, invalid, or expired.","retryable":false}}), None).await,
+        Ok(None) => write_json(stream, 404, &serde_json::json!({"success":false,"error":{"code":"CATALOG_SOURCE_NOT_FOUND","retryable":false}}), None).await,
+        Err(_) => write_json(stream, 503, &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","retryable":true}}), None).await,
+    }
+}
+
 async fn catalog_source_play_route(
     stream: &mut TcpStream,
     path: &str,
     state: ApiState,
+    request_headers: &HashMap<String, String>,
+    head_only: bool,
 ) -> std::io::Result<()> {
-    let Some(c) = state.catalog else {
+    let Some(c) = state.catalog.clone() else {
         return write_json(stream,503,&serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","retryable":true}}),None).await;
     };
     let id = path
@@ -1286,6 +1377,13 @@ async fn catalog_source_play_route(
                     None,
                 )
                 .await;
+            }
+            match catalog_live_source_path(&source, "playback") {
+                Ok(Some(live_path)) => {
+                    return source_route(stream, &live_path, state, request_headers, head_only).await;
+                }
+                Ok(None) => {}
+                Err((status, body)) => return write_raw_json(stream, status, &body, None).await,
             }
             let codec = source
                 .get("video_codec")
@@ -1409,6 +1507,317 @@ async fn admin_catalog_import_route(
         None,
     )
     .await
+}
+
+#[derive(Debug, Deserialize)]
+struct ImportByNameRequest {
+    #[serde(alias = "name")]
+    anime_name: String,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    provider_title_id: Option<String>,
+}
+
+fn normalize_import_match(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(char::to_lowercase)
+        .filter(|character| character.is_alphanumeric())
+        .collect()
+}
+
+fn import_resolution_height(quality: Option<&str>) -> Option<i32> {
+    let quality = quality?.to_ascii_lowercase();
+    [2160, 1440, 1080, 720, 480, 360]
+        .into_iter()
+        .find(|height| quality.contains(&height.to_string()))
+}
+
+fn import_container(filename: &str) -> Option<String> {
+    let extension = filename.rsplit_once('.')?.1.trim();
+    (!extension.is_empty()
+        && extension.len() <= 10
+        && extension.chars().all(|c| c.is_ascii_alphanumeric()))
+    .then(|| extension.to_ascii_lowercase())
+}
+
+async fn import_episode_sources(
+    state: &ApiState,
+    provider: ProviderKind,
+    provider_title_id: &str,
+    season: usize,
+    episode: usize,
+) -> Result<Vec<crate::catalog::ProviderSourceInput>, &'static str> {
+    let episode_ref = OpaqueRef {
+        p: provider,
+        v: provider_title_id.to_string(),
+        s: season,
+        e: episode,
+    };
+    let releases =
+        match tokio::time::timeout(SOURCE_TIMEOUT, cached_releases(state, &episode_ref)).await {
+            Ok(Ok(releases)) => releases,
+            Ok(Err(_)) => return Err("SOURCE_LOOKUP_FAILED"),
+            Err(_) => return Err("SOURCE_LOOKUP_TIMEOUT"),
+        };
+    let sources = releases
+        .iter()
+        .enumerate()
+        .filter(|(_, release)| release.provider == provider && release_has_usable_source(release))
+        .take(3)
+        .map(|(index, release)| crate::catalog::ProviderSourceInput {
+            provider_source_id: source_ref(release, &episode_ref, index),
+            source_reference: None,
+            quality: release.quality.clone(),
+            codec: release.codec.clone(),
+            audio_codec: None,
+            container: import_container(&release.filename),
+            resolution_width: None,
+            resolution_height: import_resolution_height(release.quality.as_deref()),
+            source_status: Some("active".into()),
+            codec_verification_status: Some("unverified".into()),
+            expires_at: None,
+            audio_tracks: Vec::new(),
+            subtitle_tracks: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    if sources.is_empty() {
+        Err("NO_ELIGIBLE_SOURCE")
+    } else {
+        Ok(sources)
+    }
+}
+
+async fn admin_catalog_import_by_name_route(
+    stream: &mut TcpStream,
+    state: ApiState,
+    headers: &HashMap<String, String>,
+    body: &[u8],
+) -> std::io::Result<()> {
+    if !admin_authorized(headers) {
+        return write_json(stream, 401, &serde_json::json!({"success":false,"error":{"code":"UNAUTHORIZED","message":"Administrator authentication is required.","retryable":false}}), None).await;
+    }
+    let Some(catalog) = state.catalog.clone() else {
+        return write_json(stream, 503, &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","message":"The catalog database is not configured.","retryable":true}}), None).await;
+    };
+    let request: ImportByNameRequest = match serde_json::from_slice(body) {
+        Ok(request) => request,
+        Err(_) => return write_json(stream, 422, &serde_json::json!({"success":false,"error":{"code":"VALIDATION_FAILED","message":"Expected {\"anime_name\":\"title\"}.","retryable":false}}), None).await,
+    };
+    let anime_name = request.anime_name.trim();
+    if anime_name.chars().count() < 2 || anime_name.chars().count() > MAX_QUERY {
+        return write_json(stream, 422, &serde_json::json!({"success":false,"error":{"code":"VALIDATION_FAILED","message":"anime_name must contain 2 to 200 characters.","retryable":false}}), None).await;
+    }
+    let provider = match request.provider.as_deref() {
+        None => ProviderKind::FourKHdHub,
+        Some(value) => match ProviderKind::parse(value) {
+            Some(provider) => provider,
+            None => return write_json(stream, 422, &serde_json::json!({"success":false,"error":{"code":"UNSUPPORTED_PROVIDER","message":"Import-by-name currently supports the FourKHDHub anime provider.","retryable":false}}), None).await,
+        },
+    };
+    if provider != ProviderKind::FourKHdHub {
+        return write_json(stream, 422, &serde_json::json!({"success":false,"error":{"code":"UNSUPPORTED_PROVIDER","message":"Import-by-name currently supports the FourKHDHub anime provider.","retryable":false}}), None).await;
+    }
+    let items = match tokio::time::timeout(
+        OVERALL_TIMEOUT,
+        state.service.search_typed(provider, anime_name, 0),
+    )
+    .await
+    {
+        Ok(Ok(items)) => items,
+        Ok(Err(error)) => {
+            let (status, body) = provider_error(error, provider);
+            return write_raw_json(stream, status, &body, None).await;
+        }
+        Err(_) => {
+            let (status, body) = err(
+                "PROVIDER_TIMEOUT",
+                "The anime provider search timed out.",
+                Some(provider),
+                504,
+            );
+            return write_raw_json(stream, status, &body, None).await;
+        }
+    };
+    let target = normalize_import_match(anime_name);
+    let mut matches = items
+        .iter()
+        .filter(|item| {
+            item.media_type == MediaType::Series && normalize_import_match(&item.title) == target
+        })
+        .filter(|item| {
+            request
+                .provider_title_id
+                .as_deref()
+                .is_none_or(|id| id == item.id.value)
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| left.id.value.cmp(&right.id.value));
+    matches.dedup_by(|left, right| left.id == right.id);
+    if matches.len() != 1 {
+        let candidates = items.iter().take(8).map(|item| serde_json::json!({"title":item.title,"year":item.year,"media_type":item.media_type,"provider_title_id":item.id.value})).collect::<Vec<_>>();
+        let (status, code, message) = if matches.is_empty() {
+            (
+                404,
+                "ANIME_NOT_FOUND",
+                "No exact anime title match was found; retry with the exact provider title.",
+            )
+        } else {
+            (
+                409,
+                "AMBIGUOUS_TITLE_MATCH",
+                "More than one exact title matched; retry with provider_title_id from candidates.",
+            )
+        };
+        return write_json(stream, status, &serde_json::json!({"success":false,"error":{"code":code,"message":message,"retryable":false},"data":{"candidates":candidates}}), None).await;
+    }
+    let item = matches[0];
+    let details = match tokio::time::timeout(
+        OVERALL_TIMEOUT,
+        state.service.details_typed(provider, &item.id.value),
+    )
+    .await
+    {
+        Ok(Ok(details)) => details,
+        Ok(Err(error)) => {
+            let (status, body) = provider_error(error, provider);
+            return write_raw_json(stream, status, &body, None).await;
+        }
+        Err(_) => {
+            let (status, body) = err(
+                "PROVIDER_TIMEOUT",
+                "The anime detail lookup timed out.",
+                Some(provider),
+                504,
+            );
+            return write_raw_json(stream, status, &body, None).await;
+        }
+    };
+    if !details.is_series() || details.seasons.is_empty() {
+        return write_json(stream, 422, &serde_json::json!({"success":false,"error":{"code":"ANIME_DETAILS_INCOMPLETE","message":"The provider did not return a series with episode metadata.","retryable":false}}), None).await;
+    }
+    let episode_total: usize = details
+        .seasons
+        .iter()
+        .map(|season| season.episodes.len())
+        .sum();
+    if episode_total == 0 || episode_total > 200 {
+        return write_json(stream, 422, &serde_json::json!({"success":false,"error":{"code":"EPISODE_LIMIT_EXCEEDED","message":"Import-by-name requires 1 to 200 provider episodes.","retryable":false}}), None).await;
+    }
+    let mut source_warnings = Vec::new();
+    let mut provider_episodes = Vec::with_capacity(episode_total);
+    let mut seasons = Vec::with_capacity(details.seasons.len());
+    for season in &details.seasons {
+        let season_number = season.number as i32;
+        let mut canonical_episodes = Vec::with_capacity(season.episodes.len());
+        for episode in &season.episodes {
+            let mut sources = match import_episode_sources(
+                &state,
+                provider,
+                &details.id.value,
+                episode.season,
+                episode.number,
+            )
+            .await
+            {
+                Ok(sources) => sources,
+                Err(code) => {
+                    source_warnings.push(serde_json::json!({"season":episode.season,"episode":episode.number,"code":code}));
+                    Vec::new()
+                }
+            };
+            let provider_episode_id = encode(&OpaqueRef {
+                p: provider,
+                v: details.id.value.clone(),
+                s: episode.season,
+                e: episode.number,
+            });
+            provider_episodes.push(crate::catalog::ProviderEpisodeInput {
+                provider_key: None,
+                display_name: None,
+                season_number: Some(season_number),
+                provider_episode_id,
+                provider_episode_number: Some(episode.number as i32),
+                sources: std::mem::take(&mut sources),
+            });
+            canonical_episodes.push(crate::catalog::EpisodeInput {
+                episode_number: episode.number as i32,
+                episode_title: episode.title.clone(),
+                overview: episode.overview.clone(),
+                release_date: None,
+                thumbnail_url: None,
+                provider_episode_ids: Vec::new(),
+            });
+        }
+        seasons.push(crate::catalog::SeasonInput {
+            season_number,
+            canonical_label: Some(format!("Season {season_number}")),
+            episode_count_reported: Some(season.episodes.len() as i32),
+            episodes: canonical_episodes,
+        });
+    }
+    let provider_title_id = details.id.value.clone();
+    let metadata = serde_json::to_value(&details).unwrap_or_else(|_| serde_json::json!({}));
+    let import = crate::catalog::ImportTitle {
+        mal_id: None,
+        canonical_title: details.title.clone(),
+        content_type: "anime".into(),
+        synopsis: details.description.clone(),
+        release_year: details
+            .year
+            .as_deref()
+            .and_then(|year| year.get(..4))
+            .and_then(|year| year.parse().ok()),
+        poster_url: details.poster_url.clone(),
+        catalog_status: Some("active".into()),
+        alternative_titles: Vec::new(),
+        genres: details.genres.clone(),
+        providers: vec![crate::catalog::ProviderTitleInput {
+            provider_key: provider.cache_key().into(),
+            display_name: Some(provider.label().into()),
+            provider_title_id: provider_title_id.clone(),
+            provider_title: Some(details.title.clone()),
+            provider_url: None,
+            metadata,
+            episodes: provider_episodes,
+        }],
+        seasons,
+    };
+    let mut job = match catalog.create_job("import_by_name").await {
+        Ok(job) => job,
+        Err(_) => return write_json(stream, 503, &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","message":"Could not create import job.","retryable":true}}), None).await,
+    };
+    let summary = match catalog.import_title(import).await {
+        Ok(summary) => summary,
+        Err(error) => {
+            log::error!("import-by-name transaction failed: {error:?}");
+            job.failed_count = 1;
+            job.status = "failed".into();
+            let _ = catalog.finish_job(&job).await;
+            return write_json(stream, 422, &serde_json::json!({"success":false,"error":{"code":"CATALOG_IMPORT_FAILED","message":"The provider anime metadata could not be committed to the catalog.","retryable":false}}), None).await;
+        }
+    };
+    job.inserted_count = summary.inserted;
+    job.updated_count = summary.updated;
+    job.titles_imported = 1;
+    job.seasons_imported = summary.seasons;
+    job.episodes_imported = summary.episodes;
+    job.sources_imported = summary.sources;
+    job.tracks_imported = summary.tracks;
+    job.status = "completed".into();
+    let _ = catalog.finish_job(&job).await;
+    let title = catalog
+        .find_title_by_provider(provider.cache_key(), &provider_title_id)
+        .await
+        .ok()
+        .flatten();
+    write_json(
+        stream,
+        if summary.inserted > 0 { 201 } else { 200 },
+        &serde_json::json!({"success":true,"data":{"title":title,"job":job,"source_candidates":{"stored":summary.sources,"warnings":source_warnings,"signed_stream_urls_persisted":false,"playback_route":"/api/v1/catalog/sources/{source_id}/play","remux_route":"/api/v1/catalog/sources/{source_id}/remux"}},"meta":{"request_id":request_id()}}),
+        None,
+    ).await
 }
 
 async fn admin_catalog_update_route(
@@ -5105,8 +5514,10 @@ fn openapi() -> serde_json::Value {
             "/api/v1/catalog/episodes/{episode_id}/sources": {"get": {"description": "Eligible verified, unexpired catalog sources.", "responses": {"200": {"description": "Eligible source list"}, "503": {"description": "Catalog database unavailable"}}}},
             "/api/v1/catalog/sources/{source_id}": {"get": {"description": "Stored source metadata, including expiry and playback eligibility.", "responses": {"200": {"description": "Source detail"}, "404": {"description": "Source not found"}, "503": {"description": "Catalog database unavailable"}}}},
             "/api/v1/catalog/sources/{source_id}/tracks": {"get": {"description": "Stored audio and subtitle tracks for a source.", "responses": {"200": {"description": "Track list"}, "503": {"description": "Catalog database unavailable"}}}},
-            "/api/v1/catalog/sources/{source_id}/play": {"get": {"description": "Playback metadata for an eligible stored source; blocked and expired sources are rejected.", "responses": {"200": {"description": "Eligible stored source"}, "404": {"description": "Source unavailable, blocked, expired, or missing"}, "415": {"description": "Source codec is blocked or unverified"}, "503": {"description": "Catalog database unavailable"}}}},
+            "/api/v1/catalog/sources/{source_id}/play": {"get": {"description": "Playback resolution for an eligible stored source; imported FourKHDHub source IDs are resolved live and signed URLs are not persisted.", "responses": {"200": {"description": "Playback resolved"}, "404": {"description": "Source unavailable, blocked, expired, or missing"}, "415": {"description": "Source codec is blocked or unverified"}, "503": {"description": "Catalog database unavailable"}}}},
+            "/api/v1/catalog/sources/{source_id}/remux": {"get": {"description": "Live FourKHDHub provider source resolution followed by the guarded streaming FFmpeg remux path.", "responses": {"200": {"description": "Remuxed stream"}, "404": {"description": "Source unavailable or missing"}, "415": {"description": "Source codec is blocked or unverified"}, "503": {"description": "Catalog database unavailable"}}}},
             "/api/v1/admin/catalog/import": {"post": {"description": "Protected manual catalog import; accepts a bounded titles batch.", "responses": {"201": {"description": "Import job completed"}, "401": {"description": "Unauthorized"}, "413": {"description": "Batch too large"}, "503": {"description": "Database unavailable"}}}},
+            "/api/v1/admin/catalog/import-by-name": {"post": {"description": "Protected exact-match anime import from FourKHDHub, including provider details, episodes, and live source references.", "responses": {"201": {"description": "Anime inserted"}, "200": {"description": "Anime updated idempotently"}, "401": {"description": "Unauthorized"}, "404": {"description": "Exact title not found"}, "409": {"description": "Ambiguous exact title"}, "503": {"description": "Provider or catalog unavailable"}}}},
             "/api/v1/admin/catalog/update-all": {"post": {"description": "Protected manual catalog update job; never scheduled automatically.", "responses": {"202": {"description": "Update job accepted"}, "401": {"description": "Unauthorized"}}}},
             "/api/v1/admin/catalog/titles/upsert": {"post": {"description": "Protected idempotent catalog title upsert.", "responses": {"200": {"description": "Updated"}, "201": {"description": "Inserted"}, "401": {"description": "Unauthorized"}, "422": {"description": "Validation failed"}}}},
             "/api/v1/admin/catalog/inspect": {"get": {"description": "Protected catalog inspection.", "responses": {"200": {"description": "Catalog records"}, "401": {"description": "Unauthorized"}}}},
@@ -5164,6 +5575,18 @@ fn openapi() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn import_title_match_normalizes_case_and_punctuation_without_fuzzy_matching() {
+        assert_eq!(
+            normalize_import_match("Lookism"),
+            normalize_import_match("LOOK-ISM")
+        );
+        assert_ne!(
+            normalize_import_match("Lookism"),
+            normalize_import_match("Lookism 2")
+        );
+    }
 
     #[tokio::test]
     async fn media_info_probe_reports_missing_ffprobe_as_spawn_failure() {
