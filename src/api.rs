@@ -4835,12 +4835,17 @@ async fn media_info_route(
     let (url, referer) = match validated_media_url(query).await {
         Ok(value) => value,
         Err((status, message)) => {
+            let code = if status == 400 {
+                "INVALID_REQUEST"
+            } else {
+                "SSRF_BLOCKED"
+            };
             return write_raw_json(
                 stream,
                 status,
                 &format!(
-                    r#"{{"error":{{"code":"SSRF_BLOCKED","message":"{}"}}}}"#,
-                    message
+                    r#"{{"error":{{"code":"{}","message":"{}"}}}}"#,
+                    code, message
                 ),
                 None,
             )
