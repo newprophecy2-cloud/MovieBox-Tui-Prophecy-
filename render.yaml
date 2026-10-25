@@ -16,5 +16,7 @@ services:
         sync: false
       - key: DATABASE_URL
         sync: false
+      - key: REQUIRE_DATABASE
+        value: "true"
       - key: ADMIN_TOKEN
         sync: false

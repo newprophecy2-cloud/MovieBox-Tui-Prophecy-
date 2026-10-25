@@ -20,8 +20,12 @@ Explicit Web and Android playback contract families are registered. They intenti
 
 Set `DATABASE_URL` and restart the service. The service applies the migration at startup. The database user needs permission to create the application schema and the `pgcrypto` extension during initial provisioning. In a locked-down production setup, apply the migration with a privileged deploy role first, then run the application with a least-privilege role.
 
+For a deployment that requires the catalog, set `REQUIRE_DATABASE=true`. In that mode `/ready` returns HTTP 503 with a dependency status when PostgreSQL is missing or initialization fails; `/health` remains a lightweight process liveness check. Render is configured for this mode. Local development defaults to `REQUIRE_DATABASE=false` in `.env.example`.
+
 The current migration creates canonical titles, alternative titles, genres, provider registry/mappings, seasons, episodes, provider sources, source tracks, sections, activity events, pending import requests, catalog jobs, remux-session metadata, and privacy-safe playback progress.
 
 ## Important limitations
 
 This change does not claim that the full 700+ MAL import is complete, that all providers are mapped into PostgreSQL, or that Web remux session sharing is production-ready. The legacy provider routes are retained for compatibility. A future phase must populate the catalog from real authorized metadata, add database-backed episode/source selection, complete Web session management, and add PostgreSQL/Redis integration tests against controlled fixtures.
+
+Provider-backed browse aggregation now has a six-second bounded homepage deadline and one-second per-item classification deadline. A slow provider therefore produces a bounded upstream error instead of holding the HTTP connection until the client or proxy timeout.

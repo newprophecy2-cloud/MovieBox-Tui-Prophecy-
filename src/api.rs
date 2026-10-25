@@ -41,6 +41,8 @@ const DEFAULT_LIMIT: usize = 20;
 const MAX_LIMIT: usize = 100;
 const SOURCE_TIMEOUT: Duration = Duration::from_secs(15);
 const OVERALL_TIMEOUT: Duration = Duration::from_secs(45);
+const BROWSE_TIMEOUT: Duration = Duration::from_secs(6);
+const CLASSIFICATION_TIMEOUT: Duration = Duration::from_secs(1);
 const PLAYBACK_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(20);
 const SEARCH_SOURCE_CHECK_TIMEOUT: Duration = Duration::from_secs(45);
 const SEARCH_SOURCE_CHECK_CONCURRENCY: usize = 8;
@@ -71,6 +73,12 @@ const PROVIDERS: [ProviderKind; 6] = [
 
 fn moviebox_provider_enabled() -> bool {
     MOVIEBOX_PROVIDER_ENABLED && crate::config::load().moviebox_enabled
+}
+
+fn database_required() -> bool {
+    std::env::var("REQUIRE_DATABASE")
+        .ok()
+        .is_some_and(|value| value.eq_ignore_ascii_case("true") || value == "1")
 }
 
 fn configured_search_providers() -> Vec<ProviderKind> {
@@ -699,6 +707,11 @@ pub async fn run() -> std::io::Result<()> {
             None
         }
     };
+    log::info!(
+        "PostgreSQL catalog initialized: {}; database required for readiness: {}",
+        catalog.is_some(),
+        database_required()
+    );
     let state = ApiState {
         service: Arc::new(MovieBoxService::new()),
         catalog,
@@ -897,7 +910,7 @@ async fn route(
     match path {
         "/" => write_json(stream, 200, &serde_json::json!({"name":"MovieBox API","version":"v1","docs":"/docs","health":"/health"}), None).await,
         "/health" => write_json(stream, 200, &serde_json::json!({"status":"ok"}), None).await,
-        "/ready" => write_json(stream, 200, &serde_json::json!({"status":"ready","meaning":"The process and local service layer are initialized; upstream availability is request-specific."}), None).await,
+        "/ready" => readiness_route(stream, state).await,
         "/api/v1" => write_json(stream, 200, &serde_json::json!({"version":"v1","resources":["anime","movies","episodes","sources"]}), None).await,
         "/openapi.json" => write_json(stream, 200, &openapi(), None).await,
         "/docs" => write_text(stream, 200, "text/html; charset=utf-8", "<!doctype html><html><head><title>MovieBox API</title></head><body><h1>MovieBox API</h1><p>OpenAPI: <a href=\"/openapi.json\">/openapi.json</a></p><p>Swagger UI can load this document from a local or trusted client.</p></body></html>", None).await,
@@ -910,13 +923,13 @@ async fn route(
         "/api/v1/admin/catalog/inspect" if method == "GET" => admin_catalog_inspect_route(stream, query, state, request_headers).await,
         _ if path.starts_with("/api/v1/admin/catalog/jobs/") && method == "GET" => admin_catalog_job_route(stream, path, state, request_headers).await,
         "/api/v1/home" if state.catalog.is_some() => catalog_home_route(stream, query, state).await,
-        "/api/v1/genres" if state.catalog.is_some() => catalog_genres_route(stream, query, state).await,
+        "/api/v1/genres" => catalog_genres_route(stream, query, state).await,
         "/api/v1/trending" if state.catalog.is_some() => catalog_listing_route(stream, query, state, None, "trending").await,
         "/api/v1/popular" if state.catalog.is_some() => catalog_listing_route(stream, query, state, None, "popular").await,
         "/api/v1/latest" if state.catalog.is_some() => catalog_listing_route(stream, query, state, None, "latest").await,
         "/api/v1/movies" if state.catalog.is_some() => catalog_listing_route(stream, query, state, Some("movie"), "movies").await,
         "/api/v1/k-dramas" if state.catalog.is_some() => catalog_listing_route(stream, query, state, Some("k_drama"), "k-dramas").await,
-        _ if path.starts_with("/api/v1/catalog/titles/") && state.catalog.is_some() => catalog_title_detail_route(stream, path, state).await,
+        _ if path.starts_with("/api/v1/catalog/titles/") => catalog_title_detail_route(stream, path, state).await,
         "/api/v1/diagnostics" => diagnostics_route(stream, state).await,
         "/api/stream-proxy" => stream_proxy_route(stream, query, request_headers, head_only).await,
         "/api/media-info" => media_info_route(stream, query, request_headers).await,
@@ -974,6 +987,34 @@ fn query_number(query: &str, key: &str, default: i64) -> i64 {
     query_value(query, key)
         .and_then(|value| value.parse().ok())
         .unwrap_or(default)
+}
+
+async fn readiness_route(stream: &mut TcpStream, state: ApiState) -> std::io::Result<()> {
+    let catalog_ready = state.catalog.is_some();
+    if database_required() && !catalog_ready {
+        return write_json(
+            stream,
+            503,
+            &serde_json::json!({
+                "status": "not_ready",
+                "dependencies": {"postgresql": "unavailable"},
+                "meaning": "The PostgreSQL catalog is required for this deployment but is not initialized."
+            }),
+            None,
+        )
+        .await;
+    }
+    write_json(
+        stream,
+        200,
+        &serde_json::json!({
+            "status": "ready",
+            "dependencies": {"postgresql": if catalog_ready { "ready" } else { "optional_not_configured" }},
+            "meaning": "The process and mandatory dependencies are initialized; upstream availability is request-specific."
+        }),
+        None,
+    )
+    .await
 }
 
 async fn web_playback_contract_route(
@@ -1344,7 +1385,7 @@ async fn homepage_items(
     ),
     String,
 > {
-    tokio::time::timeout(OVERALL_TIMEOUT, homepage_items_uncapped(state, page))
+    tokio::time::timeout(BROWSE_TIMEOUT, homepage_items_uncapped(state, page))
         .await
         .map_err(|_| "MovieBox homepage request timed out.".to_string())?
 }
@@ -1403,7 +1444,13 @@ async fn homepage_items_uncapped(
         let id = item.id.value.clone();
         tasks.spawn(async move {
             let permit = semaphore.acquire_owned().await.ok()?;
-            let metadata = service.moviebox_classification_metadata(&id).await;
+            let metadata = tokio::time::timeout(
+                CLASSIFICATION_TIMEOUT,
+                service.moviebox_classification_metadata(&id),
+            )
+            .await
+            .ok()
+            .flatten();
             drop(permit);
             Some((id, metadata))
         });
@@ -4637,12 +4684,17 @@ async fn subtitle_extract_route(
     let (url, _) = match validated_media_url(query).await {
         Ok(value) => value,
         Err((status, message)) => {
+            let code = if status == 400 {
+                "INVALID_REQUEST"
+            } else {
+                "SSRF_BLOCKED"
+            };
             return write_raw_json(
                 stream,
                 status,
                 &format!(
-                    r#"{{"error":{{"code":"SSRF_BLOCKED","message":"{}"}}}}"#,
-                    message
+                    r#"{{"error":{{"code":"{}","message":"{}"}}}}"#,
+                    code, message
                 ),
                 None,
             )
@@ -4815,7 +4867,7 @@ fn openapi() -> serde_json::Value {
         "paths": {
             "/": {"get": {"responses": {"200": {"description": "API information"}}}},
             "/health": {"get": {"responses": {"200": {"description": "Liveness"}}}},
-            "/ready": {"get": {"responses": {"200": {"description": "Readiness"}}}},
+            "/ready": {"get": {"responses": {"200": {"description": "Readiness"}, "503": {"description": "Mandatory PostgreSQL catalog unavailable"}}}},
             "/api/v1": {"get": {"responses": {"200": {"description": "API version and resources"}}}},
             "/openapi.json": {"get": {"responses": {"200": {"description": "OpenAPI document"}}}},
             "/docs": {"get": {"responses": {"200": {"description": "API documentation"}}}},
