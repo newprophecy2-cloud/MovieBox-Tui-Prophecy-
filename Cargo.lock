@@ -1467,6 +1467,7 @@ dependencies = [
  "unicode-segmentation",
  "unicode-width",
  "url",
+ "uuid",
  "zip",
 ]
 
@@ -1766,6 +1767,9 @@ dependencies = [
  "bytes",
  "fallible-iterator",
  "postgres-protocol",
+ "serde_core",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]

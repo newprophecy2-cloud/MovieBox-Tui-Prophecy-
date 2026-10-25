@@ -29,3 +29,20 @@ The current migration creates canonical titles, alternative titles, genres, prov
 This change does not claim that the full 700+ MAL import is complete, that all providers are mapped into PostgreSQL, or that Web remux session sharing is production-ready. The legacy provider routes are retained for compatibility. A future phase must populate the catalog from real authorized metadata, add database-backed episode/source selection, complete Web session management, and add PostgreSQL/Redis integration tests against controlled fixtures.
 
 Provider-backed browse aggregation now has a six-second bounded homepage deadline and one-second per-item classification deadline. A slow provider therefore produces a bounded upstream error instead of holding the HTTP connection until the client or proxy timeout.
+
+## Import and navigation completion
+
+The catalog store now persists the complete expanded import graph using the existing tables. Imports execute one PostgreSQL transaction per title and report title/season/episode/source/track counters. Re-imports update canonical records using existing identities and keep records omitted from a later payload retained. The migration adds repeat-safe indexes for alternative titles, tracks, episode navigation, episode mappings, and source eligibility.
+
+Catalog UUIDs are intentionally separate from the opaque provider IDs used by the legacy anime API. Search results advertise `id_type: catalog_title`; clients continue through `/api/v1/catalog/...` routes. The catalog source list and playback route are database-backed and fail closed unless a source is active, unexpired, codec-verified, and recognized as a non-HEVC codec. No provider data is fabricated and no authorization headers are returned.
+
+Run the local checks with:
+
+```bash
+cargo fmt --all -- --check
+cargo test --locked
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo build --locked --release
+```
+
+For the database flow, set `DATABASE_URL`, `ADMIN_TOKEN`, and `REQUIRE_DATABASE=true`, start PostgreSQL, start the server, then import a fixture through `/api/v1/admin/catalog/import` and follow the catalog routes listed in `docs/catalog-api.md`. Apply `migrations/001_catalog.sql` twice to verify idempotency before running the API smoke test.

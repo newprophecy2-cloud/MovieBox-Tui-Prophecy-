@@ -80,3 +80,12 @@ CREATE TABLE IF NOT EXISTS remux_sessions (
 CREATE TABLE IF NOT EXISTS user_playback_progress (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(), title_id UUID NOT NULL REFERENCES catalog_titles(id) ON DELETE CASCADE, device_key_hash TEXT NOT NULL, position_seconds DOUBLE PRECISION NOT NULL DEFAULT 0, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(title_id, device_key_hash)
 );
+
+-- Idempotency hardening for imports. These indexes are safe to apply repeatedly.
+CREATE UNIQUE INDEX IF NOT EXISTS title_alternative_titles_identity_idx
+    ON title_alternative_titles (title_id, normalized_title, COALESCE(language, ''), COALESCE(title_type, ''));
+CREATE UNIQUE INDEX IF NOT EXISTS source_tracks_identity_idx
+    ON source_tracks (source_id, track_type, COALESCE(language_code, ''), COALESCE(codec, ''), COALESCE(format, ''), is_default, is_forced);
+CREATE INDEX IF NOT EXISTS episodes_title_season_number_idx ON episodes (title_id, season_id, episode_number);
+CREATE INDEX IF NOT EXISTS episode_provider_mappings_episode_idx ON episode_provider_mappings (episode_id, provider_id);
+CREATE INDEX IF NOT EXISTS provider_sources_episode_status_expiry_idx ON provider_sources (episode_id, source_status, expires_at);

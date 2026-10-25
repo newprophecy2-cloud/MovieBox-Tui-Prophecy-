@@ -929,6 +929,13 @@ async fn route(
         "/api/v1/latest" if state.catalog.is_some() => catalog_listing_route(stream, query, state, None, "latest").await,
         "/api/v1/movies" if state.catalog.is_some() => catalog_listing_route(stream, query, state, Some("movie"), "movies").await,
         "/api/v1/k-dramas" if state.catalog.is_some() => catalog_listing_route(stream, query, state, Some("k_drama"), "k-dramas").await,
+        _ if path.starts_with("/api/v1/catalog/titles/") && path.ends_with("/seasons") => catalog_seasons_route(stream, path, state).await,
+        _ if path.starts_with("/api/v1/catalog/titles/") && path.contains("/seasons/") && path.ends_with("/episodes") => catalog_episodes_route(stream, path, state).await,
+        _ if path.starts_with("/api/v1/catalog/episodes/") && path.ends_with("/sources") => catalog_episode_sources_route(stream, path, state).await,
+        _ if path.starts_with("/api/v1/catalog/episodes/") => catalog_episode_route(stream, path, state).await,
+        _ if path.starts_with("/api/v1/catalog/sources/") && path.ends_with("/tracks") => catalog_source_tracks_route(stream, path, state).await,
+        _ if path.starts_with("/api/v1/catalog/sources/") && path.ends_with("/play") => catalog_source_play_route(stream, path, state).await,
+        _ if path.starts_with("/api/v1/catalog/sources/") => catalog_source_route(stream, path, state).await,
         _ if path.starts_with("/api/v1/catalog/titles/") => catalog_title_detail_route(stream, path, state).await,
         "/api/v1/diagnostics" => diagnostics_route(stream, state).await,
         "/api/stream-proxy" => stream_proxy_route(stream, query, request_headers, head_only).await,
@@ -1154,10 +1161,118 @@ async fn catalog_title_detail_route(
         return write_json(stream, 400, &serde_json::json!({"success":false,"error":{"code":"INVALID_REQUEST","message":"A catalog title ID is required.","retryable":false}}), None).await;
     };
     match catalog.get_title(id).await {
-        Ok(Some(title)) => write_json(stream, 200, &serde_json::json!({"success":true,"data":{"title":title},"meta":{"request_id":request_id()}}), None).await,
+        Ok(Some(_title)) => match catalog.get_title_detail(id).await {
+            Ok(Some(detail)) => write_json(stream, 200, &serde_json::json!({"success":true,"data":detail,"meta":{"request_id":request_id()}}), None).await,
+            Ok(None) => write_json(stream, 404, &serde_json::json!({"success":false,"error":{"code":"CATALOG_TITLE_NOT_FOUND","message":"The title was not found in the catalog.","retryable":false}}), None).await,
+            Err(_) => write_json(stream, 503, &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","message":"The catalog database is unavailable.","retryable":true}}), None).await,
+        },
         Ok(None) => write_json(stream, 404, &serde_json::json!({"success":false,"error":{"code":"TITLE_NOT_FOUND","message":"The title was not found in the catalog.","retryable":false}}), None).await,
         Err(_) => write_json(stream, 503, &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","message":"The catalog database is unavailable.","retryable":true}}), None).await,
     }
+}
+
+async fn catalog_id_route(
+    stream: &mut TcpStream,
+    value: Result<Vec<serde_json::Value>, crate::catalog::CatalogError>,
+) -> std::io::Result<()> {
+    match value { Ok(items) => write_json(stream, 200, &serde_json::json!({"success":true,"data":{"items":items,"resource_type":"catalog_collection"},"meta":{"request_id":request_id()}}), None).await, Err(_) => write_json(stream, 503, &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","message":"The catalog database is unavailable.","retryable":true}}), None).await }
+}
+async fn catalog_seasons_route(
+    stream: &mut TcpStream,
+    path: &str,
+    state: ApiState,
+) -> std::io::Result<()> {
+    let Some(c) = state.catalog else {
+        return write_json(stream,503,&serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","retryable":true}}),None).await;
+    };
+    let id = path
+        .strip_prefix("/api/v1/catalog/titles/")
+        .unwrap_or("")
+        .trim_end_matches("/seasons");
+    catalog_id_route(stream, c.list_seasons(id).await).await
+}
+async fn catalog_episodes_route(
+    stream: &mut TcpStream,
+    path: &str,
+    state: ApiState,
+) -> std::io::Result<()> {
+    let Some(c) = state.catalog else {
+        return write_json(stream,503,&serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","retryable":true}}),None).await;
+    };
+    let rest = path.strip_prefix("/api/v1/catalog/titles/").unwrap_or("");
+    let mut parts = rest.split("/seasons/");
+    let title = parts.next().unwrap_or("");
+    let season = parts
+        .next()
+        .unwrap_or("")
+        .trim_end_matches("/episodes")
+        .parse()
+        .unwrap_or(0);
+    catalog_id_route(stream, c.list_episodes(title, season).await).await
+}
+async fn catalog_episode_route(
+    stream: &mut TcpStream,
+    path: &str,
+    state: ApiState,
+) -> std::io::Result<()> {
+    let Some(c) = state.catalog else {
+        return write_json(stream,503,&serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","retryable":true}}),None).await;
+    };
+    let id = path.strip_prefix("/api/v1/catalog/episodes/").unwrap_or("");
+    match c.get_episode(id).await { Ok(Some(episode))=>write_json(stream,200,&serde_json::json!({"success":true,"data":{"episode":episode},"meta":{"request_id":request_id()}}),None).await, Ok(None)=>write_json(stream,404,&serde_json::json!({"success":false,"error":{"code":"CATALOG_EPISODE_NOT_FOUND","message":"The episode was not found.","retryable":false}}),None).await, Err(_)=>write_json(stream,503,&serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","retryable":true}}),None).await }
+}
+async fn catalog_episode_sources_route(
+    stream: &mut TcpStream,
+    path: &str,
+    state: ApiState,
+) -> std::io::Result<()> {
+    let Some(c) = state.catalog else {
+        return write_json(stream,503,&serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","retryable":true}}),None).await;
+    };
+    let id = path
+        .strip_prefix("/api/v1/catalog/episodes/")
+        .unwrap_or("")
+        .trim_end_matches("/sources");
+    catalog_id_route(stream, c.list_sources(id).await).await
+}
+async fn catalog_source_route(
+    stream: &mut TcpStream,
+    path: &str,
+    state: ApiState,
+) -> std::io::Result<()> {
+    let Some(c) = state.catalog else {
+        return write_json(stream,503,&serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","retryable":true}}),None).await;
+    };
+    let id = path.strip_prefix("/api/v1/catalog/sources/").unwrap_or("");
+    match c.get_source(id).await { Ok(Some(source))=>write_json(stream,200,&serde_json::json!({"success":true,"data":{"source":source},"meta":{"request_id":request_id()}}),None).await, Ok(None)=>write_json(stream,404,&serde_json::json!({"success":false,"error":{"code":"CATALOG_SOURCE_NOT_FOUND","retryable":false}}),None).await, Err(_)=>write_json(stream,503,&serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","retryable":true}}),None).await }
+}
+async fn catalog_source_tracks_route(
+    stream: &mut TcpStream,
+    path: &str,
+    state: ApiState,
+) -> std::io::Result<()> {
+    let Some(c) = state.catalog else {
+        return write_json(stream,503,&serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","retryable":true}}),None).await;
+    };
+    let id = path
+        .strip_prefix("/api/v1/catalog/sources/")
+        .unwrap_or("")
+        .trim_end_matches("/tracks");
+    catalog_id_route(stream, c.list_tracks(id).await).await
+}
+async fn catalog_source_play_route(
+    stream: &mut TcpStream,
+    path: &str,
+    state: ApiState,
+) -> std::io::Result<()> {
+    let Some(c) = state.catalog else {
+        return write_json(stream,503,&serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","retryable":true}}),None).await;
+    };
+    let id = path
+        .strip_prefix("/api/v1/catalog/sources/")
+        .unwrap_or("")
+        .trim_end_matches("/play");
+    match c.get_source(id).await { Ok(Some(source))=>{let codec=source.get("video_codec").and_then(|x|x.as_str()).unwrap_or("").to_ascii_lowercase(); if codec.contains("hevc")||codec.contains("h265")||codec.contains("x265"){return write_json(stream,415,&serde_json::json!({"success":false,"error":{"code":"SOURCE_CODEC_BLOCKED","message":"H.265/HEVC sources are blocked by playback policy.","retryable":false}}),None).await} let verified=source.get("codec_verification_status").and_then(|x|x.as_str())==Some("verified"); let recognized=["h264","avc","av1","vp8","vp9","mpeg4","vc1","theora","xvid","divx"].iter().any(|known|codec.contains(known)); if !verified||!recognized{return write_json(stream,415,&serde_json::json!({"success":false,"error":{"code":"CODEC_UNVERIFIED","message":"The source video codec is missing or unrecognized and cannot be played.","retryable":false}}),None).await} write_json(stream,200,&serde_json::json!({"success":true,"data":{"source":source,"resolution":"stored_source"},"meta":{"request_id":request_id()}}),None).await}, Ok(None)=>write_json(stream,404,&serde_json::json!({"success":false,"error":{"code":"CATALOG_SOURCE_NOT_FOUND","retryable":false}}),None).await, Err(_)=>write_json(stream,503,&serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","retryable":true}}),None).await }
 }
 
 async fn admin_catalog_upsert_route(
@@ -1195,7 +1310,7 @@ async fn admin_catalog_import_route(
     #[derive(Deserialize)]
     struct ImportRequest {
         #[serde(default)]
-        titles: Vec<crate::catalog::TitleUpsert>,
+        titles: Vec<crate::catalog::ImportTitle>,
     }
     let request: ImportRequest = match serde_json::from_slice(body) { Ok(value) => value, Err(_) => return write_json(stream, 422, &serde_json::json!({"success":false,"error":{"code":"VALIDATION_FAILED","message":"Expected {titles:[...] }.","retryable":false}}), None).await };
     if request.titles.len() > 500 {
@@ -1203,10 +1318,21 @@ async fn admin_catalog_import_route(
     }
     let mut job = match catalog.create_job("import").await { Ok(job) => job, Err(_) => return write_json(stream, 503, &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","message":"Could not create import job.","retryable":true}}), None).await };
     for title in request.titles {
-        match catalog.upsert(title).await {
-            Ok((_, true)) => job.inserted_count += 1,
-            Ok((_, false)) => job.updated_count += 1,
-            Err(_) => job.failed_count += 1,
+        match catalog.import_title(title).await {
+            Ok(summary) => {
+                job.inserted_count += summary.inserted;
+                job.updated_count += summary.updated;
+                job.skipped_count += summary.skipped;
+                job.titles_imported += 1;
+                job.seasons_imported += summary.seasons;
+                job.episodes_imported += summary.episodes;
+                job.sources_imported += summary.sources;
+                job.tracks_imported += summary.tracks;
+            }
+            Err(error) => {
+                log::error!("catalog import title failed: {error:?}");
+                job.failed_count += 1
+            }
         }
     }
     job.status = if job.failed_count == 0 {
@@ -1217,8 +1343,8 @@ async fn admin_catalog_import_route(
     let _ = catalog.finish_job(&job).await;
     write_json(
         stream,
-        202,
-        &serde_json::json!({"success":true,"data":{"job":job},"meta":{"request_id":request_id()}}),
+        if job.failed_count == 0 { 201 } else { 422 },
+        &serde_json::json!({"success":job.failed_count == 0,"data":{"job":job},"meta":{"request_id":request_id()}}),
         None,
     )
     .await
