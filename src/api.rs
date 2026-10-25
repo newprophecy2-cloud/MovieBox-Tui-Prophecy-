@@ -1274,6 +1274,19 @@ async fn catalog_source_play_route(
         .trim_end_matches("/play");
     match c.get_source(id).await {
         Ok(Some(source)) => {
+            let playback_eligible = source
+                .get("playback_eligible")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if !playback_eligible {
+                return write_json(
+                    stream,
+                    404,
+                    &serde_json::json!({"success":false,"error":{"code":"SOURCE_UNAVAILABLE","message":"The stored source is blocked, invalid, or expired.","retryable":false}}),
+                    None,
+                )
+                .await;
+            }
             let codec = source
                 .get("video_codec")
                 .and_then(|x| x.as_str())
@@ -5052,10 +5065,18 @@ fn openapi() -> serde_json::Value {
             "/api/v1/search": {"get": {"description": "PostgreSQL-only catalog search; never performs live provider discovery.", "responses": {"200": {"description": "Catalog search results"}, "400": {"description": "Invalid query"}, "503": {"description": "Catalog database unavailable"}}}},
             "/api/v1/genres": {"get": {"description": "PostgreSQL-backed canonical genre list.", "responses": {"200": {"description": "Genres"}, "503": {"description": "Catalog database unavailable"}}}},
             "/api/v1/catalog/titles/{title_id}": {"get": {"description": "Canonical PostgreSQL catalog title detail.", "responses": {"200": {"description": "Title detail"}, "404": {"description": "Title not found"}, "503": {"description": "Catalog database unavailable"}}}},
+            "/api/v1/catalog/titles/{title_id}/seasons": {"get": {"description": "Stored catalog seasons for a title.", "responses": {"200": {"description": "Season list"}, "503": {"description": "Catalog database unavailable"}}}},
+            "/api/v1/catalog/titles/{title_id}/seasons/{season_number}/episodes": {"get": {"description": "Stored catalog episodes for a title season.", "responses": {"200": {"description": "Episode list"}, "503": {"description": "Catalog database unavailable"}}}},
+            "/api/v1/catalog/episodes/{episode_id}": {"get": {"description": "Stored catalog episode detail.", "responses": {"200": {"description": "Episode detail"}, "404": {"description": "Episode not found"}, "503": {"description": "Catalog database unavailable"}}}},
+            "/api/v1/catalog/episodes/{episode_id}/sources": {"get": {"description": "Eligible verified, unexpired catalog sources.", "responses": {"200": {"description": "Eligible source list"}, "503": {"description": "Catalog database unavailable"}}}},
+            "/api/v1/catalog/sources/{source_id}": {"get": {"description": "Stored source metadata, including expiry and playback eligibility.", "responses": {"200": {"description": "Source detail"}, "404": {"description": "Source not found"}, "503": {"description": "Catalog database unavailable"}}}},
+            "/api/v1/catalog/sources/{source_id}/tracks": {"get": {"description": "Stored audio and subtitle tracks for a source.", "responses": {"200": {"description": "Track list"}, "503": {"description": "Catalog database unavailable"}}}},
+            "/api/v1/catalog/sources/{source_id}/play": {"get": {"description": "Playback metadata for an eligible stored source; blocked and expired sources are rejected.", "responses": {"200": {"description": "Eligible stored source"}, "404": {"description": "Source unavailable, blocked, expired, or missing"}, "415": {"description": "Source codec is blocked or unverified"}, "503": {"description": "Catalog database unavailable"}}}},
             "/api/v1/admin/catalog/import": {"post": {"description": "Protected manual catalog import; accepts a bounded titles batch.", "responses": {"201": {"description": "Import job completed"}, "401": {"description": "Unauthorized"}, "413": {"description": "Batch too large"}, "503": {"description": "Database unavailable"}}}},
             "/api/v1/admin/catalog/update-all": {"post": {"description": "Protected manual catalog update job; never scheduled automatically.", "responses": {"202": {"description": "Update job accepted"}, "401": {"description": "Unauthorized"}}}},
             "/api/v1/admin/catalog/titles/upsert": {"post": {"description": "Protected idempotent catalog title upsert.", "responses": {"200": {"description": "Updated"}, "201": {"description": "Inserted"}, "401": {"description": "Unauthorized"}, "422": {"description": "Validation failed"}}}},
             "/api/v1/admin/catalog/inspect": {"get": {"description": "Protected catalog inspection.", "responses": {"200": {"description": "Catalog records"}, "401": {"description": "Unauthorized"}}}},
+            "/api/v1/admin/catalog/jobs/{job_id}": {"get": {"description": "Protected import or update job status and persisted counters.", "responses": {"200": {"description": "Job status"}, "401": {"description": "Unauthorized"}, "404": {"description": "Job not found"}, "503": {"description": "Catalog database unavailable"}}}},
             "/api/v1/web/episodes/{episode_id}/play": {"post": {"description": "Web playback contract; requires a verified stored non-HEVC source and never performs provider discovery.", "responses": {"404": {"description": "No compatible stored source"}, "503": {"description": "Database unavailable"}}}},
             "/api/v1/android/episodes/{episode_id}/play": {"post": {"description": "Android direct-play contract; server-side HEVC transcoding is forbidden.", "responses": {"404": {"description": "No compatible stored source"}, "503": {"description": "Database unavailable"}}}},
             "/api/v1/home": {"get": {"parameters": [{"name": "page", "in": "query", "schema": {"type": "integer", "minimum": 1}}, {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 100}}], "responses": {"200": {"description": "MovieBox homepage sections"}, "503": {"description": "Provider unavailable"}}}},
@@ -5900,6 +5921,14 @@ mod tests {
             "/api/v1/diagnostics",
             "/api/v1/watch",
             "/api/v1/anime/search/stream",
+            "/api/v1/catalog/titles/{title_id}/seasons",
+            "/api/v1/catalog/titles/{title_id}/seasons/{season_number}/episodes",
+            "/api/v1/catalog/episodes/{episode_id}",
+            "/api/v1/catalog/episodes/{episode_id}/sources",
+            "/api/v1/catalog/sources/{source_id}",
+            "/api/v1/catalog/sources/{source_id}/tracks",
+            "/api/v1/catalog/sources/{source_id}/play",
+            "/api/v1/admin/catalog/jobs/{job_id}",
             "/api/v1/anime/{anime_id}/episodes/{episode_id}/full",
             "/api/v1/anime/{anime_id}/episodes/{episode_id}/stream",
             "/api/v1/episodes/{episode_id}",
