@@ -1081,7 +1081,21 @@ pub(crate) fn clean_ytdlp_error(raw: &str) -> String {
     if lower.contains("timed out") || lower.contains("timeout") {
         return "Connection timed out.".to_string();
     }
-    if lower.contains("ffmpeg") || lower.contains("ffprobe") {
+    if [
+        "ffmpeg is not installed",
+        "ffmpeg not installed",
+        "ffmpeg not found",
+        "ffprobe is not installed",
+        "ffprobe not installed",
+        "ffprobe not found",
+        "unable to find ffmpeg",
+        "unable to find ffprobe",
+        "could not find ffmpeg",
+        "could not find ffprobe",
+    ]
+    .iter()
+    .any(|diagnostic| lower.contains(diagnostic))
+    {
         return "Missing ffmpeg for DASH stream muxing.".to_string();
     }
     crate::tui::text::truncate_width(stripped, 64).into_owned()
@@ -1287,6 +1301,14 @@ mod tests {
                 "ERROR: You have requested merging of multiple formats but ffmpeg is not installed"
             ),
             "Missing ffmpeg for DASH stream muxing."
+        );
+        assert_eq!(
+            super::clean_ytdlp_error("ERROR: ffmpeg exited with code 1 during remux"),
+            "ffmpeg exited with code 1 during remux"
+        );
+        assert_eq!(
+            super::clean_ytdlp_error("ERROR: ffmpeg failed: unsupported codec"),
+            "ffmpeg failed: unsupported codec"
         );
     }
 

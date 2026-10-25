@@ -91,6 +91,8 @@ The title, alternatives, genres, provider mapping, seasons, episodes, episode ma
 
 Import responses include `inserted_count`, `updated_count`, `skipped_count`, `failed_count`, `titles_imported`, `seasons_imported`, `episodes_imported`, `sources_imported`, and `tracks_imported` in the job object.
 
+When provider episode mappings are supplied on a canonical episode instead of under `providers[].episodes`, each mapping must include `provider_key`; `display_name` is optional. This explicit identity is required to attach the episode mapping, sources, and tracks to the correct provider. Mappings without it fail that title transaction rather than being silently ignored.
+
 ## Catalog UUID route family
 
 `GET /api/v1/search?q=...` searches PostgreSQL and returns records with `id_type: "catalog_title"`. These UUIDs are for the catalog route family and must not be passed to the legacy provider route family.

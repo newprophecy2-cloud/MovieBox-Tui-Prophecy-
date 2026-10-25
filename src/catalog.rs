@@ -77,6 +77,9 @@ pub struct ProviderTitleInput {
 }
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct ProviderEpisodeInput {
+    #[serde(default)]
+    pub provider_key: Option<String>,
+    pub display_name: Option<String>,
     pub season_number: Option<i32>,
     pub provider_episode_id: String,
     pub provider_episode_number: Option<i32>,
@@ -443,7 +446,20 @@ async fn import_in_tx(c: &Client, i: &ImportTitle) -> Result<ImportSummary, Cata
             let eid: String = er.get(0);
             s.episodes += 1;
             for pe in &e.provider_episode_ids {
-                map_episode(c, &eid, pe, None, &mut s).await?;
+                let provider_key = episode_provider_key(pe)?;
+                let provider = c
+                    .query_one(
+                        "INSERT INTO provider_registry(provider_key,display_name,enabled) VALUES($1,$2,true) ON CONFLICT(provider_key) DO UPDATE SET display_name=EXCLUDED.display_name,updated_at=now() RETURNING id::text",
+                        &[
+                            &provider_key,
+                            &pe.display_name
+                                .clone()
+                                .unwrap_or_else(|| provider_key.to_string()),
+                        ],
+                    )
+                    .await?;
+                let provider_id: String = provider.get(0);
+                map_episode(c, &eid, pe, Some(&provider_id), &mut s).await?;
             }
         }
     }
@@ -551,6 +567,18 @@ fn validate(t: &str, k: &str) -> Result<(), CatalogError> {
     }
     Ok(())
 }
+fn episode_provider_key(input: &ProviderEpisodeInput) -> Result<&str, CatalogError> {
+    input
+        .provider_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .ok_or_else(|| {
+            CatalogError::Validation(
+                "episode provider mappings require a non-empty provider_key".into(),
+            )
+        })
+}
 fn normalize(v: &str) -> String {
     v.trim()
         .to_lowercase()
@@ -569,9 +597,26 @@ fn new_id() -> String {
 }
 #[cfg(test)]
 mod tests {
-    use super::normalize;
+    use super::{ProviderEpisodeInput, episode_provider_key, normalize};
+    use serde_json::json;
+
     #[test]
     fn normalizes_search_text() {
         assert_eq!(normalize("  One   Piece "), "one piece");
+    }
+
+    #[test]
+    fn canonical_episode_provider_mapping_requires_a_provider_key() {
+        let mut mapping: ProviderEpisodeInput = serde_json::from_value(json!({
+            "provider_episode_id": "provider-episode-1"
+        }))
+        .unwrap();
+        assert!(episode_provider_key(&mapping).is_err());
+
+        mapping.provider_key = Some("  example-provider  ".into());
+        assert_eq!(episode_provider_key(&mapping).unwrap(), "example-provider");
+
+        mapping.provider_key = Some("   ".into());
+        assert!(episode_provider_key(&mapping).is_err());
     }
 }

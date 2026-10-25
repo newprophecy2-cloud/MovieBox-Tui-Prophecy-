@@ -4860,13 +4860,42 @@ async fn media_info_route(
             .arg(format!("Referer: {referer}\r\n"));
     }
     command.args(["-show_streams", "-show_format", "-of", "json", url.as_str()]);
-    let output = match tokio::time::timeout(Duration::from_secs(45), command.output()).await {
-        Ok(Ok(output)) if output.status.success() && output.stdout.len() <= MEDIA_BODY_LIMIT => output,
-        Ok(Ok(_)) => return write_raw_json(stream, 502, r#"{"error":{"code":"MEDIA_INFO_FAILED","message":"FFprobe could not inspect the media."}}"#, None).await,
-        _ => return write_raw_json(stream, 504, r#"{"error":{"code":"MEDIA_INFO_TIMEOUT","message":"Media inspection timed out."}}"#, None).await,
+    let output = match run_media_info_probe(&mut command, Duration::from_secs(45)).await {
+        Ok(output) => output,
+        Err(MediaInfoProbeError::Failed) => {
+            return write_raw_json(stream, 502, r#"{"error":{"code":"MEDIA_INFO_FAILED","message":"FFprobe could not inspect the media."}}"#, None).await;
+        }
+        Err(MediaInfoProbeError::Spawn(_)) => {
+            return write_raw_json(stream, 503, r#"{"error":{"code":"MEDIA_TOOL_UNAVAILABLE","message":"FFprobe is unavailable."}}"#, None).await;
+        }
+        Err(MediaInfoProbeError::Timeout) => {
+            return write_raw_json(stream, 504, r#"{"error":{"code":"MEDIA_INFO_TIMEOUT","message":"Media inspection timed out."}}"#, None).await;
+        }
     };
     write_headers(stream, 200, "application/json", None).await?;
     stream.write_all(&output.stdout).await
+}
+
+#[derive(Debug)]
+enum MediaInfoProbeError {
+    Failed,
+    Spawn(std::io::Error),
+    Timeout,
+}
+
+async fn run_media_info_probe(
+    command: &mut Command,
+    timeout_after: Duration,
+) -> Result<std::process::Output, MediaInfoProbeError> {
+    command.kill_on_drop(true);
+    match tokio::time::timeout(timeout_after, command.output()).await {
+        Ok(Ok(output)) if output.status.success() && output.stdout.len() <= MEDIA_BODY_LIMIT => {
+            Ok(output)
+        }
+        Ok(Ok(_)) => Err(MediaInfoProbeError::Failed),
+        Ok(Err(error)) => Err(MediaInfoProbeError::Spawn(error)),
+        Err(_) => Err(MediaInfoProbeError::Timeout),
+    }
 }
 
 async fn subtitle_extract_route(
@@ -5135,6 +5164,26 @@ fn openapi() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn media_info_probe_reports_missing_ffprobe_as_spawn_failure() {
+        let mut command = Command::new("/moviebox-test-missing-ffprobe");
+        assert!(matches!(
+            run_media_info_probe(&mut command, Duration::from_millis(100)).await,
+            Err(MediaInfoProbeError::Spawn(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn media_info_probe_reports_timeout() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "exec sleep 30"]);
+        assert!(matches!(
+            run_media_info_probe(&mut command, Duration::from_millis(20)).await,
+            Err(MediaInfoProbeError::Timeout)
+        ));
+    }
 
     #[test]
     fn initial_zero_byte_range_keeps_live_first_policy() {

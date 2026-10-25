@@ -18,11 +18,13 @@ MovieBox-TUI is a Rust media-discovery and playback project. The current binary 
 
 The backend is designed for clients that need a stable API while provider-specific details remain behind opaque IDs. Clients should pass IDs returned by the API back unchanged rather than decoding or constructing them.
 
-The current API is provider-backed and does not use PostgreSQL as a catalog store. Redis is optional and is used only for search-result caching; if it is unavailable, the API falls back to in-process memory.
+The API supports both provider-backed compatibility routes and a PostgreSQL-backed catalog route family. `DATABASE_URL` enables durable catalog search, anime import, episode/source lookup, and stored-source playback; legacy provider routes remain available. Redis is optional and is used only for search-result caching, with an in-process fallback.
 
 ## Current capabilities
 
-- **Anime and media search:** Concurrent provider search across MovieBox, 4KHDHub, Dramachi, and configured addon sources.
+- **Anime and media search:** Legacy anime routes search configured live providers; `/api/v1/search` searches only the PostgreSQL catalog.
+- **Anime catalog import:** Admin-authenticated, per-title transactional import of anime metadata, seasons, episodes, provider mappings, verified sources, and track metadata.
+- **Stored-source playback:** Catalog UUID routes expose imported anime through title → season → episode → eligible sources → stored playback metadata. Provider lookup is not silently invoked by this route family.
 - **Verified source eligibility:** Search and playback candidates require a valid public mirror and a recognized video-codec label; absent or unknown codec metadata is not treated as playable.
 - **Codec policy:** HEVC/H.265/x265 is blocked across search eligibility, public source lists, direct playback, and remux routes. H.265-to-H.264 transcoding is not performed.
 - **Bounded search work:** Each catalog item has a bounded source-eligibility budget so large series cannot make search latency grow without limit.
@@ -40,16 +42,11 @@ The current API is provider-backed and does not use PostgreSQL as a catalog stor
 
 ```text
 Client
-  │
-  ├── Search JSON / SSE
-  ├── Anime details → seasons → episodes
-  └── Episode sources → source resolution → playable URL
-                                      │
-                                      ├── MovieBox
-                                      ├── 4KHDHub
-                                      │    └── GreenMotors / HubCloud / HubDrive
-                                      ├── Dramachi
-                                      └── Configured addons
+  ├── Legacy provider routes → search → episode sources → provider resolution
+  └── PostgreSQL catalog routes → import → title → seasons → episodes → stored sources
+                                  │
+                                  ├── Catalog import requires ADMIN_TOKEN
+                                  └── Stored playback requires verified, eligible sources
 ```
 
 ### Playback resolution flow
@@ -79,7 +76,7 @@ Intermediate HTML resolver pages are not considered playable media. If all provi
 
 ### Runtime requirements for the HTTP API
 
-The API does not require a desktop session, VLC, mpv, IINA, or a database. Provider access is request-specific and depends on upstream availability.
+The API does not require a desktop session, VLC, mpv, or IINA. PostgreSQL is optional for provider compatibility routes and required for catalog routes; configure `DATABASE_URL` to enable the catalog. Set `REQUIRE_DATABASE=true` when the deployment must not start without it. FFmpeg and FFprobe are needed for server-side media inspection/remux features.
 
 ### Optional terminal-client requirements
 
@@ -169,6 +166,8 @@ curl "http://127.0.0.1:8080/api/v1/anime/$ANIME_ID/seasons"
 curl "http://127.0.0.1:8080/api/v1/anime/$ANIME_ID/episodes"
 ```
 
+For the persistent PostgreSQL catalog flow, configure `DATABASE_URL` and `ADMIN_TOKEN`, then import and follow the catalog routes. See [the catalog API contract](docs/catalog-api.md) for the import payload and exact response shapes. The sequence is `POST /api/v1/admin/catalog/import` → `GET /api/v1/search` → title/seasons/episodes → episode sources → source playback.
+
 Episode IDs are also opaque. A valid episode reference can be read directly:
 
 ```bash
@@ -231,8 +230,15 @@ Audio and subtitle responses are only confirmed when the resolved media can be i
 | `GET` | `/api/v1` | API resource summary |
 | `GET` | `/openapi.json` | OpenAPI document |
 | `GET` | `/docs` | Human-readable API documentation |
-| `GET` | `/api/v1/anime/search` | Concurrent JSON provider search |
+| `GET` | `/api/v1/anime/search` | Live JSON provider search |
 | `GET` | `/api/v1/anime/search/stream` | Incremental SSE provider search |
+| `GET` | `/api/v1/search` | PostgreSQL catalog search |
+| `POST` | `/api/v1/admin/catalog/import` | Admin-authenticated anime/catalog import (requires `ADMIN_TOKEN`) |
+| `GET` | `/api/v1/catalog/titles/{title_id}` | Stored catalog title details |
+| `GET` | `/api/v1/catalog/titles/{title_id}/seasons` | Stored catalog seasons |
+| `GET` | `/api/v1/catalog/titles/{title_id}/seasons/{season}/episodes` | Stored catalog episodes |
+| `GET` | `/api/v1/catalog/episodes/{episode_id}/sources` | Eligible verified catalog sources |
+| `GET` | `/api/v1/catalog/sources/{source_id}/play` | Stored playback metadata |
 | `GET` | `/api/v1/anime/{anime_id}` | Anime details |
 | `GET` | `/api/v1/anime/{anime_id}/seasons` | Season list |
 | `GET` | `/api/v1/anime/{anime_id}/episodes` | Episode list |
@@ -260,7 +266,7 @@ Built-in provider adapters include:
 - BDIX CircleFTP and DhakaFlix modules where enabled
 - Configured Stremio-compatible catalog and stream addons
 
-Provider order is used for priority and tie-breaking. Providers are queried concurrently, and one provider failure does not erase successful results from other providers. Provider errors are surfaced through `provider_status` or SSE error events.
+Provider order is used for priority and tie-breaking in provider-backed routes. Where sources are queried concurrently, one provider failure does not erase successful results from other providers; provider errors are surfaced through `provider_status` or SSE error events.
 
 ## Configuration and data
 
@@ -272,6 +278,8 @@ export MOVIEBOX_DATA_DIR="$HOME/.local/share/moviebox-tui"
 ```
 
 The application keeps user configuration, history, favorites, and cache data locally. Do not commit provider credentials, addon secrets, signed URLs, cookies, or local configuration files.
+
+For catalog mode, configure `DATABASE_URL`; set `ADMIN_TOKEN` for import/update/inspection routes and `REQUIRE_DATABASE=true` when the database is mandatory. The service applies `migrations/001_catalog.sql` at startup. PostgreSQL provisioning and import details are in [the catalog API guide](docs/catalog-api.md).
 
 Expensive source-eligibility checks use a process-wide concurrency limit in addition to each item's deadline, so concurrent API clients cannot multiply upstream verification work without bound.
 
@@ -325,7 +333,7 @@ The repository includes `render.yaml` for an HTTP service deployment. The servic
 - Use `/health` for the health check.
 - Keep provider configuration and secrets outside the repository.
 
-A deployment must be rebuilt after backend changes before the public API reflects them. The repository itself does not store media or require a database.
+A deployment must be rebuilt after backend changes before the public API reflects them. The service does not store media. Catalog deployments require PostgreSQL and should set `DATABASE_URL`, a strong `ADMIN_TOKEN`, and `REQUIRE_DATABASE=true`; provider-only local runs can omit the database.
 
 ## Contributing
 
