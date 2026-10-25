@@ -423,7 +423,7 @@ async fn import_in_tx(c: &Client, i: &ImportTitle) -> Result<ImportSummary, Cata
         if a.title.trim().is_empty() {
             continue;
         }
-        c.execute("INSERT INTO title_alternative_titles(title_id,title,normalized_title,language,title_type,source) VALUES($1::text::uuid,$2,$3,$4,$5,'import') ON CONFLICT DO NOTHING",&[&title_uuid,&a.title,&normalize(&a.title),&a.language,&a.title_type]).await?;
+        c.execute("INSERT INTO title_alternative_titles(title_id,title,normalized_title,language,title_type,source) VALUES($1,$2,$3,$4,$5,'import') ON CONFLICT DO NOTHING",&[&title_uuid,&a.title,&normalize(&a.title),&a.language,&a.title_type]).await?;
     }
     for g in &i.genres {
         if g.trim().is_empty() {
@@ -431,15 +431,15 @@ async fn import_in_tx(c: &Client, i: &ImportTitle) -> Result<ImportSummary, Cata
         }
         let r=c.query_one("INSERT INTO genres(canonical_name,normalized_name) VALUES($1,$2) ON CONFLICT(normalized_name) DO UPDATE SET canonical_name=EXCLUDED.canonical_name RETURNING id::text",&[&g,&normalize(g)]).await?;
         let gid: String = r.get(0);
-        c.execute("INSERT INTO title_genres(title_id,genre_id,source) VALUES($1::text::uuid,$2::text::uuid,'import') ON CONFLICT DO NOTHING",&[&title_uuid,&gid]).await?;
+        c.execute("INSERT INTO title_genres(title_id,genre_id,source) VALUES($1,$2::text::uuid,'import') ON CONFLICT DO NOTHING",&[&title_uuid,&gid]).await?;
     }
     for season in &i.seasons {
-        let sr=c.query_one("INSERT INTO seasons(title_id,season_number,canonical_label,episode_count_reported) VALUES($1::text::uuid,$2,$3,$4) ON CONFLICT(title_id,season_number) DO UPDATE SET canonical_label=EXCLUDED.canonical_label,episode_count_reported=EXCLUDED.episode_count_reported,updated_at=now() RETURNING id::text",&[&title_uuid,&season.season_number,&season.canonical_label,&season.episode_count_reported]).await?;
+        let sr=c.query_one("INSERT INTO seasons(title_id,season_number,canonical_label,episode_count_reported) VALUES($1,$2,$3,$4) ON CONFLICT(title_id,season_number) DO UPDATE SET canonical_label=EXCLUDED.canonical_label,episode_count_reported=EXCLUDED.episode_count_reported,updated_at=now() RETURNING id::text",&[&title_uuid,&season.season_number,&season.canonical_label,&season.episode_count_reported]).await?;
         let sid: String = sr.get(0);
         let sid_uuid = parse_uuid(&sid)?;
         s.seasons += 1;
         for e in &season.episodes {
-            let er=c.query_one("INSERT INTO episodes(title_id,season_id,episode_number,episode_title,release_date,thumbnail_url) VALUES($1::text::uuid,$2::text::uuid,$3,$4,$5::date,$6) ON CONFLICT(title_id,season_id,episode_number) DO UPDATE SET episode_title=EXCLUDED.episode_title,release_date=EXCLUDED.release_date,thumbnail_url=EXCLUDED.thumbnail_url,updated_at=now() RETURNING id::text",&[&title_uuid,&sid_uuid,&e.episode_number,&e.episode_title,&e.release_date,&e.thumbnail_url]).await?;
+            let er=c.query_one("INSERT INTO episodes(title_id,season_id,episode_number,episode_title,release_date,thumbnail_url) VALUES($1,$2,$3,$4,$5::text::date,$6) ON CONFLICT(title_id,season_id,episode_number) DO UPDATE SET episode_title=EXCLUDED.episode_title,release_date=EXCLUDED.release_date,thumbnail_url=EXCLUDED.thumbnail_url,updated_at=now() RETURNING id::text",&[&title_uuid,&sid_uuid,&e.episode_number,&e.episode_title,&e.release_date,&e.thumbnail_url]).await?;
             let eid: String = er.get(0);
             s.episodes += 1;
             for pe in &e.provider_episode_ids {
@@ -451,11 +451,11 @@ async fn import_in_tx(c: &Client, i: &ImportTitle) -> Result<ImportSummary, Cata
         let pr=c.query_one("INSERT INTO provider_registry(provider_key,display_name,enabled) VALUES($1,$2,true) ON CONFLICT(provider_key) DO UPDATE SET display_name=EXCLUDED.display_name,updated_at=now() RETURNING id::text",&[&p.provider_key,&p.display_name.clone().unwrap_or_else(||p.provider_key.clone())]).await?;
         let pid: String = pr.get(0);
         let pid_uuid = parse_uuid(&pid)?;
-        c.execute("INSERT INTO provider_titles(title_id,provider_id,provider_title_id,provider_title,provider_url,match_status,last_checked_at) VALUES($1::text::uuid,$2::text::uuid,$3,$4,$5,'verified',now()) ON CONFLICT(provider_id,provider_title_id) DO UPDATE SET title_id=EXCLUDED.title_id,provider_title=EXCLUDED.provider_title,provider_url=EXCLUDED.provider_url,match_status='verified',updated_at=now()",&[&title_uuid,&pid_uuid,&p.provider_title_id,&p.provider_title,&p.provider_url]).await?;
+        c.execute("INSERT INTO provider_titles(title_id,provider_id,provider_title_id,provider_title,provider_url,match_status,last_checked_at) VALUES($1,$2,$3,$4,$5,'verified',now()) ON CONFLICT(provider_id,provider_title_id) DO UPDATE SET title_id=EXCLUDED.title_id,provider_title=EXCLUDED.provider_title,provider_url=EXCLUDED.provider_url,match_status='verified',updated_at=now()",&[&title_uuid,&pid_uuid,&p.provider_title_id,&p.provider_title,&p.provider_url]).await?;
         for pe in &p.episodes {
             let season = pe.season_number.unwrap_or(1);
             let ep = pe.provider_episode_number.unwrap_or(1);
-            let r=c.query_opt("SELECT e.id::text FROM episodes e JOIN seasons s ON s.id=e.season_id WHERE e.title_id=$1::text::uuid AND s.season_number=$2 AND e.episode_number=$3",&[&title_uuid,&season,&ep]).await?;
+            let r=c.query_opt("SELECT e.id::text FROM episodes e JOIN seasons s ON s.id=e.season_id WHERE e.title_id=$1 AND s.season_number=$2 AND e.episode_number=$3",&[&title_uuid,&season,&ep]).await?;
             if let Some(r) = r {
                 let eid: String = r.get(0);
                 map_episode(c, &eid, pe, Some(&pid), &mut s).await?;
@@ -476,9 +476,9 @@ async fn map_episode(
         None => return Ok(()),
     };
     let eid = parse_uuid(eid)?;
-    c.execute("INSERT INTO episode_provider_mappings(episode_id,provider_id,provider_episode_id,provider_episode_number) VALUES($1::text::uuid,$2::text::uuid,$3,$4) ON CONFLICT(provider_id,provider_episode_id) DO UPDATE SET episode_id=EXCLUDED.episode_id,provider_episode_number=EXCLUDED.provider_episode_number",&[&eid,&pid,&pe.provider_episode_id,&pe.provider_episode_number]).await?;
+    c.execute("INSERT INTO episode_provider_mappings(episode_id,provider_id,provider_episode_id,provider_episode_number) VALUES($1,$2,$3,$4) ON CONFLICT(provider_id,provider_episode_id) DO UPDATE SET episode_id=EXCLUDED.episode_id,provider_episode_number=EXCLUDED.provider_episode_number",&[&eid,&pid,&pe.provider_episode_id,&pe.provider_episode_number]).await?;
     for src in &pe.sources {
-        let r=c.query_one("INSERT INTO provider_sources(episode_id,provider_id,provider_source_id,source_reference,quality_label,video_codec,audio_codec,container_format,resolution_width,resolution_height,source_status,codec_verification_status,expires_at) VALUES($1::text::uuid,$2::text::uuid,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::timestamptz) ON CONFLICT(provider_id,provider_source_id) DO UPDATE SET episode_id=EXCLUDED.episode_id,source_reference=EXCLUDED.source_reference,quality_label=EXCLUDED.quality_label,video_codec=EXCLUDED.video_codec,audio_codec=EXCLUDED.audio_codec,container_format=EXCLUDED.container_format,resolution_width=EXCLUDED.resolution_width,resolution_height=EXCLUDED.resolution_height,source_status=EXCLUDED.source_status,codec_verification_status=EXCLUDED.codec_verification_status,expires_at=EXCLUDED.expires_at,updated_at=now() RETURNING id::text",&[&eid,&pid,&src.provider_source_id,&src.source_reference,&src.quality,&src.codec,&src.audio_codec,&src.container,&src.resolution_width,&src.resolution_height,&src.source_status.clone().unwrap_or_else(||"unverified".into()),&src.codec_verification_status.clone().unwrap_or_else(||"unverified".into()),&src.expires_at]).await?;
+        let r=c.query_one("INSERT INTO provider_sources(episode_id,provider_id,provider_source_id,source_reference,quality_label,video_codec,audio_codec,container_format,resolution_width,resolution_height,source_status,codec_verification_status,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::text::timestamptz) ON CONFLICT(provider_id,provider_source_id) DO UPDATE SET episode_id=EXCLUDED.episode_id,source_reference=EXCLUDED.source_reference,quality_label=EXCLUDED.quality_label,video_codec=EXCLUDED.video_codec,audio_codec=EXCLUDED.audio_codec,container_format=EXCLUDED.container_format,resolution_width=EXCLUDED.resolution_width,resolution_height=EXCLUDED.resolution_height,source_status=EXCLUDED.source_status,codec_verification_status=EXCLUDED.codec_verification_status,expires_at=EXCLUDED.expires_at,updated_at=now() RETURNING id::text",&[&eid,&pid,&src.provider_source_id,&src.source_reference,&src.quality,&src.codec,&src.audio_codec,&src.container,&src.resolution_width,&src.resolution_height,&src.source_status.clone().unwrap_or_else(||"unverified".into()),&src.codec_verification_status.clone().unwrap_or_else(||"unverified".into()),&src.expires_at]).await?;
         let sid: String = r.get(0);
         let sid = parse_uuid(&sid)?;
         for (kind, tracks) in [
@@ -486,7 +486,7 @@ async fn map_episode(
             ("subtitle", &src.subtitle_tracks),
         ] {
             for tr in tracks {
-                c.execute("INSERT INTO source_tracks(source_id,track_type,language_code,codec,format,is_default,is_forced,verified,track_metadata) VALUES($1::text::uuid,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING",&[&sid,&kind,&tr.language_code,&tr.codec,&tr.format,&tr.is_default,&tr.is_forced,&tr.verified,&tr.metadata]).await?;
+                c.execute("INSERT INTO source_tracks(source_id,track_type,language_code,codec,format,is_default,is_forced,verified,track_metadata) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING",&[&sid,&kind,&tr.language_code,&tr.codec,&tr.format,&tr.is_default,&tr.is_forced,&tr.verified,&tr.metadata]).await?;
                 s.tracks += 1;
             }
         }
