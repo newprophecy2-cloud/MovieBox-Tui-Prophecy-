@@ -1272,7 +1272,55 @@ async fn catalog_source_play_route(
         .strip_prefix("/api/v1/catalog/sources/")
         .unwrap_or("")
         .trim_end_matches("/play");
-    match c.get_source(id).await { Ok(Some(source))=>{let codec=source.get("video_codec").and_then(|x|x.as_str()).unwrap_or("").to_ascii_lowercase(); if codec.contains("hevc")||codec.contains("h265")||codec.contains("x265"){return write_json(stream,415,&serde_json::json!({"success":false,"error":{"code":"SOURCE_CODEC_BLOCKED","message":"H.265/HEVC sources are blocked by playback policy.","retryable":false}}),None).await} let verified=source.get("codec_verification_status").and_then(|x|x.as_str())==Some("verified"); let recognized=["h264","avc","av1","vp8","vp9","mpeg4","vc1","theora","xvid","divx"].iter().any(|known|codec.contains(known)); if !verified||!recognized{return write_json(stream,415,&serde_json::json!({"success":false,"error":{"code":"CODEC_UNVERIFIED","message":"The source video codec is missing or unrecognized and cannot be played.","retryable":false}}),None).await} write_json(stream,200,&serde_json::json!({"success":true,"data":{"source":source,"resolution":"stored_source"},"meta":{"request_id":request_id()}}),None).await}, Ok(None)=>write_json(stream,404,&serde_json::json!({"success":false,"error":{"code":"CATALOG_SOURCE_NOT_FOUND","retryable":false}}),None).await, Err(_)=>write_json(stream,503,&serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","retryable":true}}),None).await }
+    match c.get_source(id).await {
+        Ok(Some(source)) => {
+            let codec = source
+                .get("video_codec")
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            let verified = source
+                .get("codec_verification_status")
+                .and_then(|x| x.as_str())
+                == Some("verified");
+            match (verified, source_codec_eligibility(Some(codec))) {
+                (true, SourceCodecEligibility::Verified) => write_json(
+                    stream,
+                    200,
+                    &serde_json::json!({"success":true,"data":{"source":source,"resolution":"stored_source"},"meta":{"request_id":request_id()}}),
+                    None,
+                )
+                .await,
+                (_, SourceCodecEligibility::BlockedH265) => write_json(
+                    stream,
+                    415,
+                    &serde_json::json!({"success":false,"error":{"code":"SOURCE_CODEC_BLOCKED","message":"H.265/HEVC sources are blocked by playback policy.","retryable":false}}),
+                    None,
+                )
+                .await,
+                _ => write_json(
+                    stream,
+                    415,
+                    &serde_json::json!({"success":false,"error":{"code":"CODEC_UNVERIFIED","message":"The source video codec is missing or unrecognized and cannot be played.","retryable":false}}),
+                    None,
+                )
+                .await,
+            }
+        }
+        Ok(None) => write_json(
+            stream,
+            404,
+            &serde_json::json!({"success":false,"error":{"code":"CATALOG_SOURCE_NOT_FOUND","retryable":false}}),
+            None,
+        )
+        .await,
+        Err(_) => write_json(
+            stream,
+            503,
+            &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","retryable":true}}),
+            None,
+        )
+        .await,
+    }
 }
 
 async fn admin_catalog_upsert_route(
@@ -4297,13 +4345,14 @@ async fn transcode_source(
         return write_raw_json(stream, status, &body, None).await;
     };
     if !validated_remux_preflight(&validated_url, &playback.headers).await {
-        let (status, body) = err(
-            "REMUX_UNAVAILABLE",
-            "This source is not browser-compatible for stream-copy remuxing.",
-            Some(source.provider),
-            415,
+        // The preflight is advisory: the actual streaming command below performs the
+        // authoritative FFmpeg startup validation and converts audio to AAC. Some
+        // providers expose valid H.264/E-AC3 files that the short probe cannot parse
+        // consistently even though the live remux succeeds.
+        log::warn!(
+            "remux preflight was inconclusive; continuing with authoritative streaming validation provider={}",
+            source.provider.label()
         );
-        return write_raw_json(stream, status, &body, None).await;
     }
 
     let mut command = Command::new("ffmpeg");
