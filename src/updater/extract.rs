@@ -1,9 +1,10 @@
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::Path;
 
 use flate2::read::GzDecoder;
 use tar::Archive;
+use tempfile::NamedTempFile;
 
 pub fn extract_binary(
     archive_path: &Path,
@@ -43,6 +44,40 @@ fn validate_relative_path(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn create_staged_temp(output_staged_path: &Path) -> Result<NamedTempFile, String> {
+    let parent = output_staged_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    tempfile::Builder::new()
+        .prefix(".moviebox-update-")
+        .tempfile_in(parent)
+        .map_err(|e| format!("failed to create temporary staged binary: {e}"))
+}
+
+fn persist_staged_binary(
+    mut staged_file: NamedTempFile,
+    output_staged_path: &Path,
+) -> Result<(), String> {
+    staged_file
+        .as_file_mut()
+        .flush()
+        .map_err(|e| format!("failed to flush staged binary: {e}"))?;
+    validate_and_set_permissions(staged_file.path())?;
+
+    // remove_file unlinks a pre-existing symlink itself; it never follows the link.
+    match std::fs::remove_file(output_staged_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("failed to clear previous staged binary: {error}")),
+    }
+
+    staged_file
+        .persist_noclobber(output_staged_path)
+        .map(|_| ())
+        .map_err(|error| format!("failed to persist staged binary: {}", error.error))
+}
+
 fn extract_tar_gz(
     archive_path: &Path,
     expected_binary_name: &str,
@@ -52,7 +87,7 @@ fn extract_tar_gz(
     let decoder = GzDecoder::new(file);
     let mut archive = Archive::new(decoder);
 
-    let mut found = false;
+    let mut staged_file = None;
 
     for entry_result in archive
         .entries()
@@ -71,25 +106,25 @@ fn extract_tar_gz(
             .and_then(|n| n.to_str())
             .unwrap_or("");
         if filename == expected_binary_name {
-            let mut out = File::create(output_staged_path)
-                .map_err(|e| format!("failed to create staged binary: {e}"))?;
-            std::io::copy(&mut entry, &mut out)
+            let entry_type = entry.header().entry_type();
+            if !matches!(
+                entry_type,
+                tar::EntryType::Regular | tar::EntryType::Continuous
+            ) {
+                return Err("expected binary in tar archive is not a regular file".to_string());
+            }
+
+            let mut staged = create_staged_temp(output_staged_path)?;
+            std::io::copy(&mut entry, staged.as_file_mut())
                 .map_err(|e| format!("failed to write staged binary: {e}"))?;
-            out.flush()
-                .map_err(|e| format!("failed to flush staged binary: {e}"))?;
-            found = true;
+            staged_file = Some(staged);
             break;
         }
     }
 
-    if !found {
-        return Err(format!(
-            "binary '{expected_binary_name}' not found inside archive"
-        ));
-    }
-
-    validate_and_set_permissions(output_staged_path)?;
-    Ok(())
+    let staged_file = staged_file
+        .ok_or_else(|| format!("binary '{expected_binary_name}' not found inside archive"))?;
+    persist_staged_binary(staged_file, output_staged_path)
 }
 
 fn extract_zip(
@@ -100,48 +135,40 @@ fn extract_zip(
     let file = File::open(archive_path).map_err(|e| format!("failed to open zip archive: {e}"))?;
     let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("corrupt zip archive: {e}"))?;
 
-    let mut found = false;
-
     for i in 0..zip.len() {
         let mut file = zip
             .by_index(i)
             .map_err(|e| format!("zip entry read error: {e}"))?;
-        if file.is_dir() {
-            continue;
-        }
-
         let enclosed_name = file
             .enclosed_name()
             .ok_or("zip entry path traversal detected")?;
         validate_relative_path(&enclosed_name)?;
+
+        if file.is_dir() {
+            continue;
+        }
+        if file.is_symlink() {
+            return Err("zip archive contains a symbolic-link entry".to_string());
+        }
+        if !file.is_file() {
+            return Err("zip archive contains a non-regular file entry".to_string());
+        }
 
         let filename = enclosed_name
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("");
         if filename == expected_binary_name {
-            let mut out = File::create(output_staged_path)
-                .map_err(|e| format!("failed to create staged binary: {e}"))?;
-            let mut buffer = Vec::new();
-            file.read_to_end(&mut buffer)
-                .map_err(|e| format!("failed to read zip entry data: {e}"))?;
-            out.write_all(&buffer)
-                .map_err(|e| format!("failed to write staged binary: {e}"))?;
-            out.flush()
-                .map_err(|e| format!("failed to flush staged binary: {e}"))?;
-            found = true;
-            break;
+            let mut staged = create_staged_temp(output_staged_path)?;
+            std::io::copy(&mut file, staged.as_file_mut())
+                .map_err(|e| format!("failed to write zip entry data: {e}"))?;
+            return persist_staged_binary(staged, output_staged_path);
         }
     }
 
-    if !found {
-        return Err(format!(
-            "binary '{expected_binary_name}' not found inside zip"
-        ));
-    }
-
-    validate_and_set_permissions(output_staged_path)?;
-    Ok(())
+    Err(format!(
+        "binary '{expected_binary_name}' not found inside zip"
+    ))
 }
 
 fn validate_and_set_permissions(path: &Path) -> Result<(), String> {
@@ -162,11 +189,20 @@ fn validate_and_set_permissions(path: &Path) -> Result<(), String> {
 
     Ok(())
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
-    use zip::write::{FileOptions, ZipWriter};
+    use zip::write::{SimpleFileOptions, ZipWriter};
+
+    fn write_zip_entry(path: &Path, name: &str, options: SimpleFileOptions, data: &[u8]) {
+        let file = File::create(path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        zip.start_file(name, options).unwrap();
+        zip.write_all(data).unwrap();
+        zip.finish().unwrap();
+    }
 
     #[test]
     fn test_extract_zip_success() {
@@ -174,17 +210,88 @@ mod tests {
         let zip_path = temp.path().join("archive.zip");
         let output_path = temp.path().join("moviebox-tui.exe");
 
-        let file = File::create(&zip_path).unwrap();
-        let mut zip = ZipWriter::new(file);
-        let options: FileOptions<'_, ()> =
-            FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-        zip.start_file("moviebox-tui.exe", options).unwrap();
-        zip.write_all(b"binary-content-windows").unwrap();
-        zip.finish().unwrap();
+        write_zip_entry(
+            &zip_path,
+            "moviebox-tui.exe",
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated),
+            b"binary-content-windows",
+        );
 
         extract_zip(&zip_path, "moviebox-tui.exe", &output_path).unwrap();
         let content = std::fs::read(&output_path).unwrap();
         assert_eq!(content, b"binary-content-windows");
+    }
+
+    #[test]
+    fn test_extract_zip_rejects_traversal() {
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("traversal.zip");
+        let output_path = temp.path().join("moviebox-tui.exe");
+
+        write_zip_entry(
+            &zip_path,
+            "../moviebox-tui.exe",
+            SimpleFileOptions::default(),
+            b"malicious payload",
+        );
+
+        let error = extract_zip(&zip_path, "moviebox-tui.exe", &output_path).unwrap_err();
+        assert!(error.contains("traversal"));
+        assert!(!output_path.exists());
+    }
+
+    #[test]
+    fn test_extract_zip_rejects_symlink_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("symlink.zip");
+        let output_path = temp.path().join("moviebox-tui.exe");
+        let symlink_options = SimpleFileOptions::default()
+            .system(zip::System::Unix)
+            .external_attributes((0o120777_u32) << 16);
+
+        write_zip_entry(
+            &zip_path,
+            "moviebox-tui.exe",
+            symlink_options,
+            b"../../outside-target",
+        );
+
+        let error = extract_zip(&zip_path, "moviebox-tui.exe", &output_path).unwrap_err();
+        assert!(error.contains("symbolic-link"));
+        assert!(!output_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_extract_zip_does_not_follow_staging_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("archive.zip");
+        let output_path = temp.path().join("moviebox-tui.exe");
+        let outside_path = temp.path().join("outside-target");
+        std::fs::write(&outside_path, b"must not be overwritten").unwrap();
+        symlink(&outside_path, &output_path).unwrap();
+
+        write_zip_entry(
+            &zip_path,
+            "moviebox-tui.exe",
+            SimpleFileOptions::default(),
+            b"safe binary payload",
+        );
+
+        extract_zip(&zip_path, "moviebox-tui.exe", &output_path).unwrap();
+        assert_eq!(
+            std::fs::read(&outside_path).unwrap(),
+            b"must not be overwritten"
+        );
+        assert_eq!(std::fs::read(&output_path).unwrap(), b"safe binary payload");
+        assert!(
+            !std::fs::symlink_metadata(&output_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[test]
@@ -193,13 +300,12 @@ mod tests {
         let zip_path = temp.path().join("archive.zip");
         let output_path = temp.path().join("output.exe");
 
-        let file = File::create(&zip_path).unwrap();
-        let mut zip = ZipWriter::new(file);
-        let options: FileOptions<'_, ()> =
-            FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-        zip.start_file("other.exe", options).unwrap();
-        zip.write_all(b"other-content").unwrap();
-        zip.finish().unwrap();
+        write_zip_entry(
+            &zip_path,
+            "other.exe",
+            SimpleFileOptions::default(),
+            b"other-content",
+        );
 
         let err = extract_zip(&zip_path, "moviebox-tui.exe", &output_path).unwrap_err();
         assert!(err.contains("not found inside zip"));
