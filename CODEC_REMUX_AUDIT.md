@@ -1,107 +1,171 @@
-# Codec and Remux Audit Report
+# Prophecy Verse Remux Root-Cause Audit
 
-## Scope and safety
+## A. Repository and baseline
 
-This audit was performed locally in an isolated checkout. Production APIs, production environment variables, production database rows, and deployment/restart operations were not touched. No source was manually marked verified.
-
-## Starting state
+The audit was performed locally in an isolated checkout. No production VPS, database, systemd unit, domain, environment variable, or deployed process was accessed or modified. No production Remux request was issued during this audit.
 
 - Repository: `https://github.com/newprophecy2-cloud/MovieBox-Tui-Prophecy-`
-- Starting branch: `main`
-- Starting HEAD: `28d861cbce3d49b3695df6e372b57983d6bd585d`
-- Starting `git status --short`: clean
-- Working branch: `manus/codec-policy-remux-audit`
-- Working tree after changes: `src/api.rs`, `src/catalog.rs`, and `src/codec_verification.rs` modified, plus this report
+- Starting branch: `manus/codec-policy-remux-audit`
+- Starting commit: `153d154fff231712188e21ef37069da6c4261873`
+- Starting working tree: clean
+- Remote `origin/main`: same starting commit
+- Final working branch remains isolated; production was not touched
 
-## Findings and changes
+Files inspected included `README.md`, `Cargo.toml`, `src/api.rs`, `src/net.rs`, `src/proxy.rs`, `src/remux_cache.rs`, `src/codec_verification.rs`, `src/catalog.rs`, provider resolver modules, all Rust integration tests, migrations, and the existing H.264/HEVC fixtures.
 
-### Authoritative codec policy
+The relevant request path is:
 
-The shared codec helpers in `src/codec_verification.rs` now implement an H.264-only allowlist. Recognized AVC forms include `h264`, `H.264`, `avc`, `avc1`, `H.264 / AVC`, common explicit H.264 profile labels, and six-hex-digit AVC codec tags such as `avc1.640028`.
-
-AV1, VP8, VP9, MPEG-4, VC-1, Theora, ProRes, Xvid, DivX, and other non-H.264 codecs are now unverified rather than advertised as compatible. HEVC detection uses recognized codec identifiers at the start of the normalized label (`hevc`, `h265`, `x265`, `hvc1`, and `hev1`) rather than arbitrary substring matching. Values such as `not-h264` and `not-hevc` do not pass the policy. Mixed video streams are blocked if any video stream is HEVC.
-
-The catalog eligibility tests now use the same policy, so a stored `verified` status with a non-H.264 codec does not grant playback.
-
-### Playback-path enforcement
-
-The actual API dispatch and call chains were traced for:
-
-| Path | Handler/call chain | Policy result |
-|---|---|---|
-| Catalog source details | `/api/v1/catalog/sources/{id}` → `catalog_source_route` | Metadata remains available; no playable URL is newly granted. |
-| Catalog Remux | `/api/v1/catalog/sources/{id}/remux` → `catalog_source_remux_route` → `catalog_live_source_path` → `source_route` → `transcode_source` | Requires current catalog `playback_eligible`; HEVC returns `SOURCE_CODEC_BLOCKED`; unverified state returns `CODEC_UNVERIFIED`. |
-| Catalog Play | `/api/v1/catalog/sources/{id}/play` → `catalog_source_play_route` → `catalog_live_source_path`/`source_route` | Same strict catalog eligibility and stable error codes. |
-| Opaque source playback | `/api/v1/sources/{id}/playback`, `/play`, `/watch` → `source_route` → `write_verified_playback_response` | Requires a fresh FFprobe-based H.264 result before returning a playable URL. |
-| Opaque source default response | `/api/v1/sources/{id}` | No longer returns a direct media URL without a positive H.264 verdict; it fails closed with `CODEC_UNVERIFIED`. |
-| Generic proxy/direct media | `/api/stream-proxy` → `stream_proxy_route` | Performs bounded FFprobe classification before direct passthrough or Remux. HEVC is rejected before media bytes; unknown, missing, unsupported, or failed verification returns `CODEC_UNVERIFIED`. |
-| Generic Remux | `/api/stream-proxy?remux=true` → `remux_media_url` | Uses the same generic URL codec gate before FFmpeg starts. |
-| HLS/DASH sidecar | `src/proxy.rs` manifest/segment/cache handlers | The sidecar is fed by resolved playback URLs; API playback URL issuance is now codec-gated. The sidecar itself does not independently probe every segment. |
-| Media-info and subtitle extraction | `/api/media-info`, `/api/subtitles/extract` | These are inspection/metadata operations rather than playable media URL issuance; URL validation and bounded process/network behavior remain in place. |
-
-## Remux investigation and evidence
-
-The current checkout contains an advisory short Remux preflight followed by an authoritative streaming FFmpeg path. The preflight is no longer treated as proof of playback success or as a reason by itself to reject a catalog source whose current authoritative verdict is verified H.264. The actual streaming path still requires fragmented-MP4 startup (`moof`), drains FFmpeg stderr, checks process exit, kills on disconnect/error, and does not append JSON after binary headers are committed.
-
-A definitive production-specific root cause for a live verified-H.264 failure cannot be established from this checkout alone because no production logs or source requests were accessed. The reproducible defects found locally were:
-
-1. The shared allowlist incorrectly treated AV1/VP9 and several other codecs as verified-compatible.
-2. The generic URL proxy could return arbitrary validated media bytes without a codec verdict.
-3. An opaque-source response path exposed a direct media URL without the fresh verification required by the strict policy.
-
-Controlled local evidence:
-
-- `tests/fixtures/codec-h264.mkv`: FFprobe reports one `h264` video stream.
-- `tests/fixtures/codec-hevc.mkv`: FFprobe reports one `hevc` video stream.
-- The production Remux flags applied to the H.264 fixture produced a complete 1,730-byte fragmented MP4. FFprobe reported MP4 format and an H.264 video stream. This validates complete output structurally, not merely the first bytes.
-- The available H.264 fixture is video-only, so the E-AC3 audio-conversion case remains an integration test still requiring a suitable controlled audio fixture.
-
-## Tests and commands
-
-Baseline from starting HEAD:
-
-- `cargo fmt --check`: unavailable initially because `cargo-fmt` was not installed.
-- `cargo test --locked`: 489 passed, 1 failed. The failure was the pre-existing unrelated `tui::app::playback::tests::test_explicit_player_incompatible_does_not_launch_alternative` assertion.
-- `cargo clippy --locked --all-targets -- -D warnings`: unavailable initially because `cargo-clippy` was not installed.
-- `cargo build --release --locked`: passed.
-
-Edited branch:
-
-- `cargo fmt --check`: passed.
-- Focused codec policy tests: passed.
-- Mixed-video-stream HEVC regression test: passed.
-- `cargo test --locked`: 489 passed, 1 failed with the same unrelated TUI assertion; no new test failure was observed.
-- `cargo clippy --locked --all-targets -- -D warnings`: passed.
-- `cargo build --release --locked`: passed.
-- Complete local FFprobe/FFmpeg fixture validation: passed for H.264 classification, HEVC classification, and complete fragmented-MP4 output.
-
-## Security and resource controls
-
-Existing URL syntax checks, public-destination/DNS checks, redirect restrictions in the guarded verifier, bounded FFprobe/FFmpeg timeouts, output limits, `kill_on_drop`, Remux concurrency limits, provider header filtering, and sanitized logging were preserved. No automatic transcoding fallback was introduced. Generic proxy verification runs before direct response headers are committed.
-
-One limitation remains: FFprobe invoked directly on a generic URL relies on the existing validated destination plus FFmpeg/FFprobe network behavior; it is not a replacement for a fully buffered, redirect-aware local-media probe. The catalog verifier continues to use the guarded bounded sample path for supported FourKHDHub sources.
-
-## API compatibility notes
-
-- Stable codec error codes are preserved/used: `SOURCE_CODEC_BLOCKED` for confirmed HEVC and `CODEC_UNVERIFIED` for all non-positive H.264 states.
-- The opaque default source route no longer exposes an unverified direct URL. This is an intentional strict-policy compatibility change and should be documented for clients that previously consumed that URL field.
-- Remux remains GET-only and does not claim byte-range seeking.
-
-## Commit and next steps
-
-- No local commit was created.
-- Nothing was pushed or deployed.
-- Production database and services remain untouched.
-
-Run next from the working branch:
-
-```sh
-cd /home/ubuntu/work/MovieBox-Tui-Prophecy-
-. "$HOME/.cargo/env"
-cargo fmt --check
-cargo test --locked
-cargo clippy --locked --all-targets -- -D warnings
-cargo build --release --locked
+```text
+GET /api/v1/sources/{opaque_source_id}/remux
+  → route → source_route → transcode_source
+  → resolve_transcode_playback_source
+  → FourKHDHub resolver when applicable
+  → validate_transcode_destination
+  → bounded Remux semaphore
+  → advisory FFmpeg/FFprobe preflight
+  → authoritative FFmpeg fragmented-MP4 stream
+  → stream_ffmpeg_remux
 ```
 
-Before deployment, add a controlled local integration fixture containing H.264 plus E-AC3 and exercise the full HTTP response lifecycle, including client disconnect, timeout, FFmpeg early EOF, and proxy redirect cases. Do not deploy until the pre-existing TUI test failure is separately resolved or explicitly accepted.
+Catalog Remux follows the catalog source route, checks stored eligibility, re-resolves the provider mapping, and then enters the same source route. The generic `/api/stream-proxy?remux=true` path uses a separate validated URL flow and the same streaming helper.
+
+The authoritative production FFmpeg command in `transcode_source` is:
+
+```text
+ffmpeg -hide_banner -loglevel error -nostdin
+  [-headers trusted-provider-headers]
+  -rw_timeout 120000000 -i <validated-public-https-url>
+  -map 0:v:0 -map 0:a?
+  -c:v copy
+  -c:a aac -b:a 192k -ac 2
+  -sn -dn -max_interleave_delta 0
+  -movflags +frag_keyframe+empty_moov+default_base_moof
+  -flush_packets 1 -f mp4 pipe:1
+```
+
+The preflight uses the same video/audio mapping and writes a bounded two-second fragmented MP4 sample to a pipe, then FFprobe validates H.264 video and AAC audio. The authoritative stream waits for a `moof` atom before committing HTTP 200 headers, drains FFmpeg stderr, streams stdout with backpressure, waits/reaps the child, and kills it on startup failure, write failure, read failure, timeout, or disconnect.
+
+The source-resolution and codec-verification paths use opaque source IDs, public-HTTPS/SSRF validation, provider restrictions, trusted resolver headers, bounded process/network timeouts, and the strict H.264-only policy introduced in the previous audit.
+
+## B. Root-cause matrix
+
+| Issue | Evidence | Root cause | Fix | Regression test | Status |
+|---|---|---|---|---|---|
+| 20-second capture was partial | The supplied test intentionally terminated `curl` at approximately 20 seconds after receiving 217,115,376 bytes. It reported HTTP 200, `video/mp4`, Remux mode, and a valid ISO Base Media signature. | The capture duration was shorter than the approximately 1,475-second source. A partial client-side file cannot establish a server premature-termination defect. The server code handles client write failure by killing and reaping FFmpeg rather than continuing work after disconnect. | No change to successful-stream semantics. Preserved cancellation-safe child cleanup and documented the distinction between client cancellation and completed streaming. | Local complete fragmented-MP4 fixture validation; source code review of all `stream_ffmpeg_remux` error paths. A live production disconnect test was not run. | VERIFIED NOT A BUG |
+| E-AC-3 browser compatibility | The supplied source has three E-AC-3 tracks. The prior command used `-map 0:a:0? -c:a aac`, so it converted only the first audio track. Controlled fixture output contained one AAC audio track and retained only Hindi metadata. | Audio mapping selected only the first source audio stream. Conversion itself was correct for that selected track, but English and Korean were silently omitted. | Changed all Remux commands and preflight to `-map 0:a?`, retaining all source audio streams and converting each to AAC stereo at 192 kbps. | `api::tests::remux_converts_and_preserves_all_eac3_audio_languages` runs FFmpeg and FFprobe against H.264 plus Hindi/English/Korean E-AC-3 and asserts one H.264 video, three AAC tracks, preserved language tags, and `ftyp`/`moov`/`moof`/`mdat`. | FIXED |
+| Output validator checked only the first audio stream | `browser_mp4_streams_compatible` previously used `.find()` for audio, so a later incompatible audio track could be missed. | Validation did not cover every mapped audio stream. | Validator now collects every audio stream and requires every one to be AAC. | `fragmented_mp4_remux_requires_browser_compatible_codecs` rejects H.264 + AAC + AC-3. | FIXED |
+| Fragmented MP4 startup and metadata | The implementation uses `empty_moov`, `frag_keyframe`, `default_base_moof`, `flush_packets`, and waits for `moof` before sending headers. The controlled output was FFprobe-readable and contained all required atoms. | No confirmed current bug. The earlier partial capture was not enough to classify the server output as invalid. | Preserved the startup gate and bounded first-fragment buffer. | Multi-audio Remux test verifies the four atoms and FFprobe output. Existing startup failure/timeout branches return structured errors before headers. | VERIFIED NOT A BUG |
+| Error status after headers | `stream_ffmpeg_remux` validates startup before writing HTTP headers. Once 200 and media bytes are committed, later failures return an I/O error to the server and cannot change the already-sent status. | No bug found; HTTP semantics are correctly constrained by header commitment. | Preserved pre-header structured errors and midstream logging. | Existing startup/error branches plus full test suite; no fake post-200 JSON is appended. | VERIFIED NOT A BUG |
+| Client disconnect/process cleanup | A failed `write_all` records the error, kills FFmpeg, waits up to five seconds, and awaits stderr draining. Startup/header/write failures also kill and reap. | No confirmed leak in the reviewed paths. A real socket-disconnect integration test is not currently present. | No unnecessary behavior change; retained `kill_on_drop`, explicit kill, wait, and semaphore release. | Code-path audit and existing build/test validation. A dedicated child-process-count test remains outstanding. | UNCONFIRMED |
+| Seeking and `Accept-Ranges: none` | Remux responses explicitly advertise `Accept-Ranges: none`; byte-range requests return `501 SEEK_UNAVAILABLE`; output is streamed through a pipe and not persisted. | This is an intentional limitation of nonpersistent fragmented streaming, not fake Range support. | No change. Documentation and OpenAPI retain the limitation. | Existing route/range tests and source inspection. No unsupported Range behavior was added. | VERIFIED NOT A BUG |
+| Subtitle handling | Production Remux uses `-sn -dn`; it does not claim to embed subtitles. Separate subtitle/track routes probe and report embedded tracks. | MP4 subtitle preservation is intentionally excluded from the Remux contract. Silently carrying SubRip into browser MP4 would not be a safe universal behavior. | No change; documented as separate track discovery rather than embedded Remux output. | Existing probe metadata tests and subtitle route contract tests. A full embedded subtitle Remux test is not applicable while `-sn` remains explicit. | VERIFIED NOT A BUG |
+| Audio selection semantics | The supplied source exposes Hindi, English, and Korean audio. No Remux query parameter or API contract currently selects one language; `/api/v1/watch` is a separate Hindi-only route. | Remux had implicit first-track selection, which was inconsistent with the absence of a selection contract. | Preserve all audio languages in Remux instead of silently choosing one. Explicit single-language selection remains a future API design change. | Multi-audio fixture test verifies all three languages. | FIXED |
+| Codec policy bypasses | Earlier audit found broad non-H.264 allowlisting and arbitrary generic proxy playback without a positive codec verdict. Current code now uses strict H.264/AVC classification and gates generic proxy/source playback. | Policy was broader than the stated H.264-only requirement, and some URL playback paths trusted labels or URL validation alone. | Strict shared allowlist, bounded FFprobe checks, HEVC blocking, and fail-closed `CODEC_UNVERIFIED`. | Codec unit tests, mixed-stream HEVC test, focused and full suites. | FIXED |
+| Duplicate preflight work | Each Remux performs a bounded advisory FFmpeg preflight and then starts a second authoritative FFmpeg process. | The design validates compatibility before committing headers but duplicates upstream read/FFmpeg work. | Not changed because removing it would alter the startup/error contract and requires a larger design decision. | Existing bounded preflight behavior is covered indirectly; no performance acceptance threshold was provided. | NOT FIXED |
+| Concurrency limit | `ApiState` owns a two-permit Remux semaphore; `try_acquire_owned` returns 429 when full and the permit is dropped after `stream_ffmpeg_remux` returns, including spawn failure. | No confirmed concurrency bug in code review. | Preserved existing limit and release behavior. | Existing semaphore-related unit coverage and full suite; no live multi-client socket test. | VERIFIED NOT A BUG |
+| Persistent Remux cache | `X-Remux-Cache-State: disabled` is emitted and `remux_cache.rs` explicitly refuses persistent storage. | Caching is intentionally disabled to avoid mixing credentials, source URLs, audio choices, and user requests. | No cache added. | Existing cache-disabled implementation and route headers. | VERIFIED NOT A BUG |
+| Arbitrary generic proxy architecture | `/api/stream-proxy` accepts a validated public URL rather than an opaque source ID. It retains SSRF/public-destination checks and codec gating. | This is an existing compatibility route, but it is broader than the preferred source-ID-only security model. Removing it would be an API-breaking architecture change. | No removal in this audit; preserved validation and fail-closed codec behavior. | Existing URL-security tests plus generic codec gate review. | NOT FIXED |
+
+## C. Code changes
+
+### `src/api.rs`
+
+- Changed preflight, catalog/source Remux, and generic Remux audio mapping from `0:a:0?` to `0:a?`.
+- Updated `browser_mp4_streams_compatible` to validate all audio streams as AAC rather than checking only the first.
+- Added an executable regression test that performs the production-style FFmpeg conversion and FFprobe verification on three E-AC-3 language tracks.
+- No source-ID format, provider resolver, authentication, database schema, or response status contract was changed by this audit fix.
+
+### `README.md`
+
+- Corrected source eligibility documentation to match the strict H.264/AVC-only policy actually enforced by code.
+
+### `tests/fixtures/codec-h264-multi-eac3.mkv`
+
+- Added a small deterministic test fixture containing H.264 video and Hindi, English, and Korean E-AC-3 audio tracks.
+- It is used only for local regression testing; it is not a production source and is not presented as evidence that the PixelDrain source itself works.
+
+### API compatibility impact
+
+Remux output now contains all source audio tracks instead of only the first. Each is converted to AAC stereo, with language metadata preserved. This is a compatibility improvement for clients that support audio-track selection. Clients that assumed only one audio track should continue to work with the default first track. No new audio query parameter was invented.
+
+### Resource and security implications
+
+Mapping all audio tracks increases FFmpeg CPU and output bandwidth relative to one-track conversion, but avoids silent language loss and remains bounded by the existing two Remux slots. The source is still streamed; the entire episode is not loaded into memory. Existing URL validation, trusted headers, SSRF controls, codec policy, process timeouts, and cleanup remain intact.
+
+## D. Test results
+
+Baseline before this audit fix:
+
+```text
+cargo test --locked: 491 passed, 0 failed
+cargo clippy --locked --all-targets -- -D warnings: passed
+cargo build --release --locked: passed
+```
+
+The baseline formatting check initially reported a formatting difference from the earlier inserted test; it was corrected with `cargo fmt` before final validation.
+
+Final commands and results:
+
+```text
+cargo fmt --check
+PASS
+
+cargo test --locked api::tests::remux_converts_and_preserves_all_eac3_audio_languages
+PASS; focused test passed; 491 filtered out
+
+cargo test --locked
+PASS; 492 passed, 0 failed, 15 ignored
+
+cargo clippy --locked --all-targets -- -D warnings
+PASS
+
+cargo build --release --locked
+PASS
+```
+
+The focused Remux test verified:
+
+- one H.264 video stream;
+- three AAC audio streams;
+- Hindi (`hin`), English (`eng`), and Korean (`kor`) metadata preserved;
+- fragmented MP4 `ftyp`, `moov`, `moof`, and `mdat` atoms present;
+- FFprobe successfully parsed the output.
+
+The test suite includes existing security, provider, API contract, source eligibility, codec verification, update lifecycle, and TUI tests. No live production test was run, and the ignored live-network tests were not used as proof.
+
+Cancellation, cleanup, and concurrency were verified by code-path inspection and existing tests, but not by a new live socket/process-count integration test. No full 1.23 GB download or full-length transcode was performed.
+
+## E. Remaining issues
+
+1. The exact production client-disconnect behavior remains unconfirmed because no production request or VPS process telemetry was accessed. Required evidence: a controlled smoke test with a bounded byte/time cap plus server-side FFmpeg PID, exit, and memory/CPU observation.
+2. The Remux path performs an advisory preflight and then a second authoritative FFmpeg process. Required evidence for redesign: time-to-first-byte and upstream/CPU measurements showing the duplicate work is materially harmful, followed by a tested single-process startup-validation design.
+3. The generic `/api/stream-proxy` route remains URL-based rather than source-ID-only. Required evidence for a safe change: a complete inventory of clients using the route and a compatibility/deprecation plan.
+4. Embedded subtitles remain explicitly excluded from Remux output. Required evidence for support: a product contract for browser-compatible subtitle embedding or a separate sidecar delivery design and tests for English, Hindi, forced, and SDH tracks.
+5. No Remux query parameter selects Hindi, English, or Korean. The safe current behavior is to preserve all tracks. Required evidence for single-track selection: an approved API contract defining language/index selection and default-track semantics.
+6. The production PixelDrain source itself was not re-requested. The supplied 20-second capture is consistent with client cancellation and does not prove full-episode completion. The source-specific result remains UNCONFIRMED until a controlled smoke test is separately authorized.
+
+## F. Production readiness
+
+**READY FOR CONTROLLED SMOKE TEST**
+
+This is not a deployment claim. Local tests, codec verification, fragmented-MP4 validation, and the E-AC-3 multi-language regression all pass. A bounded production smoke test may be prepared, but it must use the existing opaque source-resolution flow, avoid logging or exposing the direct URL, cap duration and bytes, monitor process/resource usage, distinguish expected client cancellation from server failure, and include rollback instructions. No production smoke test was run automatically.
+
+Suggested bounded smoke-test plan, requiring separate authorization:
+
+1. Resolve the existing verified opaque source through `/api/v1/sources/{source_id}` without printing the resolved URL or headers.
+2. Request `/api/v1/sources/{source_id}/remux` with a client-side byte/time cap well below a full episode.
+3. Record only status, content type, Remux/cache headers, received byte count, elapsed time, and sanitized server request ID.
+4. On intentional client cancellation, confirm the corresponding FFmpeg child exits and the semaphore permit is released.
+5. Do not download the full source or deploy/restart anything as part of the smoke test.
+6. Roll back by reverting the application commit and restarting only through the separately approved deployment procedure; no rollback was performed here.
+
+## G. Git state
+
+Files modified after the previously pushed commit:
+
+- `README.md`
+- `src/api.rs`
+- `tests/fixtures/codec-h264-multi-eac3.mkv`
+- `CODEC_REMUX_AUDIT.md`
+
+The current changes are not yet committed or pushed. The previous audit commit remains at `153d154fff231712188e21ef37069da6c4261873` on remote `main`. Production was not touched.

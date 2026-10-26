@@ -4902,7 +4902,7 @@ async fn remux_preflight_output_valid(url: &str, headers: &[(String, String)]) -
         "-map",
         "0:v:0",
         "-map",
-        "0:a:0?",
+        "0:a?",
         "-c:v",
         "copy",
         "-c:a",
@@ -5001,9 +5001,12 @@ fn browser_mp4_streams_compatible(streams: &[ProbeStream]) -> bool {
         .find(|stream| stream.codec_type.as_deref() == Some("video"));
     let audio = streams
         .iter()
-        .find(|stream| stream.codec_type.as_deref() == Some("audio"));
+        .filter(|stream| stream.codec_type.as_deref() == Some("audio"))
+        .collect::<Vec<_>>();
     video.is_some_and(|stream| stream.codec_name.as_deref() == Some("h264"))
-        && audio.is_none_or(|stream| stream.codec_name.as_deref() == Some("aac"))
+        && audio
+            .iter()
+            .all(|stream| stream.codec_name.as_deref() == Some("aac"))
 }
 
 async fn transcode_source(
@@ -5093,7 +5096,7 @@ async fn transcode_source(
         "-map",
         "0:v:0",
         "-map",
-        "0:a:0?",
+        "0:a?",
         "-c:v",
         "copy",
         "-c:a",
@@ -5506,7 +5509,7 @@ async fn remux_media_url(
         "-map",
         "0:v:0",
         "-map",
-        "0:a:0?",
+        "0:a?",
         "-c:v",
         "copy",
         "-c:a",
@@ -6818,6 +6821,104 @@ mod tests {
             stream("video", "h264"),
             stream("audio", "ac3"),
         ]));
+        assert!(!browser_mp4_streams_compatible(&[
+            stream("video", "h264"),
+            stream("audio", "aac"),
+            stream("audio", "ac3"),
+        ]));
+    }
+
+    #[test]
+    fn remux_converts_and_preserves_all_eac3_audio_languages() {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/codec-h264-multi-eac3.mkv");
+        let output = tempfile::NamedTempFile::new().expect("temporary remux output");
+        let ffmpeg = std::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-i",
+                source.to_str().unwrap(),
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a?",
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-ac",
+                "2",
+                "-sn",
+                "-dn",
+                "-max_interleave_delta",
+                "0",
+                "-movflags",
+                "+frag_keyframe+empty_moov+default_base_moof",
+                "-flush_packets",
+                "1",
+                "-f",
+                "mp4",
+                "-y",
+                output.path().to_str().unwrap(),
+            ])
+            .output()
+            .expect("ffmpeg is installed for Remux tests");
+        assert!(
+            ffmpeg.status.success(),
+            "ffmpeg failed: {}",
+            String::from_utf8_lossy(&ffmpeg.stderr)
+        );
+        let bytes = std::fs::read(output.path()).expect("read remux output");
+        for atom in [b"ftyp".as_slice(), b"moov", b"moof", b"mdat"] {
+            assert!(bytes.windows(atom.len()).any(|window| window == atom));
+        }
+        let probe = std::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=index,codec_type,codec_name:stream_tags=language,title",
+                "-of",
+                "json",
+                output.path().to_str().unwrap(),
+            ])
+            .output()
+            .expect("ffprobe is installed for Remux tests");
+        assert!(
+            probe.status.success(),
+            "ffprobe failed: {}",
+            String::from_utf8_lossy(&probe.stderr)
+        );
+        let parsed: ProbeOutput =
+            serde_json::from_slice(&probe.stdout).expect("valid Remux probe JSON");
+        let videos = parsed
+            .streams
+            .iter()
+            .filter(|stream| stream.codec_type.as_deref() == Some("video"))
+            .collect::<Vec<_>>();
+        let audio = parsed
+            .streams
+            .iter()
+            .filter(|stream| stream.codec_type.as_deref() == Some("audio"))
+            .collect::<Vec<_>>();
+        assert_eq!(videos.len(), 1);
+        assert_eq!(videos[0].codec_name.as_deref(), Some("h264"));
+        assert_eq!(audio.len(), 3);
+        assert!(
+            audio
+                .iter()
+                .all(|stream| stream.codec_name.as_deref() == Some("aac"))
+        );
+        let languages = audio
+            .iter()
+            .filter_map(|stream| tag_value(stream.tags.as_ref(), "language"))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(languages, ["eng", "hin", "kor"].into_iter().collect());
     }
 
     #[test]

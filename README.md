@@ -25,7 +25,7 @@ The API supports both provider-backed compatibility routes and a PostgreSQL-back
 - **Anime and media search:** Legacy anime routes search configured live providers; `/api/v1/search` searches only the PostgreSQL catalog.
 - **Anime catalog import:** Admin-authenticated, per-title transactional import of anime metadata, seasons, episodes, provider mappings, verified sources, and track metadata.
 - **Catalog-backed source flow:** Title, season, episode, source, and track routes read imported catalog data. Explicit catalog `/play` and `/remux` requests re-resolve the stored provider mapping at request time.
-- **Verified source eligibility:** Search and playback candidates require a valid public mirror and a recognized video-codec label; absent or unknown codec metadata is not treated as playable.
+- **Verified source eligibility:** Search and playback candidates require a valid public mirror and a positively recognized H.264/AVC video-codec label; absent, unknown, and non-H.264 codec metadata is not treated as playable.
 - **Codec policy:** HEVC/H.265/x265 is blocked across search eligibility, public source lists, direct playback, and remux routes. H.265-to-H.264 transcoding is not performed.
 - **Bounded search work:** Each catalog item has a bounded source-eligibility budget so large series cannot make search latency grow without limit.
 - **Episode metadata:** Fresh anime details, season lists, episode lists, and individual episode lookups.
@@ -139,7 +139,7 @@ curl --get 'http://127.0.0.1:8080/api/v1/anime/search' \
 
 Search responses include `results`, `partial`, optional `next_cursor`, and provider status information. A partial response means one or more providers were unavailable or source checks could not complete; it does not mean the returned results are fabricated.
 
-Search accepts every source with a valid public mirror URL, including unknown, H.264, AV1, and other codec metadata. The only codec-family exclusion is explicit HEVC/H.265/x265, which is blocked by policy.
+Search exposes only sources with a valid public mirror URL and a positively recognized H.264/AVC codec label. HEVC/H.265/x265 and all unknown or other codec families are excluded by policy.
 
 ### Stream search events
 
