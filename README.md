@@ -24,7 +24,7 @@ The API supports both provider-backed compatibility routes and a PostgreSQL-back
 
 - **Anime and media search:** Legacy anime routes search configured live providers; `/api/v1/search` searches only the PostgreSQL catalog.
 - **Anime catalog import:** Admin-authenticated, per-title transactional import of anime metadata, seasons, episodes, provider mappings, verified sources, and track metadata.
-- **Stored-source playback:** Catalog UUID routes expose imported anime through title → season → episode → eligible sources → stored playback metadata. Provider lookup is not silently invoked by this route family.
+- **Catalog-backed source flow:** Title, season, episode, source, and track routes read imported catalog data. Explicit catalog `/play` and `/remux` requests re-resolve the stored provider mapping at request time.
 - **Verified source eligibility:** Search and playback candidates require a valid public mirror and a recognized video-codec label; absent or unknown codec metadata is not treated as playable.
 - **Codec policy:** HEVC/H.265/x265 is blocked across search eligibility, public source lists, direct playback, and remux routes. H.265-to-H.264 transcoding is not performed.
 - **Bounded search work:** Each catalog item has a bounded source-eligibility budget so large series cannot make search latency grow without limit.
@@ -44,9 +44,9 @@ The API supports both provider-backed compatibility routes and a PostgreSQL-back
 Client
   ├── Legacy provider routes → search → episode sources → provider resolution
   └── PostgreSQL catalog routes → import → title → seasons → episodes → stored sources
-                                  │
-                                  ├── Catalog import requires ADMIN_TOKEN
-                                  └── Stored playback requires verified, eligible sources
+                                  ├── Import requires ADMIN_TOKEN
+                                  ├── /play → fresh provider resolution
+                                  └── /remux → fresh resolution → FFmpeg fragmented MP4
 ```
 
 ### Playback resolution flow
@@ -76,7 +76,7 @@ Intermediate HTML resolver pages are not considered playable media. If all provi
 
 ### Runtime requirements for the HTTP API
 
-The API does not require a desktop session, VLC, mpv, or IINA. PostgreSQL is optional for provider compatibility routes and required for catalog routes; configure `DATABASE_URL` to enable the catalog. Set `REQUIRE_DATABASE=true` when the deployment must not start without it. FFmpeg and FFprobe are needed for server-side media inspection/remux features.
+The API does not require a desktop session, VLC, mpv, or IINA. PostgreSQL is optional for provider compatibility routes and required for catalog routes; configure `DATABASE_URL` to enable the catalog. Set `REQUIRE_DATABASE=true` when the deployment must not start without it. FFmpeg and FFprobe are needed for server-side media inspection/remux features. The Tokio HTTP runtime configures an 8 MiB worker stack for the nested asynchronous provider-resolution and media-preflight path.
 
 ### Optional terminal-client requirements
 
@@ -226,7 +226,7 @@ Audio and subtitle responses are only confirmed when the resolved media can be i
 |---|---|---|
 | `GET` | `/` | API information |
 | `GET` | `/health` | Lightweight liveness check |
-| `GET` | `/ready` | Local service-layer readiness |
+| `GET` | `/ready` | Readiness of configured mandatory dependencies (including PostgreSQL when required) |
 | `GET` | `/api/v1` | API resource summary |
 | `GET` | `/openapi.json` | OpenAPI document |
 | `GET` | `/docs` | Human-readable API documentation |
@@ -239,6 +239,7 @@ Audio and subtitle responses are only confirmed when the resolved media can be i
 | `GET` | `/api/v1/catalog/titles/{title_id}/seasons` | Stored catalog seasons |
 | `GET` | `/api/v1/catalog/titles/{title_id}/seasons/{season}/episodes` | Stored catalog episodes |
 | `GET` | `/api/v1/catalog/episodes/{episode_id}/sources` | Verified sources and supported live provider candidates |
+| `GET` | `/api/v1/catalog/sources/{source_id}/tracks` | Stored audio/subtitle track metadata |
 | `GET` | `/api/v1/catalog/sources/{source_id}/play` | Re-resolve provider playback at request time |
 | `GET` | `/api/v1/catalog/sources/{source_id}/remux` | Live FFmpeg remux for imported provider source candidates |
 | `GET` | `/api/v1/anime/{anime_id}` | Anime details |

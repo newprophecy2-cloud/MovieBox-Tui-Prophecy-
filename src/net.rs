@@ -120,15 +120,70 @@ pub fn is_public_ip(address: std::net::IpAddr) -> bool {
     }
 }
 
+const MAX_URL_INPUT_BYTES: usize = 32 * 1024;
+const MAX_RAW_HOST_BYTES: usize = 1024;
+
+fn has_bounded_url_authority(raw: &str) -> bool {
+    if raw.len() > MAX_URL_INPUT_BYTES {
+        return false;
+    }
+    let Some((scheme, remainder)) = raw.split_once("://") else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return false;
+    }
+    let authority = remainder.split(['/', '?', '#']).next().unwrap_or_default();
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    if authority.starts_with('[') {
+        return authority.find(']').is_some_and(|end| end <= 64);
+    }
+    let host = authority
+        .split_once(':')
+        .map_or(authority, |(host, _)| host)
+        .strip_suffix('.')
+        .unwrap_or_else(|| {
+            authority
+                .split_once(':')
+                .map_or(authority, |(host, _)| host)
+        });
+    !host.is_empty()
+        && host.len() <= MAX_RAW_HOST_BYTES
+        && host.chars().count() <= 253
+        && host
+            .split('.')
+            .all(|label| !label.is_empty() && label.len() <= 256 && label.chars().count() <= 63)
+}
+
+fn normalized_host_has_bounded_dns_size(host: &str) -> bool {
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    let host = host.strip_suffix('.').unwrap_or(host);
+    !host.is_empty()
+        && host.len() <= 253
+        && host
+            .split('.')
+            .all(|label| !label.is_empty() && label.len() <= 63)
+}
+
 pub fn validate_url_syntax(raw: &str, allow_http: bool) -> Result<reqwest::Url, String> {
-    let url = reqwest::Url::parse(raw.trim()).map_err(|_| "invalid URL".to_string())?;
+    let trimmed = raw.trim();
+    if !has_bounded_url_authority(trimmed) {
+        return Err("invalid URL".to_string());
+    }
+    let url = reqwest::Url::parse(trimmed).map_err(|_| "invalid URL".to_string())?;
     let scheme_ok = url.scheme() == "https" || (allow_http && url.scheme() == "http");
     let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    let host_size_ok = normalized_host_has_bounded_dns_size(&host);
     let literal_private = host
         .parse::<std::net::IpAddr>()
         .is_ok_and(|address| !is_public_ip(address));
     if !scheme_ok
         || url.host_str().is_none()
+        || !host_size_ok
         || !url.username().is_empty()
         || url.password().is_some()
         || host == "localhost"
@@ -142,9 +197,17 @@ pub fn validate_url_syntax(raw: &str, allow_http: bool) -> Result<reqwest::Url, 
 
 pub async fn validate_public_url(raw: &str, allow_http: bool) -> Result<reqwest::Url, String> {
     if crate::config::is_test_environment() {
-        let url = reqwest::Url::parse(raw.trim()).map_err(|_| "invalid URL".to_string())?;
+        let trimmed = raw.trim();
+        if !has_bounded_url_authority(trimmed) {
+            return Err("invalid URL".to_string());
+        }
+        let url = reqwest::Url::parse(trimmed).map_err(|_| "invalid URL".to_string())?;
         let scheme_ok = url.scheme() == "https" || (allow_http && url.scheme() == "http");
-        if scheme_ok && url.host_str().is_some() {
+        if scheme_ok
+            && url
+                .host_str()
+                .is_some_and(normalized_host_has_bounded_dns_size)
+        {
             return Ok(url);
         }
         return Err("URL is not an allowed HTTP(S) test destination".to_string());
@@ -322,6 +385,19 @@ mod tests {
         let url = format!("http://{addr}/video.mkv");
         assert!(probe_url(&url, std::time::Duration::from_secs(2)).await);
     }
+
+    #[test]
+    fn url_validation_rejects_oversized_authorities_before_idna_parsing() {
+        let overlong_label = format!("https://{}.example/video", "a".repeat(64));
+        let oversized_host = format!("https://{}/video", "a".repeat(MAX_RAW_HOST_BYTES + 1));
+        let oversized_url = format!("https://example.com/{}", "x".repeat(MAX_URL_INPUT_BYTES));
+
+        assert!(validate_url_syntax(&overlong_label, true).is_err());
+        assert!(validate_url_syntax(&oversized_host, true).is_err());
+        assert!(validate_url_syntax(&oversized_url, true).is_err());
+        assert!(validate_url_syntax("https://例え.テスト/video", true).is_ok());
+    }
+
     #[test]
     fn test_is_http_url() {
         assert!(is_http_url("http://example.com"));

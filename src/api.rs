@@ -3966,9 +3966,16 @@ async fn source_sse(stream: &mut TcpStream, r: OpaqueRef, state: ApiState) -> st
     }
 }
 async fn probe_media(url: &str, headers: &[(String, String)]) -> Result<ProbeOutput, String> {
-    crate::net::validate_public_url(url, true)
+    let validated_url = crate::net::validate_public_url(url, true)
         .await
         .map_err(|_| "The media source URL is not an allowed public destination.".to_string())?;
+    probe_media_validated(&validated_url, headers).await
+}
+
+async fn probe_media_validated(
+    url: &reqwest::Url,
+    headers: &[(String, String)],
+) -> Result<ProbeOutput, String> {
     let mut command = Command::new("ffprobe");
     command
         .arg("-v")
@@ -3987,7 +3994,7 @@ async fn probe_media(url: &str, headers: &[(String, String)]) -> Result<ProbeOut
             .join("\r\n");
         command.arg("-headers").arg(header_text);
     }
-    command.arg(url);
+    command.arg(url.as_str());
     command.kill_on_drop(true);
     let output = tokio::time::timeout(TRACK_PROBE_TIMEOUT, command.output())
         .await
@@ -4460,8 +4467,8 @@ fn public_mirrors(
         .collect()
 }
 
-fn validate_transcode_url(raw: &str) -> Option<String> {
-    let url = reqwest::Url::parse(raw).ok()?;
+fn validate_transcode_url(raw: &str) -> Option<reqwest::Url> {
+    let url = crate::net::validate_url_syntax(raw, false).ok()?;
     let host = url.host_str()?.to_ascii_lowercase();
     let path = url.path().to_ascii_lowercase();
     let local_or_intermediate = host == "localhost"
@@ -4483,12 +4490,11 @@ fn validate_transcode_url(raw: &str) -> Option<String> {
     {
         return None;
     }
-    Some(url.to_string())
+    Some(url)
 }
 
-async fn validate_transcode_destination(raw: &str) -> Option<String> {
-    let normalized = validate_transcode_url(raw)?;
-    let url = reqwest::Url::parse(&normalized).ok()?;
+async fn validate_transcode_destination(raw: &str) -> Option<reqwest::Url> {
+    let url = validate_transcode_url(raw)?;
     let host = url.host_str()?;
     let port = url.port_or_known_default()?;
     let addresses = tokio::net::lookup_host((host, port)).await.ok()?;
@@ -4499,7 +4505,7 @@ async fn validate_transcode_destination(raw: &str) -> Option<String> {
             return None;
         }
     }
-    found.then_some(normalized)
+    found.then_some(url)
 }
 
 fn is_public_transcode_ip(address: std::net::IpAddr) -> bool {
@@ -4513,12 +4519,16 @@ fn direct_transcode_playback_source(source: &Release) -> Option<PlaybackSource> 
     if source.provider == ProviderKind::FourKHdHub {
         return None;
     }
-    let mirror = source.mirrors.iter().find(|mirror| {
-        mirror.direct_file && validate_transcode_url(&mirror.resolver_url).is_some()
+    let (mirror, url) = source.mirrors.iter().find_map(|mirror| {
+        mirror
+            .direct_file
+            .then(|| validate_transcode_url(&mirror.resolver_url))
+            .flatten()
+            .map(|url| (mirror, url))
     })?;
     Some(PlaybackSource {
         provider: source.provider,
-        url: validate_transcode_url(&mirror.resolver_url)?,
+        url: url.to_string(),
         headers: mirror.headers.clone(),
         subtitle: None,
         source_label: mirror.label.clone(),
@@ -4564,15 +4574,15 @@ async fn resolve_transcode_playback_source(
         })
 }
 
-async fn validated_remux_preflight(url: &str, headers: &[(String, String)]) -> bool {
+async fn validated_remux_preflight(url: &reqwest::Url, headers: &[(String, String)]) -> bool {
     // Provider codec labels are often incomplete or inferred. Try a short real stream-copy
     // into browser-compatible fragmented MP4, then verify the resulting video/audio codecs
     // before allowing stream-copy mode.
     let Ok(source_probe) =
-        tokio::time::timeout(REMUX_PREFLIGHT_TIMEOUT, probe_media(url, headers)).await
+        tokio::time::timeout(REMUX_PREFLIGHT_TIMEOUT, probe_media_validated(url, headers)).await
     else {
         // Metadata inspection is best-effort; unknown metadata does not itself rule out remux.
-        return remux_preflight_output_valid(url, headers).await;
+        return remux_preflight_output_valid(url.as_str(), headers).await;
     };
     if let Ok(probe) = source_probe
         && !probe
@@ -4582,7 +4592,7 @@ async fn validated_remux_preflight(url: &str, headers: &[(String, String)]) -> b
     {
         return false;
     }
-    remux_preflight_output_valid(url, headers).await
+    remux_preflight_output_valid(url.as_str(), headers).await
 }
 
 async fn remux_preflight_output_valid(url: &str, headers: &[(String, String)]) -> bool {
