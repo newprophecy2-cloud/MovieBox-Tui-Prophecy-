@@ -315,26 +315,20 @@ impl CatalogStore {
         let r=self.client.lock().await.query("SELECT ps.id::text AS id,ps.episode_id::text AS episode_id,ps.provider_source_id,pr.provider_key,ps.source_reference,ps.quality_label,ps.video_codec,ps.audio_codec,ps.container_format,ps.resolution_width,ps.resolution_height,ps.source_status,ps.codec_verification_status,ps.expires_at::text AS expires_at FROM provider_sources ps JOIN provider_registry pr ON pr.id=ps.provider_id WHERE ps.episode_id=$1::text::uuid AND ps.source_status NOT IN('blocked','invalid') AND (ps.expires_at IS NULL OR ps.expires_at>now()) ORDER BY ps.resolution_height DESC NULLS LAST", &[&id]).await?;
         Ok(r.iter()
             .map(row_json)
-            .filter(|source| {
-                let provider = source
-                    .get("provider_key")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                let verified = source
-                    .get("codec_verification_status")
-                    .and_then(Value::as_str)
-                    == Some("verified");
-                let codec = source
-                    .get("video_codec")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                verified || (provider == "fourkhdhub" && source_codec_is_known_non_hevc(codec))
-            })
+            .filter(source_is_playback_eligible)
             .collect())
     }
     pub async fn get_source(&self, id: &str) -> Result<Option<Value>, CatalogError> {
-        let r=self.client.lock().await.query_opt("SELECT ps.id::text AS id,ps.episode_id::text AS episode_id,ps.provider_source_id,pr.provider_key,ps.source_reference,ps.quality_label,ps.video_codec,ps.audio_codec,ps.container_format,ps.resolution_width,ps.resolution_height,ps.source_status,ps.codec_verification_status,ps.expires_at::text AS expires_at,(ps.source_status NOT IN('blocked','invalid') AND (ps.expires_at IS NULL OR ps.expires_at>now())) AS playback_eligible FROM provider_sources ps JOIN provider_registry pr ON pr.id=ps.provider_id WHERE ps.id::text=$1", &[&id]).await?;
-        Ok(r.as_ref().map(row_json))
+        let r=self.client.lock().await.query_opt("SELECT ps.id::text AS id,ps.episode_id::text AS episode_id,ps.provider_source_id,pr.provider_key,ps.source_reference,ps.quality_label,ps.video_codec,ps.audio_codec,ps.container_format,ps.resolution_width,ps.resolution_height,ps.source_status,ps.codec_verification_status,ps.expires_at::text AS expires_at,(ps.expires_at IS NULL OR ps.expires_at>now()) AS source_not_expired FROM provider_sources ps JOIN provider_registry pr ON pr.id=ps.provider_id WHERE ps.id::text=$1", &[&id]).await?;
+        Ok(r.as_ref().map(|row| {
+            let mut source = row_json(row);
+            let eligible = source_is_playback_eligible(&source);
+            if let Some(object) = source.as_object_mut() {
+                object.remove("source_not_expired");
+                object.insert("playback_eligible".into(), Value::Bool(eligible));
+            }
+            source
+        }))
     }
     pub async fn list_tracks(&self, id: &str) -> Result<Vec<Value>, CatalogError> {
         let r=self.client.lock().await.query("SELECT id::text AS id,track_type,language_code,codec,format,is_default,is_forced,verified,track_metadata FROM source_tracks WHERE source_id=$1::text::uuid ORDER BY track_type,language_code",&[&id]).await?;
@@ -675,6 +669,32 @@ fn source_codec_is_known_non_hevc(codec: &str) -> bool {
     .iter()
     .any(|family| normalized.contains(family))
 }
+fn source_is_playback_eligible(source: &Value) -> bool {
+    if source
+        .get("source_not_expired")
+        .is_some_and(|value| value != &Value::Bool(true))
+    {
+        return false;
+    }
+    let status = source
+        .get("source_status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if matches!(status, "blocked" | "invalid") {
+        return false;
+    }
+    if source
+        .get("codec_verification_status")
+        .and_then(Value::as_str)
+        != Some("verified")
+    {
+        return false;
+    }
+    source
+        .get("video_codec")
+        .and_then(Value::as_str)
+        .is_some_and(source_codec_is_known_non_hevc)
+}
 fn normalize(v: &str) -> String {
     v.trim()
         .to_lowercase()
@@ -695,6 +715,7 @@ fn new_id() -> String {
 mod tests {
     use super::{
         ProviderEpisodeInput, episode_provider_key, normalize, source_codec_is_known_non_hevc,
+        source_is_playback_eligible,
     };
     use serde_json::json;
 
@@ -709,6 +730,36 @@ mod tests {
         assert!(source_codec_is_known_non_hevc("AV1"));
         assert!(!source_codec_is_known_non_hevc("H.265 / HEVC"));
         assert!(!source_codec_is_known_non_hevc("mystery-codec"));
+    }
+    #[test]
+    fn catalog_playback_requires_verified_non_hevc_codec() {
+        let base = serde_json::json!({
+            "source_status": "playable",
+            "source_not_expired": true,
+            "codec_verification_status": "verified",
+            "video_codec": "H.264"
+        });
+        assert!(source_is_playback_eligible(&base));
+
+        let mut unverified = base.clone();
+        unverified["codec_verification_status"] = serde_json::json!("unverified");
+        assert!(!source_is_playback_eligible(&unverified));
+
+        let mut hevc = base.clone();
+        hevc["video_codec"] = serde_json::json!("H.265 / HEVC");
+        assert!(!source_is_playback_eligible(&hevc));
+
+        let mut blocked = base;
+        blocked["source_status"] = serde_json::json!("blocked");
+        assert!(!source_is_playback_eligible(&blocked));
+
+        let expired = serde_json::json!({
+            "source_status": "playable",
+            "source_not_expired": false,
+            "codec_verification_status": "verified",
+            "video_codec": "H.264"
+        });
+        assert!(!source_is_playback_eligible(&expired));
     }
 
     #[test]

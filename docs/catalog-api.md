@@ -99,7 +99,7 @@ When provider episode mappings are supplied on a canonical episode instead of un
 
 The import stores canonical title, synopsis, year, poster, genres, the complete provider detail object (including rating, tagline, cast/crew, formats and audio options), season and episode titles/overviews, provider episode IDs, and up to three eligible provider source candidates per episode. Repeating the same import updates the existing catalog title using provider identity rather than creating a duplicate. A provider outage for an individual episode's source list does not discard the title/episode metadata; the response reports those episodes in `source_candidates.warnings`.
 
-Provider source IDs are stable opaque references. Signed/final media URLs are not stored. Imported provider-reported codec labels remain `unverified`; the catalog source list exposes eligible non-HEVC candidates, while `/play` re-resolves the current stream through the provider and the `/remux` route uses the existing live remux safeguards. This import step collects source candidates; it does not claim that every candidate has already passed an FFprobe inspection.
+Provider source IDs are stable opaque references. Signed/final media URLs are not stored. Imported provider-reported codec labels remain `unverified` until an authorized verification step records a verified codec. The catalog source list and `playback_eligible` flag fail closed and expose only non-HEVC sources with verified codec metadata; unverified candidates remain stored for later validation but are not presented as playable. `/play` re-resolves an eligible source through the provider and the `/remux` route uses the existing live remux safeguards. This import step collects source candidates; it does not claim that every candidate has already passed an FFprobe inspection.
 
 ```bash
 curl -X POST "$BASE_URL/api/v1/admin/catalog/import-by-name" \
@@ -115,7 +115,7 @@ curl -X POST "$BASE_URL/api/v1/admin/catalog/import-by-name" \
 - `GET /api/v1/catalog/titles/{title_id}/seasons`: seasons.
 - `GET /api/v1/catalog/titles/{title_id}/seasons/{season}/episodes`: episodes.
 - `GET /api/v1/catalog/episodes/{episode_id}`: one episode.
-- `GET /api/v1/catalog/episodes/{episode_id}/sources`: eligible, unexpired verified sources plus recognized non-HEVC FourKHDHub candidates marked `unverified` until resolved.
+- `GET /api/v1/catalog/episodes/{episode_id}/sources`: eligible, unexpired sources with verified, recognized non-HEVC codec metadata.
 - `GET /api/v1/catalog/sources/{source_id}`: stored source metadata.
 - `GET /api/v1/catalog/sources/{source_id}/tracks`: audio and subtitle tracks.
 - `GET /api/v1/catalog/sources/{source_id}/play`: provider-backed source IDs are re-resolved at request time; signed URLs are not stored.
