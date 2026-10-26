@@ -6,6 +6,7 @@ use reqwest::Url;
 
 const DEFAULT_BASE_URL: &str = "https://4khdhub.one/";
 const BROWSER_UA: &str = crate::net::DEFAULT_BROWSER_USER_AGENT;
+const MIRROR_RESOLUTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(14);
 
 #[derive(thiserror::Error, Debug)]
 pub enum FourKHdHubError {
@@ -151,6 +152,7 @@ impl FourKHdHubClient {
             let mirror_url = mirror.resolver_url.clone();
             let mirror_label = mirror.label.clone();
             let mirror_headers = mirror.headers.clone();
+            let mirror_host = safe_host(&mirror_url);
             resolve_tasks.push(async move {
                 let fetch = async {
                     if mirror_url.contains("hubcloud.") {
@@ -166,12 +168,19 @@ impl FourKHdHubClient {
                             .map(|url| vec![(url, mirror_label, mirror_headers)])
                     }
                 };
-                tokio::time::timeout(std::time::Duration::from_millis(7000), fetch)
+                let result = tokio::time::timeout(MIRROR_RESOLUTION_TIMEOUT, fetch)
                     .await
                     .map_err(|_| {
                         FourKHdHubError::NoPlayableMirror("mirror resolver timed out".into())
                     })
-                    .and_then(|res| res)
+                    .and_then(|res| res);
+                if let Err(error) = &result {
+                    let (class, status) = safe_error_class(error);
+                    log::warn!(
+                        "4KHDHub resolver stage failed: host={mirror_host} class={class} status={status:?}"
+                    );
+                }
+                result
             });
         }
 
@@ -192,6 +201,7 @@ impl FourKHdHubClient {
                             spawned_preflights += 1;
                             let cand_score = hubcloud::score(&url, &label, intent);
                             let this = self.clone();
+                            let candidate_host = safe_host(&url);
                             let mut merged = headers;
                             if !merged
                                 .iter()
@@ -206,8 +216,14 @@ impl FourKHdHubClient {
                                 merged.push(("User-Agent".to_string(), BROWSER_UA.to_string()));
                             }
                             preflight_tasks.push(async move {
-                                let (playable_url, is_seekable) =
-                                    this.preflight_with_seekable(&url, &merged).await?;
+                                let result = this.preflight_with_seekable(&url, &merged).await;
+                                if let Err(error) = &result {
+                                    let (class, status) = safe_error_class(error);
+                                    log::warn!(
+                                        "4KHDHub preflight stage failed: host={candidate_host} class={class} status={status:?}"
+                                    );
+                                }
+                                let (playable_url, is_seekable) = result?;
                                 let resolved_score =
                                     cand_score.min(hubcloud::score(&playable_url, &label, intent));
                                 Ok::<_, FourKHdHubError>((
@@ -414,11 +430,53 @@ impl FourKHdHubClient {
 fn build_client() -> reqwest::Client {
     crate::net::http_client_builder()
         .timeout(std::time::Duration::from_secs(20))
-        .connect_timeout(std::time::Duration::from_secs(5))
+        .connect_timeout(std::time::Duration::from_secs(10))
         .user_agent(BROWSER_UA)
         .redirect(reqwest::redirect::Policy::limited(5))
         .build()
         .unwrap_or_default()
+}
+
+fn safe_host(raw: &str) -> String {
+    Url::parse(raw)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .unwrap_or_else(|| "invalid-host".into())
+}
+
+fn safe_error_class(error: &FourKHdHubError) -> (&'static str, Option<u16>) {
+    match error {
+        FourKHdHubError::Network(error) => {
+            let status = error.status().map(|status| status.as_u16());
+            let class = if error.is_connect() && error.is_timeout() {
+                "connect-timeout"
+            } else if error.is_connect() {
+                "connect-failure"
+            } else if error.is_timeout() {
+                "network-timeout"
+            } else if status.is_some() {
+                "upstream-http-error"
+            } else {
+                "network-error"
+            };
+            (class, status)
+        }
+        FourKHdHubError::InvalidUrl(_) => ("invalid-url", None),
+        FourKHdHubError::Parse(_) => ("markup-parse-failure", None),
+        FourKHdHubError::NoPlayableMirror(reason) => {
+            let reason = reason.to_ascii_lowercase();
+            let class = if reason.contains("timeout") || reason.contains("timed out") {
+                "mirror-timeout"
+            } else if reason.contains("expired") || reason.contains("quota") {
+                "expired-or-quota"
+            } else if reason.contains("content type") {
+                "unexpected-content-type"
+            } else {
+                "no-playable-mirror"
+            };
+            (class, None)
+        }
+    }
 }
 
 #[cfg(test)]
