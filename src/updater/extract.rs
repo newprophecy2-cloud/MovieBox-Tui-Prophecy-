@@ -176,7 +176,7 @@ mod tests {
 
         let file = File::create(&zip_path).unwrap();
         let mut zip = ZipWriter::new(file);
-        let options: FileOptions<'_, ()> =
+        let options: FileOptions<'_, '_, ()> =
             FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
         zip.start_file("moviebox-tui.exe", options).unwrap();
         zip.write_all(b"binary-content-windows").unwrap();
@@ -195,7 +195,7 @@ mod tests {
 
         let file = File::create(&zip_path).unwrap();
         let mut zip = ZipWriter::new(file);
-        let options: FileOptions<'_, ()> =
+        let options: FileOptions<'_, '_, ()> =
             FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
         zip.start_file("other.exe", options).unwrap();
         zip.write_all(b"other-content").unwrap();

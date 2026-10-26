@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 const MIGRATION_001: &str = include_str!("../migrations/001_catalog.sql");
 const MIGRATION_002: &str = include_str!("../migrations/002_codec_verification.sql");
+const MIGRATION_003: &str = include_str!("../migrations/003_anime_import_jobs.sql");
 
 #[derive(Clone)]
 pub struct CatalogStore {
@@ -158,6 +159,57 @@ pub struct CatalogJob {
     pub episodes_imported: i64,
     pub sources_imported: i64,
     pub tracks_imported: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anime_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_episodes: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub processed_episodes: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_episodes: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_episodes: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_warning_count: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_size: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress_percent: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resumable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_progress_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AnimeImportEpisodeRef {
+    pub ordinal: i64,
+    pub season_index: i32,
+    pub episode_index: i32,
+    pub season_number: i32,
+    pub provider_season: i32,
+    pub episode_number: i32,
+    pub provider_episode_id: String,
+    pub episode_metadata: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClaimedAnimeImportJob {
+    pub id: String,
+    pub anime_name: String,
+    pub provider_key: String,
+    pub provider_title_id: String,
+    pub base_import: Value,
+    pub total_episodes: i64,
+    pub batch_size: i32,
+    pub metadata_imported: bool,
+    pub metadata_attempt_count: i32,
 }
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ImportSummary {
@@ -229,6 +281,254 @@ impl CatalogStore {
         let client = self.client.lock().await;
         client.batch_execute(MIGRATION_001).await?;
         client.batch_execute(MIGRATION_002).await?;
+        client.batch_execute(MIGRATION_003).await?;
+        Ok(())
+    }
+
+    pub async fn create_anime_import_job(
+        &self,
+        anime_name: &str,
+        provider_key: &str,
+        provider_title_id: &str,
+        base_import: &ImportTitle,
+        batch_size: i32,
+        total_episodes: i64,
+    ) -> Result<(String, bool), CatalogError> {
+        if !(1..=50).contains(&batch_size) || total_episodes <= 0 {
+            return Err(CatalogError::Validation("invalid anime import job".into()));
+        }
+        let id = new_id();
+        let base = serde_json::to_value(base_import)
+            .map_err(|e| CatalogError::Validation(format!("invalid import snapshot: {e}")))?;
+        let mut client = self.client.lock().await;
+        let tx = client.transaction().await?;
+        let active_key = format!("{provider_key}:{provider_title_id}");
+        if let Some(row) = tx.query_opt("SELECT job_id FROM catalog_anime_import_jobs WHERE active_import_key=$1 FOR UPDATE", &[&active_key]).await? {
+            let id: String = row.get("job_id");
+            tx.commit().await?;
+            return Ok((id, false));
+        }
+        tx.execute("INSERT INTO catalog_jobs(id,job_type,status,started_at) VALUES($1,'import_by_name','staging',now())", &[&id]).await?;
+        let inserted = tx.execute("INSERT INTO catalog_anime_import_jobs(job_id,active_import_key,anime_name,provider_key,provider_title_id,base_import,total_episodes,batch_size) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(active_import_key) DO NOTHING", &[&id,&active_key,&anime_name,&provider_key,&provider_title_id,&base,&total_episodes,&batch_size]).await?;
+        if inserted == 0 {
+            tx.execute("DELETE FROM catalog_jobs WHERE id=$1", &[&id])
+                .await?;
+            let existing = tx
+                .query_one(
+                    "SELECT job_id FROM catalog_anime_import_jobs WHERE active_import_key=$1",
+                    &[&active_key],
+                )
+                .await?;
+            let existing_id: String = existing.get("job_id");
+            tx.commit().await?;
+            return Ok((existing_id, false));
+        }
+        tx.commit().await?;
+        Ok((id, true))
+    }
+
+    pub async fn append_anime_import_episode_batch(
+        &self,
+        job_id: &str,
+        episodes: &[AnimeImportEpisodeRef],
+    ) -> Result<(), CatalogError> {
+        if episodes.is_empty() || episodes.len() > 50 {
+            return Err(CatalogError::Validation(
+                "episode staging batch must contain 1 to 50 records".into(),
+            ));
+        }
+        let mut client = self.client.lock().await;
+        let tx = client.transaction().await?;
+        for episode in episodes {
+            let metadata = serde_json::json!({"provider_episode_id":episode.provider_episode_id,"episode":episode.episode_metadata});
+            tx.execute("INSERT INTO catalog_anime_import_episodes(job_id,ordinal,season_index,episode_index,season_number,provider_season,episode_number,episode_metadata) VALUES($1,$2,$3,$4,$5,$6,$7,$8)", &[&job_id,&episode.ordinal,&episode.season_index,&episode.episode_index,&episode.season_number,&episode.provider_season,&episode.episode_number,&metadata]).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn activate_anime_import_job(&self, job_id: &str) -> Result<i64, CatalogError> {
+        let mut client = self.client.lock().await;
+        let tx = client.transaction().await?;
+        let row = tx.query_one("SELECT j.total_episodes,(SELECT count(*) FROM catalog_anime_import_episodes e WHERE e.job_id=j.job_id) AS staged FROM catalog_anime_import_jobs j WHERE j.job_id=$1 FOR UPDATE", &[&job_id]).await?;
+        let expected: i64 = row.get("total_episodes");
+        let staged: i64 = row.get("staged");
+        if staged != expected {
+            return Err(CatalogError::Validation(
+                "staged episode count does not match provider count".into(),
+            ));
+        }
+        tx.execute(
+            "UPDATE catalog_jobs SET status='queued' WHERE id=$1 AND status='staging'",
+            &[&job_id],
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(staged)
+    }
+
+    pub async fn recover_staged_anime_import_jobs(&self) -> Result<(), CatalogError> {
+        let client = self.client.lock().await;
+        client.execute("UPDATE catalog_jobs c SET status='queued' FROM catalog_anime_import_jobs j WHERE c.id=j.job_id AND c.status='staging' AND j.total_episodes=(SELECT count(*) FROM catalog_anime_import_episodes e WHERE e.job_id=j.job_id)", &[]).await?;
+        client.execute("UPDATE catalog_jobs SET status='failed',failed_count=1,completed_at=now() WHERE status='staging' AND started_at < now()-interval '10 minutes'", &[]).await?;
+        client.execute("UPDATE catalog_anime_import_jobs SET active_import_key=NULL WHERE job_id IN (SELECT id FROM catalog_jobs WHERE status='failed' AND job_type='import_by_name' AND started_at < now()-interval '10 minutes')", &[]).await?;
+        Ok(())
+    }
+
+    pub async fn fail_staging_anime_import_job(
+        &self,
+        job_id: &str,
+        code: &str,
+    ) -> Result<(), CatalogError> {
+        let client = self.client.lock().await;
+        client.execute("UPDATE catalog_jobs SET status='failed',failed_count=1,completed_at=now(),error_summary=$2 WHERE id=$1 AND status='staging'", &[&job_id,&code]).await?;
+        client.execute("UPDATE catalog_anime_import_jobs SET active_import_key=NULL,failure_summary=$2,updated_at=now(),last_progress_at=now() WHERE job_id=$1", &[&job_id,&code]).await?;
+        Ok(())
+    }
+
+    pub async fn claim_anime_import_job(
+        &self,
+    ) -> Result<Option<ClaimedAnimeImportJob>, CatalogError> {
+        let mut client = self.client.lock().await;
+        let tx = client.transaction().await?;
+        let row = tx.query_opt(
+            "SELECT j.job_id,j.anime_name,j.provider_key,j.provider_title_id,j.base_import,j.total_episodes,j.batch_size,j.metadata_imported,j.metadata_attempt_count FROM catalog_anime_import_jobs j JOIN catalog_jobs c ON c.id=j.job_id WHERE c.status IN ('queued','running') AND (j.lease_until IS NULL OR j.lease_until < now()) AND EXISTS (SELECT 1 FROM catalog_anime_import_episodes e WHERE e.job_id=j.job_id AND e.status='pending') ORDER BY j.created_at FOR UPDATE OF j SKIP LOCKED LIMIT 1",
+            &[],
+        ).await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let id: String = row.get("job_id");
+        tx.execute("UPDATE catalog_anime_import_jobs SET lease_until=now()+interval '2 minutes',updated_at=now() WHERE job_id=$1", &[&id]).await?;
+        tx.execute(
+            "UPDATE catalog_jobs SET status='running' WHERE id=$1",
+            &[&id],
+        )
+        .await?;
+        let job = ClaimedAnimeImportJob {
+            id,
+            anime_name: row.get("anime_name"),
+            provider_key: row.get("provider_key"),
+            provider_title_id: row.get("provider_title_id"),
+            base_import: row.get("base_import"),
+            total_episodes: row.get("total_episodes"),
+            batch_size: row.get("batch_size"),
+            metadata_imported: row.get("metadata_imported"),
+            metadata_attempt_count: row.get("metadata_attempt_count"),
+        };
+        tx.commit().await?;
+        Ok(Some(job))
+    }
+
+    pub async fn pending_anime_import_episodes(
+        &self,
+        job_id: &str,
+        limit: i64,
+    ) -> Result<Vec<(i64, i32, i32, i32, i32, i32, Value)>, CatalogError> {
+        let rows = self.client.lock().await.query(
+            "SELECT ordinal,season_index,episode_index,season_number,provider_season,episode_number,episode_metadata FROM catalog_anime_import_episodes WHERE job_id=$1 AND status='pending' ORDER BY ordinal LIMIT $2",
+            &[&job_id,&limit.clamp(1,50)],
+        ).await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                (
+                    r.get("ordinal"),
+                    r.get("season_index"),
+                    r.get("episode_index"),
+                    r.get("season_number"),
+                    r.get("provider_season"),
+                    r.get("episode_number"),
+                    r.get("episode_metadata"),
+                )
+            })
+            .collect())
+    }
+
+    pub async fn mark_anime_import_metadata(&self, job_id: &str) -> Result<(), CatalogError> {
+        self.client.lock().await.execute(
+            "UPDATE catalog_anime_import_jobs SET metadata_imported=true,last_progress_at=now(),updated_at=now(),lease_until=now()+interval '2 minutes' WHERE job_id=$1",
+            &[&job_id],
+        ).await?;
+        Ok(())
+    }
+
+    pub async fn fail_anime_import_metadata(
+        &self,
+        job_id: &str,
+        code: &str,
+    ) -> Result<(), CatalogError> {
+        let client = self.client.lock().await;
+        client.execute("UPDATE catalog_anime_import_jobs SET metadata_attempt_count=metadata_attempt_count+1,failure_summary=$2,last_progress_at=now(),updated_at=now(),lease_until=CASE WHEN metadata_attempt_count+1 >= 5 THEN NULL ELSE now()+interval '2 minutes' END WHERE job_id=$1", &[&job_id,&code]).await?;
+        client.execute("UPDATE catalog_jobs SET status=CASE WHEN (SELECT metadata_attempt_count FROM catalog_anime_import_jobs WHERE job_id=$1) >= 5 THEN 'failed' ELSE 'running' END,failed_count=CASE WHEN (SELECT metadata_attempt_count FROM catalog_anime_import_jobs WHERE job_id=$1) >= 5 THEN 1 ELSE 0 END,completed_at=CASE WHEN (SELECT metadata_attempt_count FROM catalog_anime_import_jobs WHERE job_id=$1) >= 5 THEN now() ELSE NULL END WHERE id=$1", &[&job_id]).await?;
+        client.execute("UPDATE catalog_anime_import_jobs SET active_import_key=NULL WHERE job_id=$1 AND metadata_attempt_count >= 5", &[&job_id]).await?;
+        Ok(())
+    }
+
+    pub async fn complete_anime_import_episode(
+        &self,
+        job_id: &str,
+        ordinal: i64,
+        warning: Option<&str>,
+    ) -> Result<(), CatalogError> {
+        let client = self.client.lock().await;
+        client.execute(
+            "UPDATE catalog_anime_import_episodes SET status='completed',source_warning_code=$3,updated_at=now() WHERE job_id=$1 AND ordinal=$2 AND status='pending'",
+            &[&job_id,&ordinal,&warning],
+        ).await?;
+        client.execute(
+            "UPDATE catalog_anime_import_jobs SET processed_episodes=(SELECT count(*) FROM catalog_anime_import_episodes WHERE job_id=$1 AND status IN ('completed','failed')),source_warning_count=(SELECT count(*) FROM catalog_anime_import_episodes WHERE job_id=$1 AND source_warning_code IS NOT NULL),last_progress_at=now(),updated_at=now(),lease_until=now()+interval '2 minutes' WHERE job_id=$1",
+            &[&job_id],
+        ).await?;
+        let pending: i64 = client.query_one("SELECT count(*) FROM catalog_anime_import_episodes WHERE job_id=$1 AND status='pending'", &[&job_id]).await?.get(0);
+        if pending == 0 {
+            let failed: i64 = client.query_one("SELECT count(*) FROM catalog_anime_import_episodes WHERE job_id=$1 AND status='failed'", &[&job_id]).await?.get(0);
+            let warnings: i64 = client.query_one("SELECT count(*) FROM catalog_anime_import_episodes WHERE job_id=$1 AND source_warning_code IS NOT NULL", &[&job_id]).await?.get(0);
+            let status = if failed > 0 {
+                "failed"
+            } else if warnings > 0 {
+                "completed_with_warnings"
+            } else {
+                "completed"
+            };
+            client.execute("UPDATE catalog_jobs SET status=$2,failed_count=$3,completed_at=now() WHERE id=$1", &[&job_id,&status,&(failed+warnings)]).await?;
+            client
+                .execute(
+                    "UPDATE catalog_anime_import_jobs SET lease_until=NULL,active_import_key=NULL WHERE job_id=$1",
+                    &[&job_id],
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn release_anime_import_job_lease(&self, job_id: &str) -> Result<(), CatalogError> {
+        self.client.lock().await.execute("UPDATE catalog_anime_import_jobs SET lease_until=NULL,updated_at=now() WHERE job_id=$1 AND EXISTS (SELECT 1 FROM catalog_anime_import_episodes WHERE job_id=$1 AND status='pending')", &[&job_id]).await?;
+        Ok(())
+    }
+
+    pub async fn fail_anime_import_episode(
+        &self,
+        job_id: &str,
+        ordinal: i64,
+        code: &str,
+    ) -> Result<(), CatalogError> {
+        let client = self.client.lock().await;
+        client.execute("UPDATE catalog_anime_import_episodes SET attempt_count=attempt_count+1,last_error_code=$3,status=CASE WHEN attempt_count+1 >= 5 THEN 'failed' ELSE 'pending' END,updated_at=now() WHERE job_id=$1 AND ordinal=$2 AND status='pending'", &[&job_id,&ordinal,&code]).await?;
+        client.execute("UPDATE catalog_anime_import_jobs SET last_progress_at=now(),updated_at=now(),lease_until=now()+interval '2 minutes',failure_summary=$2 WHERE job_id=$1", &[&job_id,&format!("episode checkpoint error: {code}")]).await?;
+        client.execute("UPDATE catalog_anime_import_jobs SET processed_episodes=(SELECT count(*) FROM catalog_anime_import_episodes WHERE job_id=$1 AND status IN ('completed','failed')) WHERE job_id=$1", &[&job_id]).await?;
+        let pending: i64 = client.query_one("SELECT count(*) FROM catalog_anime_import_episodes WHERE job_id=$1 AND status='pending'", &[&job_id]).await?.get(0);
+        if pending == 0 {
+            let failed: i64 = client.query_one("SELECT count(*) FROM catalog_anime_import_episodes WHERE job_id=$1 AND status='failed'", &[&job_id]).await?.get(0);
+            client.execute("UPDATE catalog_jobs SET status='failed',failed_count=$2,completed_at=now() WHERE id=$1", &[&job_id,&failed]).await?;
+            client
+                .execute(
+                    "UPDATE catalog_anime_import_jobs SET lease_until=NULL,active_import_key=NULL WHERE job_id=$1",
+                    &[&job_id],
+                )
+                .await?;
+        }
         Ok(())
     }
     pub async fn search(
@@ -495,7 +795,7 @@ impl CatalogStore {
         Ok(())
     }
     pub async fn get_job(&self, id: &str) -> Result<Option<CatalogJob>, CatalogError> {
-        let r=self.client.lock().await.query_opt("SELECT id,job_type,status,inserted_count,updated_count,skipped_count,failed_count,error_summary FROM catalog_jobs WHERE id=$1",&[&id]).await?;
+        let r=self.client.lock().await.query_opt("SELECT c.id,c.job_type,c.status,c.inserted_count,c.updated_count,c.skipped_count,c.failed_count,c.error_summary,c.started_at::text AS started_at,c.completed_at::text AS completed_at,a.anime_name,a.total_episodes,a.processed_episodes,a.source_warning_count,a.batch_size,a.failure_summary,a.last_progress_at::text AS last_progress_at,(SELECT count(*) FROM catalog_anime_import_episodes e WHERE e.job_id=c.id AND e.status='pending') AS pending_episodes,(SELECT count(*) FROM catalog_anime_import_episodes e WHERE e.job_id=c.id AND e.status='failed') AS failed_episodes FROM catalog_jobs c LEFT JOIN catalog_anime_import_jobs a ON a.job_id=c.id WHERE c.id=$1",&[&id]).await?;
         Ok(r.map(|r| {
             let text: String = r
                 .get::<_, Option<String>>("error_summary")
@@ -520,6 +820,27 @@ impl CatalogStore {
                 episodes_imported: n("episodes"),
                 sources_imported: n("sources"),
                 tracks_imported: n("tracks"),
+                anime_title: r.get("anime_name"),
+                total_episodes: r.get("total_episodes"),
+                processed_episodes: r.get("processed_episodes"),
+                pending_episodes: r.get("pending_episodes"),
+                failed_episodes: r.get("failed_episodes"),
+                source_warning_count: r.get("source_warning_count"),
+                batch_size: r.get("batch_size"),
+                progress_percent: r.get::<_, Option<i64>>("total_episodes").map(|total| {
+                    if total <= 0 {
+                        100
+                    } else {
+                        ((r.get::<_, i64>("processed_episodes") * 100 / total).clamp(0, 100)) as i32
+                    }
+                }),
+                resumable: r
+                    .get::<_, Option<i64>>("pending_episodes")
+                    .map(|pending| pending > 0),
+                failure_summary: r.get("failure_summary"),
+                started_at: r.get("started_at"),
+                last_progress_at: r.get("last_progress_at"),
+                completed_at: r.get("completed_at"),
             }
         }))
     }
@@ -579,6 +900,19 @@ fn empty_job(id: String, kind: String) -> CatalogJob {
         episodes_imported: 0,
         sources_imported: 0,
         tracks_imported: 0,
+        anime_title: None,
+        total_episodes: None,
+        processed_episodes: None,
+        pending_episodes: None,
+        failed_episodes: None,
+        source_warning_count: None,
+        batch_size: None,
+        progress_percent: None,
+        resumable: None,
+        failure_summary: None,
+        started_at: None,
+        last_progress_at: None,
+        completed_at: None,
     }
 }
 async fn upsert_title(c: &Client, i: &TitleUpsert) -> Result<(CatalogTitle, bool), CatalogError> {

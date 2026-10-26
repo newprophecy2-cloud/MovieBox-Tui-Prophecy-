@@ -711,6 +711,7 @@ pub async fn run() -> std::io::Result<()> {
         connection_slots: Arc::new(Semaphore::new(MAX_API_CONNECTIONS)),
     };
     start_codec_verification_workers(state.clone());
+    start_anime_import_workers(state.clone());
     log::info!("MovieBox API listening on 0.0.0.0:{port}");
     loop {
         let (stream, _) = listener.accept().await?;
@@ -1723,6 +1724,184 @@ async fn import_episode_sources(
     }
 }
 
+const ANIME_IMPORT_WORKERS: usize = 1;
+const ANIME_IMPORT_IDLE: Duration = Duration::from_secs(3);
+const ANIME_IMPORT_SOURCE_ATTEMPTS: usize = 3;
+
+fn start_anime_import_workers(state: ApiState) {
+    if state.catalog.is_none() {
+        return;
+    }
+    for worker_id in 0..ANIME_IMPORT_WORKERS {
+        let state = state.clone();
+        tokio::spawn(async move { anime_import_worker(state, worker_id).await });
+    }
+}
+
+async fn anime_import_worker(state: ApiState, worker_id: usize) {
+    loop {
+        let Some(catalog) = state.catalog.as_ref() else {
+            return;
+        };
+        if let Err(error) = catalog.recover_staged_anime_import_jobs().await {
+            log::error!("anime import worker could not recover staged jobs: {error:?}");
+        }
+        match catalog.claim_anime_import_job().await {
+            Ok(Some(job)) => {
+                if let Err(error) = process_anime_import_job(&state, &job).await {
+                    log::error!(
+                        "anime import worker {worker_id} could not process job {}: {error:?}",
+                        job.id
+                    );
+                }
+            }
+            Ok(None) => tokio::time::sleep(ANIME_IMPORT_IDLE).await,
+            Err(error) => {
+                log::error!("anime import worker {worker_id} could not claim a job: {error:?}");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
+    }
+}
+
+async fn process_anime_import_job(
+    state: &ApiState,
+    job: &crate::catalog::ClaimedAnimeImportJob,
+) -> Result<(), crate::catalog::CatalogError> {
+    let catalog = state
+        .catalog
+        .as_ref()
+        .expect("worker starts only with catalog");
+    if !job.metadata_imported {
+        let base: crate::catalog::ImportTitle =
+            match serde_json::from_value(job.base_import.clone()) {
+                Ok(base) => base,
+                Err(error) => {
+                    log::error!(
+                        "anime import {} has invalid metadata snapshot: {error}",
+                        job.id
+                    );
+                    catalog
+                        .fail_anime_import_metadata(&job.id, "INVALID_METADATA_SNAPSHOT")
+                        .await?;
+                    return Ok(());
+                }
+            };
+        if let Err(error) = catalog.import_title(base).await {
+            log::error!(
+                "anime import {} metadata transaction failed: {error:?}",
+                job.id
+            );
+            catalog
+                .fail_anime_import_metadata(&job.id, "METADATA_IMPORT_FAILED")
+                .await?;
+            return Ok(());
+        }
+        catalog.mark_anime_import_metadata(&job.id).await?;
+    }
+    let Some(provider) = ProviderKind::parse(&job.provider_key) else {
+        catalog
+            .fail_anime_import_metadata(&job.id, "UNSUPPORTED_PROVIDER_SNAPSHOT")
+            .await?;
+        return Ok(());
+    };
+    let rows = catalog
+        .pending_anime_import_episodes(&job.id, i64::from(job.batch_size))
+        .await?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    for (
+        ordinal,
+        _season_index,
+        _episode_index,
+        season_number,
+        provider_season,
+        episode_number,
+        record,
+    ) in rows
+    {
+        let episode: crate::catalog::EpisodeInput = serde_json::from_value(
+            record.get("episode").cloned().unwrap_or_default(),
+        )
+        .map_err(|error| {
+            crate::catalog::CatalogError::Validation(format!("invalid episode checkpoint: {error}"))
+        })?;
+        let mut source_result = Err("SOURCE_LOOKUP_FAILED");
+        for attempt in 0..ANIME_IMPORT_SOURCE_ATTEMPTS {
+            source_result = import_episode_sources(
+                state,
+                provider,
+                &job.provider_title_id,
+                usize::try_from(provider_season).unwrap_or_default(),
+                usize::try_from(episode_number).unwrap_or_default(),
+            )
+            .await;
+            if source_result.is_ok() {
+                break;
+            }
+            if attempt + 1 < ANIME_IMPORT_SOURCE_ATTEMPTS {
+                tokio::time::sleep(Duration::from_millis(250 * (1 << attempt))).await;
+            }
+        }
+        let (sources, warning) = match source_result {
+            Ok(sources) => (sources, None),
+            Err(code) => (Vec::new(), Some(code)),
+        };
+        let mut input: crate::catalog::ImportTitle =
+            serde_json::from_value(job.base_import.clone()).map_err(|error| {
+                crate::catalog::CatalogError::Validation(format!(
+                    "invalid durable metadata snapshot: {error}"
+                ))
+            })?;
+        let Some(season) = input
+            .seasons
+            .iter_mut()
+            .find(|season| season.season_number == season_number)
+        else {
+            catalog
+                .fail_anime_import_episode(&job.id, ordinal, "SEASON_SNAPSHOT_MISSING")
+                .await?;
+            continue;
+        };
+        season.episodes = vec![episode];
+        let provider_episode_id = record
+            .get("provider_episode_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let Some(provider_title) = input.providers.first_mut() else {
+            catalog
+                .fail_anime_import_episode(&job.id, ordinal, "PROVIDER_SNAPSHOT_MISSING")
+                .await?;
+            continue;
+        };
+        provider_title.episodes = vec![crate::catalog::ProviderEpisodeInput {
+            provider_key: None,
+            display_name: None,
+            season_number: Some(season_number),
+            provider_episode_id,
+            provider_episode_number: Some(episode_number),
+            sources,
+        }];
+        if let Err(error) = catalog.import_title(input).await {
+            log::error!(
+                "anime import {} episode checkpoint {ordinal} transaction failed: {error:?}",
+                job.id
+            );
+            catalog
+                .fail_anime_import_episode(&job.id, ordinal, "EPISODE_IMPORT_FAILED")
+                .await?;
+            continue;
+        }
+        catalog
+            .complete_anime_import_episode(&job.id, ordinal, warning)
+            .await?;
+    }
+    catalog.release_anime_import_job_lease(&job.id).await?;
+    Ok(())
+}
+
 fn start_codec_verification_workers(state: ApiState) {
     if state.catalog.is_none()
         || state.service.fourk_client.is_none()
@@ -1971,13 +2150,152 @@ async fn admin_catalog_import_by_name_route(
     if !details.is_series() || details.seasons.is_empty() {
         return write_json(stream, 422, &serde_json::json!({"success":false,"error":{"code":"ANIME_DETAILS_INCOMPLETE","message":"The provider did not return a series with episode metadata.","retryable":false}}), None).await;
     }
-    let episode_total: usize = details
-        .seasons
-        .iter()
-        .map(|season| season.episodes.len())
-        .sum();
-    if episode_total == 0 || episode_total > 200 {
-        return write_json(stream, 422, &serde_json::json!({"success":false,"error":{"code":"EPISODE_LIMIT_EXCEEDED","message":"Import-by-name requires 1 to 200 provider episodes.","retryable":false}}), None).await;
+    let Some(episode_total) = details.seasons.iter().try_fold(0usize, |total, season| {
+        total.checked_add(season.episodes.len())
+    }) else {
+        return write_json(stream, 422, &serde_json::json!({"success":false,"error":{"code":"ANIME_DETAILS_INCOMPLETE","message":"The provider episode metadata is invalid.","retryable":false}}), None).await;
+    };
+    if episode_total == 0 {
+        return write_json(stream, 422, &serde_json::json!({"success":false,"error":{"code":"ANIME_DETAILS_INCOMPLETE","message":"The provider did not return any episode metadata.","retryable":false}}), None).await;
+    }
+    if episode_total > 200 {
+        let batch_size = std::env::var("ANIME_IMPORT_BATCH_SIZE")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .filter(|value| (1..=50).contains(value))
+            .unwrap_or(10);
+        let provider_title_id = details.id.value.clone();
+        let base = crate::catalog::ImportTitle {
+            mal_id: None,
+            canonical_title: details.title.clone(),
+            content_type: "anime".into(),
+            synopsis: details.description.clone(),
+            release_year: details
+                .year
+                .as_deref()
+                .and_then(|year| year.get(..4))
+                .and_then(|year| year.parse().ok()),
+            poster_url: details.poster_url.clone(),
+            catalog_status: Some("active".into()),
+            alternative_titles: Vec::new(),
+            genres: details.genres.clone(),
+            providers: vec![crate::catalog::ProviderTitleInput {
+                provider_key: provider.cache_key().into(),
+                display_name: Some(provider.label().into()),
+                provider_title_id: provider_title_id.clone(),
+                provider_title: Some(details.title.clone()),
+                provider_url: None,
+                metadata: serde_json::json!({"import_source":"anime_import_by_name","season_count":details.seasons.len()}),
+                episodes: Vec::new(),
+            }],
+            seasons: details
+                .seasons
+                .iter()
+                .map(|season| crate::catalog::SeasonInput {
+                    season_number: season.number as i32,
+                    canonical_label: Some(format!("Season {}", season.number)),
+                    episode_count_reported: i32::try_from(season.episodes.len()).ok(),
+                    episodes: Vec::new(),
+                })
+                .collect(),
+        };
+        let (job_id, created) = match catalog.create_anime_import_job(anime_name, provider.cache_key(), &provider_title_id, &base, batch_size, episode_total as i64).await {
+            Ok(result) => result,
+            Err(crate::catalog::CatalogError::Validation(_)) => return write_json(stream, 422, &serde_json::json!({"success":false,"error":{"code":"ANIME_DETAILS_INCOMPLETE","message":"The provider returned invalid or empty episode records.","retryable":false}}), None).await,
+            Err(error) => {
+                log::error!("could not enqueue large anime import: {error:?}");
+                return write_json(stream, 503, &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","message":"Could not create a durable anime import job.","retryable":true}}), None).await;
+            }
+        };
+        if !created {
+            let job = catalog.get_job(&job_id).await.ok().flatten();
+            return write_json(stream, 202, &serde_json::json!({"success":true,"data":{"job_id":job_id,"status":job.as_ref().map(|job| job.status.as_str()).unwrap_or("queued"),"anime_title":details.title,"total_episodes":job.as_ref().and_then(|job| job.total_episodes).unwrap_or(episode_total as i64),"batch_size":job.as_ref().and_then(|job| job.batch_size).unwrap_or(batch_size)},"meta":{"request_id":request_id()}}), None).await;
+        }
+        let mut ordinal = 0_i64;
+        let mut batch = Vec::with_capacity(batch_size as usize);
+        for (season_index, season) in details.seasons.iter().enumerate() {
+            for (episode_index, episode) in season.episodes.iter().enumerate() {
+                let record = (|| -> Result<_, crate::catalog::CatalogError> {
+                    let season_number = i32::try_from(season.number).map_err(|_| {
+                        crate::catalog::CatalogError::Validation(
+                            "invalid provider season number".into(),
+                        )
+                    })?;
+                    let season_index = i32::try_from(season_index).map_err(|_| {
+                        crate::catalog::CatalogError::Validation("invalid season index".into())
+                    })?;
+                    let episode_index = i32::try_from(episode_index).map_err(|_| {
+                        crate::catalog::CatalogError::Validation("invalid episode index".into())
+                    })?;
+                    let provider_season = i32::try_from(episode.season).map_err(|_| {
+                        crate::catalog::CatalogError::Validation(
+                            "invalid provider season reference".into(),
+                        )
+                    })?;
+                    let episode_number = i32::try_from(episode.number).map_err(|_| {
+                        crate::catalog::CatalogError::Validation(
+                            "invalid provider episode number".into(),
+                        )
+                    })?;
+                    let episode_metadata = serde_json::to_value(crate::catalog::EpisodeInput {
+                        episode_number,
+                        episode_title: episode.title.clone(),
+                        overview: episode.overview.clone(),
+                        release_date: None,
+                        thumbnail_url: None,
+                        provider_episode_ids: Vec::new(),
+                    })
+                    .map_err(|error| crate::catalog::CatalogError::Validation(error.to_string()))?;
+                    Ok(crate::catalog::AnimeImportEpisodeRef {
+                        ordinal,
+                        season_index,
+                        episode_index,
+                        season_number,
+                        provider_season,
+                        episode_number,
+                        provider_episode_id: encode(&OpaqueRef {
+                            p: provider,
+                            v: provider_title_id.clone(),
+                            s: episode.season,
+                            e: episode.number,
+                        }),
+                        episode_metadata,
+                    })
+                })();
+                ordinal += 1;
+                match record {
+                    Ok(record) => batch.push(record),
+                    Err(_) => return write_json(stream, 422, &serde_json::json!({"success":false,"error":{"code":"ANIME_DETAILS_INCOMPLETE","message":"The provider returned an invalid episode record.","retryable":false}}), None).await,
+                }
+                if batch.len() == batch_size as usize {
+                    if let Err(error) = catalog
+                        .append_anime_import_episode_batch(&job_id, &batch)
+                        .await
+                    {
+                        log::error!("could not stage anime import episode batch: {error:?}",);
+                        return write_json(stream, 503, &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","message":"Could not stage the complete anime import job.","retryable":true}}), None).await;
+                    }
+                    batch.clear();
+                }
+            }
+        }
+        if !batch.is_empty() {
+            if let Err(error) = catalog
+                .append_anime_import_episode_batch(&job_id, &batch)
+                .await
+            {
+                log::error!("could not stage final anime import episode batch: {error:?}",);
+                return write_json(stream, 503, &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","message":"Could not stage the complete anime import job.","retryable":true}}), None).await;
+            }
+        }
+        let queued_episodes = match catalog.activate_anime_import_job(&job_id).await {
+            Ok(count) => count,
+            Err(error) => {
+                log::error!("could not activate anime import after staging: {error:?}");
+                return write_json(stream, 503, &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","message":"The anime import job could not be activated.","retryable":true}}), None).await;
+            }
+        };
+        return write_json(stream, 202, &serde_json::json!({"success":true,"data":{"job_id":job_id,"status":"queued","anime_title":details.title,"total_episodes":queued_episodes,"batch_size":batch_size},"meta":{"request_id":request_id()}}), None).await;
     }
     let mut source_warnings = Vec::new();
     let mut provider_episodes = Vec::with_capacity(episode_total);

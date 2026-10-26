@@ -61,7 +61,7 @@ redis = { version = "0.32.7", default-features = false, features = ["tokio-comp"
 sha2 = "0.11.0"
 flate2 = "1.0.35"
 tar = "0.4.44"
-zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+zip = { version = "9.1.2", default-features = false, features = ["deflate"] }
 tempfile = "3.17.1"
 
 [lib]

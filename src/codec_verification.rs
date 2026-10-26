@@ -380,7 +380,9 @@ fn normalize_codec_label(codec: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{os::unix::fs::PermissionsExt, path::Path};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
 
     async fn probe_fixture(bytes: &[u8]) -> Result<CodecProbeResult, CodecProbeError> {
         let executable = ffprobe_executable().expect("ffprobe installed for this test run");
