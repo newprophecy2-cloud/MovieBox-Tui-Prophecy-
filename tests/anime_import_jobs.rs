@@ -58,7 +58,7 @@ async fn large_anime_jobs_stage_all_records_resume_and_upsert_idempotently() {
     for count in [201_i64, 500, 1000] {
         let provider_title_id = format!("fixture-{}", Uuid::new_v4());
         let base = base_import(&provider_title_id);
-        let job_id = store
+        let (job_id, created) = store
             .create_anime_import_job(
                 "synthetic isolated test",
                 "fourkhdhub",
@@ -69,6 +69,7 @@ async fn large_anime_jobs_stage_all_records_resume_and_upsert_idempotently() {
             )
             .await
             .expect("create job");
+        assert!(created, "fixture job should be newly created");
         for start in (0..count).step_by(25) {
             let batch = (start..(start + 25).min(count))
                 .map(staged_episode)

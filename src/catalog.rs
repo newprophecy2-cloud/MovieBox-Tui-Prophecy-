@@ -12,6 +12,7 @@ use uuid::Uuid;
 const MIGRATION_001: &str = include_str!("../migrations/001_catalog.sql");
 const MIGRATION_002: &str = include_str!("../migrations/002_codec_verification.sql");
 const MIGRATION_003: &str = include_str!("../migrations/003_anime_import_jobs.sql");
+const MIGRATION_004: &str = include_str!("../migrations/004_movie_sources.sql");
 
 #[derive(Clone)]
 pub struct CatalogStore {
@@ -79,6 +80,8 @@ pub struct ProviderTitleInput {
     pub metadata: Value,
     #[serde(default)]
     pub episodes: Vec<ProviderEpisodeInput>,
+    #[serde(default)]
+    pub sources: Vec<ProviderSourceInput>,
 }
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct ProviderEpisodeInput {
@@ -226,7 +229,8 @@ pub struct ImportSummary {
 pub(crate) struct CodecVerificationJob {
     pub source_id: String,
     pub provider_source_id: String,
-    pub provider_episode_id: String,
+    pub provider_content_id: String,
+    pub content_type: String,
     pub identity_fingerprint: String,
     pub lease_token: Uuid,
     pub attempt_count: i32,
@@ -245,6 +249,8 @@ pub struct CatalogDetail {
     pub genres: Vec<Value>,
     pub provider_mappings: Vec<Value>,
     pub seasons: Vec<Value>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<Value>,
 }
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
@@ -282,6 +288,7 @@ impl CatalogStore {
         client.batch_execute(MIGRATION_001).await?;
         client.batch_execute(MIGRATION_002).await?;
         client.batch_execute(MIGRATION_003).await?;
+        client.batch_execute(MIGRATION_004).await?;
         Ok(())
     }
 
@@ -587,12 +594,19 @@ impl CatalogStore {
         let genres=c.query("SELECT g.id::text AS id,g.canonical_name,g.normalized_name,tg.source FROM genres g JOIN title_genres tg ON tg.genre_id=g.id WHERE tg.title_id=$1::text::uuid ORDER BY g.normalized_name", &[&tid]).await?.iter().map(row_json).collect();
         let providers=c.query("SELECT pt.id::text AS id,pr.provider_key,pr.display_name,pt.provider_title_id,pt.provider_title,pt.provider_url,pt.metadata,pt.match_status,pt.match_confidence FROM provider_titles pt JOIN provider_registry pr ON pr.id=pt.provider_id WHERE pt.title_id=$1::text::uuid ORDER BY pr.provider_key", &[&tid]).await?.iter().map(row_json).collect();
         let seasons=c.query("SELECT id::text AS id,season_number,canonical_label,episode_count_reported FROM seasons WHERE title_id=$1::text::uuid ORDER BY season_number", &[&tid]).await?.iter().map(row_json).collect();
+        let title = title_from_row(&r);
+        let sources = if title.content_type == "movie" {
+            c.query("SELECT ps.id::text AS id,ps.title_id::text AS title_id,ps.provider_source_id,pr.provider_key,ps.source_reference,ps.quality_label,ps.video_codec,ps.audio_codec,ps.container_format,ps.resolution_width,ps.resolution_height,ps.source_status,ps.codec_verification_status,ps.last_error_code,ps.expires_at::text AS expires_at,(ps.expires_at IS NULL OR ps.expires_at>now()) AS source_not_expired FROM provider_sources ps JOIN provider_registry pr ON pr.id=ps.provider_id WHERE ps.title_id=$1::text::uuid AND ps.source_status NOT IN('blocked','invalid') AND (ps.expires_at IS NULL OR ps.expires_at>now()) ORDER BY ps.resolution_height DESC NULLS LAST", &[&tid]).await?.iter().map(row_json).filter(source_is_playback_eligible).collect()
+        } else {
+            Vec::new()
+        };
         Ok(Some(CatalogDetail {
-            title: title_from_row(&r),
+            title,
             alternative_titles: alternatives,
             genres,
             provider_mappings: providers,
             seasons,
+            sources,
         }))
     }
     pub async fn list_genres(
@@ -633,7 +647,7 @@ impl CatalogStore {
             .collect())
     }
     pub async fn get_source(&self, id: &str) -> Result<Option<Value>, CatalogError> {
-        let r=self.client.lock().await.query_opt("SELECT ps.id::text AS id,ps.episode_id::text AS episode_id,ps.provider_source_id,pr.provider_key,ps.source_reference,ps.quality_label,ps.video_codec,ps.audio_codec,ps.container_format,ps.resolution_width,ps.resolution_height,ps.source_status,ps.codec_verification_status,ps.last_error_code,ps.expires_at::text AS expires_at,(ps.expires_at IS NULL OR ps.expires_at>now()) AS source_not_expired FROM provider_sources ps JOIN provider_registry pr ON pr.id=ps.provider_id WHERE ps.id::text=$1", &[&id]).await?;
+        let r=self.client.lock().await.query_opt("SELECT ps.id::text AS id,ps.episode_id::text AS episode_id,ps.title_id::text AS title_id,ps.provider_source_id,pr.provider_key,ps.source_reference,ps.quality_label,ps.video_codec,ps.audio_codec,ps.container_format,ps.resolution_width,ps.resolution_height,ps.source_status,ps.codec_verification_status,ps.last_error_code,ps.expires_at::text AS expires_at,(ps.expires_at IS NULL OR ps.expires_at>now()) AS source_not_expired FROM provider_sources ps JOIN provider_registry pr ON pr.id=ps.provider_id WHERE ps.id::text=$1", &[&id]).await?;
         Ok(r.as_ref().map(|row| {
             let mut source = row_json(row);
             let eligible = source_is_playback_eligible(&source);
@@ -653,7 +667,7 @@ impl CatalogStore {
         let transaction = client.transaction().await?;
         let candidate = transaction
             .query_opt(
-                "SELECT ps.id::text AS source_id,ps.provider_source_id,ps.source_identity_fingerprint,epm.provider_episode_id FROM provider_sources ps JOIN provider_registry pr ON pr.id=ps.provider_id JOIN episode_provider_mappings epm ON epm.episode_id=ps.episode_id AND epm.provider_id=ps.provider_id LEFT JOIN catalog_codec_verification_jobs j ON j.source_id=ps.id WHERE pr.provider_key='fourkhdhub' AND ps.source_status IN ('active','playable') AND ps.codec_verification_status='unverified' AND (ps.expires_at IS NULL OR ps.expires_at>now()) AND (j.source_id IS NULL OR (j.status='pending' AND j.next_attempt_at<=now()) OR (j.status='running' AND j.lease_until<=now())) ORDER BY COALESCE(j.next_attempt_at,ps.created_at),ps.created_at LIMIT 1 FOR UPDATE OF ps SKIP LOCKED",
+                "SELECT ps.id::text AS source_id,ps.provider_source_id,ps.source_identity_fingerprint,COALESCE(pt.provider_title_id,epm.provider_episode_id) AS provider_content_id,CASE WHEN ps.title_id IS NOT NULL THEN 'movie' ELSE ct.content_type END AS content_type FROM provider_sources ps JOIN provider_registry pr ON pr.id=ps.provider_id LEFT JOIN episode_provider_mappings epm ON epm.episode_id=ps.episode_id AND epm.provider_id=ps.provider_id LEFT JOIN episodes e ON e.id=ps.episode_id LEFT JOIN catalog_titles ct ON ct.id=COALESCE(ps.title_id,e.title_id) LEFT JOIN provider_titles pt ON pt.title_id=ps.title_id AND pt.provider_id=ps.provider_id LEFT JOIN catalog_codec_verification_jobs j ON j.source_id=ps.id WHERE pr.provider_key='fourkhdhub' AND ps.source_status IN ('active','playable') AND ps.codec_verification_status='unverified' AND (ps.expires_at IS NULL OR ps.expires_at>now()) AND ((ps.episode_id IS NOT NULL AND epm.provider_episode_id IS NOT NULL) OR (ps.title_id IS NOT NULL AND ct.content_type='movie' AND pt.provider_title_id IS NOT NULL AND pt.match_status='verified')) AND (j.source_id IS NULL OR (j.status='pending' AND j.next_attempt_at<=now()) OR (j.status='running' AND j.lease_until<=now())) ORDER BY COALESCE(j.next_attempt_at,ps.created_at),ps.created_at LIMIT 1 FOR UPDATE OF ps SKIP LOCKED",
                 &[],
             )
             .await?;
@@ -664,7 +678,8 @@ impl CatalogStore {
         let source_id: String = candidate.get("source_id");
         let provider_source_id: String = candidate.get("provider_source_id");
         let identity_fingerprint: String = candidate.get("source_identity_fingerprint");
-        let provider_episode_id: String = candidate.get("provider_episode_id");
+        let provider_content_id: String = candidate.get("provider_content_id");
+        let content_type: String = candidate.get("content_type");
         let lease = transaction
             .query_one(
                 "INSERT INTO catalog_codec_verification_jobs(source_id,status,attempt_count,next_attempt_at,lease_until,lease_token,updated_at) VALUES($1::text::uuid,'running',1,now(),now()+make_interval(secs=>$2),gen_random_uuid(),now()) ON CONFLICT(source_id) DO UPDATE SET status='running',attempt_count=catalog_codec_verification_jobs.attempt_count+1,lease_until=EXCLUDED.lease_until,lease_token=EXCLUDED.lease_token,last_error_code=NULL,updated_at=now() RETURNING lease_token,attempt_count",
@@ -674,7 +689,8 @@ impl CatalogStore {
         let job = CodecVerificationJob {
             source_id,
             provider_source_id,
-            provider_episode_id,
+            provider_content_id,
+            content_type,
             identity_fingerprint,
             lease_token: lease.get("lease_token"),
             attempt_count: lease.get("attempt_count"),
@@ -702,8 +718,8 @@ impl CatalogStore {
         let transaction = client.transaction().await?;
         let updated = transaction
             .execute(
-                "UPDATE provider_sources SET video_codec=$4,codec_verification_status=$5,last_validated_at=now(),last_error_code=NULL,updated_at=now() WHERE id=$1::text::uuid AND provider_source_id=$2 AND source_identity_fingerprint=$3 AND source_status IN ('active','playable') AND codec_verification_status='unverified' AND (expires_at IS NULL OR expires_at>now()) AND EXISTS(SELECT 1 FROM episode_provider_mappings epm WHERE epm.episode_id=provider_sources.episode_id AND epm.provider_id=provider_sources.provider_id AND epm.provider_episode_id=$6) AND EXISTS(SELECT 1 FROM catalog_codec_verification_jobs j WHERE j.source_id=provider_sources.id AND j.status='running' AND j.lease_token=$7 AND j.lease_until>now())",
-                &[&job.source_id, &job.provider_source_id, &job.identity_fingerprint, &normalized, &verification_status, &job.provider_episode_id, &job.lease_token],
+                "UPDATE provider_sources SET video_codec=$4,codec_verification_status=$5,last_validated_at=now(),last_error_code=NULL,updated_at=now() WHERE id=$1::text::uuid AND provider_source_id=$2 AND source_identity_fingerprint=$3 AND source_status IN ('active','playable') AND codec_verification_status='unverified' AND (expires_at IS NULL OR expires_at>now()) AND (($6='movie' AND provider_sources.title_id IS NOT NULL AND EXISTS(SELECT 1 FROM provider_titles pt WHERE pt.title_id=provider_sources.title_id AND pt.provider_id=provider_sources.provider_id AND pt.provider_title_id=$7 AND pt.match_status='verified')) OR ($6<>'movie' AND provider_sources.episode_id IS NOT NULL AND EXISTS(SELECT 1 FROM episode_provider_mappings epm WHERE epm.episode_id=provider_sources.episode_id AND epm.provider_id=provider_sources.provider_id AND epm.provider_episode_id=$7))) AND EXISTS(SELECT 1 FROM catalog_codec_verification_jobs j WHERE j.source_id=provider_sources.id AND j.status='running' AND j.lease_token=$8 AND j.lease_until>now())",
+                &[&job.source_id, &job.provider_source_id, &job.identity_fingerprint, &normalized, &verification_status, &job.content_type, &job.provider_content_id, &job.lease_token],
             )
             .await?;
         if updated == 1 {
@@ -742,8 +758,8 @@ impl CatalogStore {
         let transaction = client.transaction().await?;
         let updated = transaction
             .execute(
-                "UPDATE provider_sources SET last_error_code=$4 WHERE id=$1::text::uuid AND provider_source_id=$2 AND source_identity_fingerprint=$3 AND source_status IN ('active','playable') AND codec_verification_status='unverified' AND (expires_at IS NULL OR expires_at>now()) AND EXISTS(SELECT 1 FROM episode_provider_mappings epm WHERE epm.episode_id=provider_sources.episode_id AND epm.provider_id=provider_sources.provider_id AND epm.provider_episode_id=$5) AND EXISTS(SELECT 1 FROM catalog_codec_verification_jobs j WHERE j.source_id=provider_sources.id AND j.status='running' AND j.lease_token=$6 AND j.lease_until>now())",
-                &[&job.source_id, &job.provider_source_id, &job.identity_fingerprint, &code, &job.provider_episode_id, &job.lease_token],
+                "UPDATE provider_sources SET last_error_code=$4 WHERE id=$1::text::uuid AND provider_source_id=$2 AND source_identity_fingerprint=$3 AND source_status IN ('active','playable') AND codec_verification_status='unverified' AND (expires_at IS NULL OR expires_at>now()) AND (($5='movie' AND provider_sources.title_id IS NOT NULL AND EXISTS(SELECT 1 FROM provider_titles pt WHERE pt.title_id=provider_sources.title_id AND pt.provider_id=provider_sources.provider_id AND pt.provider_title_id=$6 AND pt.match_status='verified')) OR ($5<>'movie' AND provider_sources.episode_id IS NOT NULL AND EXISTS(SELECT 1 FROM episode_provider_mappings epm WHERE epm.episode_id=provider_sources.episode_id AND epm.provider_id=provider_sources.provider_id AND epm.provider_episode_id=$6))) AND EXISTS(SELECT 1 FROM catalog_codec_verification_jobs j WHERE j.source_id=provider_sources.id AND j.status='running' AND j.lease_token=$7 AND j.lease_until>now())",
+                &[&job.source_id, &job.provider_source_id, &job.identity_fingerprint, &code, &job.content_type, &job.provider_content_id, &job.lease_token],
             )
             .await?;
         if updated == 1 {
@@ -1015,6 +1031,21 @@ async fn import_in_tx(c: &Client, i: &ImportTitle) -> Result<ImportSummary, Cata
             p.metadata.clone()
         };
         c.execute("INSERT INTO provider_titles(title_id,provider_id,provider_title_id,provider_title,provider_url,metadata,match_status,last_checked_at) VALUES($1,$2,$3,$4,$5,$6,'verified',now()) ON CONFLICT(provider_id,provider_title_id) DO UPDATE SET title_id=EXCLUDED.title_id,provider_title=EXCLUDED.provider_title,provider_url=EXCLUDED.provider_url,metadata=EXCLUDED.metadata,match_status='verified',updated_at=now()",&[&title_uuid,&pid_uuid,&p.provider_title_id,&p.provider_title,&p.provider_url,&metadata]).await?;
+        if t.content_type == "movie" {
+            map_movie_sources(
+                c,
+                &title_uuid,
+                &p.sources,
+                &p.provider_key,
+                &pid_uuid,
+                &mut s,
+            )
+            .await?;
+        } else if !p.sources.is_empty() {
+            return Err(CatalogError::Validation(
+                "provider title sources are only valid for movie titles".into(),
+            ));
+        }
         for pe in &p.episodes {
             let season = pe.season_number.unwrap_or(1);
             let ep = pe.provider_episode_number.unwrap_or(1);
@@ -1027,6 +1058,104 @@ async fn import_in_tx(c: &Client, i: &ImportTitle) -> Result<ImportSummary, Cata
     }
     Ok(s)
 }
+async fn map_movie_sources(
+    c: &Client,
+    title_id: &Uuid,
+    sources: &[ProviderSourceInput],
+    provider_key: &str,
+    provider_id: &Uuid,
+    summary: &mut ImportSummary,
+) -> Result<(), CatalogError> {
+    if !sources.is_empty() {
+        let current_source_ids = sources
+            .iter()
+            .map(|source| source.provider_source_id.clone())
+            .collect::<Vec<_>>();
+        c.execute(
+            "UPDATE provider_sources SET source_status='invalid',updated_at=now() WHERE title_id=$1 AND provider_id=$2 AND source_status NOT IN ('blocked','invalid') AND NOT (provider_source_id=ANY($3::text[]))",
+            &[title_id, provider_id, &current_source_ids],
+        )
+        .await?;
+    }
+    for source in sources {
+        ensure_source_owner(
+            c,
+            provider_id,
+            &source.provider_source_id,
+            None,
+            Some(title_id),
+        )
+        .await?;
+        let identity_fingerprint =
+            source_identity_fingerprint(provider_key, provider_id, "movie", title_id, source);
+        let incoming_status = import_source_status(source.source_status.as_deref());
+        let row = c
+            .query_one(
+                "INSERT INTO provider_sources(episode_id,title_id,provider_id,provider_source_id,source_reference,quality_label,video_codec,audio_codec,container_format,resolution_width,resolution_height,source_status,codec_verification_status,expires_at,source_identity_fingerprint) VALUES(NULL,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'unverified',$12::text::timestamptz,$13) ON CONFLICT(provider_id,provider_source_id) DO UPDATE SET episode_id=NULL,title_id=EXCLUDED.title_id,source_reference=EXCLUDED.source_reference,quality_label=EXCLUDED.quality_label,video_codec=CASE WHEN provider_sources.source_identity_fingerprint=EXCLUDED.source_identity_fingerprint AND provider_sources.codec_verification_status IN ('verified','blocked') THEN provider_sources.video_codec ELSE EXCLUDED.video_codec END,audio_codec=EXCLUDED.audio_codec,container_format=EXCLUDED.container_format,resolution_width=EXCLUDED.resolution_width,resolution_height=EXCLUDED.resolution_height,source_status=CASE WHEN provider_sources.source_status IN ('blocked','invalid') THEN provider_sources.source_status ELSE EXCLUDED.source_status END,codec_verification_status=CASE WHEN provider_sources.source_identity_fingerprint=EXCLUDED.source_identity_fingerprint AND provider_sources.codec_verification_status IN ('verified','blocked') THEN provider_sources.codec_verification_status ELSE 'unverified' END,last_validated_at=CASE WHEN provider_sources.source_identity_fingerprint=EXCLUDED.source_identity_fingerprint THEN provider_sources.last_validated_at ELSE NULL END,last_error_code=CASE WHEN provider_sources.source_identity_fingerprint=EXCLUDED.source_identity_fingerprint THEN provider_sources.last_error_code ELSE NULL END,expires_at=EXCLUDED.expires_at,source_identity_fingerprint=EXCLUDED.source_identity_fingerprint,updated_at=now() RETURNING id::text,source_status,codec_verification_status,(expires_at IS NULL OR expires_at>now()) AS source_not_expired",
+                &[title_id, provider_id, &source.provider_source_id, &source.source_reference, &source.quality, &source.codec, &source.audio_codec, &source.container, &source.resolution_width, &source.resolution_height, &incoming_status, &source.expires_at, &identity_fingerprint],
+            )
+            .await?;
+        let source_uuid = parse_uuid(&row.get::<_, String>("id"))?;
+        let stored_status: String = row.get("source_status");
+        let verification_status: String = row.get("codec_verification_status");
+        let not_expired: bool = row.get("source_not_expired");
+        if provider_key == "fourkhdhub"
+            && matches!(stored_status.as_str(), "active" | "playable")
+            && verification_status == "unverified"
+            && not_expired
+        {
+            c.execute(
+                "INSERT INTO catalog_codec_verification_jobs(source_id,status,attempt_count,next_attempt_at,updated_at) VALUES($1,'pending',0,now(),now()) ON CONFLICT(source_id) DO UPDATE SET status='pending',attempt_count=0,next_attempt_at=now(),lease_until=NULL,lease_token=NULL,last_error_code=NULL,updated_at=now() WHERE catalog_codec_verification_jobs.status<>'running",
+                &[&source_uuid],
+            )
+            .await?;
+        }
+        c.execute(
+            "DELETE FROM source_tracks WHERE source_id=$1",
+            &[&source_uuid],
+        )
+        .await?;
+        for (kind, tracks) in [
+            ("audio", &source.audio_tracks),
+            ("subtitle", &source.subtitle_tracks),
+        ] {
+            for track in tracks {
+                let inserted = c.execute("INSERT INTO source_tracks(source_id,track_type,language_code,codec,format,is_default,is_forced,verified,track_metadata) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING", &[&source_uuid,&kind,&track.language_code,&track.codec,&track.format,&track.is_default,&track.is_forced,&track.verified,&track.metadata]).await?;
+                summary.tracks += i64::from(inserted > 0);
+            }
+        }
+        summary.sources += 1;
+    }
+    Ok(())
+}
+
+async fn ensure_source_owner(
+    c: &Client,
+    provider_id: &Uuid,
+    provider_source_id: &str,
+    episode_id: Option<&Uuid>,
+    title_id: Option<&Uuid>,
+) -> Result<(), CatalogError> {
+    if let Some(existing) = c
+        .query_opt(
+            "SELECT episode_id::text AS episode_id,title_id::text AS title_id FROM provider_sources WHERE provider_id=$1 AND provider_source_id=$2",
+            &[provider_id, &provider_source_id],
+        )
+        .await?
+    {
+        let existing_episode: Option<String> = existing.get("episode_id");
+        let existing_title: Option<String> = existing.get("title_id");
+        if existing_episode.as_deref() != episode_id.map(Uuid::to_string).as_deref()
+            || existing_title.as_deref() != title_id.map(Uuid::to_string).as_deref()
+        {
+            return Err(CatalogError::Validation(
+                "provider source is already associated with different catalog content".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 async fn map_episode(
     c: &Client,
     eid: &str,
@@ -1054,11 +1183,13 @@ async fn map_episode(
         .await?;
     }
     for src in &pe.sources {
-        let identity_fingerprint = source_identity_fingerprint(provider_key, &pid, &eid, src);
+        ensure_source_owner(c, &pid, &src.provider_source_id, Some(&eid), None).await?;
+        let identity_fingerprint =
+            source_identity_fingerprint(provider_key, &pid, "episode", &eid, src);
         let incoming_status = import_source_status(src.source_status.as_deref());
         let r = c
             .query_one(
-                "INSERT INTO provider_sources(episode_id,provider_id,provider_source_id,source_reference,quality_label,video_codec,audio_codec,container_format,resolution_width,resolution_height,source_status,codec_verification_status,expires_at,source_identity_fingerprint) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'unverified',$12::text::timestamptz,$13) ON CONFLICT(provider_id,provider_source_id) DO UPDATE SET episode_id=EXCLUDED.episode_id,source_reference=EXCLUDED.source_reference,quality_label=EXCLUDED.quality_label,video_codec=CASE WHEN provider_sources.source_identity_fingerprint=EXCLUDED.source_identity_fingerprint AND provider_sources.codec_verification_status IN ('verified','blocked') THEN provider_sources.video_codec ELSE EXCLUDED.video_codec END,audio_codec=EXCLUDED.audio_codec,container_format=EXCLUDED.container_format,resolution_width=EXCLUDED.resolution_width,resolution_height=EXCLUDED.resolution_height,source_status=CASE WHEN provider_sources.source_status IN ('blocked','invalid') THEN provider_sources.source_status ELSE EXCLUDED.source_status END,codec_verification_status=CASE WHEN provider_sources.source_identity_fingerprint=EXCLUDED.source_identity_fingerprint AND provider_sources.codec_verification_status IN ('verified','blocked') THEN provider_sources.codec_verification_status ELSE 'unverified' END,last_validated_at=CASE WHEN provider_sources.source_identity_fingerprint=EXCLUDED.source_identity_fingerprint THEN provider_sources.last_validated_at ELSE NULL END,last_error_code=CASE WHEN provider_sources.source_identity_fingerprint=EXCLUDED.source_identity_fingerprint THEN provider_sources.last_error_code ELSE NULL END,expires_at=EXCLUDED.expires_at,source_identity_fingerprint=EXCLUDED.source_identity_fingerprint,updated_at=now() RETURNING id::text,source_status,codec_verification_status,(expires_at IS NULL OR expires_at>now()) AS source_not_expired",
+                "INSERT INTO provider_sources(episode_id,title_id,provider_id,provider_source_id,source_reference,quality_label,video_codec,audio_codec,container_format,resolution_width,resolution_height,source_status,codec_verification_status,expires_at,source_identity_fingerprint) VALUES($1,NULL,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'unverified',$12::text::timestamptz,$13) ON CONFLICT(provider_id,provider_source_id) DO UPDATE SET episode_id=EXCLUDED.episode_id,title_id=NULL,source_reference=EXCLUDED.source_reference,quality_label=EXCLUDED.quality_label,video_codec=CASE WHEN provider_sources.source_identity_fingerprint=EXCLUDED.source_identity_fingerprint AND provider_sources.codec_verification_status IN ('verified','blocked') THEN provider_sources.video_codec ELSE EXCLUDED.video_codec END,audio_codec=EXCLUDED.audio_codec,container_format=EXCLUDED.container_format,resolution_width=EXCLUDED.resolution_width,resolution_height=EXCLUDED.resolution_height,source_status=CASE WHEN provider_sources.source_status IN ('blocked','invalid') THEN provider_sources.source_status ELSE EXCLUDED.source_status END,codec_verification_status=CASE WHEN provider_sources.source_identity_fingerprint=EXCLUDED.source_identity_fingerprint AND provider_sources.codec_verification_status IN ('verified','blocked') THEN provider_sources.codec_verification_status ELSE 'unverified' END,last_validated_at=CASE WHEN provider_sources.source_identity_fingerprint=EXCLUDED.source_identity_fingerprint THEN provider_sources.last_validated_at ELSE NULL END,last_error_code=CASE WHEN provider_sources.source_identity_fingerprint=EXCLUDED.source_identity_fingerprint THEN provider_sources.last_error_code ELSE NULL END,expires_at=EXCLUDED.expires_at,source_identity_fingerprint=EXCLUDED.source_identity_fingerprint,updated_at=now() RETURNING id::text,source_status,codec_verification_status,(expires_at IS NULL OR expires_at>now()) AS source_not_expired",
                 &[&eid,&pid,&src.provider_source_id,&src.source_reference,&src.quality,&src.codec,&src.audio_codec,&src.container,&src.resolution_width,&src.resolution_height,&incoming_status,&src.expires_at,&identity_fingerprint],
             )
             .await?;
@@ -1108,13 +1239,15 @@ fn import_source_status(status: Option<&str>) -> &'static str {
 fn source_identity_fingerprint(
     provider_key: &str,
     provider_id: &Uuid,
-    episode_id: &Uuid,
+    owner_kind: &str,
+    owner_id: &Uuid,
     source: &ProviderSourceInput,
 ) -> String {
     let identity = serde_json::to_vec(&(
         provider_key,
         provider_id.to_string(),
-        episode_id.to_string(),
+        owner_kind,
+        owner_id.to_string(),
         &source.provider_source_id,
         &source.source_reference,
         &source.quality,
@@ -1295,11 +1428,26 @@ mod tests {
             codec: Some("h264".into()),
             ..Default::default()
         };
-        let original =
-            source_identity_fingerprint("fourkhdhub", &provider_id, &episode_id, &source);
+        let original = source_identity_fingerprint(
+            "fourkhdhub",
+            &provider_id,
+            "episode",
+            &episode_id,
+            &source,
+        );
         assert_eq!(
             original,
-            source_identity_fingerprint("fourkhdhub", &provider_id, &episode_id, &source)
+            source_identity_fingerprint(
+                "fourkhdhub",
+                &provider_id,
+                "episode",
+                &episode_id,
+                &source
+            )
+        );
+        assert_ne!(
+            original,
+            source_identity_fingerprint("fourkhdhub", &provider_id, "movie", &episode_id, &source)
         );
         let changed = ProviderSourceInput {
             source_reference: Some("provider-ref-b".into()),
@@ -1307,7 +1455,13 @@ mod tests {
         };
         assert_ne!(
             original,
-            source_identity_fingerprint("fourkhdhub", &provider_id, &episode_id, &changed)
+            source_identity_fingerprint(
+                "fourkhdhub",
+                &provider_id,
+                "episode",
+                &episode_id,
+                &changed
+            )
         );
     }
     #[test]

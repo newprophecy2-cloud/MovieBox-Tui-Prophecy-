@@ -26,6 +26,11 @@ pub struct Config {
     pub vlc_path: Option<String>,
     pub mpv_path: Option<String>,
     pub iina_path: Option<String>,
+    pub media_cache_directory: Option<String>,
+    pub remux_cache_ttl_seconds: u64,
+    pub remux_cache_max_bytes: u64,
+    pub max_concurrent_media_jobs: usize,
+    pub media_job_timeout_seconds: u64,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -49,7 +54,78 @@ impl Default for Config {
             vlc_path: None,
             mpv_path: None,
             iina_path: None,
+            media_cache_directory: None,
+            remux_cache_ttl_seconds: 3_600,
+            remux_cache_max_bytes: 512 * 1024 * 1024,
+            max_concurrent_media_jobs: 1,
+            media_job_timeout_seconds: 1_800,
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct MediaSettings {
+    pub cache_dir: PathBuf,
+    pub cache_ttl: std::time::Duration,
+    pub cache_max_bytes: u64,
+    pub max_concurrent_jobs: usize,
+    pub job_timeout: std::time::Duration,
+}
+
+impl Config {
+    pub fn validate_media_settings(&self) -> Result<MediaSettings, String> {
+        if !(60..=604_800).contains(&self.remux_cache_ttl_seconds) {
+            return Err("remux_cache_ttl_seconds must be between 60 and 604800".into());
+        }
+        if !(1_048_576..=1_099_511_627_776).contains(&self.remux_cache_max_bytes) {
+            return Err("remux_cache_max_bytes must be between 1048576 and 1099511627776".into());
+        }
+        if !(1..=4).contains(&self.max_concurrent_media_jobs) {
+            return Err("max_concurrent_media_jobs must be between 1 and 4".into());
+        }
+        if !(60..=86_400).contains(&self.media_job_timeout_seconds) {
+            return Err("media_job_timeout_seconds must be between 60 and 86400".into());
+        }
+
+        let configured_cache_dir = match self
+            .media_cache_directory
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+        {
+            Some(path) => PathBuf::from(path),
+            None => cache_dir().join("remux"),
+        };
+        if !configured_cache_dir.is_absolute() {
+            return Err("the configured cache directory must be an absolute path".into());
+        }
+        std::fs::create_dir_all(&configured_cache_dir)
+            .map_err(|_| "the configured cache directory cannot be created".to_string())?;
+        let canonical_cache_dir = std::fs::canonicalize(&configured_cache_dir)
+            .map_err(|_| "the configured cache directory cannot be resolved".to_string())?;
+        if !canonical_cache_dir.is_dir() {
+            return Err("the configured cache path is not a directory".into());
+        }
+        let probe_path = canonical_cache_dir.join(format!(
+            ".moviebox-cache-check-{}-{}.tmp",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe_path)
+            .map_err(|_| "the configured cache directory is not writable".to_string())?;
+        std::fs::remove_file(&probe_path)
+            .map_err(|_| "the cache directory write-check file could not be removed".to_string())?;
+
+        Ok(MediaSettings {
+            cache_dir: canonical_cache_dir,
+            cache_ttl: std::time::Duration::from_secs(self.remux_cache_ttl_seconds),
+            cache_max_bytes: self.remux_cache_max_bytes,
+            max_concurrent_jobs: self.max_concurrent_media_jobs,
+            job_timeout: std::time::Duration::from_secs(self.media_job_timeout_seconds),
+        })
     }
 }
 
@@ -362,9 +438,67 @@ mod tests {
         let config = Config::default();
         assert!(config.auto_update);
         assert_eq!(config.active_provider, ProviderKind::MovieBox);
+        assert_eq!(config.remux_cache_ttl_seconds, 3_600);
+        assert_eq!(config.remux_cache_max_bytes, 512 * 1024 * 1024);
+        assert_eq!(config.max_concurrent_media_jobs, 1);
+        assert_eq!(config.media_job_timeout_seconds, 1_800);
 
         let json = serde_json::to_string(&config).expect("serialize");
         let deserialized: Config = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(deserialized.active_mode, config.active_mode);
+        let old_config: Config = serde_json::from_str(r#"{"auto_update":false}"#)
+            .expect("older config without media settings remains compatible");
+        assert_eq!(old_config.remux_cache_ttl_seconds, 3_600);
+    }
+
+    #[test]
+    fn media_settings_validate_and_resolve_existing_cache_root() {
+        let settings = Config::default()
+            .validate_media_settings()
+            .expect("local test cache path is writable");
+        assert!(settings.cache_dir.is_absolute());
+        assert!(settings.cache_dir.ends_with("remux"));
+        assert_eq!(settings.max_concurrent_jobs, 1);
+    }
+
+    #[test]
+    fn media_settings_reject_out_of_range_values() {
+        let mut config = Config::default();
+        config.remux_cache_ttl_seconds = 59;
+        assert!(config.validate_media_settings().is_err());
+
+        let mut config = Config::default();
+        config.remux_cache_max_bytes = 1_048_575;
+        assert!(config.validate_media_settings().is_err());
+
+        let mut config = Config::default();
+        config.max_concurrent_media_jobs = 5;
+        assert!(config.validate_media_settings().is_err());
+
+        let mut config = Config::default();
+        config.media_job_timeout_seconds = 59;
+        assert!(config.validate_media_settings().is_err());
+    }
+
+    #[test]
+    fn media_cache_directory_override_must_be_absolute_and_is_persisted() {
+        let root =
+            std::env::temp_dir().join(format!("moviebox-config-cache-{}", uuid::Uuid::new_v4()));
+        let mut config = Config::default();
+        config.media_cache_directory = Some(root.to_string_lossy().into_owned());
+        let settings = config
+            .validate_media_settings()
+            .expect("absolute override is valid");
+        assert_eq!(settings.cache_dir, std::fs::canonicalize(&root).unwrap());
+
+        let mut invalid = Config::default();
+        invalid.media_cache_directory = Some("relative/cache".into());
+        assert!(
+            invalid
+                .validate_media_settings()
+                .unwrap_err()
+                .contains("absolute path")
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }

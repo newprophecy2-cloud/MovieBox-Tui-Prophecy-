@@ -346,6 +346,7 @@ impl App {
             vlc_path: self.state.vlc_path.clone(),
             mpv_path: self.state.mpv_path.clone(),
             iina_path: self.state.iina_path.clone(),
+            ..crate::tui::config::load()
         };
         crate::tui::config::save(&config);
     }

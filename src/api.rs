@@ -59,11 +59,10 @@ const MAX_REQUEST_BODY_BYTES: usize = 256 * 1024;
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_API_CONNECTIONS: usize = 256;
 const MOVIEBOX_PROVIDER_ENABLED: bool = true;
-const MAX_REMUX_SESSIONS: usize = 2;
 const REMUX_STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
 const REMUX_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(20);
 static REMUX_LIMITER: std::sync::LazyLock<Arc<Semaphore>> =
-    std::sync::LazyLock::new(|| Arc::new(Semaphore::new(MAX_REMUX_SESSIONS)));
+    std::sync::LazyLock::new(|| Arc::new(Semaphore::new(2)));
 static REMUX_DEBUG_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const PROVIDERS: [ProviderKind; 6] = [
     ProviderKind::MovieBox,
@@ -113,7 +112,7 @@ pub struct ApiState {
     search_cache: Arc<Mutex<HashMap<String, SearchCacheEntry>>>,
     redis_search: Option<redis::aio::MultiplexedConnection>,
     search_source_check_slots: Arc<Semaphore>,
-    remux_slots: Arc<Semaphore>,
+    remux_cache: crate::remux_cache::RemuxCache,
     connection_slots: Arc<Semaphore>,
 }
 
@@ -150,6 +149,8 @@ struct OpaqueSource {
     v: String,
     s: usize,
     e: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content_type: Option<String>,
     #[serde(default)]
     f: Option<String>,
     #[serde(default)]
@@ -499,11 +500,20 @@ fn release_fingerprint(r: &Release) -> String {
     URL_SAFE_NO_PAD.encode(hasher.finalize())
 }
 fn source_ref(r: &Release, episode: &OpaqueRef, i: usize) -> String {
+    source_ref_for_content(r, episode, i, None)
+}
+fn source_ref_for_content(
+    r: &Release,
+    episode: &OpaqueRef,
+    i: usize,
+    content_type: Option<&str>,
+) -> String {
     encode(&OpaqueSource {
         p: r.provider,
         v: episode.v.clone(),
         s: episode.s,
         e: episode.e,
+        content_type: content_type.map(str::to_string),
         f: Some(release_fingerprint(r)),
         i,
     })
@@ -580,7 +590,13 @@ fn err(
             provider: provider.map(|p| p.label().to_string()),
             retryable: matches!(
                 code,
-                "PROVIDER_TIMEOUT" | "SOURCE_TIMEOUT" | "UPSTREAM_UNAVAILABLE"
+                "PROVIDER_TIMEOUT"
+                    | "SOURCE_TIMEOUT"
+                    | "UPSTREAM_UNAVAILABLE"
+                    | "REMUX_BUSY"
+                    | "MEDIA_CACHE_FULL"
+                    | "MEDIA_CACHE_IO_ERROR"
+                    | "REMUX_TIMEOUT"
             ),
             request_id: request_id(),
         },
@@ -676,9 +692,33 @@ async fn init_redis_search_cache() -> Option<redis::aio::MultiplexedConnection> 
 }
 
 pub async fn run() -> std::io::Result<()> {
-    if let Err(error) = crate::remux_cache::clear_legacy_cache().await {
-        log::warn!("could not remove legacy persistent remux cache: {error}");
-    }
+    let media_settings = crate::config::load()
+        .validate_media_settings()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let cache_ttl_seconds = media_settings.cache_ttl.as_secs();
+    let cache_max_bytes = media_settings.cache_max_bytes;
+    let max_media_jobs = media_settings.max_concurrent_jobs;
+    let media_job_timeout_seconds = media_settings.job_timeout.as_secs();
+    let remux_cache = crate::remux_cache::RemuxCache::open(media_settings)
+        .await
+        .map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("could not initialize temporary media cache: {error}"),
+            )
+        })?;
+    let janitor_cache = remux_cache.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            if let Err(error) = janitor_cache.cleanup_expired().await {
+                log::warn!("temporary media cache cleanup failed: {error}");
+            }
+        }
+    });
+    log::info!(
+        "temporary media cache initialized ttl_seconds={cache_ttl_seconds} max_bytes={cache_max_bytes} max_concurrent_jobs={max_media_jobs} job_timeout_seconds={media_job_timeout_seconds}; capacity is not production-validated"
+    );
     let port = std::env::var("PORT")
         .unwrap_or_else(|_| "8080".into())
         .parse::<u16>()
@@ -707,7 +747,7 @@ pub async fn run() -> std::io::Result<()> {
         search_cache: Arc::new(Mutex::new(HashMap::new())),
         redis_search,
         search_source_check_slots: Arc::new(Semaphore::new(SEARCH_SOURCE_CHECK_CONCURRENCY)),
-        remux_slots: Arc::new(Semaphore::new(MAX_REMUX_SESSIONS)),
+        remux_cache,
         connection_slots: Arc::new(Semaphore::new(MAX_API_CONNECTIONS)),
     };
     start_codec_verification_workers(state.clone());
@@ -927,7 +967,9 @@ async fn route(
         _ if path.starts_with("/api/v1/catalog/sources/") => catalog_source_route(stream, path, state).await,
         _ if path.starts_with("/api/v1/catalog/titles/") => catalog_title_detail_route(stream, path, state).await,
         "/api/v1/diagnostics" => diagnostics_route(stream, state).await,
-        "/api/stream-proxy" => stream_proxy_route(stream, query, request_headers, head_only).await,
+        "/api/stream-proxy" => {
+            stream_proxy_route(stream, query, state, request_headers, head_only).await
+        }
         "/api/media-info" => media_info_route(stream, query, request_headers).await,
         "/api/subtitles/extract" => subtitle_extract_route(stream, query, request_headers).await,
         "/api/pretranscode/start" => pretranscode_unavailable(stream, 501).await,
@@ -1295,8 +1337,21 @@ fn catalog_live_source_path(
             400,
         ));
     };
+    let title_owned = source
+        .get("title_id")
+        .and_then(serde_json::Value::as_str)
+        .is_some();
     match parse_source(id) {
-        Ok(reference) if reference.p == ProviderKind::FourKHdHub => {
+        Ok(reference)
+            if reference.p == ProviderKind::FourKHdHub
+                && if title_owned {
+                    reference.content_type.as_deref() == Some("movie")
+                        && reference.s == 0
+                        && reference.e == 0
+                } else {
+                    reference.content_type.is_none()
+                } =>
+        {
             Ok(Some(format!("/api/v1/sources/{id}/{action}")))
         }
         _ => Err(err(
@@ -1991,19 +2046,41 @@ async fn verify_catalog_source(
     if source_ref.f.is_none() {
         return Err(("SOURCE_MAPPING_INVALID", false));
     }
-    let episode_ref = decode::<OpaqueRef>(&job.provider_episode_id)
-        .map_err(|_| ("SOURCE_MAPPING_INVALID", false))?;
-    if source_ref.p != ProviderKind::FourKHdHub
-        || episode_ref.p != ProviderKind::FourKHdHub
-        || source_ref.p != episode_ref.p
-        || source_ref.v != episode_ref.v
-        || source_ref.s != episode_ref.s
-        || source_ref.e != episode_ref.e
-    {
+    if source_ref.p != ProviderKind::FourKHdHub {
         return Err(("SOURCE_MAPPING_INVALID", false));
     }
+    let provider_ref = match job.content_type.as_str() {
+        "movie"
+            if source_ref.content_type.as_deref() == Some("movie")
+                && source_ref.s == 0
+                && source_ref.e == 0
+                && source_ref.v == job.provider_content_id =>
+        {
+            OpaqueRef {
+                p: source_ref.p,
+                v: job.provider_content_id.clone(),
+                s: 0,
+                e: 0,
+            }
+        }
+        "movie" => return Err(("SOURCE_MAPPING_INVALID", false)),
+        _ => {
+            let episode_ref = decode::<OpaqueRef>(&job.provider_content_id)
+                .map_err(|_| ("SOURCE_MAPPING_INVALID", false))?;
+            if source_ref.content_type.is_some()
+                || episode_ref.p != ProviderKind::FourKHdHub
+                || source_ref.p != episode_ref.p
+                || source_ref.v != episode_ref.v
+                || source_ref.s != episode_ref.s
+                || source_ref.e != episode_ref.e
+            {
+                return Err(("SOURCE_MAPPING_INVALID", false));
+            }
+            episode_ref
+        }
+    };
     let releases =
-        match tokio::time::timeout(SOURCE_TIMEOUT, cached_releases(state, &episode_ref)).await {
+        match tokio::time::timeout(SOURCE_TIMEOUT, cached_releases(state, &provider_ref)).await {
             Ok(Ok(releases)) => releases,
             Ok(Err(_)) => return Err(("PROVIDER_RESOLUTION_FAILED", true)),
             Err(_) => return Err(("PROVIDER_RESOLUTION_TIMEOUT", true)),
@@ -2027,6 +2104,10 @@ async fn verify_catalog_source(
         Ok(Err(_)) => return Err(("PROVIDER_RESOLUTION_FAILED", true)),
         Err(_) => return Err(("PROVIDER_RESOLUTION_TIMEOUT", true)),
     };
+    let _media_job = state
+        .remux_cache
+        .try_acquire_job()
+        .map_err(|_| ("REMUX_BUSY", true))?;
     crate::codec_verification::verify_playback_source(&playback)
         .await
         .map_err(|error| (error.code(), error.retryable()))
@@ -2187,6 +2268,7 @@ async fn admin_catalog_import_by_name_route(
                 provider_url: None,
                 metadata: serde_json::json!({"import_source":"anime_import_by_name","season_count":details.seasons.len()}),
                 episodes: Vec::new(),
+                sources: Vec::new(),
             }],
             seasons: details
                 .seasons
@@ -2373,6 +2455,7 @@ async fn admin_catalog_import_by_name_route(
             provider_url: None,
             metadata,
             episodes: provider_episodes,
+            sources: Vec::new(),
         }],
         seasons,
     };
@@ -3251,11 +3334,13 @@ async fn direct_watch_route(
                         // MovieBox-Tui can expose dual/multi-audio streams without a Hindi tag.
                         let anime_id = encode(&anime_ref);
                         let episode_id = provider_ref(&anime_details.id, season, episode);
-                        return anime_episode_stream_route(
+                        return playback_route(
                             stream,
-                            &anime_id,
-                            &episode_id,
-                            anime_ref,
+                            PlaybackIdentity::Episode {
+                                anime_id,
+                                episode_id,
+                                anime_ref,
+                            },
                             anime_details,
                             state,
                             &audio,
@@ -3771,21 +3856,29 @@ async fn movie_route(
     if parts.len() == 4 {
         return write_json(stream, 200, &details(details_result), None).await;
     }
-    let movie_ref = OpaqueRef {
-        p: r.p,
-        v: r.v.clone(),
-        s: 0,
-        e: 0,
+    let movie_ref = MovieIdentity {
+        provider: r.p,
+        provider_id: r.v.clone(),
     };
+    let provider_lookup_ref = movie_ref.provider_lookup_ref();
     match parts.get(4).copied() {
         Some("sources") => {
-            match tokio::time::timeout(OVERALL_TIMEOUT, cached_releases(&state, &movie_ref)).await {
+            match tokio::time::timeout(
+                OVERALL_TIMEOUT,
+                cached_releases(&state, &provider_lookup_ref),
+            )
+            .await
+            {
                 Ok(Ok(releases)) => {
                     write_json(
                         stream,
                         200,
                         &SourcesResponse {
-                            sources: api_sources(&releases, &movie_ref),
+                            sources: api_sources_for_content(
+                                &releases,
+                                &provider_lookup_ref,
+                                Some("movie"),
+                            ),
                             partial: false,
                         },
                         None,
@@ -3808,24 +3901,13 @@ async fn movie_route(
             }
         }
         Some("stream") | Some("playback") => {
-            // Reuse the tested episode playback path with the provider's movie sentinel (s=0,e=0).
-            let mut playable_details = details_result;
-            playable_details.seasons = vec![Season {
-                number: 0,
-                episodes: vec![crate::providers::models::Episode {
-                    season: 0,
-                    number: 0,
-                    title: Some(playable_details.title.clone()),
-                    overview: playable_details.description.clone(),
-                }],
-            }];
-            let encoded_movie = encode(&movie_ref);
-            anime_episode_stream_route(
+            playback_route(
                 stream,
-                &encoded_movie,
-                &encoded_movie,
-                movie_ref,
-                playable_details,
+                PlaybackIdentity::Movie {
+                    movie_id: parts[3].to_string(),
+                    movie_ref,
+                },
+                details_result,
                 state,
                 "auto",
             )
@@ -3888,7 +3970,18 @@ async fn anime_route(
             );
             return write_raw_json(stream, status, &body, None).await;
         }
-        return anime_episode_stream_route(stream, parts[3], parts[5], r, d, state, &audio).await;
+        return playback_route(
+            stream,
+            PlaybackIdentity::Episode {
+                anime_id: parts[3].to_string(),
+                episode_id: parts[5].to_string(),
+                anime_ref: r,
+            },
+            d,
+            state,
+            &audio,
+        )
+        .await;
     }
     if parts[4] == "episodes" {
         if parts.len() == 5 {
@@ -3943,76 +4036,170 @@ async fn anime_route(
     write_raw_json(stream, s, &b, None).await
 }
 
-async fn anime_episode_stream_route(
+#[derive(Clone)]
+struct MovieIdentity {
+    provider: ProviderKind,
+    provider_id: String,
+}
+
+impl MovieIdentity {
+    fn provider_lookup_ref(&self) -> OpaqueRef {
+        // The current provider API exposes only `episode_streams`; the MovieBox
+        // adapter's movie play-info protocol is selected by (0, 0). This is
+        // provider transport data, not a catalog season or episode identity.
+        OpaqueRef {
+            p: self.provider,
+            v: self.provider_id.clone(),
+            s: 0,
+            e: 0,
+        }
+    }
+}
+
+enum PlaybackIdentity {
+    Movie {
+        movie_id: String,
+        movie_ref: MovieIdentity,
+    },
+    Episode {
+        anime_id: String,
+        episode_id: String,
+        anime_ref: OpaqueRef,
+    },
+}
+
+impl PlaybackIdentity {
+    fn add_response_fields(&self, object: &mut serde_json::Map<String, serde_json::Value>) {
+        match self {
+            Self::Movie { movie_id, .. } => {
+                object.insert("movie_id".into(), serde_json::json!(movie_id));
+            }
+            Self::Episode {
+                anime_id,
+                episode_id,
+                ..
+            } => {
+                object.insert("anime_id".into(), serde_json::json!(anime_id));
+                object.insert("episode_id".into(), serde_json::json!(episode_id));
+            }
+        }
+    }
+
+    fn content_label(&self) -> &'static str {
+        match self {
+            Self::Movie { .. } => "movie",
+            Self::Episode { .. } => "episode",
+        }
+    }
+}
+
+fn source_remux_url(source_id: &str) -> String {
+    format!("/api/v1/sources/{source_id}/remux")
+}
+
+async fn playback_route(
     stream: &mut TcpStream,
-    anime_id: &str,
-    episode_id: &str,
-    anime_ref: OpaqueRef,
-    anime_details: MediaDetails,
+    identity: PlaybackIdentity,
+    media_details: MediaDetails,
     state: ApiState,
     requested_audio: &str,
 ) -> std::io::Result<()> {
-    let episode_ref = match decode::<OpaqueRef>(episode_id) {
-        Ok(reference) => reference,
-        Err(_) => {
-            let (status, body) = err(
-                "INVALID_ID",
-                "The episode identifier is invalid.",
-                None,
-                400,
-            );
-            return write_raw_json(stream, status, &body, None).await;
+    let source_ref = match &identity {
+        PlaybackIdentity::Episode {
+            anime_id,
+            episode_id,
+            anime_ref,
+        } => {
+            let episode_ref = match decode::<OpaqueRef>(episode_id) {
+                Ok(reference) => reference,
+                Err(_) => {
+                    let (status, body) = err(
+                        "INVALID_ID",
+                        "The episode identifier is invalid.",
+                        None,
+                        400,
+                    );
+                    return write_raw_json(stream, status, &body, None).await;
+                }
+            };
+            if episode_ref.p != anime_ref.p
+                || episode_ref.v != anime_ref.v
+                || media_details.id.value != anime_ref.v
+            {
+                let (status, body) = err(
+                    "INVALID_ID",
+                    "The episode does not belong to the requested anime.",
+                    Some(anime_ref.p),
+                    400,
+                );
+                return write_raw_json(stream, status, &body, None).await;
+            }
+            if media_details.id.provider != anime_ref.p || encode(anime_ref) != *anime_id {
+                let (status, body) = err(
+                    "INVALID_ID",
+                    "The anime identifier does not match the requested item.",
+                    Some(anime_ref.p),
+                    400,
+                );
+                return write_raw_json(stream, status, &body, None).await;
+            }
+            let episode_exists = media_details.seasons.iter().any(|season| {
+                season.number == episode_ref.s
+                    && season
+                        .episodes
+                        .iter()
+                        .any(|episode| episode.number == episode_ref.e)
+            });
+            if !episode_exists {
+                let (status, body) = err(
+                    "EPISODE_NOT_FOUND",
+                    "The episode was not found in this anime.",
+                    Some(anime_ref.p),
+                    404,
+                );
+                return write_raw_json(stream, status, &body, None).await;
+            }
+            episode_ref
+        }
+        PlaybackIdentity::Movie {
+            movie_id,
+            movie_ref,
+        } => {
+            let transport_ref = decode::<OpaqueRef>(movie_id).ok();
+            if media_details.media_type != MediaType::Movie
+                || media_details.id.provider != movie_ref.provider
+                || media_details.id.value != movie_ref.provider_id
+                || !transport_ref.as_ref().is_some_and(|reference| {
+                    reference.p == movie_ref.provider
+                        && reference.v == movie_ref.provider_id
+                        && reference.s == 0
+                        && reference.e == 0
+                })
+            {
+                let (status, body) = err(
+                    "INVALID_ID",
+                    "The movie identifier does not match the requested movie.",
+                    Some(movie_ref.provider),
+                    400,
+                );
+                return write_raw_json(stream, status, &body, None).await;
+            }
+            movie_ref.provider_lookup_ref()
         }
     };
-    if episode_ref.p != anime_ref.p
-        || episode_ref.v != anime_ref.v
-        || anime_details.id.value != anime_ref.v
-    {
-        let (status, body) = err(
-            "INVALID_ID",
-            "The episode does not belong to the requested anime.",
-            Some(anime_ref.p),
-            400,
-        );
-        return write_raw_json(stream, status, &body, None).await;
-    }
-    if anime_details.id.provider != anime_ref.p || encode(&anime_ref) != anime_id {
-        let (status, body) = err(
-            "INVALID_ID",
-            "The anime identifier does not match the requested item.",
-            Some(anime_ref.p),
-            400,
-        );
-        return write_raw_json(stream, status, &body, None).await;
-    }
-    let episode_exists = anime_details.seasons.iter().any(|season| {
-        season.number == episode_ref.s
-            && season
-                .episodes
-                .iter()
-                .any(|episode| episode.number == episode_ref.e)
-    });
-    if !episode_exists {
-        let (status, body) = err(
-            "EPISODE_NOT_FOUND",
-            "The episode was not found in this anime.",
-            Some(anime_ref.p),
-            404,
-        );
-        return write_raw_json(stream, status, &body, None).await;
-    }
+    let content_label = identity.content_label();
     let releases =
-        match tokio::time::timeout(OVERALL_TIMEOUT, cached_releases(&state, &episode_ref)).await {
+        match tokio::time::timeout(OVERALL_TIMEOUT, cached_releases(&state, &source_ref)).await {
             Ok(Ok(releases)) => releases,
             Ok(Err(error)) => {
-                let (status, body) = provider_error(error, episode_ref.p);
+                let (status, body) = provider_error(error, source_ref.p);
                 return write_raw_json(stream, status, &body, None).await;
             }
             Err(_) => {
                 let (status, body) = err(
                     "REQUEST_DEADLINE_EXCEEDED",
                     "The stream source request timed out.",
-                    Some(episode_ref.p),
+                    Some(source_ref.p),
                     504,
                 );
                 return write_raw_json(stream, status, &body, None).await;
@@ -4031,15 +4218,13 @@ async fn anime_episode_stream_route(
         .filter(|release| release_has_usable_source(release))
         .collect::<Vec<_>>();
     if let Some((code, message)) = codec_ineligibility_error(&releases) {
-        let (status, body) = err(code, message, Some(episode_ref.p), 415);
+        let (status, body) = err(code, message, Some(source_ref.p), 415);
         return write_raw_json(stream, status, &body, None).await;
     }
     let mut candidates: Vec<&Release> = codec_eligible_releases
         .iter()
         .copied()
-        .filter(|release| {
-            release.language.as_deref().is_some_and(is_hindi) || is_hindi(&release.filename)
-        })
+        .filter(|release| release.language.as_deref().is_some_and(is_hindi))
         .collect();
     let language_metadata_match = !candidates.is_empty();
     // Dual/multi-audio sources may have no language tag until the actual media is probed.
@@ -4050,11 +4235,29 @@ async fn anime_episode_stream_route(
     let Some(release) = candidates.first().copied() else {
         let (status, body) = err(
             "NO_STREAM_SOURCE",
-            "The provider returned no stream sources for this episode.",
-            Some(episode_ref.p),
+            format!("The provider returned no stream sources for this {content_label}."),
+            Some(source_ref.p),
             404,
         );
         return write_raw_json(stream, status, &body, None).await;
+    };
+    let source_id = match api_sources_for_content(
+        std::slice::from_ref(release),
+        &source_ref,
+        Some(content_label),
+    )
+    .first()
+    {
+        Some(source) => source.id.clone(),
+        None => {
+            let (status, body) = err(
+                "NO_STREAM_SOURCE",
+                "The selected source cannot be represented as a verified playback source.",
+                Some(release.provider),
+                404,
+            );
+            return write_raw_json(stream, status, &body, None).await;
+        }
     };
     let playback = if release.provider == ProviderKind::FourKHdHub {
         let Some(client) = state.service.fourk_client.as_ref() else {
@@ -4122,7 +4325,7 @@ async fn anime_episode_stream_route(
     };
     // Probe the resolved source for real audio tracks when possible. A failed probe
     // must not block playback (some HLS/DASH providers prevent ffprobe access).
-    let audio_tracks = match probe_media(&playback.url, &playback.headers).await {
+    let audio_tracks = match probe_media_bounded(&state, &playback.url, &playback.headers).await {
         Ok(probe) => probe
             .streams
             .into_iter()
@@ -4152,10 +4355,12 @@ async fn anime_episode_stream_route(
             .collect::<Vec<_>>(),
         Err(_) => Vec::new(),
     };
+    let mut playback = playback;
+    playback.url = source_remux_url(&source_id);
+    playback.headers.clear();
     let mut body = playback_json(&playback);
     if let Some(object) = body.as_object_mut() {
-        object.insert("anime_id".into(), serde_json::json!(anime_id));
-        object.insert("episode_id".into(), serde_json::json!(episode_id));
+        identity.add_response_fields(object);
         object.insert("audio_requested".into(), serde_json::json!(requested_audio));
         object.insert("audio_tracks".into(), serde_json::json!(audio_tracks));
         object.insert(
@@ -4384,13 +4589,20 @@ async fn releases_uncached(state: &ApiState, r: &OpaqueRef) -> Result<Vec<Releas
     }
 }
 fn api_sources(rs: &[Release], episode: &OpaqueRef) -> Vec<ApiSource> {
+    api_sources_for_content(rs, episode, None)
+}
+fn api_sources_for_content(
+    rs: &[Release],
+    episode: &OpaqueRef,
+    content_type: Option<&str>,
+) -> Vec<ApiSource> {
     rs.iter()
         .enumerate()
         .filter(|(_, release)| {
             source_codec_eligibility(release.codec.as_deref()) == SourceCodecEligibility::Verified
         })
         .map(|(i, r)| ApiSource {
-            id: source_ref(r, episode, i),
+            id: source_ref_for_content(r, episode, i, content_type),
             label: r.source_label().to_string(),
             quality: r.quality.clone(),
             codec: r.codec.clone(),
@@ -4564,6 +4776,18 @@ async fn probe_media(url: &str, headers: &[(String, String)]) -> Result<ProbeOut
     probe_media_validated(&validated_url, headers).await
 }
 
+async fn probe_media_bounded(
+    state: &ApiState,
+    url: &str,
+    headers: &[(String, String)],
+) -> Result<ProbeOutput, String> {
+    let _permit = state
+        .remux_cache
+        .try_acquire_job()
+        .map_err(|_| "Media-processing capacity is busy.".to_string())?;
+    probe_media(url, headers).await
+}
+
 async fn probe_media_validated(
     url: &reqwest::Url,
     headers: &[(String, String)],
@@ -4677,7 +4901,7 @@ async fn write_track_response(
             .unwrap_or_default();
         (url.to_string(), headers)
     };
-    let probe = match probe_media(&url, &headers).await {
+    let probe = match probe_media_bounded(state, &url, &headers).await {
         Ok(probe) => probe,
         Err(message) => {
             let (s, b) = err("TRACK_DISCOVERY_UNAVAILABLE", message, Some(provider), 503);
@@ -5020,9 +5244,24 @@ async fn write_verified_playback_response(
             return write_raw_json(stream, status, &body, None).await;
         }
     };
+    let _media_job = match state.remux_cache.try_acquire_job() {
+        Ok(permit) => permit,
+        Err(_) => {
+            let (status, body) = err(
+                "REMUX_BUSY",
+                "Media-processing capacity is busy.",
+                Some(provider),
+                429,
+            );
+            return write_raw_json(stream, status, &body, None).await;
+        }
+    };
     match crate::codec_verification::verify_playback_source(&playback).await {
         Ok(crate::codec_verification::CodecProbeResult::Allowed(_)) => {
-            write_json(stream, 200, &playback_json(&playback), None).await
+            let mut backend_playback = playback;
+            backend_playback.url = source_remux_url(source_id);
+            backend_playback.headers.clear();
+            write_json(stream, 200, &playback_json(&backend_playback), None).await
         }
         Ok(crate::codec_verification::CodecProbeResult::BlockedHevc(_)) => {
             let (status, body) = err(
@@ -5327,6 +5566,336 @@ fn browser_mp4_streams_compatible(streams: &[ProbeStream]) -> bool {
             .all(|stream| stream.codec_name.as_deref() == Some("aac"))
 }
 
+const REMUX_OUTPUT_PROFILE: &str = "mp4-faststart-h264-copy-aac-192k-stereo-v1";
+
+async fn has_faststart_mp4_index(path: &std::path::Path) -> std::io::Result<bool> {
+    use tokio::io::AsyncSeekExt;
+
+    let mut file = tokio::fs::File::open(path).await?;
+    let length = file.metadata().await?.len();
+    let mut offset = 0u64;
+    let mut saw_ftyp = false;
+    let mut saw_moov = false;
+    for _ in 0..256 {
+        if offset.saturating_add(8) > length {
+            return Ok(false);
+        }
+        file.seek(std::io::SeekFrom::Start(offset)).await?;
+        let mut header = [0u8; 16];
+        file.read_exact(&mut header[..8]).await?;
+        let size32 = u32::from_be_bytes(header[..4].try_into().unwrap()) as u64;
+        let atom_type: [u8; 4] = header[4..8].try_into().unwrap();
+        let (atom_size, header_size) = match size32 {
+            0 => (length - offset, 8u64),
+            1 => {
+                if offset.saturating_add(16) > length {
+                    return Ok(false);
+                }
+                file.read_exact(&mut header[8..16]).await?;
+                (u64::from_be_bytes(header[8..16].try_into().unwrap()), 16u64)
+            }
+            size => (size, 8u64),
+        };
+        if atom_size < header_size || offset.saturating_add(atom_size) > length {
+            return Ok(false);
+        }
+        match &atom_type {
+            b"ftyp" => saw_ftyp = true,
+            b"moov" => saw_moov = true,
+            b"mdat" => return Ok(saw_ftyp && saw_moov),
+            _ => {}
+        }
+        offset += atom_size;
+    }
+    Ok(false)
+}
+
+async fn build_cached_mp4(
+    cache: crate::remux_cache::RemuxCache,
+    cache_key: String,
+    url: reqwest::Url,
+    headers: Vec<(String, String)>,
+    partial_path: std::path::PathBuf,
+    verify_input_codec: bool,
+    run_preflight: bool,
+) -> Result<f64, crate::remux_cache::CacheError> {
+    use crate::remux_cache::CacheError;
+    let deadline = Instant::now() + cache.job_timeout();
+    let job_deadline = tokio::time::Instant::from_std(deadline);
+
+    if verify_input_codec {
+        let referer = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("referer"))
+            .map(|(_, value)| value.as_str());
+        match tokio::time::timeout_at(job_deadline, verify_generic_media_codec(&url, referer))
+            .await
+            .map_err(|_| CacheError::Build("media codec probe timed out".into()))?
+        {
+            Ok(SourceCodecEligibility::Verified) => {}
+            Ok(SourceCodecEligibility::BlockedH265) => return Err(CacheError::BlockedCodec),
+            Ok(SourceCodecEligibility::Unverified) | Err(_) => {
+                return Err(CacheError::UnverifiedCodec);
+            }
+        }
+    }
+    if run_preflight {
+        let preflight =
+            tokio::time::timeout_at(job_deadline, validated_remux_preflight(&url, &headers))
+                .await
+                .map_err(|_| CacheError::Build("media remux preflight timed out".into()))?;
+        if !preflight {
+            log::warn!("remux preflight was inconclusive; continuing with full-output validation");
+        }
+    }
+    let mut command = Command::new("ffmpeg");
+    command.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y"]);
+    if !headers.is_empty() {
+        let header_text = headers
+            .iter()
+            .map(|(name, value)| format!("{name}: {value}\r\n"))
+            .collect::<String>();
+        command.arg("-headers").arg(header_text);
+    }
+    command
+        .args([
+            "-rw_timeout",
+            "120000000",
+            "-i",
+            url.as_str(),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-ac",
+            "2",
+            "-sn",
+            "-dn",
+            "-max_interleave_delta",
+            "0",
+            "-movflags",
+            "+faststart",
+            "-f",
+            "mp4",
+        ])
+        .arg(&partial_path);
+    command
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .map_err(|_| CacheError::Build("FFmpeg is unavailable or could not be started".into()))?;
+    let stderr_task = child.stderr.take().map(|mut stderr| {
+        tokio::spawn(async move {
+            let mut sink = tokio::io::sink();
+            let _ = tokio::io::copy(&mut stderr, &mut sink).await;
+        })
+    });
+    let exit_status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                if let Some(task) = stderr_task {
+                    let _ = task.await;
+                }
+                return Err(CacheError::Io(error));
+            }
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            if let Some(task) = stderr_task {
+                let _ = task.await;
+            }
+            return Err(CacheError::Build("media remux job timed out".into()));
+        }
+        if let Ok(metadata) = tokio::fs::metadata(&partial_path).await
+            && (metadata.len() > cache.max_bytes()
+                || cache
+                    .report_partial_bytes(&cache_key, metadata.len())
+                    .await
+                    .is_err())
+        {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            if let Some(task) = stderr_task {
+                let _ = task.await;
+            }
+            return Err(CacheError::BudgetExceeded);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    if let Some(task) = stderr_task {
+        let _ = task.await;
+    }
+    if !exit_status.success() {
+        return Err(CacheError::Build(
+            "the upstream media could not be remuxed as a seekable MP4".into(),
+        ));
+    }
+    let has_faststart =
+        tokio::time::timeout_at(job_deadline, has_faststart_mp4_index(&partial_path))
+            .await
+            .map_err(|_| CacheError::Build("MP4 index validation timed out".into()))?
+            .map_err(CacheError::Io)?;
+    if !has_faststart {
+        return Err(CacheError::Build(
+            "FFmpeg output is not a complete fast-start MP4".into(),
+        ));
+    }
+    let mut probe = Command::new("ffprobe");
+    probe
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=format_name,duration:stream=codec_name,codec_type",
+            "-of",
+            "json",
+        ])
+        .arg(&partial_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout_at(job_deadline, probe.output())
+        .await
+        .map_err(|_| CacheError::Build("FFprobe timed out while validating remux output".into()))?
+        .map_err(CacheError::Io)?;
+    if !output.status.success() {
+        return Err(CacheError::Build(
+            "FFprobe could not validate the remux output".into(),
+        ));
+    }
+    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|_| CacheError::Build("FFprobe returned malformed remux metadata".into()))?;
+    let formats = metadata
+        .pointer("/format/format_name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if !formats.split(',').any(|format| format == "mp4") {
+        return Err(CacheError::Build(
+            "FFprobe did not identify the remux output as MP4".into(),
+        ));
+    }
+    let duration = metadata
+        .pointer("/format/duration")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|duration| duration.is_finite() && *duration > 0.0)
+        .ok_or_else(|| CacheError::Build("verified media duration is unavailable".into()))?;
+    let streams = metadata
+        .get("streams")
+        .cloned()
+        .and_then(|streams| serde_json::from_value::<Vec<ProbeStream>>(streams).ok())
+        .ok_or_else(|| CacheError::Build("FFprobe stream metadata is unavailable".into()))?;
+    if !browser_mp4_streams_compatible(&streams) {
+        return Err(CacheError::Build(
+            "remux output codecs do not satisfy the verified playback policy".into(),
+        ));
+    }
+    Ok(duration)
+}
+
+fn cache_error_http(error: crate::remux_cache::CacheError) -> (u16, &'static str, String) {
+    use crate::remux_cache::CacheError;
+    match error {
+        CacheError::Busy => (
+            429,
+            "REMUX_BUSY",
+            "Media-processing capacity is busy.".into(),
+        ),
+        CacheError::TooLarge | CacheError::BudgetExceeded => (
+            507,
+            "MEDIA_CACHE_FULL",
+            "Temporary media cache capacity is unavailable.".into(),
+        ),
+        CacheError::InvalidKey => (400, "INVALID_ID", "The source identity is invalid.".into()),
+        CacheError::BlockedCodec => (
+            415,
+            "SOURCE_CODEC_BLOCKED",
+            "H.265/HEVC sources are blocked by playback policy.".into(),
+        ),
+        CacheError::UnverifiedCodec => (
+            415,
+            "CODEC_UNVERIFIED",
+            "The media video codec could not be positively verified as H.264.".into(),
+        ),
+        CacheError::Build(message) if message.contains("timed out") => (
+            504,
+            "REMUX_TIMEOUT",
+            "Media preparation exceeded its configured time limit.".into(),
+        ),
+        CacheError::Build(_) => (
+            502,
+            "REMUX_FAILED",
+            "The selected source could not be prepared as seekable MP4.".into(),
+        ),
+        CacheError::Io(_) => (
+            500,
+            "MEDIA_CACHE_IO_ERROR",
+            "Temporary media storage failed.".into(),
+        ),
+    }
+}
+
+async fn write_cached_remux_response(
+    stream: &mut TcpStream,
+    lease: crate::remux_cache::CacheLease,
+    source_id: Option<&str>,
+    request_headers: &HashMap<String, String>,
+    head_only: bool,
+) -> std::io::Result<()> {
+    use crate::remux_cache::{ByteRange, copy_range_to_writer, parse_range_header};
+
+    let size = lease.cached.metadata.size_bytes;
+    let source_header = source_id
+        .map(|id| format!("X-Source-Id: {id}\r\n"))
+        .unwrap_or_default();
+    let (status, start, length, content_range) = match parse_range_header(
+        request_headers.get("range").map(String::as_str),
+        size,
+    ) {
+        ByteRange::Full => (200, 0, size, None),
+        ByteRange::Partial { start, end } => {
+            let length = end - start + 1;
+            (
+                206,
+                start,
+                length,
+                Some(format!("Content-Range: bytes {start}-{end}/{size}\r\n")),
+            )
+        }
+        ByteRange::Unsatisfiable => {
+            let extra = format!(
+                "Accept-Ranges: bytes\r\nContent-Range: bytes */{size}\r\nContent-Length: 0\r\nX-Media-Mode: remux\r\n{source_header}X-Remux-Cache-State: {}\r\n",
+                if lease.was_hit { "hit" } else { "built" }
+            );
+            return write_headers(stream, 416, "video/mp4", Some(&extra)).await;
+        }
+    };
+    let content_range = content_range.unwrap_or_default();
+    let extra = format!(
+        "Accept-Ranges: bytes\r\nContent-Length: {length}\r\n{content_range}X-Media-Mode: remux\r\n{source_header}X-Media-Duration: {:.3}\r\nX-Remux-Cache-State: {}\r\n",
+        lease.cached.metadata.duration_seconds,
+        if lease.was_hit { "hit" } else { "built" }
+    );
+    write_headers(stream, status, "video/mp4", Some(&extra)).await?;
+    if head_only {
+        return Ok(());
+    }
+    copy_range_to_writer(&lease.cached.path, start, length, stream).await
+}
+
 async fn transcode_source(
     stream: &mut TcpStream,
     source_id: &str,
@@ -5351,114 +5920,54 @@ async fn transcode_source(
         );
         return write_raw_json(stream, status, &body, None).await;
     };
-    let range_requested = is_seeking_range(request_headers);
     if head_only {
         let (status, body) = err(
             "METHOD_NOT_ALLOWED",
-            "Remuxing supports GET only; HEAD is unavailable without disk-backed output.",
+            "Remuxing supports GET only.",
             Some(source.provider),
             405,
         );
         return write_raw_json(stream, status, &body, None).await;
     }
-    if range_requested {
-        let (status, body) = err(
-            "SEEK_UNAVAILABLE",
-            "Byte-range seeking is disabled because remuxed media is streamed without disk caching.",
-            Some(source.provider),
-            501,
-        );
-        return write_raw_json(
-            stream,
-            status,
-            &body,
-            Some("X-Remux-Cache-State: disabled\r\n"),
-        )
+    let key = crate::remux_cache::cache_key(source_id, REMUX_OUTPUT_PROFILE);
+    let build_cache = state.remux_cache.clone();
+    let build_key = key.clone();
+    let build_url = validated_url;
+    let build_headers = playback.headers.clone();
+    let started = Instant::now();
+    let lease = state
+        .remux_cache
+        .get_or_build(&key, move |partial_path| async move {
+            build_cached_mp4(
+                build_cache,
+                build_key,
+                build_url,
+                build_headers,
+                partial_path,
+                false,
+                true,
+            )
+            .await
+        })
         .await;
-    }
-    let Some(permit) = state.remux_slots.clone().try_acquire_owned().ok() else {
-        let (status, body) = err(
-            "REMUX_BUSY",
-            "All media-processing slots are currently busy. Try again later.",
-            Some(source.provider),
-            429,
-        );
-        return write_raw_json(stream, status, &body, None).await;
-    };
-    if !validated_remux_preflight(&validated_url, &playback.headers).await {
-        // The preflight is advisory: the actual streaming command below performs the
-        // authoritative FFmpeg startup validation and converts audio to AAC. Some
-        // providers expose valid H.264/E-AC3 files that the short probe cannot parse
-        // consistently even though the live remux succeeds.
-        log::warn!(
-            "remux preflight was inconclusive; continuing with authoritative streaming validation provider={}",
-            source.provider.label()
-        );
-    }
-
-    let mut command = Command::new("ffmpeg");
-    command.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
-    let headers = playback
-        .headers
-        .iter()
-        .map(|(name, value)| format!("{name}: {value}\r\n"))
-        .collect::<String>();
-    if !headers.is_empty() {
-        command.arg("-headers").arg(headers);
-    }
-    command.args([
-        "-rw_timeout",
-        "120000000",
-        "-i",
-        validated_url.as_str(),
-        "-map",
-        "0:v:0",
-        "-map",
-        "0:a?",
-        "-c:v",
-        "copy",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
-        "-ac",
-        "2",
-        "-sn",
-        "-dn",
-        "-max_interleave_delta",
-        "0",
-        "-movflags",
-        "+frag_keyframe+empty_moov+default_base_moof",
-        "-flush_packets",
-        "1",
-        "-f",
-        "mp4",
-        "pipe:1",
-    ]);
-    command
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    let child = match command.spawn() {
-        Ok(child) => child,
+    let lease = match lease {
+        Ok(lease) => lease,
         Err(error) => {
-            drop(permit);
-            let (status, body) = err(
-                "REMUX_UNAVAILABLE",
-                format!("FFmpeg is not available: {error}"),
-                Some(source.provider),
-                503,
-            );
+            let (status, code, message) = cache_error_http(error);
+            let (status, body) = err(code, message, Some(source.provider), status);
             return write_raw_json(stream, status, &body, None).await;
         }
     };
-    let debug_id = REMUX_DEBUG_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let extra = format!(
-        "Accept-Ranges: none\r\nX-Media-Mode: remux\r\nX-Source-Id: {source_id}\r\nX-Remux-Cache-State: disabled\r\n"
+    log::info!(
+        "media remux prepared provider={} source_fingerprint={} cache_state={} bytes={} duration_ms={} elapsed_ms={}",
+        source.provider.label(),
+        &key[..12],
+        if lease.was_hit { "hit" } else { "built" },
+        lease.cached.metadata.size_bytes,
+        (lease.cached.metadata.duration_seconds * 1000.0) as u64,
+        started.elapsed().as_millis()
     );
-    let result = stream_ffmpeg_remux(stream, child, &extra, debug_id).await;
-    drop(permit);
-    result
+    write_cached_remux_response(stream, lease, Some(source_id), request_headers, false).await
 }
 
 const MEDIA_BODY_LIMIT: usize = 8 * 1024 * 1024;
@@ -5496,101 +6005,35 @@ fn media_request_client() -> reqwest::Client {
 async fn stream_proxy_route(
     stream: &mut TcpStream,
     query: &str,
+    state: ApiState,
     request_headers: &HashMap<String, String>,
     head_only: bool,
 ) -> std::io::Result<()> {
-    let remux_requested = query_value(query, "remux")
-        .or_else(|| query_value(query, "transcode"))
-        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
     let (url, referer) = match validated_media_url(query).await {
         Ok(value) => value,
         Err((status, message)) => {
-            return write_raw_json(
-                stream,
+            let (status, body) = err(
+                if status == 403 {
+                    "SSRF_BLOCKED"
+                } else {
+                    "INVALID_MEDIA_URL"
+                },
+                message,
+                None,
                 status,
-                &format!(
-                    r#"{{"error":{{"code":"{}","message":"{}"}}}}"#,
-                    if status == 403 {
-                        "SSRF_BLOCKED"
-                    } else {
-                        "INVALID_MEDIA_URL"
-                    },
-                    message
-                ),
-                None,
-            )
-            .await;
+            );
+            return write_raw_json(stream, status, &body, None).await;
         }
     };
-    match verify_generic_media_codec(&url, referer.as_deref()).await {
-        Ok(SourceCodecEligibility::Verified) => {}
-        Ok(SourceCodecEligibility::BlockedH265) => {
-            return write_raw_json(
-                stream,
-                415,
-                r#"{"error":{"code":"SOURCE_CODEC_BLOCKED","message":"H.265/HEVC sources are blocked by playback policy."}}"#,
-                None,
-            )
-            .await;
-        }
-        Ok(SourceCodecEligibility::Unverified) | Err(_) => {
-            return write_raw_json(
-                stream,
-                415,
-                r#"{"error":{"code":"CODEC_UNVERIFIED","message":"The media video codec could not be positively verified as H.264."}}"#,
-                None,
-            )
-            .await;
-        }
-    }
-    if remux_requested {
-        return remux_media_url(stream, &url, referer.as_deref(), request_headers, head_only).await;
-    }
-    let client = media_request_client();
-    let mut request = if head_only {
-        client.head(url.clone())
-    } else {
-        client.get(url.clone())
-    };
-    if let Some(range) = request_headers.get("range") {
-        request = request.header(reqwest::header::RANGE, range);
-    }
-    if let Some(referer) = referer.as_deref() {
-        request = request.header(reqwest::header::REFERER, referer);
-    }
-    let response = match tokio::time::timeout(Duration::from_secs(60), request.send()).await {
-        Ok(Ok(response)) => response,
-        Ok(Err(error)) => return write_raw_json(stream, 502, &format!(r#"{{"error":{{"code":"UPSTREAM_FAILED","message":"{}"}}}}"#, sanitize_error(&error.to_string())), None).await,
-        Err(_) => return write_raw_json(stream, 504, r#"{"error":{"code":"UPSTREAM_TIMEOUT","message":"The upstream media request timed out."}}"#, None).await,
-    };
-    let status = response.status().as_u16();
-    let content_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("application/octet-stream");
-    let content_length = response.content_length();
-    let content_range = response
-        .headers()
-        .get(reqwest::header::CONTENT_RANGE)
-        .and_then(|value| value.to_str().ok());
-    let extra = format!(
-        "Accept-Ranges: bytes\r\n{}{}",
-        content_length.map_or(String::new(), |value| format!(
-            "Content-Length: {value}\r\n"
-        )),
-        content_range.map_or(String::new(), |value| format!("Content-Range: {value}\r\n")),
-    );
-    write_headers(stream, status, content_type, Some(&extra)).await?;
-    if head_only {
-        return Ok(());
-    }
-    let mut body = response.bytes_stream();
-    while let Some(chunk) = body.next().await {
-        let chunk = chunk.map_err(|error| std::io::Error::other(error.to_string()))?;
-        stream.write_all(&chunk).await?;
-    }
-    Ok(())
+    remux_media_url(
+        stream,
+        &url,
+        referer.as_deref(),
+        state,
+        request_headers,
+        head_only,
+    )
+    .await
 }
 
 fn sanitize_error(error: &str) -> String {
@@ -5745,7 +6188,7 @@ async fn stream_ffmpeg_remux(
     Ok(())
 }
 
-async fn remux_media_url(
+async fn legacy_remux_media_url(
     stream: &mut TcpStream,
     url: &reqwest::Url,
     referer: Option<&str>,
@@ -5874,6 +6317,69 @@ async fn remux_media_url(
         started_at.elapsed().as_millis()
     );
     result
+}
+
+fn generic_media_identity(url: &reqwest::Url, referer: Option<&str>) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"moviebox-generic-media-v1\0");
+    digest.update(url.as_str().as_bytes());
+    digest.update([0]);
+    if let Some(referer) = referer {
+        digest.update(referer.as_bytes());
+    }
+    URL_SAFE_NO_PAD.encode(digest.finalize())
+}
+
+async fn remux_media_url(
+    stream: &mut TcpStream,
+    url: &reqwest::Url,
+    referer: Option<&str>,
+    state: ApiState,
+    request_headers: &HashMap<String, String>,
+    head_only: bool,
+) -> std::io::Result<()> {
+    let identity = generic_media_identity(url, referer);
+    let key = crate::remux_cache::cache_key(&identity, REMUX_OUTPUT_PROFILE);
+    let mut upstream_headers = vec![("User-Agent".to_string(), "Mozilla/5.0".to_string())];
+    if let Some(referer) = referer {
+        upstream_headers.push(("Referer".to_string(), referer.to_string()));
+    }
+    let build_cache = state.remux_cache.clone();
+    let build_key = key.clone();
+    let build_url = url.clone();
+    let build_headers = upstream_headers;
+    let started = Instant::now();
+    let lease = state
+        .remux_cache
+        .get_or_build(&key, move |partial_path| async move {
+            build_cached_mp4(
+                build_cache,
+                build_key,
+                build_url,
+                build_headers,
+                partial_path,
+                true,
+                false,
+            )
+            .await
+        })
+        .await;
+    let lease = match lease {
+        Ok(lease) => lease,
+        Err(error) => {
+            let (status, code, message) = cache_error_http(error);
+            let (status, body) = err(code, message, None, status);
+            return write_raw_json(stream, status, &body, None).await;
+        }
+    };
+    log::info!(
+        "generic media remux prepared source_fingerprint={} cache_state={} bytes={} elapsed_ms={}",
+        &key[..12],
+        if lease.was_hit { "hit" } else { "built" },
+        lease.cached.metadata.size_bytes,
+        started.elapsed().as_millis()
+    );
+    write_cached_remux_response(stream, lease, None, request_headers, head_only).await
 }
 
 async fn verify_generic_media_codec(
@@ -6132,6 +6638,7 @@ async fn write_headers(
         405 => "Method Not Allowed",
         416 => "Range Not Satisfiable",
         429 => "Too Many Requests",
+        507 => "Insufficient Storage",
         501 => "Not Implemented",
         502 => "Bad Gateway",
         503 => "Service Unavailable",
@@ -6193,11 +6700,11 @@ fn openapi() -> serde_json::Value {
             "/openapi.json": {"get": {"responses": {"200": {"description": "OpenAPI document"}}}},
             "/docs": {"get": {"responses": {"200": {"description": "API documentation"}}}},
             "/api/v1/diagnostics": {"get": {"responses": {"200": {"description": "Sanitized provider diagnostics"}}}},
-            "/api/v1/watch": {"get": {"responses": {"200": {"description": "Direct watch resolution"}, "400": {"description": "Invalid watch request"}, "415": {"description": "All discovered sources are blocked or have unverified codecs"}}}},
+            "/api/v1/watch": {"get": {"responses": {"200": {"description": "Episode playback descriptor pointing to the backend seekable MP4 route"}, "400": {"description": "Invalid watch request"}, "415": {"description": "All discovered sources are blocked or have unverified codecs"}}}},
             "/api/v1/anime/search": {"get": {"parameters": [{"name": "q", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 200}}, {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 100}}, {"name": "cursor", "in": "query", "schema": {"type": "string"}}], "responses": {"200": {"description": "Search results"}, "400": {"description": "Invalid query"}}}},
             "/api/v1/search": {"get": {"description": "PostgreSQL-only catalog search; never performs live provider discovery.", "responses": {"200": {"description": "Catalog search results"}, "400": {"description": "Invalid query"}, "503": {"description": "Catalog database unavailable"}}}},
             "/api/v1/genres": {"get": {"description": "PostgreSQL-backed canonical genre list.", "responses": {"200": {"description": "Genres"}, "503": {"description": "Catalog database unavailable"}}}},
-            "/api/v1/catalog/titles/{title_id}": {"get": {"description": "Canonical PostgreSQL catalog title detail.", "responses": {"200": {"description": "Title detail"}, "404": {"description": "Title not found"}, "503": {"description": "Catalog database unavailable"}}}},
+            "/api/v1/catalog/titles/{title_id}": {"get": {"description": "Canonical PostgreSQL catalog title detail; movie titles may include eligible title-owned movie_sources.", "responses": {"200": {"description": "Title detail"}, "404": {"description": "Title not found"}, "503": {"description": "Catalog database unavailable"}}}},
             "/api/v1/catalog/titles/{title_id}/seasons": {"get": {"description": "Stored catalog seasons for a title.", "responses": {"200": {"description": "Season list"}, "503": {"description": "Catalog database unavailable"}}}},
             "/api/v1/catalog/titles/{title_id}/seasons/{season_number}/episodes": {"get": {"description": "Stored catalog episodes for a title season.", "responses": {"200": {"description": "Episode list"}, "503": {"description": "Catalog database unavailable"}}}},
             "/api/v1/catalog/episodes/{episode_id}": {"get": {"description": "Stored catalog episode detail.", "responses": {"200": {"description": "Episode detail"}, "404": {"description": "Episode not found"}, "503": {"description": "Catalog database unavailable"}}}},
@@ -6205,7 +6712,7 @@ fn openapi() -> serde_json::Value {
             "/api/v1/catalog/sources/{source_id}": {"get": {"description": "Stored source metadata, including expiry and playback eligibility.", "responses": {"200": {"description": "Source detail"}, "404": {"description": "Source not found"}, "503": {"description": "Catalog database unavailable"}}}},
             "/api/v1/catalog/sources/{source_id}/tracks": {"get": {"description": "Stored audio and subtitle tracks for a source.", "responses": {"200": {"description": "Track list"}, "503": {"description": "Catalog database unavailable"}}}},
             "/api/v1/catalog/sources/{source_id}/play": {"get": {"description": "Playback resolution for an eligible stored source; imported FourKHDHub source IDs are resolved live and signed URLs are not persisted.", "responses": {"200": {"description": "Playback resolved"}, "404": {"description": "Source unavailable, blocked, expired, or missing"}, "415": {"description": "Source codec is blocked or unverified"}, "503": {"description": "Catalog database unavailable"}}}},
-            "/api/v1/catalog/sources/{source_id}/remux": {"get": {"description": "Live FourKHDHub provider source resolution followed by the guarded streaming FFmpeg remux path.", "responses": {"200": {"description": "Remuxed stream"}, "404": {"description": "Source unavailable or missing"}, "415": {"description": "Source codec is blocked or unverified"}, "503": {"description": "Catalog database unavailable"}}}},
+            "/api/v1/catalog/sources/{source_id}/remux": {"get": {"description": "Live FourKHDHub source resolution followed by a validated temporary seekable MP4 remux; valid single byte ranges return exact file bytes.", "responses": {"200": {"description": "Complete seekable MP4"}, "206": {"description": "Requested MP4 byte range"}, "404": {"description": "Source unavailable or missing"}, "415": {"description": "Source codec is blocked or unverified"}, "416": {"description": "Unsatisfiable byte range"}, "429": {"description": "Media-job capacity is busy"}, "504": {"description": "Configured media-job timeout"}, "507": {"description": "Temporary cache budget unavailable"}, "503": {"description": "Catalog database unavailable"}}}},
             "/api/v1/admin/catalog/import": {"post": {"description": "Protected manual catalog import; accepts a bounded titles batch.", "responses": {"201": {"description": "Import job completed"}, "401": {"description": "Unauthorized"}, "413": {"description": "Batch too large"}, "503": {"description": "Database unavailable"}}}},
             "/api/v1/admin/catalog/import-by-name": {"post": {"description": "Protected exact-match anime import from FourKHDHub, including provider details, episodes, and live source references.", "responses": {"201": {"description": "Anime inserted"}, "200": {"description": "Anime updated idempotently"}, "401": {"description": "Unauthorized"}, "404": {"description": "Exact title not found"}, "409": {"description": "Ambiguous exact title"}, "503": {"description": "Provider or catalog unavailable"}}}},
             "/api/v1/admin/catalog/update-all": {"post": {"description": "Protected manual catalog update job; never scheduled automatically.", "responses": {"202": {"description": "Update job accepted"}, "401": {"description": "Unauthorized"}}}},
@@ -6228,7 +6735,7 @@ fn openapi() -> serde_json::Value {
             "/api/v1/movies": {"get": {"responses": {"200": {"description": "MovieBox movie catalogue"}}}},
             "/api/v1/movies/{movie_id}": {"get": {"responses": {"200": {"description": "Movie details"}}}},
             "/api/v1/movies/{movie_id}/sources": {"get": {"responses": {"200": {"description": "Movie source candidates"}, "502": {"description": "Movie source resolution failed"}}}},
-            "/api/v1/movies/{movie_id}/stream": {"get": {"responses": {"200": {"description": "Resolved eligible movie playback source using stream-copy remux when needed"}, "415": {"description": "Sources are blocked or have unverified codecs"}, "502": {"description": "Movie playback resolution failed"}, "504": {"description": "Movie playback resolution timed out"}}}},
+            "/api/v1/movies/{movie_id}/stream": {"get": {"responses": {"200": {"description": "Movie playback descriptor pointing to a validated temporary seekable MP4 URL"}, "415": {"description": "Sources are blocked or have unverified codecs"}, "429": {"description": "Media-job capacity is busy"}, "502": {"description": "Movie playback resolution failed"}, "504": {"description": "Movie playback resolution timed out"}}}},
             "/api/v1/movies/{movie_id}/playback": {"get": {"responses": {"200": {"description": "Alias for movie stream playback"}}}},
             "/api/v1/k-dramas": {"get": {"responses": {"200": {"description": "Metadata-backed K-Drama catalogue"}}}},
             "/api/v1/k-dramas/{id}": {"get": {"responses": {"501": {"description": "Unsupported category"}}}},
@@ -6238,7 +6745,7 @@ fn openapi() -> serde_json::Value {
             "/api/v1/anime/{anime_id}/seasons": {"get": {"responses": {"200": {"description": "Seasons"}}}},
             "/api/v1/anime/{anime_id}/episodes": {"get": {"responses": {"200": {"description": "Episodes"}}}},
             "/api/v1/anime/{anime_id}/episodes/{episode_id}/full": {"get": {"responses": {"200": {"description": "Anime details, selected episode, and source candidates"}, "400": {"description": "Invalid anime or episode ID"}, "404": {"description": "Episode not found"}}}},
-            "/api/v1/anime/{anime_id}/episodes/{episode_id}/stream": {"get": {"responses": {"200": {"description": "Resolved eligible episode playback source"}, "415": {"description": "Sources are blocked or have unverified codecs"}, "502": {"description": "Playback resolution failed"}, "504": {"description": "Playback resolution timed out"}}}},
+            "/api/v1/anime/{anime_id}/episodes/{episode_id}/stream": {"get": {"responses": {"200": {"description": "Episode playback descriptor pointing to the backend seekable MP4 route"}, "415": {"description": "Sources are blocked or have unverified codecs"}, "429": {"description": "Media-job capacity is busy"}, "502": {"description": "Playback resolution failed"}, "504": {"description": "Playback resolution timed out"}}}},
             "/api/v1/episodes/{episode_id}": {"get": {"responses": {"200": {"description": "Episode details"}, "400": {"description": "Invalid episode ID"}}}},
             "/api/v1/episodes/{episode_id}/sources": {"get": {"responses": {"200": {"description": "Fresh source candidates"}}}},
             "/api/v1/episodes/{episode_id}/sources/stream": {"get": {"responses": {"200": {"description": "SSE source_result, source_error, source_complete events"}}}},
@@ -6247,12 +6754,12 @@ fn openapi() -> serde_json::Value {
             "/api/v1/sources/{source_id}/audio-tracks": {"get": {"responses": {"200": {"description": "Confirmed embedded audio tracks"}, "415": {"description": "Source codec is blocked or unverified"}, "503": {"description": "Track discovery unavailable"}}}},
             "/api/v1/sources/{source_id}/subtitles": {"get": {"responses": {"200": {"description": "Confirmed embedded subtitle tracks"}, "415": {"description": "Source codec is blocked or unverified"}, "503": {"description": "Track discovery unavailable"}}}},
             "/api/v1/sources/{source_id}/subtitle-tracks": {"get": {"responses": {"200": {"description": "Confirmed embedded subtitle tracks"}, "415": {"description": "Source codec is blocked or unverified"}, "503": {"description": "Track discovery unavailable"}}}},
-            "/api/v1/sources/{source_id}/transcode": {"get": {"responses": {"200": {"description": "Nonpersistent stream-copy remux media stream"}, "415": {"description": "Source codec is blocked or unverified"}, "501": {"description": "Byte-range seeking is disabled"}, "502": {"description": "Remux failed"}}}},
-            "/api/v1/sources/{source_id}/remux": {"get": {"responses": {"200": {"description": "Nonpersistent stream-copy remux media stream"}, "415": {"description": "Source codec is blocked or unverified"}, "501": {"description": "Byte-range seeking is disabled"}, "502": {"description": "Remux failed"}}}},
-            "/api/v1/sources/{source_id}/playback": {"get": {"responses": {"200": {"description": "Server-resolved eligible 4KHDHub URL"}, "415": {"description": "Source codec is blocked or unverified"}, "502": {"description": "Playback resolution failed"}, "504": {"description": "Playback resolution timed out"}}}},
-            "/api/v1/sources/{source_id}/watch": {"get": {"responses": {"200": {"description": "Server-resolved eligible watch URL with inline media disposition"}, "415": {"description": "Source codec is blocked or unverified"}, "502": {"description": "Watch resolution failed"}, "504": {"description": "Watch resolution timed out"}}}},
+            "/api/v1/sources/{source_id}/transcode": {"get": {"responses": {"200": {"description": "Validated temporary seekable MP4"}, "206": {"description": "Requested MP4 byte range"}, "415": {"description": "Source codec is blocked or unverified"}, "416": {"description": "Unsatisfiable byte range"}, "429": {"description": "Media-job capacity is busy"}, "502": {"description": "Remux failed"}, "504": {"description": "Configured media-job timeout"}, "507": {"description": "Temporary cache budget unavailable"}}}},
+            "/api/v1/sources/{source_id}/remux": {"get": {"responses": {"200": {"description": "Validated temporary seekable MP4"}, "206": {"description": "Requested MP4 byte range"}, "415": {"description": "Source codec is blocked or unverified"}, "416": {"description": "Unsatisfiable byte range"}, "429": {"description": "Media-job capacity is busy"}, "502": {"description": "Remux failed"}, "504": {"description": "Configured media-job timeout"}, "507": {"description": "Temporary cache budget unavailable"}}}},
+            "/api/v1/sources/{source_id}/playback": {"get": {"responses": {"200": {"description": "Playback descriptor pointing to the backend seekable MP4 route"}, "415": {"description": "Source codec is blocked or unverified"}, "429": {"description": "Media-job capacity is busy"}, "502": {"description": "Playback resolution failed"}, "504": {"description": "Playback resolution timed out"}}}},
+            "/api/v1/sources/{source_id}/watch": {"get": {"responses": {"200": {"description": "Watch descriptor pointing to the backend seekable MP4 route"}, "415": {"description": "Source codec is blocked or unverified"}, "502": {"description": "Watch resolution failed"}, "504": {"description": "Watch resolution timed out"}}}},
             "/api/v1/sources/{source_id}/download": {"get": {"responses": {"200": {"description": "Download metadata"}, "415": {"description": "Source codec is blocked or unverified"}, "501": {"description": "Unsupported"}}}},
-            "/api/stream-proxy": {"get": {"responses": {"200": {"description": "Proxied media stream"}, "206": {"description": "Partial passthrough media stream when supported upstream"}, "400": {"description": "Missing or invalid media URL"}, "403": {"description": "Unsafe destination rejected"}, "501": {"description": "Byte-range seeking is disabled for remux output"}}}, "head": {"responses": {"200": {"description": "Media headers"}, "206": {"description": "Partial passthrough media headers"}}}},
+            "/api/stream-proxy": {"get": {"responses": {"200": {"description": "Validated temporary seekable MP4"}, "206": {"description": "Requested MP4 byte range"}, "400": {"description": "Missing or invalid media URL"}, "403": {"description": "Unsafe destination rejected"}, "416": {"description": "Unsatisfiable byte range"}, "429": {"description": "Media-job capacity is busy"}, "504": {"description": "Configured media-job timeout"}, "507": {"description": "Temporary cache budget unavailable"}}}, "head": {"responses": {"405": {"description": "HEAD is not supported for remuxed media"}}}},
             "/api/media-info": {"get": {"responses": {"200": {"description": "FFprobe media metadata including duration"}, "400": {"description": "Missing or invalid media URL"}, "502": {"description": "Media inspection failed"}, "504": {"description": "Media inspection timed out"}}}},
             "/api/subtitles/extract": {"get": {"responses": {"200": {"description": "Retrieved external subtitle body"}, "400": {"description": "Missing or invalid subtitle URL"}, "404": {"description": "Subtitle not found"}}}},
             "/api/subtitles/assemblyai/{transcript_id}": {"get": {"responses": {"501": {"description": "AssemblyAI subtitle retrieval is not configured"}}}},
@@ -6312,6 +6819,53 @@ mod tests {
         assert!(is_seeking_range(&headers));
         headers.insert("range".to_string(), "bytes=-512".to_string());
         assert!(is_seeking_range(&headers));
+    }
+
+    #[tokio::test]
+    async fn cached_remux_http_range_returns_exact_requested_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = crate::remux_cache::RemuxCache::open(crate::config::MediaSettings {
+            cache_dir: root.path().to_path_buf(),
+            cache_ttl: Duration::from_secs(60),
+            cache_max_bytes: 1024,
+            max_concurrent_jobs: 1,
+            job_timeout: Duration::from_secs(30),
+        })
+        .await
+        .unwrap();
+        let key = crate::remux_cache::cache_key("range-fixture", "test-profile");
+        let lease = cache
+            .get_or_build(&key, |path| async move {
+                tokio::fs::write(path, b"0123456789")
+                    .await
+                    .map_err(crate::remux_cache::CacheError::Io)?;
+                Ok(12.0)
+            })
+            .await
+            .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(address).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        let mut headers = HashMap::new();
+        headers.insert("range".into(), "bytes=3-6".into());
+        write_cached_remux_response(&mut server, lease, None, &headers, false)
+            .await
+            .unwrap();
+        server.shutdown().await.unwrap();
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        let boundary = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("HTTP header boundary");
+        let response_headers = String::from_utf8_lossy(&response[..boundary]);
+        assert!(response_headers.starts_with("HTTP/1.1 206"));
+        assert!(response_headers.contains("Content-Range: bytes 3-6/10"));
+        assert!(response_headers.contains("Content-Length: 4"));
+        assert_eq!(&response[boundary + 4..], b"3456");
     }
 
     #[test]
@@ -7104,6 +7658,43 @@ mod tests {
     }
 
     #[test]
+    fn movie_and_episode_source_ids_remain_distinct_at_zero_zero_provider_transport() {
+        let release = Release {
+            provider: ProviderKind::MovieBox,
+            filename: "example.mp4".into(),
+            quality: Some("1080p".into()),
+            codec: Some("h264".into()),
+            language: None,
+            size_bytes: None,
+            season: Some(0),
+            episode: Some(0),
+            mirrors: vec![],
+            resource_id: Some("resource-1".into()),
+        };
+        let transport_ref = OpaqueRef {
+            p: ProviderKind::MovieBox,
+            v: "same-provider-id".into(),
+            s: 0,
+            e: 0,
+        };
+        let episode_id = source_ref_for_content(&release, &transport_ref, 0, None);
+        let movie_id = source_ref_for_content(&release, &transport_ref, 0, Some("movie"));
+
+        assert_ne!(episode_id, movie_id);
+        assert_eq!(
+            decode::<OpaqueSource>(&episode_id).unwrap().content_type,
+            None
+        );
+        assert_eq!(
+            decode::<OpaqueSource>(&movie_id)
+                .unwrap()
+                .content_type
+                .as_deref(),
+            Some("movie")
+        );
+    }
+
+    #[test]
     fn remux_mode_depends_on_validated_output_not_provider_codec_label() {
         // Codec metadata is a provider hint only. A successful real remux preflight is
         // authoritative even when the hint is absent or names a different codec family.
@@ -7381,6 +7972,26 @@ mod tests {
         assert_eq!(decoded.p, ProviderKind::MovieBox);
         assert_eq!(decoded.v, "movie-123");
         assert_eq!(public.media_type, MediaType::Movie);
+    }
+
+    #[test]
+    fn movie_playback_identity_does_not_require_or_emit_episode_id() {
+        let identity = PlaybackIdentity::Movie {
+            movie_id: "opaque-movie-id".into(),
+            movie_ref: MovieIdentity {
+                provider: ProviderKind::MovieBox,
+                provider_id: "movie-123".into(),
+            },
+        };
+        let mut fields = serde_json::Map::new();
+        identity.add_response_fields(&mut fields);
+
+        assert_eq!(
+            fields.get("movie_id"),
+            Some(&serde_json::json!("opaque-movie-id"))
+        );
+        assert!(!fields.contains_key("anime_id"));
+        assert!(!fields.contains_key("episode_id"));
     }
 
     #[test]
