@@ -78,7 +78,7 @@ impl FourKHdHubClient {
             return Err(FourKHdHubError::InvalidUrl(base.to_string()));
         }
         Ok(Self {
-            client: build_client(),
+            client: build_client().map_err(FourKHdHubError::Network)?,
             base_url,
             page_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
         })
@@ -308,10 +308,10 @@ impl FourKHdHubClient {
         headers: &[(String, String)],
     ) -> Result<(String, bool), FourKHdHubError> {
         let probe = async {
-            hubcloud::validate_playback_url(url)?;
+            let validated_url = self.validate_public_playback_url(url).await?;
             let mut request = self
                 .client
-                .get(url)
+                .get(&validated_url)
                 .header(reqwest::header::RANGE, "bytes=0-8191");
             for (name, value) in headers {
                 request = request.header(name, value);
@@ -319,7 +319,8 @@ impl FourKHdHubClient {
             let response = request.send().await?.error_for_status()?;
             let mut is_seekable = response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
             let mut final_url = response.url().clone();
-            hubcloud::validate_playback_url(final_url.as_str())?;
+            self.validate_public_playback_url(final_url.as_str())
+                .await?;
             let content_type = response
                 .headers()
                 .get(reqwest::header::CONTENT_TYPE)
@@ -357,7 +358,7 @@ impl FourKHdHubClient {
                             "invalid media content type: {content_type}"
                         ))
                     })?;
-                hubcloud::validate_playback_url(&wrapped)?;
+                let wrapped = self.validate_public_playback_url(&wrapped).await?;
                 let mut wrapped_request = self
                     .client
                     .get(&wrapped)
@@ -368,7 +369,8 @@ impl FourKHdHubClient {
                 let wrapped_response = wrapped_request.send().await?.error_for_status()?;
                 is_seekable = wrapped_response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
                 final_url = wrapped_response.url().clone();
-                hubcloud::validate_playback_url(final_url.as_str())?;
+                self.validate_public_playback_url(final_url.as_str())
+                    .await?;
                 let wrapped_type = wrapped_response
                     .headers()
                     .get(reqwest::header::CONTENT_TYPE)
@@ -410,6 +412,14 @@ impl FourKHdHubClient {
             })?
     }
 
+    async fn validate_public_playback_url(&self, raw: &str) -> Result<String, FourKHdHubError> {
+        let validated = hubcloud::validate_playback_url(raw)?;
+        crate::net::validate_public_url(&validated, false)
+            .await
+            .map_err(|_| FourKHdHubError::InvalidUrl(raw.to_string()))?;
+        Ok(validated)
+    }
+
     async fn fetch_text(&self, url: Url) -> Result<String, FourKHdHubError> {
         let response = self.client.get(url).send().await?.error_for_status()?;
         Ok(response.text().await?)
@@ -427,14 +437,12 @@ impl FourKHdHubClient {
     }
 }
 
-fn build_client() -> reqwest::Client {
+fn build_client() -> Result<reqwest::Client, reqwest::Error> {
     crate::net::http_client_builder()
         .timeout(std::time::Duration::from_secs(20))
         .connect_timeout(std::time::Duration::from_secs(10))
         .user_agent(BROWSER_UA)
-        .redirect(reqwest::redirect::Policy::limited(5))
         .build()
-        .unwrap_or_default()
 }
 
 fn safe_host(raw: &str) -> String {

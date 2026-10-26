@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -9,6 +10,7 @@ use tokio_postgres::{Client, NoTls, Row};
 use uuid::Uuid;
 
 const MIGRATION_001: &str = include_str!("../migrations/001_catalog.sql");
+const MIGRATION_002: &str = include_str!("../migrations/002_codec_verification.sql");
 
 #[derive(Clone)]
 pub struct CatalogStore {
@@ -117,6 +119,9 @@ pub struct ProviderSourceInput {
     pub resolution_width: Option<i32>,
     pub resolution_height: Option<i32>,
     pub source_status: Option<String>,
+    // Kept in serialized responses for compatibility, but never accepted from
+    // ordinary import payloads. Only the trusted verifier may set this state.
+    #[serde(skip_deserializing)]
     pub codec_verification_status: Option<String>,
     pub expires_at: Option<String>,
     #[serde(default)]
@@ -164,6 +169,17 @@ pub struct ImportSummary {
     pub sources: i64,
     pub tracks: i64,
 }
+
+#[derive(Debug, Clone)]
+pub(crate) struct CodecVerificationJob {
+    pub source_id: String,
+    pub provider_source_id: String,
+    pub provider_episode_id: String,
+    pub identity_fingerprint: String,
+    pub lease_token: Uuid,
+    pub attempt_count: i32,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CatalogGenre {
     pub id: String,
@@ -210,11 +226,9 @@ impl CatalogStore {
         Ok(Some(store))
     }
     pub async fn migrate(&self) -> Result<(), CatalogError> {
-        self.client
-            .lock()
-            .await
-            .batch_execute(MIGRATION_001)
-            .await?;
+        let client = self.client.lock().await;
+        client.batch_execute(MIGRATION_001).await?;
+        client.batch_execute(MIGRATION_002).await?;
         Ok(())
     }
     pub async fn search(
@@ -319,7 +333,7 @@ impl CatalogStore {
             .collect())
     }
     pub async fn get_source(&self, id: &str) -> Result<Option<Value>, CatalogError> {
-        let r=self.client.lock().await.query_opt("SELECT ps.id::text AS id,ps.episode_id::text AS episode_id,ps.provider_source_id,pr.provider_key,ps.source_reference,ps.quality_label,ps.video_codec,ps.audio_codec,ps.container_format,ps.resolution_width,ps.resolution_height,ps.source_status,ps.codec_verification_status,ps.expires_at::text AS expires_at,(ps.expires_at IS NULL OR ps.expires_at>now()) AS source_not_expired FROM provider_sources ps JOIN provider_registry pr ON pr.id=ps.provider_id WHERE ps.id::text=$1", &[&id]).await?;
+        let r=self.client.lock().await.query_opt("SELECT ps.id::text AS id,ps.episode_id::text AS episode_id,ps.provider_source_id,pr.provider_key,ps.source_reference,ps.quality_label,ps.video_codec,ps.audio_codec,ps.container_format,ps.resolution_width,ps.resolution_height,ps.source_status,ps.codec_verification_status,ps.last_error_code,ps.expires_at::text AS expires_at,(ps.expires_at IS NULL OR ps.expires_at>now()) AS source_not_expired FROM provider_sources ps JOIN provider_registry pr ON pr.id=ps.provider_id WHERE ps.id::text=$1", &[&id]).await?;
         Ok(r.as_ref().map(|row| {
             let mut source = row_json(row);
             let eligible = source_is_playback_eligible(&source);
@@ -330,6 +344,122 @@ impl CatalogStore {
             source
         }))
     }
+
+    pub(crate) async fn claim_codec_verification_job(
+        &self,
+        lease_seconds: i32,
+    ) -> Result<Option<CodecVerificationJob>, CatalogError> {
+        let mut client = self.client.lock().await;
+        let transaction = client.transaction().await?;
+        let candidate = transaction
+            .query_opt(
+                "SELECT ps.id::text AS source_id,ps.provider_source_id,ps.source_identity_fingerprint,epm.provider_episode_id FROM provider_sources ps JOIN provider_registry pr ON pr.id=ps.provider_id JOIN episode_provider_mappings epm ON epm.episode_id=ps.episode_id AND epm.provider_id=ps.provider_id LEFT JOIN catalog_codec_verification_jobs j ON j.source_id=ps.id WHERE pr.provider_key='fourkhdhub' AND ps.source_status IN ('active','playable') AND ps.codec_verification_status='unverified' AND (ps.expires_at IS NULL OR ps.expires_at>now()) AND (j.source_id IS NULL OR (j.status='pending' AND j.next_attempt_at<=now()) OR (j.status='running' AND j.lease_until<=now())) ORDER BY COALESCE(j.next_attempt_at,ps.created_at),ps.created_at LIMIT 1 FOR UPDATE OF ps SKIP LOCKED",
+                &[],
+            )
+            .await?;
+        let Some(candidate) = candidate else {
+            transaction.commit().await?;
+            return Ok(None);
+        };
+        let source_id: String = candidate.get("source_id");
+        let provider_source_id: String = candidate.get("provider_source_id");
+        let identity_fingerprint: String = candidate.get("source_identity_fingerprint");
+        let provider_episode_id: String = candidate.get("provider_episode_id");
+        let lease = transaction
+            .query_one(
+                "INSERT INTO catalog_codec_verification_jobs(source_id,status,attempt_count,next_attempt_at,lease_until,lease_token,updated_at) VALUES($1::text::uuid,'running',1,now(),now()+make_interval(secs=>$2),gen_random_uuid(),now()) ON CONFLICT(source_id) DO UPDATE SET status='running',attempt_count=catalog_codec_verification_jobs.attempt_count+1,lease_until=EXCLUDED.lease_until,lease_token=EXCLUDED.lease_token,last_error_code=NULL,updated_at=now() RETURNING lease_token,attempt_count",
+                &[&source_id, &lease_seconds],
+            )
+            .await?;
+        let job = CodecVerificationJob {
+            source_id,
+            provider_source_id,
+            provider_episode_id,
+            identity_fingerprint,
+            lease_token: lease.get("lease_token"),
+            attempt_count: lease.get("attempt_count"),
+        };
+        transaction.commit().await?;
+        Ok(Some(job))
+    }
+
+    pub(crate) async fn complete_codec_verification(
+        &self,
+        job: &CodecVerificationJob,
+        codec: &str,
+        blocked: bool,
+    ) -> Result<(), CatalogError> {
+        let normalized = codec.trim().to_ascii_lowercase();
+        if (blocked && !crate::codec_verification::is_hevc_codec(&normalized))
+            || (!blocked && !crate::codec_verification::is_allowed_codec(&normalized))
+        {
+            return Err(CatalogError::Validation(
+                "codec verification result is not permitted by policy".into(),
+            ));
+        }
+        let verification_status = if blocked { "blocked" } else { "verified" };
+        let mut client = self.client.lock().await;
+        let transaction = client.transaction().await?;
+        let updated = transaction
+            .execute(
+                "UPDATE provider_sources SET video_codec=$4,codec_verification_status=$5,last_validated_at=now(),last_error_code=NULL,updated_at=now() WHERE id=$1::text::uuid AND provider_source_id=$2 AND source_identity_fingerprint=$3 AND source_status IN ('active','playable') AND codec_verification_status='unverified' AND (expires_at IS NULL OR expires_at>now()) AND EXISTS(SELECT 1 FROM episode_provider_mappings epm WHERE epm.episode_id=provider_sources.episode_id AND epm.provider_id=provider_sources.provider_id AND epm.provider_episode_id=$6) AND EXISTS(SELECT 1 FROM catalog_codec_verification_jobs j WHERE j.source_id=provider_sources.id AND j.status='running' AND j.lease_token=$7 AND j.lease_until>now())",
+                &[&job.source_id, &job.provider_source_id, &job.identity_fingerprint, &normalized, &verification_status, &job.provider_episode_id, &job.lease_token],
+            )
+            .await?;
+        if updated == 1 {
+            transaction
+                .execute(
+                    "UPDATE catalog_codec_verification_jobs SET status='completed',lease_until=NULL,lease_token=NULL,last_error_code=NULL,updated_at=now() WHERE source_id=$1::text::uuid AND lease_token=$2",
+                    &[&job.source_id, &job.lease_token],
+                )
+                .await?;
+        } else {
+            requeue_or_close_stale_job(&transaction, job).await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn fail_codec_verification(
+        &self,
+        job: &CodecVerificationJob,
+        error_code: &str,
+        retryable: bool,
+    ) -> Result<(), CatalogError> {
+        let code = if error_code.len() <= 64
+            && error_code
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+        {
+            error_code
+        } else {
+            "VERIFICATION_FAILED"
+        };
+        let will_retry = retryable && job.attempt_count < 3;
+        let backoff = if job.attempt_count <= 1 { 15 } else { 60 };
+        let status = if will_retry { "pending" } else { "failed" };
+        let mut client = self.client.lock().await;
+        let transaction = client.transaction().await?;
+        let updated = transaction
+            .execute(
+                "UPDATE provider_sources SET last_error_code=$4 WHERE id=$1::text::uuid AND provider_source_id=$2 AND source_identity_fingerprint=$3 AND source_status IN ('active','playable') AND codec_verification_status='unverified' AND (expires_at IS NULL OR expires_at>now()) AND EXISTS(SELECT 1 FROM episode_provider_mappings epm WHERE epm.episode_id=provider_sources.episode_id AND epm.provider_id=provider_sources.provider_id AND epm.provider_episode_id=$5) AND EXISTS(SELECT 1 FROM catalog_codec_verification_jobs j WHERE j.source_id=provider_sources.id AND j.status='running' AND j.lease_token=$6 AND j.lease_until>now())",
+                &[&job.source_id, &job.provider_source_id, &job.identity_fingerprint, &code, &job.provider_episode_id, &job.lease_token],
+            )
+            .await?;
+        if updated == 1 {
+            transaction
+                .execute(
+                    "UPDATE catalog_codec_verification_jobs SET status=$3,lease_until=NULL,lease_token=NULL,next_attempt_at=CASE WHEN $3='pending' THEN now()+make_interval(secs=>$4) ELSE now() END,last_error_code=$5,updated_at=now() WHERE source_id=$1::text::uuid AND lease_token=$2",
+                    &[&job.source_id, &job.lease_token, &status, &backoff, &code],
+                )
+                .await?;
+        } else {
+            requeue_or_close_stale_job(&transaction, job).await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
     pub async fn list_tracks(&self, id: &str) -> Result<Vec<Value>, CatalogError> {
         let r=self.client.lock().await.query("SELECT id::text AS id,track_type,language_code,codec,format,is_default,is_forced,verified,track_metadata FROM source_tracks WHERE source_id=$1::text::uuid ORDER BY track_type,language_code",&[&id]).await?;
         Ok(r.iter().map(row_json).collect())
@@ -405,6 +535,36 @@ impl CatalogStore {
         }
     }
 }
+async fn requeue_or_close_stale_job(
+    transaction: &tokio_postgres::Transaction<'_>,
+    job: &CodecVerificationJob,
+) -> Result<(), CatalogError> {
+    let still_eligible: bool = transaction
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM provider_sources WHERE id=$1::text::uuid AND source_status IN ('active','playable') AND codec_verification_status='unverified' AND (expires_at IS NULL OR expires_at>now()))",
+            &[&job.source_id],
+        )
+        .await?
+        .get(0);
+    let next_status = if still_eligible {
+        "pending"
+    } else {
+        "completed"
+    };
+    let attempts = if still_eligible {
+        0_i32
+    } else {
+        job.attempt_count
+    };
+    transaction
+        .execute(
+            "UPDATE catalog_codec_verification_jobs SET status=$3,attempt_count=$4,next_attempt_at=now(),lease_until=NULL,lease_token=NULL,last_error_code=CASE WHEN $3='pending' THEN NULL ELSE 'SOURCE_NO_LONGER_ELIGIBLE' END,updated_at=now() WHERE source_id=$1::text::uuid AND lease_token=$2",
+            &[&job.source_id, &job.lease_token, &next_status, &attempts],
+        )
+        .await?;
+    Ok(())
+}
+
 fn empty_job(id: String, kind: String) -> CatalogJob {
     CatalogJob {
         id,
@@ -507,7 +667,7 @@ async fn import_in_tx(c: &Client, i: &ImportTitle) -> Result<ImportSummary, Cata
                     )
                     .await?;
                 let provider_id: String = provider.get(0);
-                map_episode(c, &eid, pe, Some(&provider_id), &mut s).await?;
+                map_episode(c, &eid, pe, provider_key, Some(&provider_id), &mut s).await?;
             }
         }
     }
@@ -527,7 +687,7 @@ async fn import_in_tx(c: &Client, i: &ImportTitle) -> Result<ImportSummary, Cata
             let r=c.query_opt("SELECT e.id::text FROM episodes e JOIN seasons s ON s.id=e.season_id WHERE e.title_id=$1 AND s.season_number=$2 AND e.episode_number=$3",&[&title_uuid,&season,&ep]).await?;
             if let Some(r) = r {
                 let eid: String = r.get(0);
-                map_episode(c, &eid, pe, Some(&pid), &mut s).await?;
+                map_episode(c, &eid, pe, &p.provider_key, Some(&pid), &mut s).await?;
             }
         }
     }
@@ -537,6 +697,7 @@ async fn map_episode(
     c: &Client,
     eid: &str,
     pe: &ProviderEpisodeInput,
+    provider_key: &str,
     pid: Option<&String>,
     s: &mut ImportSummary,
 ) -> Result<(), CatalogError> {
@@ -547,12 +708,42 @@ async fn map_episode(
     let eid = parse_uuid(eid)?;
     c.execute("INSERT INTO episode_provider_mappings(episode_id,provider_id,provider_episode_id,provider_episode_number) VALUES($1,$2,$3,$4) ON CONFLICT(provider_id,provider_episode_id) DO UPDATE SET episode_id=EXCLUDED.episode_id,provider_episode_number=EXCLUDED.provider_episode_number",&[&eid,&pid,&pe.provider_episode_id,&pe.provider_episode_number]).await?;
     if !pe.sources.is_empty() {
-        c.execute("UPDATE provider_sources SET source_status='invalid',updated_at=now() WHERE episode_id=$1 AND provider_id=$2", &[&eid, &pid]).await?;
+        let current_source_ids = pe
+            .sources
+            .iter()
+            .map(|source| source.provider_source_id.clone())
+            .collect::<Vec<_>>();
+        c.execute(
+            "UPDATE provider_sources SET source_status='invalid',updated_at=now() WHERE episode_id=$1 AND provider_id=$2 AND source_status NOT IN ('blocked','invalid') AND NOT (provider_source_id=ANY($3::text[]))",
+            &[&eid, &pid, &current_source_ids],
+        )
+        .await?;
     }
     for src in &pe.sources {
-        let r=c.query_one("INSERT INTO provider_sources(episode_id,provider_id,provider_source_id,source_reference,quality_label,video_codec,audio_codec,container_format,resolution_width,resolution_height,source_status,codec_verification_status,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::text::timestamptz) ON CONFLICT(provider_id,provider_source_id) DO UPDATE SET episode_id=EXCLUDED.episode_id,source_reference=EXCLUDED.source_reference,quality_label=EXCLUDED.quality_label,video_codec=EXCLUDED.video_codec,audio_codec=EXCLUDED.audio_codec,container_format=EXCLUDED.container_format,resolution_width=EXCLUDED.resolution_width,resolution_height=EXCLUDED.resolution_height,source_status=EXCLUDED.source_status,codec_verification_status=EXCLUDED.codec_verification_status,expires_at=EXCLUDED.expires_at,updated_at=now() RETURNING id::text",&[&eid,&pid,&src.provider_source_id,&src.source_reference,&src.quality,&src.codec,&src.audio_codec,&src.container,&src.resolution_width,&src.resolution_height,&src.source_status.clone().unwrap_or_else(||"unverified".into()),&src.codec_verification_status.clone().unwrap_or_else(||"unverified".into()),&src.expires_at]).await?;
-        let sid: String = r.get(0);
+        let identity_fingerprint = source_identity_fingerprint(provider_key, &pid, &eid, src);
+        let incoming_status = import_source_status(src.source_status.as_deref());
+        let r = c
+            .query_one(
+                "INSERT INTO provider_sources(episode_id,provider_id,provider_source_id,source_reference,quality_label,video_codec,audio_codec,container_format,resolution_width,resolution_height,source_status,codec_verification_status,expires_at,source_identity_fingerprint) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'unverified',$12::text::timestamptz,$13) ON CONFLICT(provider_id,provider_source_id) DO UPDATE SET episode_id=EXCLUDED.episode_id,source_reference=EXCLUDED.source_reference,quality_label=EXCLUDED.quality_label,video_codec=CASE WHEN provider_sources.source_identity_fingerprint=EXCLUDED.source_identity_fingerprint AND provider_sources.codec_verification_status IN ('verified','blocked') THEN provider_sources.video_codec ELSE EXCLUDED.video_codec END,audio_codec=EXCLUDED.audio_codec,container_format=EXCLUDED.container_format,resolution_width=EXCLUDED.resolution_width,resolution_height=EXCLUDED.resolution_height,source_status=CASE WHEN provider_sources.source_status IN ('blocked','invalid') THEN provider_sources.source_status ELSE EXCLUDED.source_status END,codec_verification_status=CASE WHEN provider_sources.source_identity_fingerprint=EXCLUDED.source_identity_fingerprint AND provider_sources.codec_verification_status IN ('verified','blocked') THEN provider_sources.codec_verification_status ELSE 'unverified' END,last_validated_at=CASE WHEN provider_sources.source_identity_fingerprint=EXCLUDED.source_identity_fingerprint THEN provider_sources.last_validated_at ELSE NULL END,last_error_code=CASE WHEN provider_sources.source_identity_fingerprint=EXCLUDED.source_identity_fingerprint THEN provider_sources.last_error_code ELSE NULL END,expires_at=EXCLUDED.expires_at,source_identity_fingerprint=EXCLUDED.source_identity_fingerprint,updated_at=now() RETURNING id::text,source_status,codec_verification_status,(expires_at IS NULL OR expires_at>now()) AS source_not_expired",
+                &[&eid,&pid,&src.provider_source_id,&src.source_reference,&src.quality,&src.codec,&src.audio_codec,&src.container,&src.resolution_width,&src.resolution_height,&incoming_status,&src.expires_at,&identity_fingerprint],
+            )
+            .await?;
+        let sid: String = r.get("id");
+        let stored_status: String = r.get("source_status");
+        let verification_status: String = r.get("codec_verification_status");
+        let not_expired: bool = r.get("source_not_expired");
         let sid = parse_uuid(&sid)?;
+        if provider_key == "fourkhdhub"
+            && matches!(stored_status.as_str(), "active" | "playable")
+            && verification_status == "unverified"
+            && not_expired
+        {
+            c.execute(
+                "INSERT INTO catalog_codec_verification_jobs(source_id,status,attempt_count,next_attempt_at,updated_at) VALUES($1,'pending',0,now(),now()) ON CONFLICT(source_id) DO UPDATE SET status='pending',attempt_count=0,next_attempt_at=now(),lease_until=NULL,lease_token=NULL,last_error_code=NULL,updated_at=now() WHERE catalog_codec_verification_jobs.status<>'running'",
+                &[&sid],
+            )
+            .await?;
+        }
         c.execute("DELETE FROM source_tracks WHERE source_id=$1", &[&sid])
             .await?;
         for (kind, tracks) in [
@@ -568,6 +759,49 @@ async fn map_episode(
     }
     Ok(())
 }
+
+fn import_source_status(status: Option<&str>) -> &'static str {
+    match status {
+        Some("active") => "active",
+        Some("playable") => "playable",
+        Some("blocked") => "blocked",
+        Some("invalid") => "invalid",
+        Some("unverified") => "unverified",
+        _ => "unverified",
+    }
+}
+
+fn source_identity_fingerprint(
+    provider_key: &str,
+    provider_id: &Uuid,
+    episode_id: &Uuid,
+    source: &ProviderSourceInput,
+) -> String {
+    let identity = serde_json::to_vec(&(
+        provider_key,
+        provider_id.to_string(),
+        episode_id.to_string(),
+        &source.provider_source_id,
+        &source.source_reference,
+        &source.quality,
+        &source.codec,
+        &source.audio_codec,
+        &source.container,
+        source.resolution_width,
+        source.resolution_height,
+        &source.expires_at,
+    ))
+    .expect("source identity fields serialize");
+    let digest = Sha256::digest(identity);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut fingerprint = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        fingerprint.push(HEX[(byte >> 4) as usize] as char);
+        fingerprint.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    fingerprint
+}
+
 fn parse_uuid(value: &str) -> Result<Uuid, CatalogError> {
     Uuid::parse_str(value)
         .map_err(|_| CatalogError::Validation("database returned an invalid UUID".into()))
@@ -638,36 +872,7 @@ fn episode_provider_key(input: &ProviderEpisodeInput) -> Result<&str, CatalogErr
         })
 }
 fn source_codec_is_known_non_hevc(codec: &str) -> bool {
-    let normalized = codec
-        .trim()
-        .to_ascii_lowercase()
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric())
-        .collect::<String>();
-    if ["hevc", "h265", "x265", "hvc1", "hev1"]
-        .iter()
-        .any(|family| normalized.contains(family))
-    {
-        return false;
-    }
-    [
-        "h264",
-        "avc",
-        "x264",
-        "av1",
-        "vp8",
-        "vp9",
-        "vp09",
-        "mpeg2video",
-        "mpeg4",
-        "vc1",
-        "theora",
-        "prores",
-        "xvid",
-        "divx",
-    ]
-    .iter()
-    .any(|family| normalized.contains(family))
+    crate::codec_verification::is_allowed_codec(codec)
 }
 fn source_is_playback_eligible(source: &Value) -> bool {
     if source
@@ -680,7 +885,7 @@ fn source_is_playback_eligible(source: &Value) -> bool {
         .get("source_status")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if matches!(status, "blocked" | "invalid") {
+    if !matches!(status, "active" | "playable") {
         return false;
     }
     if source
@@ -714,8 +919,8 @@ fn new_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProviderEpisodeInput, episode_provider_key, normalize, source_codec_is_known_non_hevc,
-        source_is_playback_eligible,
+        ProviderEpisodeInput, ProviderSourceInput, episode_provider_key, normalize,
+        source_codec_is_known_non_hevc, source_identity_fingerprint, source_is_playback_eligible,
     };
     use serde_json::json;
 
@@ -726,10 +931,49 @@ mod tests {
 
     #[test]
     fn provider_source_candidates_fail_closed_for_hevc_and_unknown_codecs() {
-        assert!(source_codec_is_known_non_hevc("H.264 / AVC"));
+        assert!(source_codec_is_known_non_hevc("h264"));
         assert!(source_codec_is_known_non_hevc("AV1"));
-        assert!(!source_codec_is_known_non_hevc("H.265 / HEVC"));
+        assert!(!source_codec_is_known_non_hevc("hevc"));
         assert!(!source_codec_is_known_non_hevc("mystery-codec"));
+        assert!(!source_codec_is_known_non_hevc("not-h264"));
+    }
+
+    #[test]
+    fn ordinary_import_payload_cannot_set_codec_verification_state() {
+        let source: ProviderSourceInput = serde_json::from_value(json!({
+            "provider_source_id": "source-1",
+            "codec": "h264",
+            "codec_verification_status": "verified"
+        }))
+        .unwrap();
+        assert_eq!(source.codec_verification_status, None);
+    }
+
+    #[test]
+    fn source_identity_fingerprint_changes_with_media_mapping() {
+        let provider_id = uuid::Uuid::new_v4();
+        let episode_id = uuid::Uuid::new_v4();
+        let source = ProviderSourceInput {
+            provider_source_id: "opaque-release-id".into(),
+            source_reference: Some("provider-ref-a".into()),
+            quality: Some("1080p".into()),
+            codec: Some("h264".into()),
+            ..Default::default()
+        };
+        let original =
+            source_identity_fingerprint("fourkhdhub", &provider_id, &episode_id, &source);
+        assert_eq!(
+            original,
+            source_identity_fingerprint("fourkhdhub", &provider_id, &episode_id, &source)
+        );
+        let changed = ProviderSourceInput {
+            source_reference: Some("provider-ref-b".into()),
+            ..source
+        };
+        assert_ne!(
+            original,
+            source_identity_fingerprint("fourkhdhub", &provider_id, &episode_id, &changed)
+        );
     }
     #[test]
     fn catalog_playback_requires_verified_non_hevc_codec() {

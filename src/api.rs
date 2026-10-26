@@ -47,6 +47,9 @@ const PLAYBACK_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(20);
 const SEARCH_SOURCE_CHECK_TIMEOUT: Duration = Duration::from_secs(45);
 const SEARCH_SOURCE_CHECK_CONCURRENCY: usize = 8;
 const TRACK_PROBE_TIMEOUT: Duration = Duration::from_secs(45);
+const CODEC_VERIFICATION_WORKERS: usize = 2;
+const CODEC_VERIFICATION_LEASE_SECONDS: i32 = 120;
+const CODEC_VERIFICATION_IDLE: Duration = Duration::from_secs(3);
 const RELEASE_CACHE_TTL: Duration = Duration::from_secs(600);
 const PLAYBACK_CACHE_TTL: Duration = Duration::from_secs(120);
 const SEARCH_CACHE_TTL: Duration = Duration::from_secs(60);
@@ -208,36 +211,10 @@ fn source_codec_eligibility(codec: Option<&str>) -> SourceCodecEligibility {
     let Some(codec) = codec.map(str::trim).filter(|value| !value.is_empty()) else {
         return SourceCodecEligibility::Unverified;
     };
-    let normalized = codec
-        .to_ascii_lowercase()
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric())
-        .collect::<String>();
-    if ["hevc", "h265", "x265", "hvc1", "hev1"]
-        .iter()
-        .any(|family| normalized.contains(family))
-    {
+    if crate::codec_verification::is_hevc_codec(codec) {
         return SourceCodecEligibility::BlockedH265;
     }
-    if [
-        "h264",
-        "avc",
-        "x264",
-        "av1",
-        "vp8",
-        "vp9",
-        "vp09",
-        "mpeg2video",
-        "mpeg4",
-        "vc1",
-        "theora",
-        "prores",
-        "xvid",
-        "divx",
-    ]
-    .iter()
-    .any(|known| normalized.contains(known))
-    {
+    if crate::codec_verification::is_allowed_codec(codec) {
         SourceCodecEligibility::Verified
     } else {
         SourceCodecEligibility::Unverified
@@ -249,6 +226,14 @@ fn release_has_usable_source(release: &Release) -> bool {
         && release.mirrors.iter().any(|mirror| {
             !mirror.resolver_url.trim().is_empty()
                 && crate::net::validate_url_syntax(&mirror.resolver_url, true).is_ok()
+        })
+}
+
+fn release_has_verification_candidate(release: &Release) -> bool {
+    release.provider == ProviderKind::FourKHdHub
+        && release.mirrors.iter().any(|mirror| {
+            !mirror.resolver_url.trim().is_empty()
+                && crate::net::validate_url_syntax(&mirror.resolver_url, false).is_ok()
         })
 }
 
@@ -725,6 +710,7 @@ pub async fn run() -> std::io::Result<()> {
         remux_slots: Arc::new(Semaphore::new(MAX_REMUX_SESSIONS)),
         connection_slots: Arc::new(Semaphore::new(MAX_API_CONNECTIONS)),
     };
+    start_codec_verification_workers(state.clone());
     log::info!("MovieBox API listening on 0.0.0.0:{port}");
     loop {
         let (stream, _) = listener.accept().await?;
@@ -1321,6 +1307,158 @@ fn catalog_live_source_path(
     }
 }
 
+fn catalog_source_ineligible_error(
+    source: &serde_json::Value,
+) -> (u16, &'static str, &'static str, bool) {
+    let source_status = source
+        .get("source_status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if source_status == "blocked" {
+        return (
+            404,
+            "SOURCE_BLOCKED",
+            "The source is explicitly blocked.",
+            false,
+        );
+    }
+    if source_status == "invalid" {
+        return (
+            404,
+            "SOURCE_INVALID",
+            "The source mapping is invalid.",
+            false,
+        );
+    }
+    if source
+        .get("source_not_expired")
+        .and_then(serde_json::Value::as_bool)
+        == Some(false)
+    {
+        return (
+            410,
+            "SOURCE_EXPIRED",
+            "The provider source has expired.",
+            false,
+        );
+    }
+    let codec = source
+        .get("video_codec")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let verification_status = source
+        .get("codec_verification_status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if verification_status == "blocked" || is_blocked_h265_codec(Some(codec)) {
+        return (
+            415,
+            "SOURCE_CODEC_BLOCKED",
+            "H.265/HEVC sources are blocked by playback policy.",
+            false,
+        );
+    }
+    let last_error = source
+        .get("last_error_code")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    match last_error {
+        "PROVIDER_RESOLUTION_TIMEOUT" => {
+            return (
+                504,
+                "PROVIDER_RESOLUTION_TIMEOUT",
+                "The provider source could not be resolved before timeout.",
+                true,
+            );
+        }
+        "PROVIDER_RESOLUTION_FAILED" => {
+            return (
+                502,
+                "PROVIDER_RESOLUTION_FAILED",
+                "The provider could not resolve this source.",
+                true,
+            );
+        }
+        "MEDIA_PROBE_TIMEOUT" => {
+            return (
+                504,
+                "MEDIA_PROBE_TIMEOUT",
+                "Media codec inspection timed out.",
+                true,
+            );
+        }
+        "FFPROBE_UNAVAILABLE" => {
+            return (
+                503,
+                "FFPROBE_UNAVAILABLE",
+                "The FFprobe media tool is unavailable.",
+                true,
+            );
+        }
+        "UNSUPPORTED_VIDEO_CODEC" => {
+            return (
+                415,
+                "CODEC_UNVERIFIED",
+                "The inspected video codec is not permitted by playback policy.",
+                false,
+            );
+        }
+        "VIDEO_STREAM_MISSING" => {
+            return (
+                415,
+                "CODEC_UNVERIFIED",
+                "The media contains no video stream.",
+                false,
+            );
+        }
+        "SOURCE_MAPPING_CHANGED" | "SOURCE_MAPPING_INVALID" => {
+            return (
+                409,
+                "CODEC_UNVERIFIED",
+                "The provider source mapping could not be verified.",
+                false,
+            );
+        }
+        value if value.starts_with("MEDIA_PROBE") => {
+            return (
+                502,
+                "MEDIA_PROBE_FAILED",
+                "The media could not be inspected.",
+                true,
+            );
+        }
+        _ => {}
+    }
+    if !matches!(source_status, "active" | "playable") {
+        return (
+            404,
+            "SOURCE_UNAVAILABLE",
+            "The source is not active.",
+            false,
+        );
+    }
+    (
+        409,
+        "CODEC_UNVERIFIED",
+        "The media codec has not been successfully verified.",
+        true,
+    )
+}
+
+async fn write_catalog_source_ineligible(
+    stream: &mut TcpStream,
+    source: &serde_json::Value,
+) -> std::io::Result<()> {
+    let (status, code, message, retryable) = catalog_source_ineligible_error(source);
+    write_json(
+        stream,
+        status,
+        &serde_json::json!({"success":false,"error":{"code":code,"message":message,"retryable":retryable}}),
+        None,
+    )
+    .await
+}
+
 async fn catalog_source_remux_route(
     stream: &mut TcpStream,
     path: &str,
@@ -1339,11 +1477,11 @@ async fn catalog_source_remux_route(
         Ok(Some(source)) if source.get("playback_eligible").and_then(serde_json::Value::as_bool).unwrap_or(false) => {
             match catalog_live_source_path(&source, "remux") {
                 Ok(Some(live_path)) => source_route(stream, &live_path, state, request_headers, head_only).await,
-                Ok(None) => write_json(stream, 501, &serde_json::json!({"success":false,"error":{"code":"UNSUPPORTED_OPERATION","message":"This source has no live provider remux mapping.","retryable":false}}), None).await,
+                Ok(None) => write_json(stream, 501, &serde_json::json!({"success":false,"error":{"code":"REMUX_UNAVAILABLE","message":"This source has no live provider remux mapping.","retryable":false}}), None).await,
                 Err((status, body)) => write_raw_json(stream, status, &body, None).await,
             }
         }
-        Ok(Some(_)) => write_json(stream, 404, &serde_json::json!({"success":false,"error":{"code":"SOURCE_UNAVAILABLE","message":"The source is blocked, invalid, or expired.","retryable":false}}), None).await,
+        Ok(Some(source)) => write_catalog_source_ineligible(stream, &source).await,
         Ok(None) => write_json(stream, 404, &serde_json::json!({"success":false,"error":{"code":"CATALOG_SOURCE_NOT_FOUND","retryable":false}}), None).await,
         Err(_) => write_json(stream, 503, &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","retryable":true}}), None).await,
     }
@@ -1370,13 +1508,7 @@ async fn catalog_source_play_route(
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
             if !playback_eligible {
-                return write_json(
-                    stream,
-                    404,
-                    &serde_json::json!({"success":false,"error":{"code":"SOURCE_UNAVAILABLE","message":"The stored source is blocked, invalid, or expired.","retryable":false}}),
-                    None,
-                )
-                .await;
+                return write_catalog_source_ineligible(stream, &source).await;
             }
             match catalog_live_source_path(&source, "playback") {
                 Ok(Some(live_path)) => {
@@ -1564,7 +1696,9 @@ async fn import_episode_sources(
     let sources = releases
         .iter()
         .enumerate()
-        .filter(|(_, release)| release.provider == provider && release_has_usable_source(release))
+        .filter(|(_, release)| {
+            release.provider == provider && release_has_verification_candidate(release)
+        })
         .take(3)
         .map(|(index, release)| crate::catalog::ProviderSourceInput {
             provider_source_id: source_ref(release, &episode_ref, index),
@@ -1587,6 +1721,146 @@ async fn import_episode_sources(
     } else {
         Ok(sources)
     }
+}
+
+fn start_codec_verification_workers(state: ApiState) {
+    if state.catalog.is_none()
+        || state.service.fourk_client.is_none()
+        || !crate::config::load().fourkhdhub_enabled
+    {
+        return;
+    }
+    for worker_id in 0..CODEC_VERIFICATION_WORKERS {
+        let state = state.clone();
+        tokio::spawn(async move { codec_verification_worker(state, worker_id).await });
+    }
+}
+
+async fn codec_verification_worker(state: ApiState, worker_id: usize) {
+    loop {
+        let Some(catalog) = state.catalog.as_ref() else {
+            return;
+        };
+        match catalog
+            .claim_codec_verification_job(CODEC_VERIFICATION_LEASE_SECONDS)
+            .await
+        {
+            Ok(Some(job)) => match verify_catalog_source(&state, &job).await {
+                Ok(crate::codec_verification::CodecProbeResult::Allowed(codec)) => {
+                    if let Err(error) = catalog
+                        .complete_codec_verification(&job, &codec, false)
+                        .await
+                    {
+                        log::error!(
+                            "codec verifier could not persist a successful result: {error}"
+                        );
+                    }
+                }
+                Ok(crate::codec_verification::CodecProbeResult::BlockedHevc(codec)) => {
+                    if let Err(error) = catalog
+                        .complete_codec_verification(&job, &codec, true)
+                        .await
+                    {
+                        log::error!(
+                            "codec verifier could not persist a blocked HEVC result: {error}"
+                        );
+                    }
+                }
+                Ok(crate::codec_verification::CodecProbeResult::Unsupported(_)) => {
+                    if let Err(error) = catalog
+                        .fail_codec_verification(&job, "UNSUPPORTED_VIDEO_CODEC", false)
+                        .await
+                    {
+                        log::error!(
+                            "codec verifier could not persist an unsupported-codec result: {error}"
+                        );
+                    }
+                }
+                Ok(crate::codec_verification::CodecProbeResult::NoVideoStream) => {
+                    if let Err(error) = catalog
+                        .fail_codec_verification(&job, "VIDEO_STREAM_MISSING", false)
+                        .await
+                    {
+                        log::error!(
+                            "codec verifier could not persist a missing-video result: {error}"
+                        );
+                    }
+                }
+                Err((code, retryable)) => {
+                    log::warn!("codec verification worker {worker_id} failed: code={code}");
+                    if let Err(error) = catalog.fail_codec_verification(&job, code, retryable).await
+                    {
+                        log::error!("codec verifier could not persist failure state: {error}");
+                    }
+                }
+            },
+            Ok(None) => tokio::time::sleep(CODEC_VERIFICATION_IDLE).await,
+            Err(error) => {
+                log::error!("codec verification worker {worker_id} could not claim a job: {error}");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
+    }
+}
+
+async fn verify_catalog_source(
+    state: &ApiState,
+    job: &crate::catalog::CodecVerificationJob,
+) -> Result<crate::codec_verification::CodecProbeResult, (&'static str, bool)> {
+    let source_ref = decode::<OpaqueSource>(&job.provider_source_id)
+        .map_err(|_| ("SOURCE_MAPPING_INVALID", false))?;
+    if source_ref.f.is_none() {
+        return Err(("SOURCE_MAPPING_INVALID", false));
+    }
+    let episode_ref = decode::<OpaqueRef>(&job.provider_episode_id)
+        .map_err(|_| ("SOURCE_MAPPING_INVALID", false))?;
+    if source_ref.p != ProviderKind::FourKHdHub
+        || episode_ref.p != ProviderKind::FourKHdHub
+        || source_ref.p != episode_ref.p
+        || source_ref.v != episode_ref.v
+        || source_ref.s != episode_ref.s
+        || source_ref.e != episode_ref.e
+    {
+        return Err(("SOURCE_MAPPING_INVALID", false));
+    }
+    let releases =
+        match tokio::time::timeout(SOURCE_TIMEOUT, cached_releases(state, &episode_ref)).await {
+            Ok(Ok(releases)) => releases,
+            Ok(Err(_)) => return Err(("PROVIDER_RESOLUTION_FAILED", true)),
+            Err(_) => return Err(("PROVIDER_RESOLUTION_TIMEOUT", true)),
+        };
+    let Some(release) = exact_fourk_release(&releases, &source_ref) else {
+        return Err(("SOURCE_MAPPING_CHANGED", false));
+    };
+    let Some(client) = state.service.fourk_client.as_ref() else {
+        return Err(("PROVIDER_RESOLUTION_FAILED", true));
+    };
+    let playback = match tokio::time::timeout(
+        PLAYBACK_RESOLUTION_TIMEOUT,
+        client.resolve_release(
+            release,
+            crate::providers::models::ResolutionIntent::Playback,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(playback)) => playback,
+        Ok(Err(_)) => return Err(("PROVIDER_RESOLUTION_FAILED", true)),
+        Err(_) => return Err(("PROVIDER_RESOLUTION_TIMEOUT", true)),
+    };
+    crate::codec_verification::verify_playback_source(&playback)
+        .await
+        .map_err(|error| (error.code(), error.retryable()))
+}
+
+fn exact_fourk_release<'a>(releases: &'a [Release], source: &OpaqueSource) -> Option<&'a Release> {
+    let fingerprint = source.f.as_deref()?;
+    if source.p != ProviderKind::FourKHdHub {
+        return None;
+    }
+    releases.iter().find(|release| {
+        release.provider == ProviderKind::FourKHdHub && release_fingerprint(release) == fingerprint
+    })
 }
 
 async fn admin_catalog_import_by_name_route(
@@ -6011,6 +6285,131 @@ mod tests {
         assert_eq!(status, 503);
         assert!(body.contains("UPSTREAM_UNAVAILABLE"));
         assert!(body.contains("retryable\":true"));
+    }
+
+    #[test]
+    fn catalog_import_candidate_does_not_require_or_trust_codec_hints() {
+        let mut release = Release {
+            provider: ProviderKind::FourKHdHub,
+            filename: "episode.mkv".into(),
+            quality: Some("2160p".into()),
+            codec: None,
+            language: None,
+            size_bytes: None,
+            season: Some(1),
+            episode: Some(1),
+            mirrors: vec![crate::providers::models::SourceMirror {
+                label: "Provider mirror".into(),
+                resolver_url: "https://hubcloud.example/drive/opaque".into(),
+                headers: vec![],
+                direct_file: false,
+            }],
+            resource_id: None,
+        };
+        assert!(release_has_verification_candidate(&release));
+        assert!(!release_has_usable_source(&release));
+
+        release.codec = Some("HEVC".into());
+        assert!(release_has_verification_candidate(&release));
+        assert!(!release_has_usable_source(&release));
+
+        release.provider = ProviderKind::Dramachi;
+        assert!(!release_has_verification_candidate(&release));
+    }
+
+    #[test]
+    fn verifier_release_selection_requires_exact_fingerprint_and_provider() {
+        let episode = OpaqueRef {
+            p: ProviderKind::FourKHdHub,
+            v: "provider-title".into(),
+            s: 1,
+            e: 2,
+        };
+        let release = Release {
+            provider: ProviderKind::FourKHdHub,
+            filename: "episode.mkv".into(),
+            quality: Some("1080p".into()),
+            codec: None,
+            language: None,
+            size_bytes: None,
+            season: Some(1),
+            episode: Some(2),
+            mirrors: vec![],
+            resource_id: None,
+        };
+        let mut source: OpaqueSource =
+            decode(&source_ref(&release, &episode, 0)).expect("encoded source reference");
+        let other_release = Release {
+            filename: "different.mkv".into(),
+            ..release.clone()
+        };
+        assert!(exact_fourk_release(&[other_release.clone(), release.clone()], &source).is_some());
+
+        source.f = None;
+        assert!(exact_fourk_release(std::slice::from_ref(&release), &source).is_none());
+        source.f = Some("wrong-fingerprint".into());
+        assert!(exact_fourk_release(std::slice::from_ref(&release), &source).is_none());
+        source.f = Some(release_fingerprint(&release));
+        source.p = ProviderKind::MovieBox;
+        assert!(exact_fourk_release(&[release], &source).is_none());
+    }
+
+    #[test]
+    fn catalog_source_errors_distinguish_blocked_expired_resolution_and_probe_states() {
+        let blocked = serde_json::json!({
+            "source_status":"active",
+            "source_not_expired":true,
+            "codec_verification_status":"blocked",
+            "video_codec":"hevc"
+        });
+        assert_eq!(
+            catalog_source_ineligible_error(&blocked).1,
+            "SOURCE_CODEC_BLOCKED"
+        );
+
+        let expired = serde_json::json!({
+            "source_status":"active",
+            "source_not_expired":false,
+            "codec_verification_status":"unverified",
+            "video_codec":"h264"
+        });
+        assert_eq!(
+            catalog_source_ineligible_error(&expired).1,
+            "SOURCE_EXPIRED"
+        );
+
+        let resolver_failed = serde_json::json!({
+            "source_status":"active",
+            "source_not_expired":true,
+            "codec_verification_status":"unverified",
+            "last_error_code":"PROVIDER_RESOLUTION_FAILED"
+        });
+        assert_eq!(
+            catalog_source_ineligible_error(&resolver_failed).1,
+            "PROVIDER_RESOLUTION_FAILED"
+        );
+
+        let probe_timed_out = serde_json::json!({
+            "source_status":"active",
+            "source_not_expired":true,
+            "codec_verification_status":"unverified",
+            "last_error_code":"MEDIA_PROBE_TIMEOUT"
+        });
+        assert_eq!(
+            catalog_source_ineligible_error(&probe_timed_out).1,
+            "MEDIA_PROBE_TIMEOUT"
+        );
+
+        let unknown = serde_json::json!({
+            "source_status":"active",
+            "source_not_expired":true,
+            "codec_verification_status":"unverified",
+            "last_error_code":null
+        });
+        assert_eq!(
+            catalog_source_ineligible_error(&unknown).1,
+            "CODEC_UNVERIFIED"
+        );
     }
 
     #[test]

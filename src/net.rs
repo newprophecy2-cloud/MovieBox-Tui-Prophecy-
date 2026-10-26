@@ -9,6 +9,7 @@ use hickory_resolver::name_server::TokioConnectionProvider;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 
 const FALLBACK_DNS_PORT: u16 = 53;
+const MAX_SAFE_REDIRECTS: usize = 5;
 pub const DEFAULT_BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 pub const APP_HTTP_USER_AGENT: &str = concat!("MovieBox-Tui/", env!("CARGO_PKG_VERSION"));
 
@@ -87,6 +88,7 @@ pub fn is_public_ip(address: std::net::IpAddr) -> bool {
             let is_shared_address_space = first == 100 && (64..=127).contains(&second);
             let is_benchmarking = first == 198 && (18..=19).contains(&second);
             let is_protocol_assignment = first == 192 && second == 0 && octets[2] == 0;
+            let is_6to4_relay = first == 192 && second == 88 && octets[2] == 99;
             !(address.is_private()
                 || address.is_loopback()
                 || address.is_link_local()
@@ -97,7 +99,8 @@ pub fn is_public_ip(address: std::net::IpAddr) -> bool {
                 || first >= 224
                 || is_shared_address_space
                 || is_benchmarking
-                || is_protocol_assignment)
+                || is_protocol_assignment
+                || is_6to4_relay)
         }
         std::net::IpAddr::V6(address) => {
             if let Some(mapped) = address.to_ipv4_mapped() {
@@ -107,11 +110,17 @@ pub fn is_public_ip(address: std::net::IpAddr) -> bool {
             let is_global_unicast = segments[0] & 0xe000 == 0x2000;
             let is_documentation = segments[0] == 0x2001 && segments[1] == 0x0db8;
             let is_benchmarking = segments[0] == 0x2001 && segments[1] == 0x0002;
-            let is_orchid = segments[0] == 0x2001 && segments[1] & 0xfff0 == 0x0010;
+            let is_ietf_special = segments[0] == 0x2001 && segments[1] <= 0x01ff;
+            let is_orchid = segments[0] == 0x2001
+                && (segments[1] & 0xfff0 == 0x0010 || segments[1] & 0xfff0 == 0x0020);
+            let is_transition =
+                segments[0] == 0x2002 || (segments[0] == 0x2001 && segments[1] == 0);
             is_global_unicast
                 && !is_documentation
                 && !is_benchmarking
+                && !is_ietf_special
                 && !is_orchid
+                && !is_transition
                 && !address.is_loopback()
                 && !address.is_unspecified()
                 && !address.is_unique_local()
@@ -179,6 +188,8 @@ pub fn validate_url_syntax(raw: &str, allow_http: bool) -> Result<reqwest::Url, 
     let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
     let host_size_ok = normalized_host_has_bounded_dns_size(&host);
     let literal_private = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
         .parse::<std::net::IpAddr>()
         .is_ok_and(|address| !is_public_ip(address));
     if !scheme_ok
@@ -220,21 +231,28 @@ pub async fn validate_public_url(raw: &str, allow_http: bool) -> Result<reqwest:
     let port = url
         .port_or_known_default()
         .ok_or_else(|| "URL has no known port".to_string())?;
-    let mut addresses = tokio::net::lookup_host((host, port))
+    let addresses = tokio::net::lookup_host((host, port))
         .await
-        .map_err(|_| "destination DNS lookup failed".to_string())?;
-    if addresses.all(|address| is_public_ip(address.ip())) {
+        .map_err(|_| "destination DNS lookup failed".to_string())?
+        .collect::<Vec<_>>();
+    if resolved_addresses_are_public(&addresses) {
         Ok(url)
     } else {
         Err("destination resolves to a private or local address".to_string())
     }
 }
 
+fn resolved_addresses_are_public(addresses: &[SocketAddr]) -> bool {
+    !addresses.is_empty() && addresses.iter().all(|address| is_public_ip(address.ip()))
+}
+
 pub fn http_client_builder_base() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .dns_resolver(Arc::new(FallbackResolver::new()))
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            if validate_url_syntax(attempt.url().as_str(), true).is_ok() {
+            if attempt.previous().len() >= MAX_SAFE_REDIRECTS {
+                attempt.error("redirect limit exceeded")
+            } else if validate_url_syntax(attempt.url().as_str(), true).is_ok() {
                 attempt.follow()
             } else {
                 attempt.error("redirect target is not an allowed public HTTP(S) URL")
@@ -420,9 +438,31 @@ mod tests {
         assert!(is_public_ip("::ffff:8.8.8.8".parse().unwrap()));
         assert!(!is_public_ip("100.64.0.1".parse().unwrap()));
         assert!(!is_public_ip("198.18.0.1".parse().unwrap()));
+        assert!(!is_public_ip("192.88.99.1".parse().unwrap()));
+        assert!(!is_public_ip("192.0.0.10".parse().unwrap()));
+        assert!(!is_public_ip("240.0.0.1".parse().unwrap()));
         assert!(!is_public_ip("224.0.0.1".parse().unwrap()));
         assert!(!is_public_ip("2001:db8::1".parse().unwrap()));
         assert!(!is_public_ip("2001:2::1".parse().unwrap()));
+        assert!(!is_public_ip("2001::1".parse().unwrap()));
+        assert!(!is_public_ip("2001:20::1".parse().unwrap()));
+        assert!(!is_public_ip("2002:0808:0808::1".parse().unwrap()));
+        assert!(!is_public_ip(
+            "2001:0000:4136:e378:8000:63bf:3fff:fdd2".parse().unwrap()
+        ));
+        assert!(!is_public_ip("fc00::1".parse().unwrap()));
         assert!(is_public_ip("2606:4700:4700::1111".parse().unwrap()));
+    }
+
+    #[test]
+    fn dns_validation_requires_at_least_one_public_address_and_rejects_mixed_answers() {
+        assert!(!resolved_addresses_are_public(&[]));
+        assert!(resolved_addresses_are_public(&["8.8.8.8:443"
+            .parse()
+            .unwrap()]));
+        assert!(!resolved_addresses_are_public(&[
+            "8.8.8.8:443".parse().unwrap(),
+            "127.0.0.1:443".parse().unwrap(),
+        ]));
     }
 }
