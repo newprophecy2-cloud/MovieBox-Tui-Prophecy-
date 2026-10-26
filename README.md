@@ -209,7 +209,7 @@ curl --no-buffer \
 
 Source SSE events include `source_result`, `source_error`, and `source_complete`.
 
-### Audio, subtitles, downloads, and transcode
+### Audio, subtitles, downloads, and Remux
 
 ```bash
 curl "http://127.0.0.1:8080/api/v1/sources/$SOURCE_ID/audio"
@@ -219,6 +219,10 @@ curl "http://127.0.0.1:8080/api/v1/sources/$SOURCE_ID/transcode"
 ```
 
 Audio and subtitle responses are only confirmed when the resolved media can be inspected. Download support is reported only for sources that advertise a permitted direct file; the API does not turn arbitrary resolver pages into downloads.
+
+Remux produces a browser-oriented fragmented MP4 stream. H.264 video is copied; every selected source audio track is converted to AAC stereo at 192 kbps, and language metadata is preserved. This supports sources with multiple audio languages, including E-AC-3 inputs. Embedded subtitles are intentionally excluded from the Remux output (`-sn`); use the subtitle-track endpoint for confirmed embedded subtitle metadata.
+
+Remux responses advertise `X-Media-Mode: remux`, `X-Remux-Cache-State: disabled`, and `Accept-Ranges: none`. Remux is a forward-only stream, so byte-range seeking and `HEAD` requests are not supported. A client disconnect stops the FFmpeg process rather than allowing work to continue in the background.
 
 ## API routes
 
@@ -258,6 +262,8 @@ Audio and subtitle responses are only confirmed when the resolved media can be i
 | `GET` | `/api/v1/sources/{source_id}/subtitles` | Embedded subtitle tracks |
 | `GET` | `/api/v1/sources/{source_id}/download` | Direct-download metadata |
 | `GET` | `/api/v1/sources/{source_id}/transcode` | Supported server-side media transcode |
+
+The `/api/v1/sources/{source_id}/remux` and `/api/v1/catalog/sources/{source_id}/remux` endpoints return `415` for blocked or unverified codecs, `429` when the bounded Remux concurrency limit is reached, `501` for byte-range requests, and `502`/`504` for provider or FFmpeg startup failures. They do not expose the resolved provider URL in error messages.
 
 ## Providers
 
@@ -306,9 +312,10 @@ cargo fmt --all -- --check
 cargo check --locked
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
+cargo build --release --locked
 ```
 
-The deterministic test suite covers provider parsers, resolver payload decoding, source identity, API contracts, error handling, player contracts, downloads, history, favorites, settings, and TUI behavior. Live provider tests are marked ignored because they depend on external services:
+The deterministic test suite covers provider parsers, resolver payload decoding, source identity, API contracts, error handling, player contracts, downloads, history, favorites, settings, TUI behavior, strict H.264/HEVC policy, fragmented MP4 structure, and multi-language E-AC-3-to-AAC Remux conversion. Live provider tests are marked ignored because they depend on external services:
 
 ```bash
 cargo test --test live_stream_verification -- --ignored
