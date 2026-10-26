@@ -4554,55 +4554,18 @@ async fn source_route(
         parts.get(4),
         Some(&"playback") | Some(&"play") | Some(&"watch")
     ) {
-        return match cached_playback_source(id, rel, &state).await {
-            Ok(playback) => write_json(stream, 200, &playback_json(&playback), None).await,
-            Err(message) => {
-                let timed_out = message.to_ascii_lowercase().contains("timed out");
-                let (s, b) = err(
-                    if timed_out {
-                        "PLAYBACK_RESOLUTION_TIMEOUT"
-                    } else {
-                        "PLAYBACK_RESOLUTION_FAILED"
-                    },
-                    message,
-                    Some(sr.p),
-                    if timed_out { 504 } else { 502 },
-                );
-                write_raw_json(stream, s, &b, None).await
-            }
-        };
+        return write_verified_playback_response(stream, id, rel, &state, sr.p).await;
     }
     if sr.p == ProviderKind::FourKHdHub {
-        return match cached_playback_source(id, rel, &state).await {
-            Ok(playback) => write_json(stream, 200, &playback_json(&playback), None).await,
-            Err(message) => {
-                let timed_out = message.to_ascii_lowercase().contains("timed out");
-                let (s, b) = err(
-                    if timed_out {
-                        "PLAYBACK_RESOLUTION_TIMEOUT"
-                    } else {
-                        "PLAYBACK_RESOLUTION_FAILED"
-                    },
-                    message,
-                    Some(sr.p),
-                    if timed_out { 504 } else { 502 },
-                );
-                write_raw_json(stream, s, &b, None).await
-            }
-        };
+        return write_verified_playback_response(stream, id, rel, &state, sr.p).await;
     }
-    write_json(
-        stream,
-        200,
-        &serde_json::json!({
-            "source": api_sources(std::slice::from_ref(rel), &r),
-            "url": rel.direct_url(),
-            "headers": rel.mirrors.first().map(|m| public_headers(&m.headers)),
-            "sensitive_headers_redacted": true
-        }),
-        None,
-    )
-    .await
+    let (status, body) = err(
+        "CODEC_UNVERIFIED",
+        "Direct media URLs are withheld until the source is positively verified as H.264.",
+        Some(sr.p),
+        415,
+    );
+    write_raw_json(stream, status, &body, None).await
 }
 fn watch_url(raw: &str) -> String {
     let Ok(mut url) = reqwest::Url::parse(raw) else {
@@ -4713,6 +4676,57 @@ async fn cached_playback_source(
         );
     }
     resolved
+}
+
+async fn write_verified_playback_response(
+    stream: &mut TcpStream,
+    source_id: &str,
+    release: &Release,
+    state: &ApiState,
+    provider: ProviderKind,
+) -> std::io::Result<()> {
+    let playback = match cached_playback_source(source_id, release, state).await {
+        Ok(playback) => playback,
+        Err(message) => {
+            let timed_out = message.to_ascii_lowercase().contains("timed out");
+            let (status, body) = err(
+                if timed_out {
+                    "PLAYBACK_RESOLUTION_TIMEOUT"
+                } else {
+                    "PLAYBACK_RESOLUTION_FAILED"
+                },
+                message,
+                Some(provider),
+                if timed_out { 504 } else { 502 },
+            );
+            return write_raw_json(stream, status, &body, None).await;
+        }
+    };
+    match crate::codec_verification::verify_playback_source(&playback).await {
+        Ok(crate::codec_verification::CodecProbeResult::Allowed(_)) => {
+            write_json(stream, 200, &playback_json(&playback), None).await
+        }
+        Ok(crate::codec_verification::CodecProbeResult::BlockedHevc(_)) => {
+            let (status, body) = err(
+                "SOURCE_CODEC_BLOCKED",
+                "H.265/HEVC sources are blocked by playback policy.",
+                Some(provider),
+                415,
+            );
+            write_raw_json(stream, status, &body, None).await
+        }
+        Ok(crate::codec_verification::CodecProbeResult::Unsupported(_))
+        | Ok(crate::codec_verification::CodecProbeResult::NoVideoStream)
+        | Err(_) => {
+            let (status, body) = err(
+                "CODEC_UNVERIFIED",
+                "The media video codec could not be positively verified as H.264.",
+                Some(provider),
+                415,
+            );
+            write_raw_json(stream, status, &body, None).await
+        }
+    }
 }
 
 fn public_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
@@ -5187,6 +5201,27 @@ async fn stream_proxy_route(
             .await;
         }
     };
+    match verify_generic_media_codec(&url, referer.as_deref()).await {
+        Ok(SourceCodecEligibility::Verified) => {}
+        Ok(SourceCodecEligibility::BlockedH265) => {
+            return write_raw_json(
+                stream,
+                415,
+                r#"{"error":{"code":"SOURCE_CODEC_BLOCKED","message":"H.265/HEVC sources are blocked by playback policy."}}"#,
+                None,
+            )
+            .await;
+        }
+        Ok(SourceCodecEligibility::Unverified) | Err(_) => {
+            return write_raw_json(
+                stream,
+                415,
+                r#"{"error":{"code":"CODEC_UNVERIFIED","message":"The media video codec could not be positively verified as H.264."}}"#,
+                None,
+            )
+            .await;
+        }
+    }
     if remux_requested {
         return remux_media_url(stream, &url, referer.as_deref(), request_headers, head_only).await;
     }
@@ -5518,6 +5553,56 @@ async fn remux_media_url(
         started_at.elapsed().as_millis()
     );
     result
+}
+
+async fn verify_generic_media_codec(
+    url: &reqwest::Url,
+    referer: Option<&str>,
+) -> Result<SourceCodecEligibility, MediaInfoProbeError> {
+    let mut command = Command::new("ffprobe");
+    command.args([
+        "-hide_banner",
+        "-v",
+        "error",
+        "-rw_timeout",
+        "15000000",
+        "-show_entries",
+        "stream=codec_type,codec_name",
+        "-of",
+        "json",
+    ]);
+    if let Some(referer) = referer {
+        command
+            .arg("-headers")
+            .arg(format!("Referer: {referer}\r\n"));
+    }
+    command.arg(url.as_str());
+    let output = run_media_info_probe(&mut command, Duration::from_secs(20)).await?;
+    let probe: ProbeOutput =
+        serde_json::from_slice(&output.stdout).map_err(|_| MediaInfoProbeError::Failed)?;
+    let video_codecs = probe
+        .streams
+        .iter()
+        .filter(|stream| stream.codec_type.as_deref() == Some("video"))
+        .filter_map(|stream| stream.codec_name.as_deref())
+        .collect::<Vec<_>>();
+    if video_codecs.is_empty() {
+        return Ok(SourceCodecEligibility::Unverified);
+    }
+    if video_codecs
+        .iter()
+        .any(|codec| crate::codec_verification::is_hevc_codec(codec))
+    {
+        return Ok(SourceCodecEligibility::BlockedH265);
+    }
+    if video_codecs
+        .iter()
+        .all(|codec| crate::codec_verification::is_allowed_codec(codec))
+    {
+        Ok(SourceCodecEligibility::Verified)
+    } else {
+        Ok(SourceCodecEligibility::Unverified)
+    }
 }
 
 async fn media_info_route(
@@ -6631,11 +6716,18 @@ mod tests {
                 "codec should be blocked: {codec:?}"
             );
         }
-        for codec in [Some("H.264"), Some("AVC"), Some("AV1"), Some("vp9")] {
+        for codec in [Some("H.264"), Some("AVC"), Some("H.264 / AVC")] {
             assert_eq!(
                 source_codec_eligibility(codec),
                 SourceCodecEligibility::Verified,
-                "known codec should be accepted: {codec:?}"
+                "verified H.264 codec should be accepted: {codec:?}"
+            );
+        }
+        for codec in [Some("AV1"), Some("vp9"), Some("not-h264")] {
+            assert_eq!(
+                source_codec_eligibility(codec),
+                SourceCodecEligibility::Unverified,
+                "non-H.264 codec must fail closed: {codec:?}"
             );
         }
         for codec in [None, Some(""), Some("unknown"), Some("mystery-codec")] {

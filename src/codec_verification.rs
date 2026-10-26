@@ -350,30 +350,22 @@ pub fn is_hevc_codec(codec: &str) -> bool {
     let normalized = normalize_codec_label(codec);
     ["hevc", "h265", "x265", "hvc1", "hev1"]
         .iter()
-        .any(|marker| normalized.contains(marker))
+        .any(|identifier| normalized == *identifier || normalized.starts_with(identifier))
 }
 
 pub fn is_allowed_codec(codec: &str) -> bool {
     let normalized = normalize_codec_label(codec);
     matches!(
         normalized.as_str(),
-        "h264"
-            | "avc"
-            | "avc1"
-            | "h264avc"
-            | "avch264"
-            | "av1"
-            | "vp8"
-            | "vp9"
-            | "vp09"
-            | "mpeg2video"
-            | "mpeg4"
-            | "vc1"
-            | "theora"
-            | "prores"
-            | "xvid"
-            | "divx"
-    )
+        "h264" | "avc" | "avc1" | "h264avc" | "avch264"
+    ) || normalized.strip_prefix("h264").is_some_and(|suffix| {
+        matches!(
+            suffix,
+            "baseline" | "constrainedbaseline" | "main" | "high" | "high10" | "high422" | "high444"
+        )
+    }) || normalized.strip_prefix("avc1").is_some_and(|suffix| {
+        suffix.len() == 6 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
 }
 
 fn normalize_codec_label(codec: &str) -> String {
@@ -477,6 +469,17 @@ mod tests {
     }
 
     #[test]
+    fn mixed_video_streams_are_blocked_if_any_stream_is_hevc() {
+        assert_eq!(
+            classify_probe_json(
+                br#"{"streams":[{"codec_type":"video","codec_name":"h264"},{"codec_type":"video","codec_name":"hevc"}]}"#,
+            )
+            .unwrap(),
+            CodecProbeResult::BlockedHevc("hevc".into())
+        );
+    }
+
+    #[test]
     fn url_validation_rejects_local_or_non_https_media_targets() {
         assert!(crate::net::validate_url_syntax("http://example.com/video", false).is_err());
         assert!(crate::net::validate_url_syntax("https://127.0.0.1/video", false).is_err());
@@ -545,10 +548,14 @@ mod tests {
     fn codec_allowlist_is_exact_and_excludes_hevc() {
         assert!(is_allowed_codec("h264"));
         assert!(is_allowed_codec("H.264 / AVC"));
-        assert!(is_allowed_codec("av1"));
+        assert!(is_allowed_codec("H.264 High"));
+        assert!(is_allowed_codec("avc1.640028"));
+        assert!(!is_allowed_codec("av1"));
+        assert!(!is_allowed_codec("vp9"));
         assert!(!is_allowed_codec("not-h264"));
         assert!(is_hevc_codec("H.265 / HEVC"));
         assert!(is_hevc_codec("HEVC Main 10"));
+        assert!(!is_hevc_codec("not-hevc"));
         assert!(!is_allowed_codec("hevc"));
     }
 }

@@ -932,7 +932,8 @@ mod tests {
     #[test]
     fn provider_source_candidates_fail_closed_for_hevc_and_unknown_codecs() {
         assert!(source_codec_is_known_non_hevc("h264"));
-        assert!(source_codec_is_known_non_hevc("AV1"));
+        assert!(source_codec_is_known_non_hevc("H.264 / AVC"));
+        assert!(!source_codec_is_known_non_hevc("AV1"));
         assert!(!source_codec_is_known_non_hevc("hevc"));
         assert!(!source_codec_is_known_non_hevc("mystery-codec"));
         assert!(!source_codec_is_known_non_hevc("not-h264"));
