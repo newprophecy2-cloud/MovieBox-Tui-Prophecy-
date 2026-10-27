@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13,17 +14,34 @@ const MAX_HEADERS: usize = 64;
 const MAX_MANIFEST_BYTES: usize = 10 * 1024 * 1024;
 const CHUNK_IDLE_TIMEOUT_SECS: u64 = 60;
 const WATCHDOG_IDLE_SECS: u64 = 600;
+const PREFETCH_IDLE_CANCEL_SECS: u64 = 5;
 const DASH_RANGE_CHUNK_BYTES: usize = 95 * 1024;
 const MAX_CACHED_SEGMENTS: usize = 24;
 const MAX_CACHED_SEGMENT_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CONCURRENT_SEGMENT_FETCHES: usize = 4;
 const MAX_SEGMENT_BYTES: usize = 16 * 1024 * 1024;
-const PREFETCH_LOOKAHEAD: u32 = 3;
-
-type CachedSegment = (String, String, Arc<[u8]>);
+const HLS_CHUNK_TTL: Duration = Duration::from_secs(120);
+const MAX_HLS_PLAYLIST_SEGMENTS: usize = 10_000;
+const MAX_TRACKED_HLS_PLAYLISTS: usize = 8;
+type CachedSegment = (String, String, Arc<[u8]>, Instant);
 type CachedManifest = (String, Arc<[u8]>);
 
-fn is_hls_url(url: &str) -> bool {
+#[derive(Clone, Debug)]
+struct HlsMediaSegment {
+    url: String,
+    duration_seconds: f64,
+    byte_range: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct HlsMediaPlaylist {
+    segments: Vec<HlsMediaSegment>,
+    target_duration_seconds: Option<u64>,
+    total_duration_seconds: Option<f64>,
+    is_vod: bool,
+}
+
+pub fn is_hls_url(url: &str) -> bool {
     url.split(['?', '#'])
         .next()
         .unwrap_or(url)
@@ -31,10 +49,269 @@ fn is_hls_url(url: &str) -> bool {
         .ends_with(".m3u8")
 }
 
+fn parse_hls_media_playlist(manifest: &str, manifest_url: &str) -> HlsMediaPlaylist {
+    let Ok(base) = reqwest::Url::parse(manifest_url) else {
+        return HlsMediaPlaylist::default();
+    };
+    let mut playlist = HlsMediaPlaylist::default();
+    let mut pending_duration = None;
+    let mut pending_byte_range = false;
+    let mut total_duration = 0.0f64;
+    let mut truncated = false;
+
+    for line in manifest.lines().map(str::trim) {
+        if let Some(value) = line.strip_prefix("#EXT-X-TARGETDURATION:") {
+            playlist.target_duration_seconds = value.trim().parse::<u64>().ok();
+        } else if let Some(value) = line.strip_prefix("#EXTINF:") {
+            pending_duration = value
+                .split(',')
+                .next()
+                .and_then(|duration| duration.trim().parse::<f64>().ok())
+                .filter(|duration| duration.is_finite() && *duration > 0.0);
+        } else if line.starts_with("#EXT-X-BYTERANGE:") {
+            pending_byte_range = true;
+        } else if line == "#EXT-X-ENDLIST" || line == "#EXT-X-PLAYLIST-TYPE:VOD" {
+            playlist.is_vod = true;
+        } else if !line.is_empty() && !line.starts_with('#') {
+            if let Some(duration) = pending_duration.take() {
+                if playlist.segments.len() >= MAX_HLS_PLAYLIST_SEGMENTS {
+                    truncated = true;
+                } else if let Ok(url) = base.join(line)
+                    && matches!(url.scheme(), "http" | "https")
+                {
+                    total_duration += duration;
+                    playlist.segments.push(HlsMediaSegment {
+                        url: url.to_string(),
+                        duration_seconds: duration,
+                        byte_range: pending_byte_range,
+                    });
+                }
+            }
+            pending_byte_range = false;
+        }
+    }
+
+    if playlist.is_vod && !truncated && !playlist.segments.is_empty() {
+        playlist.total_duration_seconds = Some(total_duration);
+    }
+    playlist
+}
+
+fn register_hls_playlist(ctx: &ProxyContext, playlist_url: &str, manifest: &str) {
+    let playlist = parse_hls_media_playlist(manifest, playlist_url);
+    if playlist.segments.is_empty() {
+        return;
+    }
+    log::info!(
+        "HLS playlist relayed segments={} target_duration_seconds={:?} vod_duration_seconds={:?} vod={} two_second_target={}",
+        playlist.segments.len(),
+        playlist.target_duration_seconds,
+        playlist.total_duration_seconds,
+        playlist.is_vod,
+        playlist.target_duration_seconds == Some(2)
+    );
+    if let Ok(mut playlists) = ctx.hls_playlists.lock() {
+        if !playlists.contains_key(playlist_url) && playlists.len() >= MAX_TRACKED_HLS_PLAYLISTS {
+            if let Some(oldest) = playlists.keys().next().cloned() {
+                playlists.remove(&oldest);
+            }
+        }
+        playlists.insert(playlist_url.to_string(), playlist);
+    }
+}
+
+fn find_hls_segment(
+    ctx: &ProxyContext,
+    segment_url: &str,
+) -> Option<(String, usize, HlsMediaSegment)> {
+    let playlists = ctx.hls_playlists.lock().ok()?;
+    playlists.iter().find_map(|(playlist_url, playlist)| {
+        playlist
+            .segments
+            .iter()
+            .enumerate()
+            .find(|(_, segment)| segment.url == segment_url)
+            .map(|(index, segment)| (playlist_url.clone(), index, segment.clone()))
+    })
+}
+
+async fn prefetch_url_is_public(url: &str) -> bool {
+    #[cfg(test)]
+    if reqwest::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_string))
+        .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+        .is_some_and(|address| address.is_loopback())
+    {
+        return true;
+    }
+    crate::net::validate_public_url(url, true).await.is_ok()
+}
+
+fn schedule_hls_prefetch(ctx: &ProxyContext, playlist_url: &str, current_index: usize) {
+    let previous = ctx
+        .hls_prefetch
+        .lock()
+        .ok()
+        .and_then(|mut jobs| jobs.remove(playlist_url));
+    if let Some(jobs) = previous {
+        for job in jobs {
+            job.abort();
+        }
+    }
+    if ctx.hls_prefetch_depth == 0 {
+        return;
+    }
+    let next_segments = ctx
+        .hls_playlists
+        .lock()
+        .ok()
+        .and_then(|playlists| {
+            playlists.get(playlist_url).map(|playlist| {
+                playlist
+                    .segments
+                    .iter()
+                    .skip(current_index.saturating_add(1))
+                    .filter(|segment| !segment.byte_range)
+                    .take(ctx.hls_prefetch_depth)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+        })
+        .unwrap_or_default();
+    if next_segments.is_empty() {
+        return;
+    }
+
+    let mut jobs = Vec::with_capacity(next_segments.len());
+    for segment in next_segments {
+        let Some(host) = extract_host_authority(&segment.url) else {
+            continue;
+        };
+        let allowed = ctx.target_host.as_deref() == Some(host.as_str())
+            || ctx
+                .subtitle_url
+                .as_deref()
+                .and_then(extract_host_authority)
+                .as_deref()
+                == Some(host.as_str())
+            || ctx
+                .hls_allowed_hosts
+                .lock()
+                .is_ok_and(|hosts| hosts.contains(&host));
+        if !allowed {
+            continue;
+        }
+        let url = segment.url.clone();
+        let duration = segment.duration_seconds;
+        let cache = Arc::clone(&ctx.segment_cache);
+        let client = ctx.client.clone();
+        let headers = Arc::clone(&ctx.auth_headers);
+        let forward_all_headers = ctx.target_host.as_deref() == Some(host.as_str());
+        jobs.push(tokio::spawn(async move {
+            if !prefetch_url_is_public(&url).await {
+                log::debug!("HLS segment prefetch skipped category=unsafe_or_unresolvable_url");
+                return;
+            }
+            let started = Instant::now();
+            if fetch_or_get_segment(
+                &cache,
+                &client,
+                &url,
+                &headers,
+                forward_all_headers,
+                true,
+            )
+            .await
+            .is_ok()
+            {
+                log::debug!(
+                    "HLS segment prefetch completed elapsed_ms={} source_duration_seconds={duration:.3}",
+                    started.elapsed().as_millis()
+                );
+            }
+        }));
+    }
+    if !jobs.is_empty()
+        && let Ok(mut active) = ctx.hls_prefetch.lock()
+    {
+        active.insert(playlist_url.to_string(), jobs);
+    }
+}
+
+fn schedule_dash_prefetch(ctx: &ProxyContext, current_url: &str) {
+    const DASH_KEY: &str = "__dash_prefetch__";
+    if let Some(previous) = ctx
+        .hls_prefetch
+        .lock()
+        .ok()
+        .and_then(|mut jobs| jobs.remove(DASH_KEY))
+    {
+        for job in previous {
+            job.abort();
+        }
+    }
+
+    let mut jobs = Vec::new();
+    let depth = ctx.hls_prefetch_depth.min(u32::MAX as usize) as u32;
+    for url in next_dash_segment_urls(current_url, depth) {
+        let Some(host) = extract_host_authority(&url) else {
+            continue;
+        };
+        if ctx.target_host.as_deref() != Some(host.as_str())
+            || ctx.segment_cache.contains_or_in_flight(&url)
+        {
+            continue;
+        }
+        let cache = Arc::clone(&ctx.segment_cache);
+        let client = ctx.client.clone();
+        let headers = Arc::clone(&ctx.auth_headers);
+        jobs.push(tokio::spawn(async move {
+            if !prefetch_url_is_public(&url).await {
+                log::debug!("DASH prefetch skipped category=unsafe_or_unresolvable_url");
+                return;
+            }
+            let started = Instant::now();
+            if fetch_or_get_segment(&cache, &client, &url, &headers, true, true)
+                .await
+                .is_ok()
+            {
+                log::debug!(
+                    "DASH segment prefetch completed elapsed_ms={}",
+                    started.elapsed().as_millis()
+                );
+            }
+        }));
+    }
+    if !jobs.is_empty()
+        && let Ok(mut active) = ctx.hls_prefetch.lock()
+    {
+        active.insert(DASH_KEY.to_string(), jobs);
+    }
+}
+
+fn cancel_all_prefetch(ctx: &ProxyContext) {
+    let jobs = ctx
+        .hls_prefetch
+        .lock()
+        .ok()
+        .map(|mut jobs| std::mem::take(&mut *jobs))
+        .unwrap_or_default();
+    for playlist_jobs in jobs.into_values() {
+        for job in playlist_jobs {
+            job.abort();
+        }
+    }
+}
+
 struct SegmentCache {
     completed: Mutex<std::collections::VecDeque<CachedSegment>>,
     in_flight: Mutex<std::collections::HashMap<String, Arc<tokio::sync::Notify>>>,
     fetch_slots: Arc<tokio::sync::Semaphore>,
+    prefetch_slots: Arc<tokio::sync::Semaphore>,
+    disk_cache: Option<Arc<crate::hls_chunk_cache::HlsChunkCache>>,
+    namespace: String,
+    ttl: Duration,
 }
 
 impl Default for SegmentCache {
@@ -43,21 +320,34 @@ impl Default for SegmentCache {
             completed: Mutex::new(std::collections::VecDeque::new()),
             in_flight: Mutex::new(std::collections::HashMap::new()),
             fetch_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SEGMENT_FETCHES)),
+            prefetch_slots: Arc::new(tokio::sync::Semaphore::new(1)),
+            disk_cache: None,
+            namespace: String::new(),
+            ttl: HLS_CHUNK_TTL,
         }
     }
 }
 
 impl SegmentCache {
     fn get(&self, url: &str) -> Option<(String, Arc<[u8]>)> {
-        let lock = self.completed.lock().ok()?;
-        lock.iter()
-            .find(|(u, _, _)| u == url)
-            .map(|(_, ct, b)| (ct.clone(), b.clone()))
+        let mut lock = self.completed.lock().ok()?;
+        let index = lock.iter().position(|(u, _, _, _)| u == url)?;
+        if lock[index].3.elapsed() >= self.ttl {
+            lock.remove(index);
+            return None;
+        }
+        let item = lock.remove(index)?;
+        let result = (item.1.clone(), Arc::clone(&item.2));
+        lock.push_back(item);
+        Some(result)
     }
 
     fn contains_or_in_flight(&self, url: &str) -> bool {
         if let Ok(lock) = self.completed.lock() {
-            if lock.iter().any(|(u, _, _)| u == url) {
+            if lock
+                .iter()
+                .any(|(u, _, _, created)| u == url && created.elapsed() < self.ttl)
+            {
                 return true;
             }
         }
@@ -74,19 +364,20 @@ impl SegmentCache {
             return;
         }
         if let Ok(mut lock) = self.completed.lock() {
-            if lock.iter().any(|(u, _, _)| u == &url) {
+            lock.retain(|(_, _, _, created)| created.elapsed() < self.ttl);
+            if lock.iter().any(|(u, _, _, _)| u == &url) {
                 return;
             }
-            let mut cached_bytes: usize = lock.iter().map(|(_, _, bytes)| bytes.len()).sum();
+            let mut cached_bytes: usize = lock.iter().map(|(_, _, bytes, _)| bytes.len()).sum();
             while !lock.is_empty()
                 && (lock.len() >= MAX_CACHED_SEGMENTS
                     || cached_bytes.saturating_add(data.len()) > MAX_CACHED_SEGMENT_CACHE_BYTES)
             {
-                if let Some((_, _, evicted)) = lock.pop_front() {
+                if let Some((_, _, evicted, _)) = lock.pop_front() {
                     cached_bytes = cached_bytes.saturating_sub(evicted.len());
                 }
             }
-            lock.push_back((url, content_type, data));
+            lock.push_back((url, content_type, data, Instant::now()));
         }
     }
 }
@@ -116,6 +407,10 @@ struct ProxyContext {
     max_height: Option<u64>,
     segment_cache: Arc<SegmentCache>,
     manifest_cache: Arc<Mutex<Option<CachedManifest>>>,
+    hls_playlists: Arc<Mutex<std::collections::HashMap<String, HlsMediaPlaylist>>>,
+    hls_allowed_hosts: Arc<Mutex<HashSet<String>>>,
+    hls_prefetch: Arc<Mutex<std::collections::HashMap<String, Vec<tokio::task::JoinHandle<()>>>>>,
+    hls_prefetch_depth: usize,
 }
 struct ConnectionGuard {
     conns: Arc<AtomicUsize>,
@@ -209,6 +504,54 @@ pub async fn run_sidecar(
     subtitle_url: Option<String>,
     max_height: Option<u64>,
 ) {
+    let config = crate::config::load();
+    if let Err(error) = config.validate_hls_chunk_settings() {
+        println!("ERROR invalid HLS chunk-cache configuration: {error}");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        return;
+    }
+    let disk_cache = match crate::hls_chunk_cache::HlsChunkCache::open(
+        &crate::config::cache_dir().join("hls-chunks"),
+        HLS_CHUNK_TTL,
+        config.hls_chunk_cache_max_bytes,
+    ) {
+        Ok(cache) => Some(Arc::new(cache)),
+        Err(error) => {
+            log::warn!("HLS chunk disk cache unavailable; using bounded memory cache: {error}");
+            None
+        }
+    };
+    let namespace_material = serde_json::to_vec(&headers).unwrap_or_default();
+    let namespace = crate::hls_chunk_cache::HlsChunkCache::key_for(
+        &target_url,
+        &String::from_utf8_lossy(&namespace_material),
+    );
+    let segment_cache = Arc::new(match disk_cache {
+        Some(cache) => SegmentCache {
+            disk_cache: Some(cache.clone()),
+            namespace,
+            ..SegmentCache::default()
+        },
+        None => SegmentCache::default(),
+    });
+    if let Some(cache) = segment_cache.disk_cache.clone() {
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                if let Err(error) = cache.cleanup_expired().await {
+                    log::warn!("HLS chunk TTL cleanup failed: {error}");
+                }
+            }
+        });
+    }
+    log::info!(
+        "HLS sidecar cache ready ttl_seconds=120 budget_bytes={} prefetch_depth={} disk_enabled={}",
+        config.hls_chunk_cache_max_bytes,
+        config.hls_prefetch_depth,
+        segment_cache.disk_cache.is_some()
+    );
+
     let client = crate::net::http_client_builder_base()
         .http1_only()
         .pool_max_idle_per_host(16)
@@ -256,9 +599,31 @@ pub async fn run_sidecar(
         target_host: extract_host_authority(&target_url),
         subtitle_url,
         max_height,
-        segment_cache: Arc::new(SegmentCache::default()),
+        segment_cache,
         manifest_cache: Arc::new(Mutex::new(None)),
+        hls_playlists: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        hls_allowed_hosts: Arc::new(Mutex::new(HashSet::new())),
+        hls_prefetch: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        hls_prefetch_depth: config.hls_prefetch_depth,
     };
+
+    let idle_ctx = ctx.clone();
+    let idle_conns = Arc::clone(&active_connections);
+    let idle_activity = Arc::clone(&last_activity);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let idle_for = idle_activity
+                .lock()
+                .map(|activity| activity.elapsed())
+                .unwrap_or_default();
+            if idle_conns.load(Ordering::Relaxed) == 0
+                && idle_for >= Duration::from_secs(PREFETCH_IDLE_CANCEL_SECS)
+            {
+                cancel_all_prefetch(&idle_ctx);
+            }
+        }
+    });
 
     if crate::player::is_dash_url(&target_url) {
         let warm_ctx = ctx.clone();
@@ -415,11 +780,18 @@ async fn handle_connection(
         }
         let extracted_host = extract_host_authority(&target_url);
         let sub_host = subtitle_url.and_then(extract_host_authority);
+        let manifest_host_allowed = extracted_host.as_ref().is_some_and(|host| {
+            ctx.hls_allowed_hosts
+                .lock()
+                .is_ok_and(|hosts| hosts.contains(host))
+        });
         let is_allowed = match (target_host, extracted_host.as_deref()) {
             (Some(allowed), Some(extracted)) => {
-                extracted == allowed || (sub_host.is_some() && extracted_host == sub_host)
+                extracted == allowed
+                    || (sub_host.is_some() && extracted_host == sub_host)
+                    || manifest_host_allowed
             }
-            _ => false,
+            _ => manifest_host_allowed,
         };
         if !is_allowed {
             let response =
@@ -462,24 +834,84 @@ async fn handle_connection(
             }
         }
 
-        if method == "GET" && is_m4s_segment(&target_url) {
-            for next_url in next_dash_segment_urls(&target_url, PREFETCH_LOOKAHEAD) {
-                if !ctx.segment_cache.contains_or_in_flight(&next_url) {
-                    let cache_clone = Arc::clone(&ctx.segment_cache);
-                    let client_clone = client.clone();
-                    let headers_clone = Arc::clone(&ctx.auth_headers);
-                    tokio::spawn(async move {
-                        let _ = fetch_or_get_segment(
-                            &cache_clone,
-                            &client_clone,
-                            &next_url,
-                            &headers_clone,
-                            forward_all_headers,
-                        )
-                        .await;
-                    });
+        let hls_segment = if method == "GET" {
+            find_hls_segment(ctx, &target_url)
+        } else {
+            None
+        };
+        if let Some((playlist_url, segment_index, segment)) = hls_segment.as_ref()
+            && !segment.byte_range
+        {
+            schedule_hls_prefetch(ctx, playlist_url, *segment_index);
+            match fetch_or_get_segment(
+                &ctx.segment_cache,
+                client,
+                &target_url,
+                auth_headers,
+                forward_all_headers,
+                false,
+            )
+            .await
+            {
+                Ok((seg_status, content_type, seg_bytes)) if seg_status.is_success() => {
+                    if let Err(total) = cached_segment_range(&seg_bytes, range_header.as_deref()) {
+                        let header = format!(
+                            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{total}\r\nContent-Length: 0\r\nAccept-Ranges: bytes\r\nConnection: {}\r\n\r\n",
+                            if client_close { "close" } else { "keep-alive" }
+                        );
+                        writer.write_all(header.as_bytes()).await?;
+                        writer.flush().await?;
+                    } else {
+                        let (out_status, content_range, body) =
+                            cached_segment_range(&seg_bytes, range_header.as_deref())
+                                .expect("range selection checked above");
+                        let header = format!(
+                            "HTTP/1.1 {} {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{content_range}Accept-Ranges: bytes\r\nAccess-Control-Allow-Origin: *\r\nConnection: {}\r\n\r\n",
+                            out_status.as_u16(),
+                            out_status.canonical_reason().unwrap_or("OK"),
+                            body.len(),
+                            if client_close { "close" } else { "keep-alive" }
+                        );
+                        writer.write_all(header.as_bytes()).await?;
+                        writer.write_all(body).await?;
+                        writer.flush().await?;
+                    }
+                    if client_close {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                Ok((status, _, _)) => {
+                    let phrase = status.canonical_reason().unwrap_or("Upstream Error");
+                    let header = format!(
+                        "HTTP/1.1 {} {}\r\nContent-Length: 0\r\nConnection: {}\r\n\r\n",
+                        status.as_u16(),
+                        phrase,
+                        if client_close { "close" } else { "keep-alive" }
+                    );
+                    writer.write_all(header.as_bytes()).await?;
+                    writer.flush().await?;
+                    if client_close {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                Err(_) => {
+                    let response = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    writer.write_all(response.as_bytes()).await?;
+                    writer.flush().await?;
+                    return Ok(());
                 }
             }
+        }
+
+        if method == "GET"
+            && is_m4s_segment(&target_url)
+            && hls_segment
+                .as_ref()
+                .is_none_or(|(_, _, segment)| !segment.byte_range)
+        {
+            schedule_dash_prefetch(ctx, &target_url);
 
             match fetch_or_get_segment(
                 &ctx.segment_cache,
@@ -487,28 +919,37 @@ async fn handle_connection(
                 &target_url,
                 auth_headers,
                 forward_all_headers,
+                false,
             )
             .await
             {
                 Ok((seg_status, content_type, seg_bytes)) => {
                     let conn_hdr = if client_close { "close" } else { "keep-alive" };
-                    let total = seg_bytes.len();
-                    let parsed_range = range_header
-                        .as_deref()
-                        .and_then(|r| parse_byte_range_request(r, total));
-                    let (out_status, content_range_hdr, body_slice) = if seg_status.is_success()
-                        && let Some((start, end)) = parsed_range
-                    {
-                        (
-                            reqwest::StatusCode::PARTIAL_CONTENT,
-                            format!("Content-Range: bytes {start}-{end}/{total}\r\n"),
-                            &seg_bytes[start..=end],
-                        )
+                    let (out_status, content_range_hdr, body_slice) = if seg_status.is_success() {
+                        match cached_segment_range(&seg_bytes, range_header.as_deref()) {
+                            Ok(selection) => selection,
+                            Err(total) => {
+                                let response = format!(
+                                    "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{total}\r\nContent-Length: 0\r\nAccept-Ranges: bytes\r\nConnection: {conn_hdr}\r\n\r\n"
+                                );
+                                writer.write_all(response.as_bytes()).await?;
+                                writer.flush().await?;
+                                if client_close {
+                                    return Ok(());
+                                }
+                                continue;
+                            }
+                        }
                     } else {
                         (seg_status, String::new(), seg_bytes.as_ref())
                     };
+                    let accept_ranges = if seg_status.is_success() {
+                        "Accept-Ranges: bytes\r\n"
+                    } else {
+                        ""
+                    };
                     let response_hdr = format!(
-                        "HTTP/1.1 {} {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{content_range_hdr}Accept-Ranges: bytes\r\nAccess-Control-Allow-Origin: *\r\nConnection: {conn_hdr}\r\n\r\n",
+                        "HTTP/1.1 {} {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{content_range_hdr}{accept_ranges}Access-Control-Allow-Origin: *\r\nConnection: {conn_hdr}\r\n\r\n",
                         out_status.as_u16(),
                         out_status.canonical_reason().unwrap_or("OK"),
                         body_slice.len()
@@ -562,6 +1003,7 @@ async fn handle_connection(
         };
 
         let status = upstream_res.status();
+        let effective_url = upstream_res.url().to_string();
 
         let content_length = upstream_res
             .headers()
@@ -652,11 +1094,10 @@ async fn handle_connection(
                 return Ok(());
             }
             let manifest_str = String::from_utf8_lossy(&manifest_bytes);
-            let rewritten = rewrite_hls_manifest(&manifest_str, &target_url, proxy_port);
+            remember_hls_manifest_hosts(ctx, &manifest_str, &effective_url);
+            register_hls_playlist(ctx, &effective_url, &manifest_str);
+            let rewritten = rewrite_hls_manifest(&manifest_str, &effective_url, proxy_port);
             let rewritten_bytes = rewritten.as_bytes();
-            if let Ok(mut lock) = ctx.manifest_cache.lock() {
-                *lock = Some((target_url.clone(), Arc::from(rewritten_bytes)));
-            }
             let conn_header = if client_close {
                 "Connection: close\r\n"
             } else {
@@ -747,6 +1188,9 @@ async fn warmup_dash_sidecar(ctx: &ProxyContext, mpd_url: &str) {
     if let Ok(mut lock) = ctx.manifest_cache.lock() {
         *lock = Some((mpd_url.to_string(), Arc::from(rewritten.as_bytes())));
     }
+    if ctx.hls_prefetch_depth == 0 {
+        return;
+    }
     let Some((base_dir, _)) = mpd_url.rsplit_once('/') else {
         return;
     };
@@ -757,6 +1201,7 @@ async fn warmup_dash_sidecar(ctx: &ProxyContext, mpd_url: &str) {
     } else {
         "2"
     };
+    let mut jobs = Vec::new();
     for rel in [
         format!("init-stream{vid_id}.m4s"),
         "init-stream3.m4s".to_string(),
@@ -768,17 +1213,26 @@ async fn warmup_dash_sidecar(ctx: &ProxyContext, mpd_url: &str) {
             let cache_clone = Arc::clone(&ctx.segment_cache);
             let client_clone = ctx.client.clone();
             let headers_clone = Arc::clone(&ctx.auth_headers);
-            tokio::spawn(async move {
+            jobs.push(tokio::spawn(async move {
+                if !prefetch_url_is_public(&seg_url).await {
+                    return;
+                }
                 let _ = fetch_or_get_segment(
                     &cache_clone,
                     &client_clone,
                     &seg_url,
                     &headers_clone,
                     true,
+                    true,
                 )
                 .await;
-            });
+            }));
         }
+    }
+    if !jobs.is_empty()
+        && let Ok(mut active) = ctx.hls_prefetch.lock()
+    {
+        active.insert("__dash_prefetch__".to_string(), jobs);
     }
 }
 
@@ -881,26 +1335,67 @@ where
     Ok(bytes.len())
 }
 
-fn parse_byte_range_request(header_val: &str, total: usize) -> Option<(usize, usize)> {
+fn parse_byte_range_request(header_val: &str, total: usize) -> Result<Option<(usize, usize)>, ()> {
     if total == 0 {
-        return None;
+        return Ok(None);
     }
-    let spec = header_val.trim().strip_prefix("bytes=")?;
-    let (start_str, end_str) = spec.split_once('-')?;
-    let start = start_str.trim().parse::<usize>().ok()?;
+    let Some(spec) = header_val.trim().strip_prefix("bytes=") else {
+        return Err(());
+    };
+    if spec.contains(',') {
+        return Err(());
+    }
+    let Some((start_str, end_str)) = spec.split_once('-') else {
+        return Err(());
+    };
+    if start_str.trim().is_empty() {
+        let Ok(suffix_len) = end_str.trim().parse::<usize>() else {
+            return Err(());
+        };
+        if suffix_len == 0 {
+            return Ok(None);
+        }
+        let length = suffix_len.min(total);
+        return Ok(Some((total - length, total - 1)));
+    }
+    let Ok(start) = start_str.trim().parse::<usize>() else {
+        return Err(());
+    };
     if start >= total {
-        return None;
+        return Ok(None);
     }
     let end = if end_str.trim().is_empty() {
         total - 1
     } else {
-        end_str.trim().parse::<usize>().ok()?.min(total - 1)
+        let Ok(end) = end_str.trim().parse::<usize>() else {
+            return Err(());
+        };
+        end.min(total - 1)
     };
     if start <= end {
-        Some((start, end))
+        Ok(Some((start, end)))
     } else {
-        None
+        Ok(None)
     }
+}
+
+fn cached_segment_range<'a>(
+    bytes: &'a [u8],
+    range_header: Option<&str>,
+) -> Result<(reqwest::StatusCode, String, &'a [u8]), usize> {
+    let Some(header) = range_header else {
+        return Ok((reqwest::StatusCode::OK, String::new(), bytes));
+    };
+    let (start, end) = match parse_byte_range_request(header, bytes.len()) {
+        Ok(Some(range)) => range,
+        Ok(None) => return Err(bytes.len()),
+        Err(()) => return Ok((reqwest::StatusCode::OK, String::new(), bytes)),
+    };
+    Ok((
+        reqwest::StatusCode::PARTIAL_CONTENT,
+        format!("Content-Range: bytes {start}-{end}/{}\r\n", bytes.len()),
+        &bytes[start..=end],
+    ))
 }
 
 async fn fetch_or_get_segment(
@@ -909,54 +1404,155 @@ async fn fetch_or_get_segment(
     url: &str,
     auth_headers: &[(String, String)],
     forward_all_headers: bool,
+    is_prefetch: bool,
 ) -> Result<(reqwest::StatusCode, String, Arc<[u8]>), String> {
-    if let Some((ct, data)) = cache.get(url) {
-        return Ok((reqwest::StatusCode::OK, ct, data));
-    }
-
-    let (is_owner, notify, notified_fut) = match cache.in_flight.lock() {
-        Ok(mut lock) => {
-            if let Some(existing) = lock.get(url) {
-                let n = Arc::clone(existing);
-                (false, Arc::clone(&n), Some(n.notified_owned()))
-            } else {
-                let n = Arc::new(tokio::sync::Notify::new());
-                lock.insert(url.to_string(), Arc::clone(&n));
-                (true, n, None)
-            }
-        }
-        Err(_) => (true, Arc::new(tokio::sync::Notify::new()), None),
-    };
-
-    if let Some(fut) = notified_fut {
-        let _ = tokio::time::timeout(Duration::from_secs(15), fut).await;
-        if let Some((ct, data)) = cache.get(url) {
-            return Ok((reqwest::StatusCode::OK, ct, data));
-        }
-    }
-
-    let _guard = if is_owner {
-        Some(InFlightGuard {
-            cache: Arc::clone(cache),
-            url: url.to_string(),
-            notify,
-        })
+    let wait_deadline =
+        tokio::time::Instant::now() + Duration::from_secs(CHUNK_IDLE_TIMEOUT_SECS + 30);
+    let _prefetch_permit = if is_prefetch {
+        Some(
+            cache
+                .prefetch_slots
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| "segment prefetch limiter is closed".to_string())?,
+        )
     } else {
         None
     };
+    loop {
+        if let Some((ct, data)) = cache.get(url) {
+            log::debug!("media chunk cache hit layer=memory");
+            return Ok((reqwest::StatusCode::OK, ct, data));
+        }
+        if let Some(disk) = cache.disk_cache.as_ref() {
+            match disk.get(&cache.namespace, url).await {
+                Ok(Some(lease)) => {
+                    let content_type = lease.content_type.clone();
+                    let data = Arc::clone(&lease.bytes);
+                    cache.insert(url.to_string(), content_type.clone(), Arc::clone(&data));
+                    log::debug!("media chunk cache hit layer=disk");
+                    return Ok((reqwest::StatusCode::OK, content_type, data));
+                }
+                Ok(None) => {}
+                Err(_) => log::warn!("HLS chunk cache read failed; falling back to upstream"),
+            }
+        }
 
-    let _fetch_permit = cache
-        .fetch_slots
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|_| "segment fetch limiter is closed".to_string())?;
-    let (status, content_type, data) =
-        fetch_m4s_chunked(client, url, auth_headers, forward_all_headers).await?;
-    if status.is_success() && !data.is_empty() && data.len() <= MAX_SEGMENT_BYTES {
-        cache.insert(url.to_string(), content_type.clone(), Arc::clone(&data));
+        let (is_owner, notify, notified_fut) = match cache.in_flight.lock() {
+            Ok(mut lock) => {
+                if let Some(existing) = lock.get(url) {
+                    let n = Arc::clone(existing);
+                    (false, Arc::clone(&n), Some(n.notified_owned()))
+                } else {
+                    let n = Arc::new(tokio::sync::Notify::new());
+                    lock.insert(url.to_string(), Arc::clone(&n));
+                    (true, n, None)
+                }
+            }
+            Err(_) => (true, Arc::new(tokio::sync::Notify::new()), None),
+        };
+
+        if let Some(fut) = notified_fut {
+            let remaining = wait_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err("timed out waiting for a coalesced segment fetch".to_string());
+            }
+            let _ = tokio::time::timeout(remaining.min(Duration::from_secs(1)), fut).await;
+            continue;
+        }
+
+        let _guard = if is_owner {
+            Some(InFlightGuard {
+                cache: Arc::clone(cache),
+                url: url.to_string(),
+                notify,
+            })
+        } else {
+            None
+        };
+
+        let _fetch_permit = if is_prefetch {
+            let mut reservation = cache
+                .fetch_slots
+                .clone()
+                .try_acquire_many_owned(2)
+                .map_err(|_| {
+                    "prefetch deferred to preserve interactive fetch capacity".to_string()
+                })?;
+            let active = reservation
+                .split(1)
+                .ok_or_else(|| "could not reserve prefetch fetch slot".to_string())?;
+            drop(reservation);
+            active
+        } else {
+            cache
+                .fetch_slots
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| "segment fetch limiter is closed".to_string())?
+        };
+        log::debug!("media chunk cache miss prefetch={is_prefetch}");
+        let fetch = async {
+            if is_m4s_segment(url) {
+                fetch_m4s_chunked(client, url, auth_headers, forward_all_headers).await
+            } else {
+                fetch_full_hls_segment(client, url, auth_headers, forward_all_headers).await
+            }
+        };
+        let (status, content_type, data) =
+            tokio::time::timeout(Duration::from_secs(CHUNK_IDLE_TIMEOUT_SECS + 30), fetch)
+                .await
+                .map_err(|_| "media segment fetch timed out".to_string())??;
+        if status.is_success() && !data.is_empty() && data.len() <= MAX_SEGMENT_BYTES {
+            cache.insert(url.to_string(), content_type.clone(), Arc::clone(&data));
+            if let Some(disk) = cache.disk_cache.as_ref() {
+                match disk
+                    .insert(&cache.namespace, url, &content_type, &data)
+                    .await
+                {
+                    Ok(true) => log::debug!("media chunk persisted to bounded HLS cache"),
+                    Ok(false) => {
+                        log::debug!("media chunk not persisted category=cache_budget_or_size")
+                    }
+                    Err(_) => {
+                        log::warn!(
+                            "HLS chunk cache write failed; serving complete upstream segment"
+                        )
+                    }
+                }
+            }
+        }
+        return Ok((status, content_type, data));
     }
-    Ok((status, content_type, data))
+}
+
+async fn fetch_full_hls_segment(
+    client: &reqwest::Client,
+    url: &str,
+    auth_headers: &[(String, String)],
+    forward_all_headers: bool,
+) -> Result<(reqwest::StatusCode, String, Arc<[u8]>), String> {
+    let mut request = client.get(url);
+    for (name, value) in auth_headers {
+        if should_forward_header(forward_all_headers, name) {
+            request = request.header(name.as_str(), value.as_str());
+        }
+    }
+    let response = request.send().await.map_err(|error| error.to_string())?;
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    if !status.is_success() {
+        return Ok((status, content_type, Arc::from([])));
+    }
+    let body = read_response_limited(response, MAX_SEGMENT_BYTES).await?;
+    Ok((status, content_type, Arc::from(body)))
 }
 
 async fn read_response_limited(
@@ -1220,6 +1816,73 @@ fn rewrite_hls_uri_attributes(line: &str, manifest_url: &reqwest::Url, proxy_por
     out
 }
 
+fn hls_manifest_host_references(manifest: &str, manifest_url: &str) -> HashMap<String, String> {
+    let Ok(base) = reqwest::Url::parse(manifest_url) else {
+        return HashMap::new();
+    };
+    let mut hosts = HashMap::new();
+    for line in manifest
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let mut references = Vec::new();
+        if line.starts_with('#') {
+            let mut cursor = 0;
+            while let Some(relative) = line[cursor..].find("URI=") {
+                let start = cursor + relative + 4;
+                let Some(quote) = line.as_bytes().get(start).copied() else {
+                    break;
+                };
+                if quote != b'"' && quote != b'\'' {
+                    cursor = start;
+                    continue;
+                }
+                let value_start = start + 1;
+                let Some(end_rel) = line[value_start..].find(quote as char) else {
+                    break;
+                };
+                references.push(&line[value_start..value_start + end_rel]);
+                cursor = value_start + end_rel + 1;
+            }
+        } else {
+            references.push(line);
+        }
+        for reference in references {
+            let Ok(url) = base.join(reference) else {
+                continue;
+            };
+            if !matches!(url.scheme(), "http" | "https") {
+                continue;
+            }
+            let url = url.to_string();
+            if let Some(host) = extract_host_authority(&url) {
+                hosts.entry(host).or_insert(url);
+                if hosts.len() >= 32 {
+                    return hosts;
+                }
+            }
+        }
+    }
+    hosts
+}
+
+fn remember_hls_manifest_hosts(ctx: &ProxyContext, manifest: &str, effective_url: &str) {
+    let mut references = hls_manifest_host_references(manifest, effective_url);
+    if let Some(host) = extract_host_authority(effective_url) {
+        references
+            .entry(host)
+            .or_insert_with(|| effective_url.to_string());
+    }
+    // This is only a playlist-derived host allowlist. Each actual request is still
+    // independently checked by validate_public_url before passing the host gate.
+    for host in references.into_keys().take(32) {
+        if let Ok(mut allowed) = ctx.hls_allowed_hosts.lock() {
+            allowed.insert(host);
+        }
+    }
+}
+
 fn rewrite_hls_manifest(manifest: &str, manifest_url: &str, proxy_port: u16) -> String {
     let Ok(base) = reqwest::Url::parse(manifest_url) else {
         return manifest.to_string();
@@ -1406,6 +2069,22 @@ mod tests {
         assert!(cache.get("second").unwrap().1.len() <= MAX_CACHED_SEGMENT_CACHE_BYTES);
     }
 
+    #[tokio::test]
+    async fn in_memory_segment_cache_expires_using_configured_test_ttl() {
+        let cache = SegmentCache {
+            ttl: Duration::from_millis(10),
+            ..SegmentCache::default()
+        };
+        cache.insert(
+            "segment".into(),
+            "video/mp2t".into(),
+            Arc::from(&b"chunk"[..]),
+        );
+        assert!(cache.get("segment").is_some());
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        assert!(cache.get("segment").is_none());
+    }
+
     #[test]
     fn test_extract_target_url() {
         assert_eq!(
@@ -1429,7 +2108,7 @@ mod tests {
 
     #[test]
     fn test_rewrite_hls_manifest_rewrites_relative_segments_variants_and_uri_attributes() {
-        let manifest = "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"keys/key.bin\"\n#EXT-X-STREAM-INF:BANDWIDTH=100000\nvariants/low.m3u8\n#EXTINF:5,\nsegments/001.ts\n";
+        let manifest = "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"Hindi\",LANGUAGE=\"hi\",DEFAULT=YES,URI=\"audio/hi.m3u8\"\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"English\",LANGUAGE=\"en\",DEFAULT=NO,URI=\"audio/en.m3u8\"\n#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"Hindi\",LANGUAGE=\"hi\",URI=\"subs/hi.m3u8\"\n#EXT-X-KEY:METHOD=AES-128,URI=\"keys/key.bin\"\n#EXT-X-STREAM-INF:BANDWIDTH=100000,AUDIO=\"audio\",SUBTITLES=\"subs\"\nvariants/low.m3u8\n#EXTINF:5,\nsegments/001.ts\n";
         let rewritten = rewrite_hls_manifest(
             manifest,
             "https://cdn.example.com/video/master.m3u8?token=abc",
@@ -1444,8 +2123,25 @@ mod tests {
                 .contains("http://127.0.0.1:8765/https/cdn.example.com/video/variants/low.m3u8")
         );
         assert!(
-            rewritten.contains("http://127.0.0.1:8765/https/cdn.example.com/video/segments/001.ts")
+            rewritten
+                .contains("URI=\"http://127.0.0.1:8765/https/cdn.example.com/video/keys/key.bin\"")
         );
+        assert!(rewritten.contains("LANGUAGE=\"hi\",DEFAULT=YES,URI=\"http://127.0.0.1:8765/https/cdn.example.com/video/audio/hi.m3u8\""));
+        assert!(rewritten.contains("LANGUAGE=\"en\",DEFAULT=NO,URI=\"http://127.0.0.1:8765/https/cdn.example.com/video/audio/en.m3u8\""));
+        assert!(rewritten.contains("TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"Hindi\",LANGUAGE=\"hi\",URI=\"http://127.0.0.1:8765/https/cdn.example.com/video/subs/hi.m3u8\""));
+    }
+
+    #[test]
+    fn redirected_hls_base_and_cross_host_track_references_are_resolved() {
+        let manifest = "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",URI=\"https://audio.cdn.example/en.m3u8\"\n#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",URI=\"subs/en.vtt\"\nrelative/seg.ts\n";
+        let final_url = "https://final.cdn.example/redirected/master.m3u8?sig=x";
+        let rewritten = rewrite_hls_manifest(manifest, final_url, 8765);
+        assert!(rewritten.contains("/https/audio.cdn.example/en.m3u8"));
+        assert!(rewritten.contains("/https/final.cdn.example/redirected/subs/en.vtt"));
+        assert!(rewritten.contains("/https/final.cdn.example/redirected/relative/seg.ts"));
+        let references = hls_manifest_host_references(manifest, final_url);
+        assert!(references.contains_key("audio.cdn.example"));
+        assert!(references.contains_key("final.cdn.example"));
     }
 
     #[test]
@@ -1455,6 +2151,99 @@ mod tests {
         ));
         assert!(!is_hls_url("https://cdn.example.com/video.mp4"));
     }
+
+    #[test]
+    fn hls_vod_duration_comes_from_complete_extinf_list() {
+        let source = "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXTINF:2.003,\nseg-0.ts\n#EXTINF:1.997,\nseg-1.ts\n#EXT-X-ENDLIST\n";
+        let playlist = parse_hls_media_playlist(source, "https://cdn.example/movie/index.m3u8");
+        assert_eq!(playlist.segments.len(), 2);
+        assert_eq!(
+            playlist.segments[0].url,
+            "https://cdn.example/movie/seg-0.ts"
+        );
+        assert_eq!(playlist.segments[0].duration_seconds, 2.003);
+        assert_eq!(playlist.target_duration_seconds, Some(2));
+        assert_eq!(playlist.total_duration_seconds, Some(4.0));
+        assert!(playlist.is_vod);
+        let rewritten = rewrite_hls_manifest(source, "https://cdn.example/movie/index.m3u8", 8765);
+        assert!(rewritten.contains("#EXTINF:2.003,"));
+        assert!(rewritten.contains("#EXT-X-ENDLIST"));
+    }
+
+    #[test]
+    fn live_hls_playlist_does_not_claim_a_full_duration_and_marks_byte_ranges() {
+        let source = "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2.0,\n#EXT-X-BYTERANGE:10@0\nshared.mp4\n#EXTINF:1.8,\nseg.ts\n";
+        let playlist = parse_hls_media_playlist(source, "https://cdn.example/live/index.m3u8");
+        assert_eq!(playlist.segments.len(), 2);
+        assert!(playlist.segments[0].byte_range);
+        assert!(!playlist.segments[1].byte_range);
+        assert_eq!(playlist.total_duration_seconds, None);
+    }
+
+    #[test]
+    fn cached_hls_range_returns_exact_requested_bytes_and_headers() {
+        let source = b"0123456789";
+        let (status, content_range, body) =
+            cached_segment_range(source, Some("bytes=3-6")).unwrap();
+        assert_eq!(status, reqwest::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(content_range, "Content-Range: bytes 3-6/10\r\n");
+        assert_eq!(body, b"3456");
+        let (status, content_range, body) = cached_segment_range(source, Some("bytes=-4")).unwrap();
+        assert_eq!(status, reqwest::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(content_range, "Content-Range: bytes 6-9/10\r\n");
+        assert_eq!(body, b"6789");
+        assert_eq!(cached_segment_range(source, Some("bytes=12-15")), Err(10));
+        assert_eq!(cached_segment_range(source, Some("bytes=-0")), Err(10));
+        let (status, _, body) = cached_segment_range(source, Some("bytes=0-1,4-5")).unwrap();
+        assert_eq!(status, reqwest::StatusCode::OK);
+        assert_eq!(body, source);
+    }
+
+    #[tokio::test]
+    async fn seek_cancels_previous_hls_prefetch_jobs() {
+        let ctx = ProxyContext {
+            proxy_port: 0,
+            client: crate::net::http_client_builder_base().build().unwrap(),
+            auth_headers: Arc::new(Vec::new()),
+            target_host: None,
+            subtitle_url: None,
+            max_height: None,
+            segment_cache: Arc::new(SegmentCache::default()),
+            manifest_cache: Arc::new(Mutex::new(None)),
+            hls_playlists: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            hls_allowed_hosts: Arc::new(Mutex::new(HashSet::new())),
+            hls_prefetch: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            hls_prefetch_depth: 2,
+        };
+        let job = tokio::spawn(std::future::pending::<()>());
+        let abort = job.abort_handle();
+        ctx.hls_prefetch
+            .lock()
+            .unwrap()
+            .insert("https://cdn.example/index.m3u8".into(), vec![job]);
+        schedule_hls_prefetch(&ctx, "https://cdn.example/index.m3u8", 7);
+        tokio::task::yield_now().await;
+        assert!(abort.is_finished());
+
+        let first_task = tokio::spawn(std::future::pending::<()>());
+        let second_task = tokio::spawn(std::future::pending::<()>());
+        let first_abort = first_task.abort_handle();
+        let second_abort = second_task.abort_handle();
+        ctx.hls_prefetch
+            .lock()
+            .unwrap()
+            .insert("https://cdn.example/audio.m3u8".into(), vec![first_task]);
+        ctx.hls_prefetch
+            .lock()
+            .unwrap()
+            .insert("__dash_prefetch__".into(), vec![second_task]);
+        cancel_all_prefetch(&ctx);
+        tokio::task::yield_now().await;
+        assert!(first_abort.is_finished());
+        assert!(second_abort.is_finished());
+        assert!(ctx.hls_prefetch.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn test_extract_target_url_sub_rejects_non_http() {
         assert_eq!(
@@ -1733,7 +2522,7 @@ mod tests {
 
         let client = crate::net::http_client_builder_base().build().unwrap();
         let cache = Arc::new(SegmentCache::default());
-        let (status, ct, assembled) = fetch_or_get_segment(&cache, &client, &url, &[], true)
+        let (status, ct, assembled) = fetch_or_get_segment(&cache, &client, &url, &[], true, false)
             .await
             .unwrap();
         assert_eq!(status, reqwest::StatusCode::OK);
@@ -1741,11 +2530,192 @@ mod tests {
         assert_eq!(assembled.as_ref(), payload.as_slice());
         assert_eq!(request_count.load(Ordering::Relaxed), 3);
 
-        let (_, _, cached) = fetch_or_get_segment(&cache, &client, &url, &[], true)
+        let (_, _, cached) = fetch_or_get_segment(&cache, &client, &url, &[], true, false)
             .await
             .unwrap();
         assert_eq!(cached.as_ref(), payload.as_slice());
         assert_eq!(request_count.load(Ordering::Relaxed), 3);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn hls_direct_segment_is_reused_from_disk_after_cache_reopen() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}/movie/seg-000.ts");
+        let server_count = Arc::clone(&request_count);
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let count = Arc::clone(&server_count);
+                tokio::spawn(async move {
+                    let mut req = [0u8; 1024];
+                    if socket.read(&mut req).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    count.fetch_add(1, Ordering::Relaxed);
+                    let body = b"first-playable-segment";
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(headers.as_bytes()).await;
+                    let _ = socket.write_all(body).await;
+                });
+            }
+        });
+
+        let client = crate::net::http_client_builder_base().build().unwrap();
+        let disk1 = Arc::new(
+            crate::hls_chunk_cache::HlsChunkCache::open(dir.path(), HLS_CHUNK_TTL, 1024 * 1024)
+                .unwrap(),
+        );
+        let cache1 = Arc::new(SegmentCache {
+            disk_cache: Some(disk1),
+            namespace: "source-episode-audio-variant".into(),
+            ..SegmentCache::default()
+        });
+        let cold_started = Instant::now();
+        let (_, content_type, first) =
+            fetch_or_get_segment(&cache1, &client, &url, &[], true, false)
+                .await
+                .unwrap();
+        let cold_elapsed = cold_started.elapsed();
+        assert_eq!(content_type, "video/mp2t");
+        assert_eq!(first.as_ref(), b"first-playable-segment");
+        let persisted_bytes = cache1.disk_cache.as_ref().unwrap().disk_bytes();
+        drop(cache1);
+
+        let disk2 = Arc::new(
+            crate::hls_chunk_cache::HlsChunkCache::open(dir.path(), HLS_CHUNK_TTL, 1024 * 1024)
+                .unwrap(),
+        );
+        let cache2 = Arc::new(SegmentCache {
+            disk_cache: Some(disk2),
+            namespace: "source-episode-audio-variant".into(),
+            ..SegmentCache::default()
+        });
+        let warm_started = Instant::now();
+        let (_, _, warm) = fetch_or_get_segment(&cache2, &client, &url, &[], true, false)
+            .await
+            .unwrap();
+        let warm_elapsed = warm_started.elapsed();
+        assert_eq!(warm.as_ref(), b"first-playable-segment");
+        assert_eq!(request_count.load(Ordering::Relaxed), 1);
+        eprintln!(
+            "LOCAL_MOCK_HLS cold_first_segment_ms={} warm_disk_hit_ms={} persisted_bytes={} upstream_requests=1",
+            cold_elapsed.as_millis(),
+            warm_elapsed.as_millis(),
+            persisted_bytes
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn same_segment_requests_coalesce_and_prefetch_is_globally_bounded() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let server_requests = Arc::clone(&request_count);
+        let server_active = Arc::clone(&active);
+        let server_maximum = Arc::clone(&maximum);
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let requests = Arc::clone(&server_requests);
+                let active = Arc::clone(&server_active);
+                let maximum = Arc::clone(&server_maximum);
+                tokio::spawn(async move {
+                    let mut req = [0u8; 1024];
+                    if socket.read(&mut req).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    requests.fetch_add(1, Ordering::Relaxed);
+                    let now = active.fetch_add(1, Ordering::Relaxed) + 1;
+                    maximum.fetch_max(now, Ordering::Relaxed);
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    let body = b"data";
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(headers.as_bytes()).await;
+                    let _ = socket.write_all(body).await;
+                    active.fetch_sub(1, Ordering::Relaxed);
+                });
+            }
+        });
+
+        let client = crate::net::http_client_builder_base().build().unwrap();
+        let shared = Arc::new(SegmentCache::default());
+        let same_url = format!("http://127.0.0.1:{port}/same.ts");
+        let mut same_requests = Vec::new();
+        for _ in 0..8 {
+            let cache = Arc::clone(&shared);
+            let client = client.clone();
+            let url = same_url.clone();
+            same_requests.push(tokio::spawn(async move {
+                fetch_or_get_segment(&cache, &client, &url, &[], true, false).await
+            }));
+        }
+        for request in same_requests {
+            assert_eq!(request.await.unwrap().unwrap().2.as_ref(), b"data");
+        }
+        assert_eq!(request_count.load(Ordering::Relaxed), 1);
+
+        let mut distinct_requests = Vec::new();
+        for index in 0..12 {
+            let cache = Arc::clone(&shared);
+            let client = client.clone();
+            let url = format!("http://127.0.0.1:{port}/seg-{index}.ts");
+            let prefetch = index < 6;
+            distinct_requests.push((
+                prefetch,
+                tokio::spawn(async move {
+                    fetch_or_get_segment(&cache, &client, &url, &[], true, prefetch).await
+                }),
+            ));
+        }
+        let mut started_prefetches = 0;
+        let mut deferred_prefetches = 0;
+        for (prefetch, request) in distinct_requests {
+            match request.await.unwrap() {
+                Ok(result) => {
+                    assert_eq!(result.2.as_ref(), b"data");
+                    if prefetch {
+                        started_prefetches += 1;
+                    }
+                }
+                Err(error) if prefetch && error.contains("prefetch deferred") => {
+                    deferred_prefetches += 1;
+                }
+                Err(error) => panic!("unexpected segment fetch failure: {error}"),
+            }
+        }
+        eprintln!(
+            "LOCAL_MOCK_HLS concurrent_peak_upstream_requests={} configured_max={} same_key_requests=8 same_key_upstream_count=1",
+            maximum.load(Ordering::Relaxed),
+            MAX_CONCURRENT_SEGMENT_FETCHES
+        );
+        assert!(maximum.load(Ordering::Relaxed) <= MAX_CONCURRENT_SEGMENT_FETCHES);
+        assert!(maximum.load(Ordering::Relaxed) > 1);
+        assert_eq!(
+            request_count.load(Ordering::Relaxed),
+            7 + started_prefetches
+        );
+        assert_eq!(started_prefetches + deferred_prefetches, 6);
         server.abort();
     }
 
@@ -1794,6 +2764,10 @@ mod tests {
             max_height: Some(720),
             segment_cache: Arc::new(SegmentCache::default()),
             manifest_cache: Arc::new(Mutex::new(None)),
+            hls_playlists: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            hls_allowed_hosts: Arc::new(Mutex::new(HashSet::new())),
+            hls_prefetch: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            hls_prefetch_depth: 2,
         };
 
         warmup_dash_sidecar(&ctx, &target_url).await;

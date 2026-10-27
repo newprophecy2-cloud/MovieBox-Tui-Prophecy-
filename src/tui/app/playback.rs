@@ -334,16 +334,7 @@ impl App {
         let service = self.service.clone();
         tokio::spawn(async move {
             let is_android = matches!(kind, crate::tui::state::PlayerKind::AndroidIntent);
-            let is_dash = crate::player::is_dash_url(&link);
-            let has_extra_headers = headers.iter().any(|(name, _)| {
-                !name.eq_ignore_ascii_case("referer") && !name.eq_ignore_ascii_case("user-agent")
-            });
-            let eager_proxy = is_dash
-                || (matches!(
-                    kind,
-                    crate::tui::state::PlayerKind::Vlc
-                        | crate::tui::state::PlayerKind::AndroidIntent
-                ) && has_extra_headers);
+            let eager_proxy = should_eager_proxy(kind, &link, &headers);
             let sidecar_sub = if is_android {
                 subtitle.as_deref()
             } else {
@@ -751,6 +742,22 @@ impl App {
         });
     }
 }
+fn should_eager_proxy(
+    kind: crate::tui::state::PlayerKind,
+    link: &str,
+    headers: &[(String, String)],
+) -> bool {
+    let is_manifest_stream = crate::player::is_dash_url(link) || crate::proxy::is_hls_url(link);
+    let has_extra_headers = headers.iter().any(|(name, _)| {
+        !name.eq_ignore_ascii_case("referer") && !name.eq_ignore_ascii_case("user-agent")
+    });
+    is_manifest_stream
+        || (matches!(
+            kind,
+            crate::tui::state::PlayerKind::Vlc | crate::tui::state::PlayerKind::AndroidIntent
+        ) && has_extra_headers)
+}
+
 fn is_vlc_normal_exit(
     kind: crate::tui::state::PlayerKind,
     code: Option<i32>,
@@ -1207,7 +1214,38 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::clean_player_error;
+    use super::{clean_player_error, should_eager_proxy};
+
+    #[test]
+    fn manifest_streams_use_proxy_without_changing_direct_mp4_policy() {
+        use crate::tui::state::PlayerKind;
+
+        assert!(should_eager_proxy(
+            PlayerKind::Mpv,
+            "https://cdn.example/master.m3u8?token=x",
+            &[]
+        ));
+        assert!(should_eager_proxy(
+            PlayerKind::Mpv,
+            "https://cdn.example/manifest.mpd",
+            &[]
+        ));
+        assert!(!should_eager_proxy(
+            PlayerKind::Mpv,
+            "https://cdn.example/video.mp4",
+            &[]
+        ));
+        assert!(!should_eager_proxy(
+            PlayerKind::Vlc,
+            "https://cdn.example/video.mp4",
+            &[("Referer".into(), "https://provider.example/".into())]
+        ));
+        assert!(should_eager_proxy(
+            PlayerKind::Vlc,
+            "https://cdn.example/video.mp4",
+            &[("Cookie".into(), "session=redacted".into())]
+        ));
+    }
 
     #[test]
     fn failed_player_with_stderr_keeps_diagnostic() {

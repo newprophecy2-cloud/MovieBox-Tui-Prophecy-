@@ -4,6 +4,9 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+const HLS_CHUNK_CACHE_MIN_BYTES: u64 = 512 * 1024 * 1024;
+const HLS_CHUNK_CACHE_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -31,6 +34,8 @@ pub struct Config {
     pub remux_cache_max_bytes: u64,
     pub max_concurrent_media_jobs: usize,
     pub media_job_timeout_seconds: u64,
+    pub hls_chunk_cache_max_bytes: u64,
+    pub hls_prefetch_depth: usize,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -59,6 +64,8 @@ impl Default for Config {
             remux_cache_max_bytes: 512 * 1024 * 1024,
             max_concurrent_media_jobs: 1,
             media_job_timeout_seconds: 1_800,
+            hls_chunk_cache_max_bytes: HLS_CHUNK_CACHE_MIN_BYTES,
+            hls_prefetch_depth: 2,
         }
     }
 }
@@ -73,6 +80,20 @@ pub struct MediaSettings {
 }
 
 impl Config {
+    pub fn validate_hls_chunk_settings(&self) -> Result<(), String> {
+        if !(HLS_CHUNK_CACHE_MIN_BYTES..=HLS_CHUNK_CACHE_MAX_BYTES)
+            .contains(&self.hls_chunk_cache_max_bytes)
+        {
+            return Err(
+                "hls_chunk_cache_max_bytes must be between 536870912 and 10737418240".into(),
+            );
+        }
+        if self.hls_prefetch_depth > 4 {
+            return Err("hls_prefetch_depth must be between 0 and 4".into());
+        }
+        Ok(())
+    }
+
     pub fn validate_media_settings(&self) -> Result<MediaSettings, String> {
         if !(60..=604_800).contains(&self.remux_cache_ttl_seconds) {
             return Err("remux_cache_ttl_seconds must be between 60 and 604800".into());
@@ -442,6 +463,8 @@ mod tests {
         assert_eq!(config.remux_cache_max_bytes, 512 * 1024 * 1024);
         assert_eq!(config.max_concurrent_media_jobs, 1);
         assert_eq!(config.media_job_timeout_seconds, 1_800);
+        assert_eq!(config.hls_chunk_cache_max_bytes, 512 * 1024 * 1024);
+        assert_eq!(config.hls_prefetch_depth, 2);
 
         let json = serde_json::to_string(&config).expect("serialize");
         let deserialized: Config = serde_json::from_str(&json).expect("deserialize");
@@ -449,6 +472,8 @@ mod tests {
         let old_config: Config = serde_json::from_str(r#"{"auto_update":false}"#)
             .expect("older config without media settings remains compatible");
         assert_eq!(old_config.remux_cache_ttl_seconds, 3_600);
+        assert_eq!(old_config.hls_chunk_cache_max_bytes, 512 * 1024 * 1024);
+        assert_eq!(old_config.hls_prefetch_depth, 2);
     }
 
     #[test]
@@ -463,36 +488,77 @@ mod tests {
 
     #[test]
     fn media_settings_reject_out_of_range_values() {
-        let mut config = Config::default();
-        config.remux_cache_ttl_seconds = 59;
+        let config = Config {
+            remux_cache_ttl_seconds: 59,
+            ..Config::default()
+        };
         assert!(config.validate_media_settings().is_err());
 
-        let mut config = Config::default();
-        config.remux_cache_max_bytes = 1_048_575;
+        let config = Config {
+            remux_cache_max_bytes: 1_048_575,
+            ..Config::default()
+        };
         assert!(config.validate_media_settings().is_err());
 
-        let mut config = Config::default();
-        config.max_concurrent_media_jobs = 5;
+        let config = Config {
+            max_concurrent_media_jobs: 5,
+            ..Config::default()
+        };
         assert!(config.validate_media_settings().is_err());
 
-        let mut config = Config::default();
-        config.media_job_timeout_seconds = 59;
+        let config = Config {
+            media_job_timeout_seconds: 59,
+            ..Config::default()
+        };
         assert!(config.validate_media_settings().is_err());
+    }
+
+    #[test]
+    fn hls_chunk_settings_reject_unbounded_values() {
+        let config = Config {
+            hls_chunk_cache_max_bytes: HLS_CHUNK_CACHE_MIN_BYTES - 1,
+            ..Config::default()
+        };
+        assert!(config.validate_hls_chunk_settings().is_err());
+
+        let config = Config {
+            hls_chunk_cache_max_bytes: HLS_CHUNK_CACHE_MAX_BYTES + 1,
+            ..Config::default()
+        };
+        assert!(config.validate_hls_chunk_settings().is_err());
+
+        for bytes in [HLS_CHUNK_CACHE_MIN_BYTES, HLS_CHUNK_CACHE_MAX_BYTES] {
+            let config = Config {
+                hls_chunk_cache_max_bytes: bytes,
+                ..Config::default()
+            };
+            assert!(config.validate_hls_chunk_settings().is_ok());
+        }
+
+        let config = Config {
+            hls_prefetch_depth: 5,
+            ..Config::default()
+        };
+        assert!(config.validate_hls_chunk_settings().is_err());
     }
 
     #[test]
     fn media_cache_directory_override_must_be_absolute_and_is_persisted() {
         let root =
             std::env::temp_dir().join(format!("moviebox-config-cache-{}", uuid::Uuid::new_v4()));
-        let mut config = Config::default();
-        config.media_cache_directory = Some(root.to_string_lossy().into_owned());
+        let config = Config {
+            media_cache_directory: Some(root.to_string_lossy().into_owned()),
+            ..Config::default()
+        };
         let settings = config
             .validate_media_settings()
             .expect("absolute override is valid");
         assert_eq!(settings.cache_dir, std::fs::canonicalize(&root).unwrap());
 
-        let mut invalid = Config::default();
-        invalid.media_cache_directory = Some("relative/cache".into());
+        let invalid = Config {
+            media_cache_directory: Some("relative/cache".into()),
+            ..Config::default()
+        };
         assert!(
             invalid
                 .validate_media_settings()
