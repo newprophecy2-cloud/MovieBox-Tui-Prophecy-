@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 
 pub mod api;
+pub(crate) mod api_native_stream;
 pub mod cache;
 pub mod catalog;
 pub mod codec_verification;

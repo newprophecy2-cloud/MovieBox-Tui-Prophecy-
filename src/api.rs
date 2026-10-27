@@ -113,6 +113,7 @@ pub struct ApiState {
     redis_search: Option<redis::aio::MultiplexedConnection>,
     search_source_check_slots: Arc<Semaphore>,
     remux_cache: crate::remux_cache::RemuxCache,
+    native_stream: crate::api_native_stream::NativeStreamProxy,
     connection_slots: Arc<Semaphore>,
 }
 
@@ -692,7 +693,11 @@ async fn init_redis_search_cache() -> Option<redis::aio::MultiplexedConnection> 
 }
 
 pub async fn run() -> std::io::Result<()> {
-    let media_settings = crate::config::load()
+    let config = crate::config::load();
+    config
+        .validate_hls_chunk_settings()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let media_settings = config
         .validate_media_settings()
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     let cache_ttl_seconds = media_settings.cache_ttl.as_secs();
@@ -707,6 +712,9 @@ pub async fn run() -> std::io::Result<()> {
                 format!("could not initialize temporary media cache: {error}"),
             )
         })?;
+    let native_stream =
+        crate::api_native_stream::NativeStreamProxy::new(config.hls_max_segment_bytes)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     let janitor_cache = remux_cache.clone();
     tokio::spawn(async move {
         loop {
@@ -748,6 +756,7 @@ pub async fn run() -> std::io::Result<()> {
         redis_search,
         search_source_check_slots: Arc::new(Semaphore::new(SEARCH_SOURCE_CHECK_CONCURRENCY)),
         remux_cache,
+        native_stream,
         connection_slots: Arc::new(Semaphore::new(MAX_API_CONNECTIONS)),
     };
     start_codec_verification_workers(state.clone());
@@ -969,6 +978,12 @@ async fn route(
         "/api/v1/diagnostics" => diagnostics_route(stream, state).await,
         "/api/stream-proxy" => {
             stream_proxy_route(stream, query, state, request_headers, head_only).await
+        }
+        _ if path.starts_with("/api/v1/sources/")
+            && path.trim_matches('/').split('/').nth(4) == Some("native") =>
+        {
+            native_stream_route(stream, path, query, state, request_headers, method, head_only)
+                .await
         }
         "/api/media-info" => media_info_route(stream, query, request_headers).await,
         "/api/subtitles/extract" => subtitle_extract_route(stream, query, request_headers).await,
@@ -4097,6 +4112,18 @@ fn source_remux_url(source_id: &str) -> String {
     format!("/api/v1/sources/{source_id}/remux")
 }
 
+fn source_playback_url(
+    state: &ApiState,
+    source_id: &str,
+    upstream_url: &str,
+    upstream_headers: &[(String, String)],
+) -> String {
+    state
+        .native_stream
+        .playback_url(source_id, upstream_url, upstream_headers)
+        .unwrap_or_else(|| source_remux_url(source_id))
+}
+
 async fn playback_route(
     stream: &mut TcpStream,
     identity: PlaybackIdentity,
@@ -4325,7 +4352,18 @@ async fn playback_route(
     };
     // Probe the resolved source for real audio tracks when possible. A failed probe
     // must not block playback (some HLS/DASH providers prevent ffprobe access).
-    let audio_tracks = match probe_media_bounded(&state, &playback.url, &playback.headers).await {
+    let native_candidate = state.native_stream.supports_url(&playback.url);
+    let (probe_result, native_codec_result) = tokio::join!(
+        probe_media_bounded(&state, &playback.url, &playback.headers),
+        async {
+            if native_candidate {
+                Some(crate::codec_verification::verify_playback_source(&playback).await)
+            } else {
+                None
+            }
+        }
+    );
+    let audio_tracks = match probe_result {
         Ok(probe) => probe
             .streams
             .into_iter()
@@ -4356,7 +4394,34 @@ async fn playback_route(
         Err(_) => Vec::new(),
     };
     let mut playback = playback;
-    playback.url = source_remux_url(&source_id);
+    if native_candidate {
+        match native_codec_result
+            .unwrap_or(Err(crate::codec_verification::CodecProbeError::ProbeFailed))
+        {
+            Ok(crate::codec_verification::CodecProbeResult::Allowed(_)) => {}
+            Ok(crate::codec_verification::CodecProbeResult::BlockedHevc(_)) => {
+                let (status, body) = err(
+                    "SOURCE_CODEC_BLOCKED",
+                    "H.265/HEVC sources are blocked by playback policy.",
+                    Some(source_ref.p),
+                    415,
+                );
+                return write_raw_json(stream, status, &body, None).await;
+            }
+            Ok(crate::codec_verification::CodecProbeResult::Unsupported(_))
+            | Ok(crate::codec_verification::CodecProbeResult::NoVideoStream)
+            | Err(_) => {
+                let (status, body) = err(
+                    "CODEC_UNVERIFIED",
+                    "The media video codec could not be positively verified as H.264.",
+                    Some(source_ref.p),
+                    415,
+                );
+                return write_raw_json(stream, status, &body, None).await;
+            }
+        }
+    }
+    playback.url = source_playback_url(&state, &source_id, &playback.url, &playback.headers);
     playback.headers.clear();
     let mut body = playback_json(&playback);
     if let Some(object) = body.as_object_mut() {
@@ -5109,6 +5174,79 @@ async fn source_route(
     );
     write_raw_json(stream, status, &body, None).await
 }
+
+async fn native_stream_route(
+    stream: &mut TcpStream,
+    path: &str,
+    query: &str,
+    state: ApiState,
+    request_headers: &HashMap<String, String>,
+    method: &str,
+    head_only: bool,
+) -> std::io::Result<()> {
+    if !matches!(method, "GET" | "HEAD") {
+        let (status, body) = err(
+            "METHOD_NOT_ALLOWED",
+            "Native media streaming supports GET and HEAD only.",
+            None,
+            405,
+        );
+        return write_raw_json(stream, status, &body, None).await;
+    }
+    let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
+    let (Some(source_id), Some("native"), Some(token)) =
+        (parts.get(3), parts.get(4).copied(), parts.get(5))
+    else {
+        return write_json(
+            stream,
+            404,
+            &serde_json::json!({"error":"Native playback reference not found."}),
+            None,
+        )
+        .await;
+    };
+    let source_id = match percent_encoding::percent_decode_str(source_id).decode_utf8() {
+        Ok(source_id) if !source_id.is_empty() => source_id.into_owned(),
+        _ => {
+            return write_json(
+                stream,
+                400,
+                &serde_json::json!({"error":"Invalid source ID."}),
+                None,
+            )
+            .await;
+        }
+    };
+    let mut suffix = Vec::new();
+    for part in parts.iter().skip(6) {
+        let decoded = match percent_encoding::percent_decode_str(part).decode_utf8() {
+            Ok(decoded) if !decoded.is_empty() => decoded.into_owned(),
+            _ => {
+                return write_json(
+                    stream,
+                    400,
+                    &serde_json::json!({"error":"Invalid media path."}),
+                    None,
+                )
+                .await;
+            }
+        };
+        suffix.push(decoded);
+    }
+    state
+        .native_stream
+        .serve(
+            stream,
+            &source_id,
+            token,
+            &suffix,
+            query,
+            request_headers,
+            head_only,
+        )
+        .await
+}
+
 fn watch_url(raw: &str) -> String {
     let Ok(mut url) = reqwest::Url::parse(raw) else {
         return raw.to_string();
@@ -5259,7 +5397,12 @@ async fn write_verified_playback_response(
     match crate::codec_verification::verify_playback_source(&playback).await {
         Ok(crate::codec_verification::CodecProbeResult::Allowed(_)) => {
             let mut backend_playback = playback;
-            backend_playback.url = source_remux_url(source_id);
+            backend_playback.url = source_playback_url(
+                state,
+                source_id,
+                &backend_playback.url,
+                &backend_playback.headers,
+            );
             backend_playback.headers.clear();
             write_json(stream, 200, &playback_json(&backend_playback), None).await
         }
@@ -6735,7 +6878,7 @@ fn openapi() -> serde_json::Value {
             "/api/v1/movies": {"get": {"responses": {"200": {"description": "MovieBox movie catalogue"}}}},
             "/api/v1/movies/{movie_id}": {"get": {"responses": {"200": {"description": "Movie details"}}}},
             "/api/v1/movies/{movie_id}/sources": {"get": {"responses": {"200": {"description": "Movie source candidates"}, "502": {"description": "Movie source resolution failed"}}}},
-            "/api/v1/movies/{movie_id}/stream": {"get": {"responses": {"200": {"description": "Movie playback descriptor pointing to a validated temporary seekable MP4 URL"}, "415": {"description": "Sources are blocked or have unverified codecs"}, "429": {"description": "Media-job capacity is busy"}, "502": {"description": "Movie playback resolution failed"}, "504": {"description": "Movie playback resolution timed out"}}}},
+            "/api/v1/movies/{movie_id}/stream": {"get": {"responses": {"200": {"description": "Movie playback descriptor; verified HLS/DASH sources use progressive native streaming, other sources use the seekable MP4 route"}, "415": {"description": "Sources are blocked or have unverified codecs"}, "429": {"description": "Media-job capacity is busy"}, "502": {"description": "Movie playback resolution failed"}, "504": {"description": "Movie playback resolution timed out"}}}},
             "/api/v1/movies/{movie_id}/playback": {"get": {"responses": {"200": {"description": "Alias for movie stream playback"}}}},
             "/api/v1/k-dramas": {"get": {"responses": {"200": {"description": "Metadata-backed K-Drama catalogue"}}}},
             "/api/v1/k-dramas/{id}": {"get": {"responses": {"501": {"description": "Unsupported category"}}}},
@@ -6745,7 +6888,7 @@ fn openapi() -> serde_json::Value {
             "/api/v1/anime/{anime_id}/seasons": {"get": {"responses": {"200": {"description": "Seasons"}}}},
             "/api/v1/anime/{anime_id}/episodes": {"get": {"responses": {"200": {"description": "Episodes"}}}},
             "/api/v1/anime/{anime_id}/episodes/{episode_id}/full": {"get": {"responses": {"200": {"description": "Anime details, selected episode, and source candidates"}, "400": {"description": "Invalid anime or episode ID"}, "404": {"description": "Episode not found"}}}},
-            "/api/v1/anime/{anime_id}/episodes/{episode_id}/stream": {"get": {"responses": {"200": {"description": "Episode playback descriptor pointing to the backend seekable MP4 route"}, "415": {"description": "Sources are blocked or have unverified codecs"}, "429": {"description": "Media-job capacity is busy"}, "502": {"description": "Playback resolution failed"}, "504": {"description": "Playback resolution timed out"}}}},
+            "/api/v1/anime/{anime_id}/episodes/{episode_id}/stream": {"get": {"responses": {"200": {"description": "Episode playback descriptor; verified HLS/DASH sources use progressive native streaming, other sources use the seekable MP4 route"}, "415": {"description": "Sources are blocked or have unverified codecs"}, "429": {"description": "Media-job capacity is busy"}, "502": {"description": "Playback resolution failed"}, "504": {"description": "Playback resolution timed out"}}}},
             "/api/v1/episodes/{episode_id}": {"get": {"responses": {"200": {"description": "Episode details"}, "400": {"description": "Invalid episode ID"}}}},
             "/api/v1/episodes/{episode_id}/sources": {"get": {"responses": {"200": {"description": "Fresh source candidates"}}}},
             "/api/v1/episodes/{episode_id}/sources/stream": {"get": {"responses": {"200": {"description": "SSE source_result, source_error, source_complete events"}}}},
@@ -6756,8 +6899,9 @@ fn openapi() -> serde_json::Value {
             "/api/v1/sources/{source_id}/subtitle-tracks": {"get": {"responses": {"200": {"description": "Confirmed embedded subtitle tracks"}, "415": {"description": "Source codec is blocked or unverified"}, "503": {"description": "Track discovery unavailable"}}}},
             "/api/v1/sources/{source_id}/transcode": {"get": {"responses": {"200": {"description": "Validated temporary seekable MP4"}, "206": {"description": "Requested MP4 byte range"}, "415": {"description": "Source codec is blocked or unverified"}, "416": {"description": "Unsatisfiable byte range"}, "429": {"description": "Media-job capacity is busy"}, "502": {"description": "Remux failed"}, "504": {"description": "Configured media-job timeout"}, "507": {"description": "Temporary cache budget unavailable"}}}},
             "/api/v1/sources/{source_id}/remux": {"get": {"responses": {"200": {"description": "Validated temporary seekable MP4"}, "206": {"description": "Requested MP4 byte range"}, "415": {"description": "Source codec is blocked or unverified"}, "416": {"description": "Unsatisfiable byte range"}, "429": {"description": "Media-job capacity is busy"}, "502": {"description": "Remux failed"}, "504": {"description": "Configured media-job timeout"}, "507": {"description": "Temporary cache budget unavailable"}}}},
-            "/api/v1/sources/{source_id}/playback": {"get": {"responses": {"200": {"description": "Playback descriptor pointing to the backend seekable MP4 route"}, "415": {"description": "Source codec is blocked or unverified"}, "429": {"description": "Media-job capacity is busy"}, "502": {"description": "Playback resolution failed"}, "504": {"description": "Playback resolution timed out"}}}},
-            "/api/v1/sources/{source_id}/watch": {"get": {"responses": {"200": {"description": "Watch descriptor pointing to the backend seekable MP4 route"}, "415": {"description": "Source codec is blocked or unverified"}, "502": {"description": "Watch resolution failed"}, "504": {"description": "Watch resolution timed out"}}}},
+            "/api/v1/sources/{source_id}/playback": {"get": {"responses": {"200": {"description": "Playback descriptor; verified HLS/DASH uses progressive native streaming, other sources use the seekable MP4 route"}, "415": {"description": "Source codec is blocked or unverified"}, "429": {"description": "Media-job capacity is busy"}, "502": {"description": "Playback resolution failed"}, "504": {"description": "Playback resolution timed out"}}}},
+            "/api/v1/sources/{source_id}/native/{token}": {"get": {"description": "Opaque source-scoped HLS/DASH manifest or media resource; child URIs are rewritten from the final upstream manifest URL and media bytes stream progressively with Range passthrough.", "responses": {"200": {"description": "Native manifest or media body"}, "206": {"description": "Exact upstream byte range"}, "400": {"description": "Invalid token path or unsupported manifest range"}, "403": {"description": "Private or unsafe upstream destination rejected"}, "404": {"description": "Expired or invalid source-scoped token"}, "413": {"description": "Configured segment size ceiling exceeded"}, "503": {"description": "Native stream capacity is busy"}, "504": {"description": "Upstream request timeout"}}}, "head": {"responses": {"200": {"description": "Native resource headers"}, "404": {"description": "Expired or invalid source-scoped token"}}}},
+            "/api/v1/sources/{source_id}/watch": {"get": {"responses": {"200": {"description": "Watch descriptor; verified HLS/DASH uses progressive native streaming, other sources use the seekable MP4 route"}, "415": {"description": "Source codec is blocked or unverified"}, "502": {"description": "Watch resolution failed"}, "504": {"description": "Watch resolution timed out"}}}},
             "/api/v1/sources/{source_id}/download": {"get": {"responses": {"200": {"description": "Download metadata"}, "415": {"description": "Source codec is blocked or unverified"}, "501": {"description": "Unsupported"}}}},
             "/api/stream-proxy": {"get": {"responses": {"200": {"description": "Validated temporary seekable MP4"}, "206": {"description": "Requested MP4 byte range"}, "400": {"description": "Missing or invalid media URL"}, "403": {"description": "Unsafe destination rejected"}, "416": {"description": "Unsatisfiable byte range"}, "429": {"description": "Media-job capacity is busy"}, "504": {"description": "Configured media-job timeout"}, "507": {"description": "Temporary cache budget unavailable"}}}, "head": {"responses": {"405": {"description": "HEAD is not supported for remuxed media"}}}},
             "/api/media-info": {"get": {"responses": {"200": {"description": "FFprobe media metadata including duration"}, "400": {"description": "Missing or invalid media URL"}, "502": {"description": "Media inspection failed"}, "504": {"description": "Media inspection timed out"}}}},
