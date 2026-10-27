@@ -971,8 +971,8 @@ async fn route(
         _ if path.starts_with("/api/v1/catalog/episodes/") && path.ends_with("/sources") => catalog_episode_sources_route(stream, path, state).await,
         _ if path.starts_with("/api/v1/catalog/episodes/") => catalog_episode_route(stream, path, state).await,
         _ if path.starts_with("/api/v1/catalog/sources/") && path.ends_with("/tracks") => catalog_source_tracks_route(stream, path, state).await,
-        _ if path.starts_with("/api/v1/catalog/sources/") && path.ends_with("/remux") => catalog_source_remux_route(stream, path, state, request_headers, head_only).await,
-        _ if path.starts_with("/api/v1/catalog/sources/") && path.ends_with("/play") => catalog_source_play_route(stream, path, state, request_headers, head_only).await,
+        _ if path.starts_with("/api/v1/catalog/sources/") && path.ends_with("/remux") => catalog_source_remux_route(stream, path, query, state, request_headers, head_only).await,
+        _ if path.starts_with("/api/v1/catalog/sources/") && path.ends_with("/play") => catalog_source_play_route(stream, path, query, state, request_headers, head_only).await,
         _ if path.starts_with("/api/v1/catalog/sources/") => catalog_source_route(stream, path, state).await,
         _ if path.starts_with("/api/v1/catalog/titles/") => catalog_title_detail_route(stream, path, state).await,
         "/api/v1/diagnostics" => diagnostics_route(stream, state).await,
@@ -1023,7 +1023,7 @@ async fn route(
         _ if path.starts_with("/api/v1/anime/") => anime_route(stream, path, query, state).await,
         _ if path.starts_with("/api/v1/episodes/") => episode_route(stream, path, state).await,
         _ if path.starts_with("/api/v1/sources/") => {
-            source_route(stream, path, state, request_headers, head_only).await
+            source_route(stream, path, query, state, request_headers, head_only).await
         }
         _ => { let (s,b) = err("INTERNAL_ERROR", "Route not found.", None, 404); write_raw_json(stream, s, &b, None).await }
     }
@@ -1538,6 +1538,7 @@ async fn write_catalog_source_ineligible(
 async fn catalog_source_remux_route(
     stream: &mut TcpStream,
     path: &str,
+    query: &str,
     state: ApiState,
     request_headers: &HashMap<String, String>,
     head_only: bool,
@@ -1552,7 +1553,7 @@ async fn catalog_source_remux_route(
     match catalog.get_source(id).await {
         Ok(Some(source)) if source.get("playback_eligible").and_then(serde_json::Value::as_bool).unwrap_or(false) => {
             match catalog_live_source_path(&source, "remux") {
-                Ok(Some(live_path)) => source_route(stream, &live_path, state, request_headers, head_only).await,
+                Ok(Some(live_path)) => source_route(stream, &live_path, query, state, request_headers, head_only).await,
                 Ok(None) => write_json(stream, 501, &serde_json::json!({"success":false,"error":{"code":"REMUX_UNAVAILABLE","message":"This source has no live provider remux mapping.","retryable":false}}), None).await,
                 Err((status, body)) => write_raw_json(stream, status, &body, None).await,
             }
@@ -1566,6 +1567,7 @@ async fn catalog_source_remux_route(
 async fn catalog_source_play_route(
     stream: &mut TcpStream,
     path: &str,
+    query: &str,
     state: ApiState,
     request_headers: &HashMap<String, String>,
     head_only: bool,
@@ -1588,7 +1590,7 @@ async fn catalog_source_play_route(
             }
             match catalog_live_source_path(&source, "playback") {
                 Ok(Some(live_path)) => {
-                    return source_route(stream, &live_path, state, request_headers, head_only).await;
+                    return source_route(stream, &live_path, query, state, request_headers, head_only).await;
                 }
                 Ok(None) => {}
                 Err((status, body)) => return write_raw_json(stream, status, &body, None).await,
@@ -5051,6 +5053,7 @@ async fn write_track_response(
 async fn source_route(
     stream: &mut TcpStream,
     path: &str,
+    query: &str,
     state: ApiState,
     request_headers: &HashMap<String, String>,
     head_only: bool,
@@ -5138,7 +5141,7 @@ async fn source_route(
         return write_track_response(stream, id, sr.p, rel, &state, false).await;
     }
     if matches!(parts.get(4), Some(&"transcode") | Some(&"remux")) {
-        return transcode_source(stream, id, rel, &state, request_headers, head_only).await;
+        return transcode_source(stream, id, rel, &state, query, request_headers, head_only).await;
     }
     if matches!(parts.get(4), Some(&"subtitles") | Some(&"subtitle-tracks")) {
         return write_track_response(stream, id, sr.p, rel, &state, true).await;
@@ -6189,6 +6192,7 @@ async fn transcode_source(
     source_id: &str,
     source: &crate::providers::models::Release,
     state: &ApiState,
+    query: &str,
     request_headers: &HashMap<String, String>,
     head_only: bool,
 ) -> std::io::Result<()> {
@@ -6217,6 +6221,13 @@ async fn transcode_source(
         );
         return write_raw_json(stream, status, &body, None).await;
     }
+    let seek_seconds = match parse_remux_seek_seconds(query) {
+        Ok(value) => value,
+        Err((status, code, message)) => {
+            let (status, body) = err(code, message, Some(source.provider), status);
+            return write_raw_json(stream, status, &body, Some("Accept-Ranges: none\r\n")).await;
+        }
+    };
     if request_headers.contains_key("range") {
         let (status, body) = err(
             "SEEK_UNAVAILABLE",
@@ -6245,14 +6256,70 @@ async fn transcode_source(
         }
     };
     let debug_id = REMUX_DEBUG_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    crate::progressive_remux::serve(
-        stream,
-        &validated_url,
-        &playback.headers,
-        state.remux_cache.job_timeout(),
-        debug_id,
-    )
-    .await
+    if let Some(seek_seconds) = seek_seconds {
+        match crate::codec_verification::inspect_direct_playback_source(&playback).await {
+            Ok(evidence) if evidence.range_supported => {
+                crate::progressive_remux::serve_from_timestamp(
+                    stream,
+                    &validated_url,
+                    &playback.headers,
+                    seek_seconds,
+                    state.remux_cache.job_timeout(),
+                    debug_id,
+                )
+                .await
+            }
+            Ok(_) => {
+                let (status, body) = err(
+                    "SEEK_UNAVAILABLE",
+                    "Timestamp seeking requires a verified upstream byte-range source.",
+                    Some(source.provider),
+                    501,
+                );
+                write_raw_json(stream, status, &body, Some("Accept-Ranges: none\r\n")).await
+            }
+            Err(_) => {
+                let (status, body) = err(
+                    "SEEK_UNAVAILABLE",
+                    "The upstream source could not be verified for timestamp seeking.",
+                    Some(source.provider),
+                    501,
+                );
+                write_raw_json(stream, status, &body, Some("Accept-Ranges: none\r\n")).await
+            }
+        }
+    } else {
+        crate::progressive_remux::serve(
+            stream,
+            &validated_url,
+            &playback.headers,
+            state.remux_cache.job_timeout(),
+            debug_id,
+        )
+        .await
+    }
+}
+
+fn parse_remux_seek_seconds(query: &str) -> Result<Option<f64>, (u16, &'static str, &'static str)> {
+    let Some(raw) = query_value(query, "start_seconds").or_else(|| query_value(query, "start"))
+    else {
+        return Ok(None);
+    };
+    let value = raw.parse::<f64>().map_err(|_| {
+        (
+            400,
+            "INVALID_SEEK",
+            "The timestamp seek position must be a finite number of seconds.",
+        )
+    })?;
+    if !value.is_finite() || !(0.0..=86_400.0).contains(&value) {
+        return Err((
+            400,
+            "INVALID_SEEK",
+            "The timestamp seek position must be between 0 and 86400 seconds.",
+        ));
+    }
+    Ok(Some(value))
 }
 
 const MEDIA_BODY_LIMIT: usize = 8 * 1024 * 1024;
@@ -6997,7 +7064,7 @@ fn openapi() -> serde_json::Value {
             "/api/v1/catalog/sources/{source_id}": {"get": {"description": "Stored source metadata, including expiry and playback eligibility.", "responses": {"200": {"description": "Source detail"}, "404": {"description": "Source not found"}, "503": {"description": "Catalog database unavailable"}}}},
             "/api/v1/catalog/sources/{source_id}/tracks": {"get": {"description": "Stored audio and subtitle tracks for a source.", "responses": {"200": {"description": "Track list"}, "503": {"description": "Catalog database unavailable"}}}},
             "/api/v1/catalog/sources/{source_id}/play": {"get": {"description": "Playback resolution for an eligible stored source; imported FourKHDHub source IDs are resolved live and signed URLs are not persisted.", "responses": {"200": {"description": "Playback resolved"}, "404": {"description": "Source unavailable, blocked, expired, or missing"}, "415": {"description": "Source codec is blocked or unverified"}, "503": {"description": "Catalog database unavailable"}}}},
-            "/api/v1/catalog/sources/{source_id}/remux": {"get": {"description": "Live FourKHDHub source resolution followed by bounded progressive fragmented-MP4 remux over pipes; this endpoint does not support byte-range seeking or store complete source/output video files.", "responses": {"200": {"description": "Progressive fragmented-MP4 stream; no Content-Length or byte-range seek support"}, "404": {"description": "Source unavailable or missing"}, "415": {"description": "Source codec is blocked or unverified"}, "429": {"description": "Media-job capacity is busy"}, "501": {"description": "Byte-range seeking is unavailable for progressive remux"}, "502": {"description": "Upstream or remux startup failed"}, "503": {"description": "Catalog database or FFmpeg unavailable"}, "504": {"description": "Configured media-job or upstream timeout"}}}},
+            "/api/v1/catalog/sources/{source_id}/remux": {"get": {"description": "Live FourKHDHub source resolution followed by bounded progressive fragmented-MP4 remux. Optional start_seconds (or start) is a non-negative timestamp in seconds; it is honored only after verified upstream byte-range capability, and does not change HTTP byte-range semantics or store complete source/output video files.", "responses": {"200": {"description": "Progressive fragmented-MP4 stream; no Content-Length or byte-range seek support"}, "400": {"description": "Malformed, non-finite, negative, or excessive timestamp"}, "404": {"description": "Source unavailable or missing"}, "415": {"description": "Source codec is blocked or unverified"}, "429": {"description": "Media-job capacity is busy"}, "501": {"description": "Timestamp or byte-range seeking is unavailable for the selected source"}, "502": {"description": "Upstream or remux startup failed"}, "503": {"description": "Catalog database or FFmpeg unavailable"}, "504": {"description": "Configured media-job or upstream timeout"}}}},
             "/api/v1/admin/catalog/import": {"post": {"description": "Protected manual catalog import; accepts a bounded titles batch.", "responses": {"201": {"description": "Import job completed"}, "401": {"description": "Unauthorized"}, "413": {"description": "Batch too large"}, "503": {"description": "Database unavailable"}}}},
             "/api/v1/admin/catalog/import-by-name": {"post": {"description": "Protected exact-match anime import from FourKHDHub, including provider details, episodes, and live source references.", "responses": {"201": {"description": "Anime inserted"}, "200": {"description": "Anime updated idempotently"}, "401": {"description": "Unauthorized"}, "404": {"description": "Exact title not found"}, "409": {"description": "Ambiguous exact title"}, "503": {"description": "Provider or catalog unavailable"}}}},
             "/api/v1/admin/catalog/update-all": {"post": {"description": "Protected manual catalog update job; never scheduled automatically.", "responses": {"202": {"description": "Update job accepted"}, "401": {"description": "Unauthorized"}}}},
@@ -7039,8 +7106,8 @@ fn openapi() -> serde_json::Value {
             "/api/v1/sources/{source_id}/audio-tracks": {"get": {"responses": {"200": {"description": "Confirmed embedded audio tracks"}, "415": {"description": "Source codec is blocked or unverified"}, "503": {"description": "Track discovery unavailable"}}}},
             "/api/v1/sources/{source_id}/subtitles": {"get": {"responses": {"200": {"description": "Confirmed embedded subtitle tracks"}, "415": {"description": "Source codec is blocked or unverified"}, "503": {"description": "Track discovery unavailable"}}}},
             "/api/v1/sources/{source_id}/subtitle-tracks": {"get": {"responses": {"200": {"description": "Confirmed embedded subtitle tracks"}, "415": {"description": "Source codec is blocked or unverified"}, "503": {"description": "Track discovery unavailable"}}}},
-            "/api/v1/sources/{source_id}/transcode": {"get": {"responses": {"200": {"description": "Progressive fragmented-MP4 remux using bounded pipes; no complete video file is cached"}, "415": {"description": "Source codec is blocked or unverified"}, "429": {"description": "Media-job capacity is busy"}, "501": {"description": "Byte-range seeking is unavailable"}, "502": {"description": "Remux startup or upstream failed"}, "503": {"description": "FFmpeg unavailable"}, "504": {"description": "Configured media-job or upstream timeout"}}}},
-            "/api/v1/sources/{source_id}/remux": {"get": {"responses": {"200": {"description": "Progressive fragmented-MP4 remux using bounded pipes; no complete video file is cached"}, "415": {"description": "Source codec is blocked or unverified"}, "429": {"description": "Media-job capacity is busy"}, "501": {"description": "Byte-range seeking is unavailable"}, "502": {"description": "Remux startup or upstream failed"}, "503": {"description": "FFmpeg unavailable"}, "504": {"description": "Configured media-job or upstream timeout"}}}},
+            "/api/v1/sources/{source_id}/transcode": {"get": {"description": "Progressive fragmented-MP4 remux using bounded pipes. Optional start_seconds (or start) requests a non-negative timestamp in seconds when the verified upstream supports byte ranges; HTTP byte ranges remain unsupported and no complete video file is cached.", "responses": {"200": {"description": "Progressive fragmented-MP4 remux"}, "400": {"description": "Malformed, non-finite, negative, or excessive timestamp"}, "415": {"description": "Source codec is blocked or unverified"}, "429": {"description": "Media-job capacity is busy"}, "501": {"description": "Timestamp or byte-range seeking is unavailable"}, "502": {"description": "Remux startup or upstream failed"}, "503": {"description": "FFmpeg unavailable"}, "504": {"description": "Configured media-job or upstream timeout"}}}},
+            "/api/v1/sources/{source_id}/remux": {"get": {"description": "Progressive fragmented-MP4 remux using bounded pipes. Optional start_seconds (or start) requests a non-negative timestamp in seconds when the verified upstream supports byte ranges; HTTP byte ranges remain unsupported and no complete video file is cached.", "responses": {"200": {"description": "Progressive fragmented-MP4 remux"}, "400": {"description": "Malformed, non-finite, negative, or excessive timestamp"}, "415": {"description": "Source codec is blocked or unverified"}, "429": {"description": "Media-job capacity is busy"}, "501": {"description": "Timestamp or byte-range seeking is unavailable"}, "502": {"description": "Remux startup or upstream failed"}, "503": {"description": "FFmpeg unavailable"}, "504": {"description": "Configured media-job or upstream timeout"}}}},
             "/api/v1/sources/{source_id}/playback": {"get": {"responses": {"200": {"description": "Playback descriptor; verified compatible MP4 sources use direct byte-range streaming, HLS/DASH uses native streaming, and other verified sources use progressive fragmented-MP4 remux without arbitrary byte-range seeking"}, "415": {"description": "Source codec or playback format is blocked or unverified"}, "429": {"description": "Media-job capacity is busy"}, "502": {"description": "Playback resolution failed"}, "504": {"description": "Playback resolution timed out"}}}},
             "/api/v1/sources/{source_id}/native/{token}": {"get": {"description": "Opaque source-scoped HLS/DASH manifest or media resource; child URIs are rewritten from the final upstream manifest URL and media bytes stream progressively with Range passthrough.", "responses": {"200": {"description": "Native manifest or media body"}, "206": {"description": "Exact upstream byte range"}, "400": {"description": "Invalid token path or unsupported manifest range"}, "403": {"description": "Private or unsafe upstream destination rejected"}, "404": {"description": "Expired or invalid source-scoped token"}, "413": {"description": "Configured segment size ceiling exceeded"}, "503": {"description": "Native stream capacity is busy"}, "504": {"description": "Upstream request timeout"}}}, "head": {"responses": {"200": {"description": "Native resource headers"}, "404": {"description": "Expired or invalid source-scoped token"}}}},
             "/api/v1/sources/{source_id}/watch": {"get": {"responses": {"200": {"description": "Watch descriptor; verified direct-compatible media uses range passthrough, native HLS/DASH stays native, and other verified media uses progressive fragmented-MP4 remux"}, "415": {"description": "Source codec is blocked or unverified"}, "502": {"description": "Watch resolution failed"}, "504": {"description": "Watch resolution timed out"}}}},
@@ -7127,6 +7194,33 @@ mod tests {
         assert!(is_seeking_range(&headers));
         headers.insert("range".to_string(), "bytes=-512".to_string());
         assert!(is_seeking_range(&headers));
+    }
+
+    #[test]
+    fn remux_timestamp_seek_is_bounded_and_uses_seconds() {
+        assert_eq!(
+            parse_remux_seek_seconds("start_seconds=120.5").unwrap(),
+            Some(120.5)
+        );
+        assert_eq!(parse_remux_seek_seconds("start=3").unwrap(), Some(3.0));
+        assert_eq!(
+            parse_remux_seek_seconds("start=3&start_seconds=120.5").unwrap(),
+            Some(120.5)
+        );
+        assert_eq!(
+            parse_remux_seek_seconds("start_seconds=120.5&start=3").unwrap(),
+            Some(120.5)
+        );
+        for query in [
+            "start_seconds=-1",
+            "start_seconds=NaN",
+            "start_seconds=inf",
+            "start_seconds=86400.1",
+            "start_seconds=not-a-number",
+        ] {
+            assert!(parse_remux_seek_seconds(query).is_err(), "{query}");
+        }
+        assert_eq!(parse_remux_seek_seconds("").unwrap(), None);
     }
 
     #[tokio::test]

@@ -106,6 +106,91 @@ pub(crate) async fn serve(
     .await
 }
 
+/// Stream a remux beginning near a validated media timestamp. The source and
+/// output remain pipes; FFmpeg performs input-side seeking against the
+/// validated URL and may issue bounded upstream range requests.
+pub(crate) async fn serve_from_timestamp(
+    stream: &mut TcpStream,
+    url: &Url,
+    provider_headers: &[(String, String)],
+    seek_seconds: f64,
+    timeout_budget: Duration,
+    debug_id: u64,
+) -> io::Result<()> {
+    let deadline = Instant::now() + timeout_budget;
+    let allow_http = crate::config::is_test_environment();
+    let validated_url = match crate::net::validate_public_url(url.as_str(), allow_http).await {
+        Ok(url) if url.scheme() == "https" || allow_http => url,
+        _ => {
+            return write_error(
+                stream,
+                403,
+                "SSRF_BLOCKED",
+                "The media destination is not a permitted public URL.",
+            )
+            .await;
+        }
+    };
+    let mut child = match timestamp_ffmpeg_command(
+        OsStr::new("ffmpeg"),
+        &validated_url,
+        provider_headers,
+        seek_seconds,
+    )
+    .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            log::warn!("timestamp remux process start failed id={debug_id}: {error}");
+            return write_error(stream, 503, "REMUX_UNAVAILABLE", "FFmpeg is unavailable.").await;
+        }
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        return write_error(
+            stream,
+            503,
+            "REMUX_UNAVAILABLE",
+            "FFmpeg could not open the remux output stream.",
+        )
+        .await;
+    };
+    let stderr_task = child.stderr.take().map(|mut stderr| {
+        tokio::spawn(async move {
+            let mut sink = tokio::io::sink();
+            let _ = tokio::io::copy(&mut stderr, &mut sink).await;
+        })
+    });
+    let mut input_task = InputTask::new(tokio::spawn(async { Ok::<(), UpstreamFailure>(()) }));
+    let mut response_started = false;
+    let result = stream_child_output(
+        stream,
+        &mut child,
+        stdout,
+        &mut input_task,
+        deadline,
+        &mut response_started,
+    )
+    .await;
+    if result.is_err() {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+    if let Some(task) = stderr_task {
+        let _ = task.await;
+    }
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if !response_started => {
+            log::warn!("timestamp remux startup failed id={debug_id} category={error:?}");
+            let (status, code, message) = public_startup_error(error);
+            write_error(stream, status, code, message).await
+        }
+        Err(_) => Err(io::Error::other("progressive media stream ended early")),
+    }
+}
+
 async fn serve_with_program(
     stream: &mut TcpStream,
     url: &Url,
@@ -265,6 +350,69 @@ fn progressive_ffmpeg_command(executable: &OsStr) -> Command {
             "pipe:1",
         ])
         .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    command
+}
+
+fn timestamp_ffmpeg_command(
+    executable: &OsStr,
+    url: &Url,
+    provider_headers: &[(String, String)],
+    seek_seconds: f64,
+) -> Command {
+    let mut command = Command::new(executable);
+    command
+        .env_clear()
+        .env("LC_ALL", "C")
+        .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-ss"])
+        .arg(format!("{seek_seconds:.3}"));
+    let headers = forwarded_headers(provider_headers, true);
+    if !headers.is_empty() {
+        let value = headers
+            .into_iter()
+            .map(|(name, value)| {
+                format!(
+                    "{}: {}\r\n",
+                    name.as_str(),
+                    value.to_str().unwrap_or_default()
+                )
+            })
+            .collect::<String>();
+        command.args(["-headers", &value]);
+    }
+    command
+        .args([
+            "-i",
+            url.as_str(),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-ac",
+            "2",
+            "-sn",
+            "-dn",
+            "-avoid_negative_ts",
+            "make_zero",
+            "-max_interleave_delta",
+            "0",
+            "-movflags",
+            "+frag_keyframe+empty_moov+default_base_moof",
+            "-flush_packets",
+            "1",
+            "-f",
+            "mp4",
+            "pipe:1",
+        ])
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -759,6 +907,27 @@ mod tests {
         );
         assert_eq!(MAX_STARTUP_BUFFER_BYTES, 4 * 1024 * 1024);
         assert_eq!(OUTPUT_CHUNK_BYTES, 64 * 1024);
+    }
+
+    #[test]
+    fn timestamp_command_seeks_before_input_and_uses_pipe_output() {
+        let command = timestamp_ffmpeg_command(
+            OsStr::new("ffmpeg"),
+            &Url::parse("https://media.example/video.mp4").unwrap(),
+            &[],
+            120.5,
+        );
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let seek = args.iter().position(|arg| arg == "-ss").unwrap();
+        let input = args.iter().position(|arg| arg == "-i").unwrap();
+        assert!(seek < input);
+        assert_eq!(args[seek + 1], "120.500");
+        assert_eq!(args[input + 1], "https://media.example/video.mp4");
+        assert_eq!(args.last().map(String::as_str), Some("pipe:1"));
     }
 
     #[test]
