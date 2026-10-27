@@ -26,9 +26,9 @@ Playback, direct-watch, source-detail, audio/subtitle, download, and remux reque
 
 ## Media handling and seeking
 
-Remuxed media is streamed from FFmpeg stdout to the client. The API does not create, serve, or retain a persistent remux MP4 cache. The short FFmpeg preflight is piped into FFprobe in memory and capped at 32 MiB; startup removes the application-owned legacy `cache/remux` directory from older versions when possible.
+Source-scoped remuxed media is streamed from FFmpeg stdout to the client using progressive pipes; these routes do not create complete source or output video files. The short FFmpeg preflight is piped into FFprobe in memory and capped at 32 MiB; startup removes the application-owned legacy `cache/remux` directory from older versions when possible. The generic `/api/stream-proxy` endpoint is separate and retains its cache-backed seekable behavior for compatibility.
 
-Remux endpoints `/api/v1/sources/{source_id}/transcode`, `/remux`, and remux-mode requests through `/api/stream-proxy` do not support byte-range seeking. A `Range` request receives HTTP `501 SEEK_UNAVAILABLE`, with `X-Remux-Cache-State: disabled`. Ordinary GET streaming remains available when the source passes eligibility and remux checks. `HEAD` is not supported for these remux routes. Direct upstream proxy behavior remains distinct from the remux path.
+The source-scoped remux endpoints `/api/v1/sources/{source_id}/transcode`, `/remux`, and `/api/v1/catalog/sources/{source_id}/remux` are progressive and do not support byte-range seeking. A `Range` request receives HTTP `501 SEEK_UNAVAILABLE`, with `Accept-Ranges: none`; ordinary GET streaming remains available when the source passes eligibility and remux checks. `HEAD` is not supported for these remux routes. The generic `/api/stream-proxy` endpoint remains a separate cache-backed, seekable compatibility route and is not used as a fallback by playback descriptors. Direct byte-range passthrough and native HLS/DASH behavior remain distinct.
 
 ## Compatibility and architecture limits
 

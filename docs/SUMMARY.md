@@ -19,6 +19,7 @@
 # Architecture & Internals
 
 - [System Architecture](architecture.md)
+- [Playback Delivery Modes](progressive-playback.md)
 - [Module Breakdown](modules.md)
 - [Caching Strategy](cache.md)
 - [Logging System](logging.md)

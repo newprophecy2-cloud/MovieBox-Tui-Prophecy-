@@ -6217,45 +6217,42 @@ async fn transcode_source(
         );
         return write_raw_json(stream, status, &body, None).await;
     }
-    let key = crate::remux_cache::cache_key(source_id, REMUX_OUTPUT_PROFILE);
-    let build_cache = state.remux_cache.clone();
-    let build_key = key.clone();
-    let build_url = validated_url;
-    let build_headers = playback.headers.clone();
-    let started = Instant::now();
-    let lease = state
-        .remux_cache
-        .get_or_build(&key, move |partial_path| async move {
-            build_cached_mp4(
-                build_cache,
-                build_key,
-                build_url,
-                build_headers,
-                partial_path,
-                false,
-                true,
-            )
-            .await
-        })
+    if request_headers.contains_key("range") {
+        let (status, body) = err(
+            "SEEK_UNAVAILABLE",
+            "Byte-range seeking is unavailable for progressive remuxed media.",
+            None,
+            501,
+        );
+        return write_raw_json(
+            stream,
+            status,
+            &body,
+            Some("Accept-Ranges: none\r\nX-Remux-Cache-State: disabled\r\n"),
+        )
         .await;
-    let lease = match lease {
-        Ok(lease) => lease,
-        Err(error) => {
-            let (status, code, message) = cache_error_http(error);
-            let (status, body) = err(code, message, Some(source.provider), status);
+    }
+    let _media_job = match state.remux_cache.try_acquire_job() {
+        Ok(permit) => permit,
+        Err(_) => {
+            let (status, body) = err(
+                "REMUX_BUSY",
+                "Media-processing capacity is busy.",
+                Some(source.provider),
+                429,
+            );
             return write_raw_json(stream, status, &body, None).await;
         }
     };
-    log::info!(
-        "media remux prepared provider={} source_fingerprint={} cache_state={} bytes={} duration_ms={} elapsed_ms={}",
-        source.provider.label(),
-        &key[..12],
-        if lease.was_hit { "hit" } else { "built" },
-        lease.cached.metadata.size_bytes,
-        (lease.cached.metadata.duration_seconds * 1000.0) as u64,
-        started.elapsed().as_millis()
-    );
-    write_cached_remux_response(stream, lease, Some(source_id), request_headers, false).await
+    let debug_id = REMUX_DEBUG_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    crate::progressive_remux::serve(
+        stream,
+        &validated_url,
+        &playback.headers,
+        state.remux_cache.job_timeout(),
+        debug_id,
+    )
+    .await
 }
 
 const MEDIA_BODY_LIMIT: usize = 8 * 1024 * 1024;
@@ -6988,7 +6985,7 @@ fn openapi() -> serde_json::Value {
             "/openapi.json": {"get": {"responses": {"200": {"description": "OpenAPI document"}}}},
             "/docs": {"get": {"responses": {"200": {"description": "API documentation"}}}},
             "/api/v1/diagnostics": {"get": {"responses": {"200": {"description": "Sanitized provider diagnostics"}}}},
-            "/api/v1/watch": {"get": {"responses": {"200": {"description": "Episode playback descriptor pointing to the backend seekable MP4 route"}, "400": {"description": "Invalid watch request"}, "415": {"description": "All discovered sources are blocked or have unverified codecs"}}}},
+            "/api/v1/watch": {"get": {"responses": {"200": {"description": "Episode playback descriptor; verified compatible MP4 sources use direct range passthrough, HLS/DASH remains native, and other verified sources use progressive fragmented-MP4 remux without arbitrary byte-range seeking"}, "400": {"description": "Invalid watch request"}, "415": {"description": "All discovered sources are blocked or have unverified codecs"}}}},
             "/api/v1/anime/search": {"get": {"parameters": [{"name": "q", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 200}}, {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 100}}, {"name": "cursor", "in": "query", "schema": {"type": "string"}}], "responses": {"200": {"description": "Search results"}, "400": {"description": "Invalid query"}}}},
             "/api/v1/search": {"get": {"description": "PostgreSQL-only catalog search; never performs live provider discovery.", "responses": {"200": {"description": "Catalog search results"}, "400": {"description": "Invalid query"}, "503": {"description": "Catalog database unavailable"}}}},
             "/api/v1/genres": {"get": {"description": "PostgreSQL-backed canonical genre list.", "responses": {"200": {"description": "Genres"}, "503": {"description": "Catalog database unavailable"}}}},
@@ -7000,7 +6997,7 @@ fn openapi() -> serde_json::Value {
             "/api/v1/catalog/sources/{source_id}": {"get": {"description": "Stored source metadata, including expiry and playback eligibility.", "responses": {"200": {"description": "Source detail"}, "404": {"description": "Source not found"}, "503": {"description": "Catalog database unavailable"}}}},
             "/api/v1/catalog/sources/{source_id}/tracks": {"get": {"description": "Stored audio and subtitle tracks for a source.", "responses": {"200": {"description": "Track list"}, "503": {"description": "Catalog database unavailable"}}}},
             "/api/v1/catalog/sources/{source_id}/play": {"get": {"description": "Playback resolution for an eligible stored source; imported FourKHDHub source IDs are resolved live and signed URLs are not persisted.", "responses": {"200": {"description": "Playback resolved"}, "404": {"description": "Source unavailable, blocked, expired, or missing"}, "415": {"description": "Source codec is blocked or unverified"}, "503": {"description": "Catalog database unavailable"}}}},
-            "/api/v1/catalog/sources/{source_id}/remux": {"get": {"description": "Live FourKHDHub source resolution followed by a validated temporary seekable MP4 remux; valid single byte ranges return exact file bytes.", "responses": {"200": {"description": "Complete seekable MP4"}, "206": {"description": "Requested MP4 byte range"}, "404": {"description": "Source unavailable or missing"}, "415": {"description": "Source codec is blocked or unverified"}, "416": {"description": "Unsatisfiable byte range"}, "429": {"description": "Media-job capacity is busy"}, "504": {"description": "Configured media-job timeout"}, "507": {"description": "Temporary cache budget unavailable"}, "503": {"description": "Catalog database unavailable"}}}},
+            "/api/v1/catalog/sources/{source_id}/remux": {"get": {"description": "Live FourKHDHub source resolution followed by bounded progressive fragmented-MP4 remux over pipes; this endpoint does not support byte-range seeking or store complete source/output video files.", "responses": {"200": {"description": "Progressive fragmented-MP4 stream; no Content-Length or byte-range seek support"}, "404": {"description": "Source unavailable or missing"}, "415": {"description": "Source codec is blocked or unverified"}, "429": {"description": "Media-job capacity is busy"}, "501": {"description": "Byte-range seeking is unavailable for progressive remux"}, "502": {"description": "Upstream or remux startup failed"}, "503": {"description": "Catalog database or FFmpeg unavailable"}, "504": {"description": "Configured media-job or upstream timeout"}}}},
             "/api/v1/admin/catalog/import": {"post": {"description": "Protected manual catalog import; accepts a bounded titles batch.", "responses": {"201": {"description": "Import job completed"}, "401": {"description": "Unauthorized"}, "413": {"description": "Batch too large"}, "503": {"description": "Database unavailable"}}}},
             "/api/v1/admin/catalog/import-by-name": {"post": {"description": "Protected exact-match anime import from FourKHDHub, including provider details, episodes, and live source references.", "responses": {"201": {"description": "Anime inserted"}, "200": {"description": "Anime updated idempotently"}, "401": {"description": "Unauthorized"}, "404": {"description": "Exact title not found"}, "409": {"description": "Ambiguous exact title"}, "503": {"description": "Provider or catalog unavailable"}}}},
             "/api/v1/admin/catalog/update-all": {"post": {"description": "Protected manual catalog update job; never scheduled automatically.", "responses": {"202": {"description": "Update job accepted"}, "401": {"description": "Unauthorized"}}}},
@@ -7023,7 +7020,7 @@ fn openapi() -> serde_json::Value {
             "/api/v1/movies": {"get": {"responses": {"200": {"description": "MovieBox movie catalogue"}}}},
             "/api/v1/movies/{movie_id}": {"get": {"responses": {"200": {"description": "Movie details"}}}},
             "/api/v1/movies/{movie_id}/sources": {"get": {"responses": {"200": {"description": "Movie source candidates"}, "502": {"description": "Movie source resolution failed"}}}},
-            "/api/v1/movies/{movie_id}/stream": {"get": {"responses": {"200": {"description": "Movie playback descriptor; verified HLS/DASH sources use progressive native streaming, other sources use the seekable MP4 route"}, "415": {"description": "Sources are blocked or have unverified codecs"}, "429": {"description": "Media-job capacity is busy"}, "502": {"description": "Movie playback resolution failed"}, "504": {"description": "Movie playback resolution timed out"}}}},
+            "/api/v1/movies/{movie_id}/stream": {"get": {"responses": {"200": {"description": "Movie playback descriptor; verified compatible MP4 sources use direct range passthrough, native HLS/DASH stays native, and other verified sources use progressive fragmented-MP4 remux"}, "415": {"description": "Sources are blocked or have unverified codecs"}, "429": {"description": "Media-job capacity is busy"}, "502": {"description": "Movie playback resolution failed"}, "504": {"description": "Movie playback resolution timed out"}}}},
             "/api/v1/movies/{movie_id}/playback": {"get": {"responses": {"200": {"description": "Alias for movie stream playback"}}}},
             "/api/v1/k-dramas": {"get": {"responses": {"200": {"description": "Metadata-backed K-Drama catalogue"}}}},
             "/api/v1/k-dramas/{id}": {"get": {"responses": {"501": {"description": "Unsupported category"}}}},
@@ -7033,7 +7030,7 @@ fn openapi() -> serde_json::Value {
             "/api/v1/anime/{anime_id}/seasons": {"get": {"responses": {"200": {"description": "Seasons"}}}},
             "/api/v1/anime/{anime_id}/episodes": {"get": {"responses": {"200": {"description": "Episodes"}}}},
             "/api/v1/anime/{anime_id}/episodes/{episode_id}/full": {"get": {"responses": {"200": {"description": "Anime details, selected episode, and source candidates"}, "400": {"description": "Invalid anime or episode ID"}, "404": {"description": "Episode not found"}}}},
-            "/api/v1/anime/{anime_id}/episodes/{episode_id}/stream": {"get": {"responses": {"200": {"description": "Episode playback descriptor; verified HLS/DASH sources use progressive native streaming, other sources use the seekable MP4 route"}, "415": {"description": "Sources are blocked or have unverified codecs"}, "429": {"description": "Media-job capacity is busy"}, "502": {"description": "Playback resolution failed"}, "504": {"description": "Playback resolution timed out"}}}},
+            "/api/v1/anime/{anime_id}/episodes/{episode_id}/stream": {"get": {"responses": {"200": {"description": "Episode playback descriptor; verified compatible MP4 sources use direct range passthrough, native HLS/DASH stays native, and other verified sources use progressive fragmented-MP4 remux"}, "415": {"description": "Sources are blocked or have unverified codecs"}, "429": {"description": "Media-job capacity is busy"}, "502": {"description": "Playback resolution failed"}, "504": {"description": "Playback resolution timed out"}}}},
             "/api/v1/episodes/{episode_id}": {"get": {"responses": {"200": {"description": "Episode details"}, "400": {"description": "Invalid episode ID"}}}},
             "/api/v1/episodes/{episode_id}/sources": {"get": {"responses": {"200": {"description": "Fresh source candidates"}}}},
             "/api/v1/episodes/{episode_id}/sources/stream": {"get": {"responses": {"200": {"description": "SSE source_result, source_error, source_complete events"}}}},
@@ -7042,11 +7039,11 @@ fn openapi() -> serde_json::Value {
             "/api/v1/sources/{source_id}/audio-tracks": {"get": {"responses": {"200": {"description": "Confirmed embedded audio tracks"}, "415": {"description": "Source codec is blocked or unverified"}, "503": {"description": "Track discovery unavailable"}}}},
             "/api/v1/sources/{source_id}/subtitles": {"get": {"responses": {"200": {"description": "Confirmed embedded subtitle tracks"}, "415": {"description": "Source codec is blocked or unverified"}, "503": {"description": "Track discovery unavailable"}}}},
             "/api/v1/sources/{source_id}/subtitle-tracks": {"get": {"responses": {"200": {"description": "Confirmed embedded subtitle tracks"}, "415": {"description": "Source codec is blocked or unverified"}, "503": {"description": "Track discovery unavailable"}}}},
-            "/api/v1/sources/{source_id}/transcode": {"get": {"responses": {"200": {"description": "Validated temporary seekable MP4"}, "206": {"description": "Requested MP4 byte range"}, "415": {"description": "Source codec is blocked or unverified"}, "416": {"description": "Unsatisfiable byte range"}, "429": {"description": "Media-job capacity is busy"}, "502": {"description": "Remux failed"}, "504": {"description": "Configured media-job timeout"}, "507": {"description": "Temporary cache budget unavailable"}}}},
-            "/api/v1/sources/{source_id}/remux": {"get": {"responses": {"200": {"description": "Validated temporary seekable MP4"}, "206": {"description": "Requested MP4 byte range"}, "415": {"description": "Source codec is blocked or unverified"}, "416": {"description": "Unsatisfiable byte range"}, "429": {"description": "Media-job capacity is busy"}, "502": {"description": "Remux failed"}, "504": {"description": "Configured media-job timeout"}, "507": {"description": "Temporary cache budget unavailable"}}}},
-            "/api/v1/sources/{source_id}/playback": {"get": {"responses": {"200": {"description": "Playback descriptor; verified compatible MP4 sources use direct byte-range streaming, HLS/DASH uses native streaming, and other verified sources use the seekable MP4 route"}, "415": {"description": "Source codec or playback format is blocked or unverified"}, "429": {"description": "Media-job capacity is busy"}, "502": {"description": "Playback resolution failed"}, "504": {"description": "Playback resolution timed out"}}}},
+            "/api/v1/sources/{source_id}/transcode": {"get": {"responses": {"200": {"description": "Progressive fragmented-MP4 remux using bounded pipes; no complete video file is cached"}, "415": {"description": "Source codec is blocked or unverified"}, "429": {"description": "Media-job capacity is busy"}, "501": {"description": "Byte-range seeking is unavailable"}, "502": {"description": "Remux startup or upstream failed"}, "503": {"description": "FFmpeg unavailable"}, "504": {"description": "Configured media-job or upstream timeout"}}}},
+            "/api/v1/sources/{source_id}/remux": {"get": {"responses": {"200": {"description": "Progressive fragmented-MP4 remux using bounded pipes; no complete video file is cached"}, "415": {"description": "Source codec is blocked or unverified"}, "429": {"description": "Media-job capacity is busy"}, "501": {"description": "Byte-range seeking is unavailable"}, "502": {"description": "Remux startup or upstream failed"}, "503": {"description": "FFmpeg unavailable"}, "504": {"description": "Configured media-job or upstream timeout"}}}},
+            "/api/v1/sources/{source_id}/playback": {"get": {"responses": {"200": {"description": "Playback descriptor; verified compatible MP4 sources use direct byte-range streaming, HLS/DASH uses native streaming, and other verified sources use progressive fragmented-MP4 remux without arbitrary byte-range seeking"}, "415": {"description": "Source codec or playback format is blocked or unverified"}, "429": {"description": "Media-job capacity is busy"}, "502": {"description": "Playback resolution failed"}, "504": {"description": "Playback resolution timed out"}}}},
             "/api/v1/sources/{source_id}/native/{token}": {"get": {"description": "Opaque source-scoped HLS/DASH manifest or media resource; child URIs are rewritten from the final upstream manifest URL and media bytes stream progressively with Range passthrough.", "responses": {"200": {"description": "Native manifest or media body"}, "206": {"description": "Exact upstream byte range"}, "400": {"description": "Invalid token path or unsupported manifest range"}, "403": {"description": "Private or unsafe upstream destination rejected"}, "404": {"description": "Expired or invalid source-scoped token"}, "413": {"description": "Configured segment size ceiling exceeded"}, "503": {"description": "Native stream capacity is busy"}, "504": {"description": "Upstream request timeout"}}}, "head": {"responses": {"200": {"description": "Native resource headers"}, "404": {"description": "Expired or invalid source-scoped token"}}}},
-            "/api/v1/sources/{source_id}/watch": {"get": {"responses": {"200": {"description": "Watch descriptor; verified HLS/DASH uses progressive native streaming, other sources use the seekable MP4 route"}, "415": {"description": "Source codec is blocked or unverified"}, "502": {"description": "Watch resolution failed"}, "504": {"description": "Watch resolution timed out"}}}},
+            "/api/v1/sources/{source_id}/watch": {"get": {"responses": {"200": {"description": "Watch descriptor; verified direct-compatible media uses range passthrough, native HLS/DASH stays native, and other verified media uses progressive fragmented-MP4 remux"}, "415": {"description": "Source codec is blocked or unverified"}, "502": {"description": "Watch resolution failed"}, "504": {"description": "Watch resolution timed out"}}}},
             "/api/v1/sources/{source_id}/download": {"get": {"responses": {"200": {"description": "Download metadata"}, "415": {"description": "Source codec is blocked or unverified"}, "501": {"description": "Unsupported"}}}},
             "/api/stream-proxy": {"get": {"responses": {"200": {"description": "Validated temporary seekable MP4"}, "206": {"description": "Requested MP4 byte range"}, "400": {"description": "Missing or invalid media URL"}, "403": {"description": "Unsafe destination rejected"}, "416": {"description": "Unsatisfiable byte range"}, "429": {"description": "Media-job capacity is busy"}, "504": {"description": "Configured media-job timeout"}, "507": {"description": "Temporary cache budget unavailable"}}}, "head": {"responses": {"405": {"description": "HEAD is not supported for remuxed media"}}}},
             "/api/media-info": {"get": {"responses": {"200": {"description": "FFprobe media metadata including duration"}, "400": {"description": "Missing or invalid media URL"}, "502": {"description": "Media inspection failed"}, "504": {"description": "Media inspection timed out"}}}},

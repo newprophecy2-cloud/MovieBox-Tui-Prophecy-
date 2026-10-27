@@ -16,6 +16,7 @@ pub mod models;
 pub mod net;
 pub(crate) mod playback_planner;
 pub mod player;
+pub(crate) mod progressive_remux;
 pub mod providers;
 pub mod proxy;
 pub mod remux_cache;
