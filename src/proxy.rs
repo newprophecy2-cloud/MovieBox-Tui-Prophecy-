@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
 const MAX_LINE_BYTES: usize = 8 * 1024;
@@ -405,6 +405,7 @@ struct ProxyContext {
     target_host: Option<String>,
     subtitle_url: Option<String>,
     max_height: Option<u64>,
+    max_segment_bytes: u64,
     segment_cache: Arc<SegmentCache>,
     manifest_cache: Arc<Mutex<Option<CachedManifest>>>,
     hls_playlists: Arc<Mutex<std::collections::HashMap<String, HlsMediaPlaylist>>>,
@@ -599,6 +600,7 @@ pub async fn run_sidecar(
         target_host: extract_host_authority(&target_url),
         subtitle_url,
         max_height,
+        max_segment_bytes: config.hls_max_segment_bytes,
         segment_cache,
         manifest_cache: Arc::new(Mutex::new(None)),
         hls_playlists: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -843,61 +845,51 @@ async fn handle_connection(
             && !segment.byte_range
         {
             schedule_hls_prefetch(ctx, playlist_url, *segment_index);
-            match fetch_or_get_segment(
+            match relay_cached_or_stream_segment(
                 &ctx.segment_cache,
                 client,
                 &target_url,
                 auth_headers,
                 forward_all_headers,
-                false,
+                range_header.as_deref(),
+                ctx.max_segment_bytes,
+                client_close,
+                &mut writer,
             )
             .await
             {
-                Ok((seg_status, content_type, seg_bytes)) if seg_status.is_success() => {
-                    if let Err(total) = cached_segment_range(&seg_bytes, range_header.as_deref()) {
-                        let header = format!(
-                            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{total}\r\nContent-Length: 0\r\nAccept-Ranges: bytes\r\nConnection: {}\r\n\r\n",
-                            if client_close { "close" } else { "keep-alive" }
-                        );
-                        writer.write_all(header.as_bytes()).await?;
-                        writer.flush().await?;
+                Ok(keep_alive) => {
+                    if client_close || !keep_alive {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                Err((headers_sent, error)) => {
+                    let category = if error.contains("configured byte limit") {
+                        "segment_over_limit"
+                    } else if error.contains("capacity is full") {
+                        "fetch_capacity_full"
+                    } else if error.contains("timed out") {
+                        "relay_timeout"
                     } else {
-                        let (out_status, content_range, body) =
-                            cached_segment_range(&seg_bytes, range_header.as_deref())
-                                .expect("range selection checked above");
-                        let header = format!(
-                            "HTTP/1.1 {} {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{content_range}Accept-Ranges: bytes\r\nAccess-Control-Allow-Origin: *\r\nConnection: {}\r\n\r\n",
-                            out_status.as_u16(),
-                            out_status.canonical_reason().unwrap_or("OK"),
-                            body.len(),
-                            if client_close { "close" } else { "keep-alive" }
-                        );
-                        writer.write_all(header.as_bytes()).await?;
-                        writer.write_all(body).await?;
-                        writer.flush().await?;
-                    }
-                    if client_close {
-                        return Ok(());
-                    }
-                    continue;
-                }
-                Ok((status, _, _)) => {
-                    let phrase = status.canonical_reason().unwrap_or("Upstream Error");
-                    let header = format!(
-                        "HTTP/1.1 {} {}\r\nContent-Length: 0\r\nConnection: {}\r\n\r\n",
-                        status.as_u16(),
-                        phrase,
-                        if client_close { "close" } else { "keep-alive" }
+                        "relay_failure"
+                    };
+                    log::warn!(
+                        "HLS segment relay stopped category={category} headers_sent={headers_sent}"
                     );
-                    writer.write_all(header.as_bytes()).await?;
-                    writer.flush().await?;
-                    if client_close {
+                    if headers_sent {
                         return Ok(());
                     }
-                    continue;
-                }
-                Err(_) => {
-                    let response = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let (status, reason) = if error.contains("configured byte limit") {
+                        (413, "Payload Too Large")
+                    } else if error.contains("capacity is full") {
+                        (503, "Service Unavailable")
+                    } else {
+                        (502, "Bad Gateway")
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
                     writer.write_all(response.as_bytes()).await?;
                     writer.flush().await?;
                     return Ok(());
@@ -913,60 +905,50 @@ async fn handle_connection(
         {
             schedule_dash_prefetch(ctx, &target_url);
 
-            match fetch_or_get_segment(
+            match relay_cached_or_stream_segment(
                 &ctx.segment_cache,
                 client,
                 &target_url,
                 auth_headers,
                 forward_all_headers,
-                false,
+                range_header.as_deref(),
+                ctx.max_segment_bytes,
+                client_close,
+                &mut writer,
             )
             .await
             {
-                Ok((seg_status, content_type, seg_bytes)) => {
-                    let conn_hdr = if client_close { "close" } else { "keep-alive" };
-                    let (out_status, content_range_hdr, body_slice) = if seg_status.is_success() {
-                        match cached_segment_range(&seg_bytes, range_header.as_deref()) {
-                            Ok(selection) => selection,
-                            Err(total) => {
-                                let response = format!(
-                                    "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{total}\r\nContent-Length: 0\r\nAccept-Ranges: bytes\r\nConnection: {conn_hdr}\r\n\r\n"
-                                );
-                                writer.write_all(response.as_bytes()).await?;
-                                writer.flush().await?;
-                                if client_close {
-                                    return Ok(());
-                                }
-                                continue;
-                            }
-                        }
-                    } else {
-                        (seg_status, String::new(), seg_bytes.as_ref())
-                    };
-                    let accept_ranges = if seg_status.is_success() {
-                        "Accept-Ranges: bytes\r\n"
-                    } else {
-                        ""
-                    };
-                    let response_hdr = format!(
-                        "HTTP/1.1 {} {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{content_range_hdr}{accept_ranges}Access-Control-Allow-Origin: *\r\nConnection: {conn_hdr}\r\n\r\n",
-                        out_status.as_u16(),
-                        out_status.canonical_reason().unwrap_or("OK"),
-                        body_slice.len()
-                    );
-                    writer.write_all(response_hdr.as_bytes()).await?;
-                    writer.write_all(body_slice).await?;
-                    writer.flush().await?;
-                    if client_close {
+                Ok(keep_alive) => {
+                    if client_close || !keep_alive {
                         return Ok(());
                     }
                     continue;
                 }
-                Err(e) => {
-                    let body = format!("Gateway Error: {e}");
+                Err((headers_sent, error)) => {
+                    let category = if error.contains("configured byte limit") {
+                        "segment_over_limit"
+                    } else if error.contains("capacity is full") {
+                        "fetch_capacity_full"
+                    } else if error.contains("timed out") {
+                        "relay_timeout"
+                    } else {
+                        "relay_failure"
+                    };
+                    log::warn!(
+                        "DASH segment relay stopped category={category} headers_sent={headers_sent}"
+                    );
+                    if headers_sent {
+                        return Ok(());
+                    }
+                    let (status, reason) = if error.contains("configured byte limit") {
+                        (413, "Payload Too Large")
+                    } else if error.contains("capacity is full") {
+                        (503, "Service Unavailable")
+                    } else {
+                        (502, "Bad Gateway")
+                    };
                     let response = format!(
-                        "HTTP/1.1 502 Bad Gateway\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
+                        "HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                     );
                     writer.write_all(response.as_bytes()).await?;
                     writer.flush().await?;
@@ -1396,6 +1378,214 @@ fn cached_segment_range<'a>(
         format!("Content-Range: bytes {start}-{end}/{}\r\n", bytes.len()),
         &bytes[start..=end],
     ))
+}
+
+async fn get_cached_segment(cache: &Arc<SegmentCache>, url: &str) -> Option<(String, Arc<[u8]>)> {
+    if let Some((content_type, data)) = cache.get(url) {
+        return Some((content_type, data));
+    }
+    let disk = cache.disk_cache.as_ref()?;
+    match disk.get(&cache.namespace, url).await {
+        Ok(Some(lease)) => {
+            let content_type = lease.content_type.clone();
+            let data = Arc::clone(&lease.bytes);
+            cache.insert(url.to_string(), content_type.clone(), Arc::clone(&data));
+            Some((content_type, data))
+        }
+        Ok(None) => None,
+        Err(_) => {
+            log::warn!("HLS chunk cache read failed; using direct segment streaming");
+            None
+        }
+    }
+}
+
+async fn write_cached_segment<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    content_type: &str,
+    bytes: &[u8],
+    range_header: Option<&str>,
+    client_close: bool,
+) -> Result<bool, std::io::Error> {
+    let conn = if client_close { "close" } else { "keep-alive" };
+    let (status, content_range, body) = match cached_segment_range(bytes, range_header) {
+        Ok(selection) => selection,
+        Err(total) => {
+            let response = format!(
+                "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{total}\r\nContent-Length: 0\r\nAccept-Ranges: bytes\r\nConnection: {conn}\r\n\r\n"
+            );
+            writer.write_all(response.as_bytes()).await?;
+            writer.flush().await?;
+            return Ok(!client_close);
+        }
+    };
+    let response = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{content_range}Accept-Ranges: bytes\r\nAccess-Control-Allow-Origin: *\r\nConnection: {conn}\r\n\r\n",
+        status.as_u16(),
+        status.canonical_reason().unwrap_or("OK"),
+        body.len()
+    );
+    writer.write_all(response.as_bytes()).await?;
+    writer.write_all(body).await?;
+    writer.flush().await?;
+    Ok(!client_close)
+}
+
+/// Stream a cache miss to the player with backpressure, caching only a fully received small body.
+/// Errors carry whether response headers have already been sent; callers must close after that.
+async fn stream_segment_to_client<W: AsyncWrite + Unpin>(
+    cache: &Arc<SegmentCache>,
+    client: &reqwest::Client,
+    url: &str,
+    auth_headers: &[(String, String)],
+    forward_all_headers: bool,
+    range_header: Option<&str>,
+    max_segment_bytes: u64,
+    client_close: bool,
+    writer: &mut W,
+) -> Result<bool, (bool, String)> {
+    let _permit = cache
+        .fetch_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| (false, "segment fetch capacity is full".to_string()))?;
+    let mut request = client.get(url);
+    for (name, value) in auth_headers {
+        if should_forward_header(forward_all_headers, name) {
+            request = request.header(name.as_str(), value.as_str());
+        }
+    }
+    if let Some(range) = range_header {
+        request = request.header(reqwest::header::RANGE, range);
+    }
+    let response = tokio::time::timeout(
+        Duration::from_secs(CHUNK_IDLE_TIMEOUT_SECS + 15),
+        request.send(),
+    )
+    .await
+    .map_err(|_| (false, "upstream segment response timed out".to_string()))?
+    .map_err(|error| (false, error.to_string()))?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_segment_bytes)
+    {
+        return Err((false, "segment exceeds configured byte limit".to_string()));
+    }
+
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let content_length = response.content_length();
+    let keep_alive = !client_close && content_length.is_some();
+    let status_line = format!(
+        "HTTP/1.1 {} {}\r\n",
+        status.as_u16(),
+        status.canonical_reason().unwrap_or("OK")
+    );
+    let response_headers = format_proxy_response_headers(response.headers(), url, keep_alive);
+    writer
+        .write_all(status_line.as_bytes())
+        .await
+        .map_err(|error| (true, error.to_string()))?;
+    writer
+        .write_all(&response_headers)
+        .await
+        .map_err(|error| (true, error.to_string()))?;
+    writer
+        .flush()
+        .await
+        .map_err(|error| (true, error.to_string()))?;
+
+    let mut cacheable = range_header.is_none() && status == reqwest::StatusCode::OK;
+    let mut cache_bytes = Vec::with_capacity(
+        content_length
+            .unwrap_or_default()
+            .min(MAX_SEGMENT_BYTES as u64) as usize,
+    );
+    let mut total = 0u64;
+    let mut body_stream = response.bytes_stream();
+    loop {
+        let next = tokio::time::timeout(
+            Duration::from_secs(CHUNK_IDLE_TIMEOUT_SECS),
+            body_stream.next(),
+        )
+        .await
+        .map_err(|_| (true, "upstream segment body timed out".to_string()))?;
+        let Some(chunk) = next else {
+            break;
+        };
+        let chunk = chunk.map_err(|error| (true, error.to_string()))?;
+        total = total.saturating_add(chunk.len() as u64);
+        if total > max_segment_bytes {
+            return Err((
+                true,
+                "segment exceeded configured byte limit while streaming".into(),
+            ));
+        }
+        if cacheable {
+            if cache_bytes.len().saturating_add(chunk.len()) <= MAX_SEGMENT_BYTES {
+                cache_bytes.extend_from_slice(&chunk);
+            } else {
+                cacheable = false;
+                cache_bytes.clear();
+            }
+        }
+        writer
+            .write_all(&chunk)
+            .await
+            .map_err(|error| (true, error.to_string()))?;
+        writer
+            .flush()
+            .await
+            .map_err(|error| (true, error.to_string()))?;
+    }
+
+    if cacheable && !cache_bytes.is_empty() {
+        let data: Arc<[u8]> = Arc::from(cache_bytes);
+        cache.insert(url.to_string(), content_type.clone(), Arc::clone(&data));
+        if let Some(disk) = cache.disk_cache.as_ref()
+            && let Err(error) = disk
+                .insert(&cache.namespace, url, &content_type, &data)
+                .await
+        {
+            log::warn!("HLS chunk cache write failed after successful stream: {error}");
+        }
+    }
+    Ok(keep_alive)
+}
+
+async fn relay_cached_or_stream_segment<W: AsyncWrite + Unpin>(
+    cache: &Arc<SegmentCache>,
+    client: &reqwest::Client,
+    url: &str,
+    auth_headers: &[(String, String)],
+    forward_all_headers: bool,
+    range_header: Option<&str>,
+    max_segment_bytes: u64,
+    client_close: bool,
+    writer: &mut W,
+) -> Result<bool, (bool, String)> {
+    if let Some((content_type, bytes)) = get_cached_segment(cache, url).await {
+        return write_cached_segment(writer, &content_type, &bytes, range_header, client_close)
+            .await
+            .map_err(|error| (true, error.to_string()));
+    }
+    stream_segment_to_client(
+        cache,
+        client,
+        url,
+        auth_headers,
+        forward_all_headers,
+        range_header,
+        max_segment_bytes,
+        client_close,
+        writer,
+    )
+    .await
 }
 
 async fn fetch_or_get_segment(
@@ -2208,6 +2398,7 @@ mod tests {
             target_host: None,
             subtitle_url: None,
             max_height: None,
+            max_segment_bytes: 1024 * 1024 * 1024,
             segment_cache: Arc::new(SegmentCache::default()),
             manifest_cache: Arc::new(Mutex::new(None)),
             hls_playlists: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -2618,6 +2809,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streamed_hls_segment_delivers_first_bytes_before_upstream_finishes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let upstream_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let finished = Arc::clone(&upstream_finished);
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: 6\r\nConnection: close\r\n\r\nabc",
+                )
+                .await
+                .unwrap();
+            socket.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            socket.write_all(b"def").await.unwrap();
+            finished.store(true, Ordering::Relaxed);
+        });
+
+        let url = format!("http://{addr}/movie/segment.ts");
+        let client = crate::net::http_client_builder_base().build().unwrap();
+        let cache = Arc::new(SegmentCache::default());
+        let (mut relay_writer, relay_reader) = tokio::io::duplex(128);
+        let cache_for_task = Arc::clone(&cache);
+        let url_for_task = url.clone();
+        let client_for_task = client.clone();
+        let relay = tokio::spawn(async move {
+            stream_segment_to_client(
+                &cache_for_task,
+                &client_for_task,
+                &url_for_task,
+                &[],
+                true,
+                None,
+                1024 * 1024,
+                true,
+                &mut relay_writer,
+            )
+            .await
+        });
+        let mut reader = BufReader::new(relay_reader);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(line.starts_with("HTTP/1.1 200"));
+        loop {
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            if line == "\r\n" {
+                break;
+            }
+        }
+        let mut first = [0u8; 3];
+        tokio::time::timeout(Duration::from_millis(150), reader.read_exact(&mut first))
+            .await
+            .expect("first segment bytes should arrive before upstream completion")
+            .unwrap();
+        assert_eq!(&first, b"abc");
+        assert!(!upstream_finished.load(Ordering::Relaxed));
+        let mut last = [0u8; 3];
+        reader.read_exact(&mut last).await.unwrap();
+        assert_eq!(&last, b"def");
+        assert!(!relay.await.unwrap().unwrap());
+        assert!(cache.get(&url).is_some());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn streamed_segment_over_16_mib_succeeds_without_caching_whole_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const TOTAL: usize = 20 * 1024 * 1024;
+        const BLOCK: usize = 64 * 1024;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await;
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: {TOTAL}\r\nConnection: close\r\n\r\n"
+            );
+            socket.write_all(headers.as_bytes()).await.unwrap();
+            let block = [0x5Au8; BLOCK];
+            for _ in 0..TOTAL / BLOCK {
+                socket.write_all(&block).await.unwrap();
+            }
+        });
+
+        let url = format!("http://{addr}/movie/large-segment.ts");
+        let client = crate::net::http_client_builder_base().build().unwrap();
+        let cache = Arc::new(SegmentCache::default());
+        let (mut relay_writer, relay_reader) = tokio::io::duplex(128 * 1024);
+        let cache_for_task = Arc::clone(&cache);
+        let url_for_task = url.clone();
+        let client_for_task = client.clone();
+        let relay = tokio::spawn(async move {
+            stream_segment_to_client(
+                &cache_for_task,
+                &client_for_task,
+                &url_for_task,
+                &[],
+                true,
+                None,
+                32 * 1024 * 1024,
+                true,
+                &mut relay_writer,
+            )
+            .await
+        });
+        let mut reader = BufReader::new(relay_reader);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(line.starts_with("HTTP/1.1 200"));
+        loop {
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            if line == "\r\n" {
+                break;
+            }
+        }
+        let mut total = 0usize;
+        let mut block = [0u8; BLOCK];
+        loop {
+            let read = reader.read(&mut block).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            assert!(block[..read].iter().all(|byte| *byte == 0x5A));
+            total += read;
+        }
+        assert_eq!(total, TOTAL);
+        assert!(!relay.await.unwrap().unwrap());
+        assert!(cache.get(&url).is_none());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn same_segment_requests_coalesce_and_prefetch_is_globally_bounded() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -2762,6 +3094,7 @@ mod tests {
             target_host: Some(addr.to_string()),
             subtitle_url: None,
             max_height: Some(720),
+            max_segment_bytes: 1024 * 1024 * 1024,
             segment_cache: Arc::new(SegmentCache::default()),
             manifest_cache: Arc::new(Mutex::new(None)),
             hls_playlists: Arc::new(Mutex::new(std::collections::HashMap::new())),

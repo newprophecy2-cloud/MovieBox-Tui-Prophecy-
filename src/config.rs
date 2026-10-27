@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 
 const HLS_CHUNK_CACHE_MIN_BYTES: u64 = 512 * 1024 * 1024;
 const HLS_CHUNK_CACHE_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+const HLS_SEGMENT_MIN_BYTES: u64 = 16 * 1024 * 1024;
+const HLS_SEGMENT_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -35,6 +37,7 @@ pub struct Config {
     pub max_concurrent_media_jobs: usize,
     pub media_job_timeout_seconds: u64,
     pub hls_chunk_cache_max_bytes: u64,
+    pub hls_max_segment_bytes: u64,
     pub hls_prefetch_depth: usize,
 }
 impl Default for Config {
@@ -65,6 +68,7 @@ impl Default for Config {
             max_concurrent_media_jobs: 1,
             media_job_timeout_seconds: 1_800,
             hls_chunk_cache_max_bytes: HLS_CHUNK_CACHE_MIN_BYTES,
+            hls_max_segment_bytes: 1024 * 1024 * 1024,
             hls_prefetch_depth: 2,
         }
     }
@@ -90,6 +94,9 @@ impl Config {
         }
         if self.hls_prefetch_depth > 4 {
             return Err("hls_prefetch_depth must be between 0 and 4".into());
+        }
+        if !(HLS_SEGMENT_MIN_BYTES..=HLS_SEGMENT_MAX_BYTES).contains(&self.hls_max_segment_bytes) {
+            return Err("hls_max_segment_bytes must be between 16777216 and 10737418240".into());
         }
         Ok(())
     }
@@ -464,6 +471,7 @@ mod tests {
         assert_eq!(config.max_concurrent_media_jobs, 1);
         assert_eq!(config.media_job_timeout_seconds, 1_800);
         assert_eq!(config.hls_chunk_cache_max_bytes, 512 * 1024 * 1024);
+        assert_eq!(config.hls_max_segment_bytes, 1024 * 1024 * 1024);
         assert_eq!(config.hls_prefetch_depth, 2);
 
         let json = serde_json::to_string(&config).expect("serialize");
@@ -473,6 +481,7 @@ mod tests {
             .expect("older config without media settings remains compatible");
         assert_eq!(old_config.remux_cache_ttl_seconds, 3_600);
         assert_eq!(old_config.hls_chunk_cache_max_bytes, 512 * 1024 * 1024);
+        assert_eq!(old_config.hls_max_segment_bytes, 1024 * 1024 * 1024);
         assert_eq!(old_config.hls_prefetch_depth, 2);
     }
 
@@ -530,6 +539,21 @@ mod tests {
         for bytes in [HLS_CHUNK_CACHE_MIN_BYTES, HLS_CHUNK_CACHE_MAX_BYTES] {
             let config = Config {
                 hls_chunk_cache_max_bytes: bytes,
+                ..Config::default()
+            };
+            assert!(config.validate_hls_chunk_settings().is_ok());
+        }
+
+        for bytes in [HLS_SEGMENT_MIN_BYTES - 1, HLS_SEGMENT_MAX_BYTES + 1] {
+            let config = Config {
+                hls_max_segment_bytes: bytes,
+                ..Config::default()
+            };
+            assert!(config.validate_hls_chunk_settings().is_err());
+        }
+        for bytes in [HLS_SEGMENT_MIN_BYTES, HLS_SEGMENT_MAX_BYTES] {
+            let config = Config {
+                hls_max_segment_bytes: bytes,
                 ..Config::default()
             };
             assert!(config.validate_hls_chunk_settings().is_ok());
