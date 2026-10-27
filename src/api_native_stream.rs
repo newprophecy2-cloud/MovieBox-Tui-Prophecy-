@@ -73,11 +73,18 @@ fn local_token_path(source_id: &str, token: &str) -> String {
     format!("/api/v1/sources/{encoded_source}/native/{token}")
 }
 
+fn local_direct_token_path(source_id: &str, token: &str) -> String {
+    let encoded_source =
+        percent_encoding::utf8_percent_encode(source_id, percent_encoding::NON_ALPHANUMERIC);
+    format!("/api/v1/sources/{encoded_source}/direct/{token}")
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TokenKind {
     Resource,
     Base,
     Template,
+    Direct,
 }
 
 #[derive(Clone)]
@@ -89,6 +96,12 @@ struct TokenClaims {
     upstream_headers: Vec<(String, String)>,
     variables: Vec<TemplateVariable>,
     expires_at: Instant,
+}
+
+struct UpstreamRequestOptions<'a> {
+    range: Option<&'a str>,
+    head_only: bool,
+    require_range: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -131,6 +144,30 @@ impl NativeStreamProxy {
             Vec::new(),
         )
         .ok()
+    }
+
+    pub(crate) fn direct_playback_url(
+        &self,
+        source_id: &str,
+        raw_url: &str,
+        upstream_headers: &[(String, String)],
+    ) -> Option<String> {
+        let url = Url::parse(raw_url).ok()?;
+        if !matches!(url.scheme(), "http" | "https") || is_native_manifest_url(&url) {
+            return None;
+        }
+        let token_path = self
+            .issue_url(
+                source_id,
+                &url,
+                url.clone(),
+                TokenKind::Direct,
+                upstream_headers,
+                Vec::new(),
+            )
+            .ok()?;
+        let token = token_path.rsplit('/').next()?;
+        Some(local_direct_token_path(source_id, token))
     }
 
     pub(crate) fn supports_url(&self, raw_url: &str) -> bool {
@@ -256,8 +293,11 @@ impl NativeStreamProxy {
                 &claims.root_url,
                 &claims.upstream_headers,
                 request_headers,
-                range,
-                head_only,
+                UpstreamRequestOptions {
+                    range,
+                    head_only,
+                    require_range: true,
+                },
             )
             .await
         {
@@ -352,15 +392,69 @@ impl NativeStreamProxy {
             .await
     }
 
+    pub(crate) async fn serve_direct(
+        &self,
+        stream: &mut TcpStream,
+        source_id: &str,
+        token: &str,
+        request_headers: &HashMap<String, String>,
+        head_only: bool,
+    ) -> io::Result<()> {
+        let Some(claims) = self
+            .claims(source_id, token)
+            .filter(|claims| claims.kind == TokenKind::Direct)
+        else {
+            return write_error(
+                stream,
+                404,
+                "The direct playback reference is invalid or expired.",
+            )
+            .await;
+        };
+        let _permit = match self.slots.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => return write_error(stream, 503, "Direct media capacity is busy.").await,
+        };
+        let range = match request_headers.get("range") {
+            Some(value) if valid_single_byte_range(value) => Some(value.as_str()),
+            Some(_) => {
+                return write_error(stream, 400, "Only valid single byte ranges are supported.")
+                    .await;
+            }
+            None => None,
+        };
+        let response = match self
+            .send_upstream(
+                &claims.target_url,
+                &claims.root_url,
+                &claims.upstream_headers,
+                request_headers,
+                UpstreamRequestOptions {
+                    range,
+                    head_only,
+                    require_range: false,
+                },
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err((status, message)) => return write_error(stream, status, message).await,
+        };
+        self.relay_direct_response(stream, response, head_only, range)
+            .await
+    }
+
     async fn send_upstream(
         &self,
         initial_url: &Url,
         root_url: &Url,
         provider_headers: &[(String, String)],
         request_headers: &HashMap<String, String>,
-        range: Option<&str>,
-        head_only: bool,
+        options: UpstreamRequestOptions<'_>,
     ) -> Result<reqwest::Response, (u16, &'static str)> {
+        let range = options.range;
+        let head_only = options.head_only;
+        let require_range = options.require_range;
         let mut current = initial_url.clone();
         for redirect_count in 0..=MAX_REDIRECTS {
             let validated = crate::net::validate_public_url(current.as_str(), true)
@@ -401,26 +495,36 @@ impl NativeStreamProxy {
                 .map_err(|_| (504, "The upstream media request timed out."))?
                 .map_err(|_| (502, "The upstream media request failed."))?;
             if !response.status().is_redirection() {
-                if let Some(range) = range
-                    && response.status().is_success()
-                {
-                    if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+                if let Some(range) = range {
+                    if require_range
+                        && response.status().is_success()
+                        && response.status() != reqwest::StatusCode::PARTIAL_CONTENT
+                    {
                         return Err((
                             502,
                             "The upstream server did not honor the requested byte range.",
                         ));
                     }
-                    let content_range = response
-                        .headers()
-                        .get(reqwest::header::CONTENT_RANGE)
-                        .and_then(|value| value.to_str().ok());
-                    if content_range
-                        .and_then(|content_range| {
-                            expected_range_length(range, content_range, response.content_length())
-                        })
-                        .is_none()
-                    {
-                        return Err((502, "The upstream server returned an invalid byte range."));
+                    if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+                        let content_range = response
+                            .headers()
+                            .get(reqwest::header::CONTENT_RANGE)
+                            .and_then(|value| value.to_str().ok());
+                        if content_range
+                            .and_then(|content_range| {
+                                expected_range_length(
+                                    range,
+                                    content_range,
+                                    response.content_length(),
+                                )
+                            })
+                            .is_none()
+                        {
+                            return Err((
+                                502,
+                                "The upstream server returned an invalid byte range.",
+                            ));
+                        }
                     }
                 }
                 return Ok(response);
@@ -541,6 +645,178 @@ impl NativeStreamProxy {
             stream.flush().await?;
         }
         Ok(())
+    }
+
+    async fn relay_direct_response(
+        &self,
+        stream: &mut TcpStream,
+        response: reqwest::Response,
+        head_only: bool,
+        request_range: Option<&str>,
+    ) -> io::Result<()> {
+        let status = response.status();
+        if !(status.is_success() || status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE) {
+            return write_error(
+                stream,
+                502,
+                "The upstream media server rejected the request.",
+            )
+            .await;
+        }
+        if !status.is_success()
+            && response
+                .content_length()
+                .is_some_and(|length| length > MAX_ERROR_BODY_BYTES as u64)
+        {
+            return write_error(
+                stream,
+                502,
+                "The upstream media server returned an oversized error.",
+            )
+            .await;
+        }
+        if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+            let valid_range = request_range.is_some_and(|request_range| {
+                response
+                    .headers()
+                    .get(reqwest::header::CONTENT_RANGE)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(unsatisfied_range_total)
+                    .is_some_and(|total| request_range_is_unsatisfiable(request_range, total))
+            });
+            if !valid_range {
+                return write_error(
+                    stream,
+                    502,
+                    "The upstream server returned an invalid unsatisfied range.",
+                )
+                .await;
+            }
+        }
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("application/octet-stream");
+        let content_length = response.content_length();
+        let expected_range_bytes = if status == reqwest::StatusCode::PARTIAL_CONTENT {
+            let Some(request_range) = request_range else {
+                return write_error(
+                    stream,
+                    502,
+                    "The upstream server returned an unsolicited byte range.",
+                )
+                .await;
+            };
+            let expected = response
+                .headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| expected_range_length(request_range, value, content_length));
+            let Some(expected) = expected else {
+                return write_error(
+                    stream,
+                    502,
+                    "The upstream server returned an invalid byte range.",
+                )
+                .await;
+            };
+            Some(expected)
+        } else {
+            None
+        };
+        let mut header = format!(
+            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n",
+            status.as_u16(),
+            status.canonical_reason().unwrap_or("Upstream Error"),
+            content_type
+        );
+        for (name, value) in response.headers() {
+            if matches!(
+                name.as_str(),
+                "content-length"
+                    | "content-range"
+                    | "accept-ranges"
+                    | "etag"
+                    | "last-modified"
+                    | "cache-control"
+                    | "content-disposition"
+            ) && let Ok(value) = value.to_str()
+            {
+                header.push_str(name.as_str());
+                header.push_str(": ");
+                header.push_str(value);
+                header.push_str("\r\n");
+            }
+        }
+        if let Some(length) = expected_range_bytes
+            && !response
+                .headers()
+                .contains_key(reqwest::header::CONTENT_LENGTH)
+        {
+            header.push_str(&format!("Content-Length: {length}\r\n"));
+        }
+        header.push_str("\r\n");
+        stream.write_all(header.as_bytes()).await?;
+        stream.flush().await?;
+        if head_only {
+            return Ok(());
+        }
+        let mut total = 0u64;
+        let mut body = response.bytes_stream();
+        loop {
+            let next = tokio::time::timeout(STREAM_IDLE_TIMEOUT, body.next()).await;
+            let chunk = match next {
+                Err(_) | Ok(None) => return Ok(()),
+                Ok(Some(Err(_))) => return Ok(()),
+                Ok(Some(Ok(chunk))) => chunk,
+            };
+            total = total.saturating_add(chunk.len() as u64);
+            if !status.is_success() && total > MAX_ERROR_BODY_BYTES as u64 {
+                return Ok(());
+            }
+            if let Some(expected) = expected_range_bytes
+                && total > expected
+            {
+                let allowed = chunk.len() as u64 - (total - expected);
+                if allowed > 0 {
+                    stream.write_all(&chunk[..allowed as usize]).await?;
+                    stream.flush().await?;
+                }
+                return Ok(());
+            }
+            stream.write_all(&chunk).await?;
+            stream.flush().await?;
+        }
+    }
+}
+
+fn unsatisfied_range_total(value: &str) -> Option<u64> {
+    let mut parts = value.split_whitespace();
+    if !parts.next()?.eq_ignore_ascii_case("bytes") {
+        return None;
+    }
+    let range = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    range.strip_prefix("*/")?.parse::<u64>().ok()
+}
+
+fn request_range_is_unsatisfiable(request_range: &str, total: u64) -> bool {
+    if !valid_single_byte_range(request_range) {
+        return false;
+    }
+    let Some((_, requested)) = request_range.trim().split_once('=') else {
+        return false;
+    };
+    let Some((start, _)) = requested.split_once('-') else {
+        return false;
+    };
+    if start.is_empty() {
+        total == 0
+    } else {
+        start.parse::<u64>().is_ok_and(|start| start >= total)
     }
 }
 
@@ -1424,6 +1700,148 @@ mod tests {
         reader.read_to_end(&mut tail).await.unwrap();
         assert_eq!([first.as_slice(), tail.as_slice()].concat(), b"abcd");
         relay_task.await.unwrap();
+        upstream_task.await.unwrap();
+    }
+
+    async fn mock_http_response(response_bytes: &'static [u8]) -> reqwest::Response {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+            }
+            socket.write_all(response_bytes).await.unwrap();
+            socket.flush().await.unwrap();
+        });
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}/video"))
+            .send()
+            .await
+            .unwrap();
+        task.await.unwrap();
+        response
+    }
+
+    async fn relay_direct_to_bytes(
+        response: reqwest::Response,
+        request_range: Option<&str>,
+    ) -> Vec<u8> {
+        let downstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = downstream.local_addr().unwrap();
+        let proxy = proxy();
+        let range = request_range.map(str::to_string);
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = downstream.accept().await.unwrap();
+            proxy
+                .relay_direct_response(&mut socket, response, false, range.as_deref())
+                .await
+                .unwrap();
+        });
+        let mut client = TcpStream::connect(address).await.unwrap();
+        let mut bytes = Vec::new();
+        client.read_to_end(&mut bytes).await.unwrap();
+        task.await.unwrap();
+        bytes
+    }
+
+    #[tokio::test]
+    async fn direct_relay_preserves_206_200_and_416_upstream_semantics() {
+        let response = mock_http_response(
+            b"HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp4\r\nContent-Length: 3\r\nContent-Range: bytes 2-4/5\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\ncde",
+        )
+        .await;
+        let relayed = relay_direct_to_bytes(response, Some("bytes=2-4")).await;
+        let relayed_text = String::from_utf8(relayed).unwrap();
+        assert!(relayed_text.starts_with("HTTP/1.1 206"));
+        assert!(
+            relayed_text
+                .to_ascii_lowercase()
+                .contains("content-range: bytes 2-4/5")
+        );
+        assert!(relayed_text.ends_with("\r\n\r\ncde"));
+
+        let response = mock_http_response(
+            b"HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: 5\r\nAccept-Ranges: none\r\nConnection: close\r\n\r\nabcde",
+        )
+        .await;
+        let relayed = relay_direct_to_bytes(response, Some("bytes=2-4")).await;
+        let relayed_text = String::from_utf8(relayed).unwrap();
+        assert!(relayed_text.starts_with("HTTP/1.1 200 OK"));
+        assert!(!relayed_text.to_ascii_lowercase().contains("content-range:"));
+        assert!(relayed_text.ends_with("\r\n\r\nabcde"));
+
+        let response = mock_http_response(
+            b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Type: video/mp4\r\nContent-Length: 0\r\nContent-Range: bytes */5\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let relayed = relay_direct_to_bytes(response, Some("bytes=8-9")).await;
+        let relayed_text = String::from_utf8(relayed).unwrap();
+        assert!(relayed_text.starts_with("HTTP/1.1 416"));
+        assert!(
+            relayed_text
+                .to_ascii_lowercase()
+                .contains("content-range: bytes */5")
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_handler_forwards_client_range_to_upstream() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut socket, _) = upstream.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+            }
+            let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+            assert!(request.contains("range: bytes=2-4"));
+            socket
+                .write_all(
+                    b"HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp4\r\nContent-Length: 3\r\nContent-Range: bytes 2-4/5\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\ncde",
+                )
+                .await
+                .unwrap();
+            socket.flush().await.unwrap();
+        });
+
+        let proxy = proxy();
+        let direct_url = proxy
+            .direct_playback_url(
+                "source-1",
+                &format!("http://{upstream_address}/video.mp4"),
+                &[],
+            )
+            .unwrap();
+        let token = direct_url.rsplit('/').next().unwrap().to_string();
+        let downstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let downstream_address = downstream.local_addr().unwrap();
+        let request_headers = HashMap::from([("range".to_string(), "bytes=2-4".to_string())]);
+        let handler = tokio::spawn(async move {
+            let (mut socket, _) = downstream.accept().await.unwrap();
+            proxy
+                .serve_direct(&mut socket, "source-1", &token, &request_headers, false)
+                .await
+                .unwrap();
+        });
+        let mut client = TcpStream::connect(downstream_address).await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 206"));
+        assert!(
+            response
+                .to_ascii_lowercase()
+                .contains("content-range: bytes 2-4/5")
+        );
+        assert!(response.ends_with("\r\n\r\ncde"));
+        handler.await.unwrap();
         upstream_task.await.unwrap();
     }
 

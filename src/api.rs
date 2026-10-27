@@ -985,6 +985,11 @@ async fn route(
             native_stream_route(stream, path, query, state, request_headers, method, head_only)
                 .await
         }
+        _ if path.starts_with("/api/v1/sources/")
+            && path.trim_matches('/').split('/').nth(4) == Some("direct") =>
+        {
+            direct_stream_route(stream, path, state, request_headers, method, head_only).await
+        }
         "/api/media-info" => media_info_route(stream, query, request_headers).await,
         "/api/subtitles/extract" => subtitle_extract_route(stream, query, request_headers).await,
         "/api/pretranscode/start" => pretranscode_unavailable(stream, 501).await,
@@ -5247,6 +5252,62 @@ async fn native_stream_route(
         .await
 }
 
+async fn direct_stream_route(
+    stream: &mut TcpStream,
+    path: &str,
+    state: ApiState,
+    request_headers: &HashMap<String, String>,
+    method: &str,
+    head_only: bool,
+) -> std::io::Result<()> {
+    if !matches!(method, "GET" | "HEAD") {
+        let (status, body) = err(
+            "METHOD_NOT_ALLOWED",
+            "Direct media streaming supports GET and HEAD only.",
+            None,
+            405,
+        );
+        return write_raw_json(stream, status, &body, None).await;
+    }
+    let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
+    let (Some(source_id), Some("direct"), Some(token)) =
+        (parts.get(3), parts.get(4).copied(), parts.get(5))
+    else {
+        return write_json(
+            stream,
+            404,
+            &serde_json::json!({"error":"Direct playback reference not found."}),
+            None,
+        )
+        .await;
+    };
+    if parts.len() != 6 {
+        return write_json(
+            stream,
+            404,
+            &serde_json::json!({"error":"Direct playback reference not found."}),
+            None,
+        )
+        .await;
+    }
+    let source_id = match percent_encoding::percent_decode_str(source_id).decode_utf8() {
+        Ok(source_id) if !source_id.is_empty() => source_id.into_owned(),
+        _ => {
+            return write_json(
+                stream,
+                400,
+                &serde_json::json!({"error":"Invalid source ID."}),
+                None,
+            )
+            .await;
+        }
+    };
+    state
+        .native_stream
+        .serve_direct(stream, &source_id, token, request_headers, head_only)
+        .await
+}
+
 fn watch_url(raw: &str) -> String {
     let Ok(mut url) = reqwest::Url::parse(raw) else {
         return raw.to_string();
@@ -5394,19 +5455,104 @@ async fn write_verified_playback_response(
             return write_raw_json(stream, status, &body, None).await;
         }
     };
-    match crate::codec_verification::verify_playback_source(&playback).await {
-        Ok(crate::codec_verification::CodecProbeResult::Allowed(_)) => {
-            let mut backend_playback = playback;
-            backend_playback.url = source_playback_url(
-                state,
-                source_id,
-                &backend_playback.url,
-                &backend_playback.headers,
+    if state.native_stream.supports_url(&playback.url) {
+        return match crate::codec_verification::verify_playback_source(&playback).await {
+            Ok(crate::codec_verification::CodecProbeResult::Allowed(_)) => {
+                let mut backend_playback = playback;
+                backend_playback.url = source_playback_url(
+                    state,
+                    source_id,
+                    &backend_playback.url,
+                    &backend_playback.headers,
+                );
+                backend_playback.headers.clear();
+                write_json(stream, 200, &playback_json(&backend_playback), None).await
+            }
+            Ok(crate::codec_verification::CodecProbeResult::BlockedHevc(_)) => {
+                let (status, body) = err(
+                    "SOURCE_CODEC_BLOCKED",
+                    "H.265/HEVC sources are blocked by playback policy.",
+                    Some(provider),
+                    415,
+                );
+                write_raw_json(stream, status, &body, None).await
+            }
+            Ok(crate::codec_verification::CodecProbeResult::Unsupported(_))
+            | Ok(crate::codec_verification::CodecProbeResult::NoVideoStream)
+            | Err(_) => {
+                let (status, body) = err(
+                    "CODEC_UNVERIFIED",
+                    "The media video codec could not be positively verified as H.264.",
+                    Some(provider),
+                    415,
+                );
+                write_raw_json(stream, status, &body, None).await
+            }
+        };
+    }
+    let evidence = match crate::codec_verification::inspect_direct_playback_source(&playback).await
+    {
+        Ok(evidence) => evidence,
+        Err(_) => {
+            let (status, body) = err(
+                "CODEC_UNVERIFIED",
+                "The media video codec could not be positively verified as H.264.",
+                Some(provider),
+                415,
             );
+            return write_raw_json(stream, status, &body, None).await;
+        }
+    };
+    let mut backend_playback = playback;
+    match evidence.codec {
+        crate::codec_verification::CodecProbeResult::Allowed(codec) => {
+            let capabilities = crate::playback_planner::VerifiedMediaCapabilities {
+                format_name: evidence.format_name,
+                video_codec: Some(codec),
+                audio_codecs: evidence.audio_codecs,
+                range_supported: evidence.range_supported,
+            };
+            match crate::playback_planner::plan_playback(&backend_playback.url, Some(&capabilities))
+            {
+                crate::playback_planner::PlaybackStrategy::DirectRangePassthrough => {
+                    backend_playback.url = state
+                        .native_stream
+                        .direct_playback_url(
+                            source_id,
+                            &backend_playback.url,
+                            &backend_playback.headers,
+                        )
+                        .unwrap_or_else(|| {
+                            source_playback_url(
+                                state,
+                                source_id,
+                                &backend_playback.url,
+                                &backend_playback.headers,
+                            )
+                        });
+                }
+                crate::playback_planner::PlaybackStrategy::RemuxRequired => {
+                    backend_playback.url = source_playback_url(
+                        state,
+                        source_id,
+                        &backend_playback.url,
+                        &backend_playback.headers,
+                    );
+                }
+                _ => {
+                    let (status, body) = err(
+                        "CODEC_UNVERIFIED",
+                        "The media format or playback capabilities could not be positively verified.",
+                        Some(provider),
+                        415,
+                    );
+                    return write_raw_json(stream, status, &body, None).await;
+                }
+            }
             backend_playback.headers.clear();
             write_json(stream, 200, &playback_json(&backend_playback), None).await
         }
-        Ok(crate::codec_verification::CodecProbeResult::BlockedHevc(_)) => {
+        crate::codec_verification::CodecProbeResult::BlockedHevc(_) => {
             let (status, body) = err(
                 "SOURCE_CODEC_BLOCKED",
                 "H.265/HEVC sources are blocked by playback policy.",
@@ -5415,9 +5561,8 @@ async fn write_verified_playback_response(
             );
             write_raw_json(stream, status, &body, None).await
         }
-        Ok(crate::codec_verification::CodecProbeResult::Unsupported(_))
-        | Ok(crate::codec_verification::CodecProbeResult::NoVideoStream)
-        | Err(_) => {
+        crate::codec_verification::CodecProbeResult::Unsupported(_)
+        | crate::codec_verification::CodecProbeResult::NoVideoStream => {
             let (status, body) = err(
                 "CODEC_UNVERIFIED",
                 "The media video codec could not be positively verified as H.264.",
@@ -6832,7 +6977,7 @@ async fn send_event(stream: &mut TcpStream, event: &str, data: &str) -> std::io:
         .await
 }
 fn openapi() -> serde_json::Value {
-    serde_json::json!({
+    let mut document = serde_json::json!({
         "openapi": "3.0.3",
         "info": {"title": "MovieBox API", "version": "1.0.0"},
         "paths": {
@@ -6899,7 +7044,7 @@ fn openapi() -> serde_json::Value {
             "/api/v1/sources/{source_id}/subtitle-tracks": {"get": {"responses": {"200": {"description": "Confirmed embedded subtitle tracks"}, "415": {"description": "Source codec is blocked or unverified"}, "503": {"description": "Track discovery unavailable"}}}},
             "/api/v1/sources/{source_id}/transcode": {"get": {"responses": {"200": {"description": "Validated temporary seekable MP4"}, "206": {"description": "Requested MP4 byte range"}, "415": {"description": "Source codec is blocked or unverified"}, "416": {"description": "Unsatisfiable byte range"}, "429": {"description": "Media-job capacity is busy"}, "502": {"description": "Remux failed"}, "504": {"description": "Configured media-job timeout"}, "507": {"description": "Temporary cache budget unavailable"}}}},
             "/api/v1/sources/{source_id}/remux": {"get": {"responses": {"200": {"description": "Validated temporary seekable MP4"}, "206": {"description": "Requested MP4 byte range"}, "415": {"description": "Source codec is blocked or unverified"}, "416": {"description": "Unsatisfiable byte range"}, "429": {"description": "Media-job capacity is busy"}, "502": {"description": "Remux failed"}, "504": {"description": "Configured media-job timeout"}, "507": {"description": "Temporary cache budget unavailable"}}}},
-            "/api/v1/sources/{source_id}/playback": {"get": {"responses": {"200": {"description": "Playback descriptor; verified HLS/DASH uses progressive native streaming, other sources use the seekable MP4 route"}, "415": {"description": "Source codec is blocked or unverified"}, "429": {"description": "Media-job capacity is busy"}, "502": {"description": "Playback resolution failed"}, "504": {"description": "Playback resolution timed out"}}}},
+            "/api/v1/sources/{source_id}/playback": {"get": {"responses": {"200": {"description": "Playback descriptor; verified compatible MP4 sources use direct byte-range streaming, HLS/DASH uses native streaming, and other verified sources use the seekable MP4 route"}, "415": {"description": "Source codec or playback format is blocked or unverified"}, "429": {"description": "Media-job capacity is busy"}, "502": {"description": "Playback resolution failed"}, "504": {"description": "Playback resolution timed out"}}}},
             "/api/v1/sources/{source_id}/native/{token}": {"get": {"description": "Opaque source-scoped HLS/DASH manifest or media resource; child URIs are rewritten from the final upstream manifest URL and media bytes stream progressively with Range passthrough.", "responses": {"200": {"description": "Native manifest or media body"}, "206": {"description": "Exact upstream byte range"}, "400": {"description": "Invalid token path or unsupported manifest range"}, "403": {"description": "Private or unsafe upstream destination rejected"}, "404": {"description": "Expired or invalid source-scoped token"}, "413": {"description": "Configured segment size ceiling exceeded"}, "503": {"description": "Native stream capacity is busy"}, "504": {"description": "Upstream request timeout"}}}, "head": {"responses": {"200": {"description": "Native resource headers"}, "404": {"description": "Expired or invalid source-scoped token"}}}},
             "/api/v1/sources/{source_id}/watch": {"get": {"responses": {"200": {"description": "Watch descriptor; verified HLS/DASH uses progressive native streaming, other sources use the seekable MP4 route"}, "415": {"description": "Source codec is blocked or unverified"}, "502": {"description": "Watch resolution failed"}, "504": {"description": "Watch resolution timed out"}}}},
             "/api/v1/sources/{source_id}/download": {"get": {"responses": {"200": {"description": "Download metadata"}, "415": {"description": "Source codec is blocked or unverified"}, "501": {"description": "Unsupported"}}}},
@@ -6910,7 +7055,29 @@ fn openapi() -> serde_json::Value {
             "/api/pretranscode/start": {"post": {"responses": {"501": {"description": "Background pretranscoding is not enabled"}}}},
             "/api/pretranscode/status": {"get": {"responses": {"501": {"description": "Background pretranscoding is not enabled"}}}}
         }
-    })
+    });
+    document["paths"]["/api/v1/sources/{source_id}/direct/{token}"] = serde_json::json!({
+        "get": {
+            "description": "Opaque source-scoped progressive direct media stream for sources proven to have a compatible MP4-family format and upstream byte-range support; preserves upstream 200, 206, and 416 responses.",
+            "responses": {
+                "200": {"description": "Upstream full media body"},
+                "206": {"description": "Exact upstream byte range"},
+                "400": {"description": "Invalid byte range"},
+                "403": {"description": "Private or unsafe upstream destination rejected"},
+                "404": {"description": "Expired or invalid source-scoped token"},
+                "502": {"description": "Upstream media request failed or returned invalid range metadata"},
+                "503": {"description": "Direct stream capacity is busy"},
+                "504": {"description": "Upstream request timeout"}
+            }
+        },
+        "head": {
+            "responses": {
+                "200": {"description": "Upstream media headers"},
+                "404": {"description": "Expired or invalid source-scoped token"}
+            }
+        }
+    });
+    document
 }
 
 #[cfg(test)]
@@ -8069,6 +8236,7 @@ mod tests {
             "/api/v1/sources/{source_id}/subtitle-tracks",
             "/api/v1/sources/{source_id}/transcode",
             "/api/v1/sources/{source_id}/remux",
+            "/api/v1/sources/{source_id}/direct/{token}",
             "/api/v1/home",
             "/api/v1/home/featured",
             "/api/v1/trending",

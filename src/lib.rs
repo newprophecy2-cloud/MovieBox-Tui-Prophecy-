@@ -14,6 +14,7 @@ pub mod language;
 pub mod logging;
 pub mod models;
 pub mod net;
+pub(crate) mod playback_planner;
 pub mod player;
 pub mod providers;
 pub mod proxy;

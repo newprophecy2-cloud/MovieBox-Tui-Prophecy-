@@ -10,6 +10,7 @@ use tokio::{
 use crate::providers::models::{PlaybackSource, ProviderKind};
 
 const SAMPLE_LIMIT: usize = 32 * 1024 * 1024;
+const DIRECT_SAMPLE_LIMIT: usize = 4 * 1024 * 1024;
 const PROBE_STDOUT_LIMIT: usize = 64 * 1024;
 const PROBE_STDERR_LIMIT: usize = 64 * 1024;
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(25);
@@ -73,12 +74,26 @@ impl CodecProbeError {
 #[derive(Debug, Deserialize)]
 struct ProbeOutput {
     streams: Option<Vec<ProbeStream>>,
+    format: Option<ProbeFormat>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProbeFormat {
+    format_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ProbeStream {
     codec_type: Option<String>,
     codec_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DirectPlaybackEvidence {
+    pub codec: CodecProbeResult,
+    pub format_name: Option<String>,
+    pub audio_codecs: Vec<String>,
+    pub range_supported: bool,
 }
 
 pub async fn verify_playback_source(
@@ -98,6 +113,125 @@ pub async fn verify_playback_source(
 
     let ffprobe = ffprobe_executable().ok_or(CodecProbeError::ProbeUnavailable)?;
     probe_sample_with_executable(&ffprobe, &sample, PROBE_TIMEOUT).await
+}
+
+pub(crate) async fn inspect_direct_playback_source(
+    source: &PlaybackSource,
+) -> Result<DirectPlaybackEvidence, CodecProbeError> {
+    if source.provider != ProviderKind::FourKHdHub {
+        return Err(CodecProbeError::UnsupportedProvider);
+    }
+    let url = validate_media_url(&source.url).await?;
+    let (sample, range_supported) =
+        download_direct_sample(&url, &source.headers, DIRECT_SAMPLE_LIMIT).await?;
+    if sample.is_empty() {
+        return Err(CodecProbeError::EmptyMedia);
+    }
+    let ffprobe = ffprobe_executable().ok_or(CodecProbeError::ProbeUnavailable)?;
+    let (codec, format_name, audio_codecs) =
+        probe_sample_details_with_executable(&ffprobe, &sample, PROBE_TIMEOUT).await?;
+    Ok(DirectPlaybackEvidence {
+        codec,
+        format_name,
+        audio_codecs,
+        range_supported,
+    })
+}
+
+async fn download_direct_sample(
+    url: &reqwest::Url,
+    trusted_headers: &[(String, String)],
+    limit: usize,
+) -> Result<(Vec<u8>, bool), CodecProbeError> {
+    let client = guarded_media_client()?;
+    let end = limit.saturating_sub(1);
+    let mut request = client
+        .get(url.clone())
+        .header(reqwest::header::RANGE, format!("bytes=0-{end}"));
+    for (name, value) in trusted_headers.iter().take(16) {
+        if name.eq_ignore_ascii_case("referer") {
+            let referer =
+                reqwest::Url::parse(value).map_err(|_| CodecProbeError::InvalidMediaUrl)?;
+            if referer.scheme() != "https"
+                || !referer.username().is_empty()
+                || referer.password().is_some()
+            {
+                return Err(CodecProbeError::InvalidMediaUrl);
+            }
+            crate::net::validate_public_url(referer.as_str(), false)
+                .await
+                .map_err(|_| CodecProbeError::InvalidMediaUrl)?;
+            request = request.header(reqwest::header::REFERER, referer.as_str());
+        } else if name.eq_ignore_ascii_case("user-agent") {
+            if value.len() > 512 || value.contains(['\r', '\n']) {
+                return Err(CodecProbeError::InvalidMediaUrl);
+            }
+            request = request.header(reqwest::header::USER_AGENT, value);
+        }
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|_| CodecProbeError::MediaUnavailable)?;
+    crate::net::validate_public_url(response.url().as_str(), false)
+        .await
+        .map_err(|_| CodecProbeError::UnsafeRedirect)?;
+    let range_supported = response.status() == reqwest::StatusCode::PARTIAL_CONTENT
+        && response
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| validated_initial_range(value, response.content_length(), limit))
+            .is_some();
+    if !response.status().is_success() {
+        return Err(CodecProbeError::MediaUnavailable);
+    }
+    let mut body = response.bytes_stream();
+    let mut sample = Vec::with_capacity(limit.min(1024 * 1024));
+    while let Some(next) = body.next().await {
+        let chunk = next.map_err(|_| CodecProbeError::MediaUnavailable)?;
+        let remaining = limit.saturating_sub(sample.len());
+        if chunk.len() > remaining {
+            sample.extend_from_slice(&chunk[..remaining]);
+            break;
+        }
+        sample.extend_from_slice(&chunk);
+        if sample.len() == limit {
+            break;
+        }
+    }
+    Ok((sample, range_supported))
+}
+
+fn validated_initial_range(
+    value: &str,
+    content_length: Option<u64>,
+    requested_limit: usize,
+) -> Option<u64> {
+    let mut parts = value.split_whitespace();
+    if !parts.next()?.eq_ignore_ascii_case("bytes") {
+        return None;
+    }
+    let (interval, total) = parts.next()?.split_once('/')?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let (start, end) = interval.split_once('-')?;
+    let start = start.parse::<u64>().ok()?;
+    let end = end.parse::<u64>().ok()?;
+    let total = total.parse::<u64>().ok()?;
+    if total == 0 || start != 0 || end < start || end >= total {
+        return None;
+    }
+    let expected_end = (requested_limit as u64).min(total).checked_sub(1)?;
+    if end != expected_end {
+        return None;
+    }
+    let length = end.checked_add(1)?;
+    if content_length.is_some_and(|actual| actual != length) {
+        return None;
+    }
+    Some(length)
 }
 
 async fn validate_media_url(raw: &str) -> Result<reqwest::Url, CodecProbeError> {
@@ -225,6 +359,16 @@ async fn probe_sample_with_executable(
     sample: &[u8],
     timeout: Duration,
 ) -> Result<CodecProbeResult, CodecProbeError> {
+    probe_sample_details_with_executable(executable, sample, timeout)
+        .await
+        .map(|(codec, _, _)| codec)
+}
+
+async fn probe_sample_details_with_executable(
+    executable: &std::path::Path,
+    sample: &[u8],
+    timeout: Duration,
+) -> Result<(CodecProbeResult, Option<String>, Vec<String>), CodecProbeError> {
     let mut command = Command::new(executable);
     command
         .env_clear()
@@ -240,7 +384,7 @@ async fn probe_sample_with_executable(
             "-protocol_whitelist",
             "pipe,crypto,data",
             "-show_entries",
-            "stream=codec_type,codec_name",
+            "stream=codec_type,codec_name:format=format_name",
             "-of",
             "json",
             "-i",
@@ -314,7 +458,7 @@ async fn probe_sample_with_executable(
         if !status.success() {
             return Err(CodecProbeError::ProbeFailed);
         }
-        classify_probe_json(&stdout_bytes)
+        classify_probe_details(&stdout_bytes)
     };
 
     tokio::time::timeout(timeout, run)
@@ -322,28 +466,45 @@ async fn probe_sample_with_executable(
         .map_err(|_| CodecProbeError::ProbeTimeout)?
 }
 
+#[cfg(test)]
 fn classify_probe_json(bytes: &[u8]) -> Result<CodecProbeResult, CodecProbeError> {
+    classify_probe_details(bytes).map(|(codec, _, _)| codec)
+}
+
+fn classify_probe_details(
+    bytes: &[u8],
+) -> Result<(CodecProbeResult, Option<String>, Vec<String>), CodecProbeError> {
     let output: ProbeOutput =
         serde_json::from_slice(bytes).map_err(|_| CodecProbeError::MalformedProbeOutput)?;
-    let video_codecs = output
-        .streams
-        .unwrap_or_default()
+    let streams = output.streams.unwrap_or_default();
+    let audio_codecs = streams
+        .iter()
+        .filter(|stream| stream.codec_type.as_deref() == Some("audio"))
+        .filter_map(|stream| stream.codec_name.clone())
+        .map(|codec| codec.trim().to_ascii_lowercase())
+        .filter(|codec| !codec.is_empty())
+        .collect::<Vec<_>>();
+    let video_codecs = streams
         .into_iter()
         .filter(|stream| stream.codec_type.as_deref() == Some("video"))
         .filter_map(|stream| stream.codec_name)
         .map(|codec| codec.trim().to_ascii_lowercase())
         .filter(|codec| !codec.is_empty())
         .collect::<Vec<_>>();
-    if video_codecs.is_empty() {
-        return Ok(CodecProbeResult::NoVideoStream);
-    }
-    if let Some(codec) = video_codecs.iter().find(|codec| is_hevc_codec(codec)) {
-        return Ok(CodecProbeResult::BlockedHevc(codec.clone()));
-    }
-    if let Some(codec) = video_codecs.iter().find(|codec| !is_allowed_codec(codec)) {
-        return Ok(CodecProbeResult::Unsupported(codec.clone()));
-    }
-    Ok(CodecProbeResult::Allowed(video_codecs[0].clone()))
+    let codec = if video_codecs.is_empty() {
+        CodecProbeResult::NoVideoStream
+    } else if let Some(codec) = video_codecs.iter().find(|codec| is_hevc_codec(codec)) {
+        CodecProbeResult::BlockedHevc(codec.clone())
+    } else if let Some(codec) = video_codecs.iter().find(|codec| !is_allowed_codec(codec)) {
+        CodecProbeResult::Unsupported(codec.clone())
+    } else {
+        CodecProbeResult::Allowed(video_codecs[0].clone())
+    };
+    Ok((
+        codec,
+        output.format.and_then(|format| format.format_name),
+        audio_codecs,
+    ))
 }
 
 pub fn is_hevc_codec(codec: &str) -> bool {
@@ -479,6 +640,25 @@ mod tests {
             .unwrap(),
             CodecProbeResult::BlockedHevc("hevc".into())
         );
+    }
+
+    #[test]
+    fn direct_probe_extracts_container_and_audio_codecs_from_ffprobe() {
+        let (codec, format_name, audio_codecs) = classify_probe_details(
+            br#"{"streams":[{"codec_type":"video","codec_name":"h264"},{"codec_type":"audio","codec_name":"aac"}],"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2"}}"#,
+        )
+        .unwrap();
+        assert_eq!(codec, CodecProbeResult::Allowed("h264".into()));
+        assert_eq!(format_name.as_deref(), Some("mov,mp4,m4a,3gp,3g2,mj2"));
+        assert_eq!(audio_codecs, vec!["aac"]);
+    }
+
+    #[test]
+    fn direct_probe_requires_an_exact_initial_byte_range_response() {
+        assert_eq!(validated_initial_range("bytes 0-3/8", Some(4), 4), Some(4));
+        assert_eq!(validated_initial_range("bytes 0-2/8", Some(3), 4), None);
+        assert_eq!(validated_initial_range("bytes 0-3/8", Some(2), 4), None);
+        assert_eq!(validated_initial_range("bytes 0-3/*", Some(4), 4), None);
     }
 
     #[test]
