@@ -1523,7 +1523,8 @@ mod tests {
         app.state.active_screen = crate::tui::state::Screen::Home;
         app.state.input_mode = InputMode::Normal;
         app.state.is_tv_mode = false;
-        app.state.active_provider = crate::models::ProviderKind::MovieBox;
+        app.state.active_provider = crate::models::ProviderKind::FourKHdHub;
+        app.state.installed_addons.clear();
         app.state.show_provider_popup = true;
         app.state.provider_list_state.select(Some(0));
 

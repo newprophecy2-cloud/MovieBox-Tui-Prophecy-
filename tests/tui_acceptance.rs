@@ -207,7 +207,7 @@ async fn test_mouse_click_favorites_item_focuses_and_selects() {
         .favorites
         .items
         .push(moviebox_tui::favorites::FavoriteItem {
-            provider: "moviebox".to_string(),
+            provider: "4khdhub".to_string(),
             subject_id: "fav-1".to_string(),
             title: "Inception".to_string(),
             cover_url: None,
@@ -597,7 +597,7 @@ async fn test_f_key_toggles_favorite_on_home_results() {
         cover_url: None,
         season: 0,
         episode: 0,
-        provider: ProviderKind::MovieBox,
+        provider: ProviderKind::FourKHdHub,
     };
     app.state_mut().search_results.push(res.clone());
     app.state_mut().search_list_state.select(Some(0));
@@ -1037,12 +1037,11 @@ async fn test_home_deck_tab_switching() {
         .set_mode(moviebox_tui::tui::state::AppMode::Streaming);
     app.state_mut().history.recent.clear();
     app.state_mut().favorites.clear();
-
     app.state_mut()
         .history
         .recent
         .push(moviebox_tui::history::WatchHistoryItem {
-            provider: "moviebox".to_string(),
+            provider: "4khdhub".to_string(),
             subject_id: "show_1".to_string(),
             title: "Severance".to_string(),
             cover_url: None,
@@ -1060,7 +1059,7 @@ async fn test_home_deck_tab_switching() {
         .favorites
         .items
         .push(moviebox_tui::favorites::FavoriteItem {
-            provider: "moviebox".to_string(),
+            provider: "4khdhub".to_string(),
             subject_id: "fav_1".to_string(),
             title: "Inception".to_string(),
             cover_url: None,
@@ -1161,7 +1160,7 @@ async fn test_home_deck_continue_watching_resume() {
         .history
         .recent
         .push(moviebox_tui::history::WatchHistoryItem {
-            provider: "moviebox".to_string(),
+            provider: "4khdhub".to_string(),
             subject_id: "cw_target".to_string(),
             title: "Severance".to_string(),
             cover_url: None,
@@ -1207,7 +1206,7 @@ async fn test_landing_deck_header_renders_without_star_or_bracket() {
         .history
         .recent
         .push(moviebox_tui::history::WatchHistoryItem {
-            provider: "moviebox".to_string(),
+            provider: "4khdhub".to_string(),
             subject_id: "show_1".to_string(),
             title: "Severance".to_string(),
             cover_url: None,
@@ -1225,7 +1224,7 @@ async fn test_landing_deck_header_renders_without_star_or_bracket() {
         .favorites
         .items
         .push(moviebox_tui::favorites::FavoriteItem {
-            provider: "moviebox".to_string(),
+            provider: "4khdhub".to_string(),
             subject_id: "fav_1".to_string(),
             title: "Inception".to_string(),
             cover_url: None,

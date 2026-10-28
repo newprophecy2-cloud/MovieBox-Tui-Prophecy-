@@ -3257,7 +3257,7 @@ mod tests {
         state.favorites_landing_state.select(Some(0));
         for i in 0..10 {
             state.favorites.items.push(crate::favorites::FavoriteItem {
-                provider: "moviebox".to_string(),
+                provider: "4khdhub".to_string(),
                 subject_id: format!("fav-{i}"),
                 title: format!("Favorite Movie {i}"),
                 cover_url: None,
@@ -3305,7 +3305,7 @@ mod tests {
         state.favorites_landing_state.select(Some(0));
         for i in 0..10 {
             state.favorites.items.push(crate::favorites::FavoriteItem {
-                provider: "moviebox".to_string(),
+                provider: "4khdhub".to_string(),
                 subject_id: format!("fav-{i}"),
                 title: format!("Favorite Movie {i}"),
                 cover_url: None,
@@ -3349,7 +3349,7 @@ mod tests {
             ..Default::default()
         };
         state.history.recent.push(crate::history::WatchHistoryItem {
-            provider: "moviebox".to_string(),
+            provider: "4khdhub".to_string(),
             subject_id: "show-1".to_string(),
             title: "Severance".to_string(),
             cover_url: None,
@@ -3364,7 +3364,7 @@ mod tests {
             stream_filename: None,
         });
         state.favorites.items.push(crate::favorites::FavoriteItem {
-            provider: "moviebox".to_string(),
+            provider: "4khdhub".to_string(),
             subject_id: "fav-1".to_string(),
             title: "Inception".to_string(),
             cover_url: None,
@@ -3503,7 +3503,7 @@ mod tests {
         state.history.recent.clear();
         for i in 1..=6 {
             state.favorites.items.push(crate::favorites::FavoriteItem {
-                provider: "moviebox".to_string(),
+                provider: "4khdhub".to_string(),
                 subject_id: format!("fav-{i}"),
                 title: format!("Interstellar {i}"),
                 cover_url: None,

@@ -59,9 +59,10 @@ fn test_clearing_watch_history_leaves_favorites_intact() {
 async fn test_favorites_slash_command_populates_search_results_accurately() {
     let mut app = App::new();
     app.state_mut().favorites.clear();
+    app.state_mut().addons_enabled = true;
 
     app.state_mut().favorites.items.push(dummy_favorite(
-        "moviebox",
+        "4khdhub",
         "mb_101",
         "Gladiator",
         1,
@@ -102,7 +103,7 @@ async fn test_favorites_slash_command_populates_search_results_accurately() {
         .iter()
         .map(|r| r.provider)
         .collect();
-    assert!(providers.contains(&ProviderKind::MovieBox));
+    assert!(providers.contains(&ProviderKind::FourKHdHub));
     assert!(providers.contains(&ProviderKind::Addons));
 
     app.state_mut().favorites.clear();
@@ -114,7 +115,7 @@ async fn test_favorites_virtual_list_orders_newest_first() {
     app.state_mut().favorites.clear();
 
     app.state_mut().favorites.items.push(dummy_favorite(
-        "moviebox",
+        "4khdhub",
         "mb_old",
         "Oldest Pick",
         1,
@@ -122,7 +123,7 @@ async fn test_favorites_virtual_list_orders_newest_first() {
         100,
     ));
     app.state_mut().favorites.items.push(dummy_favorite(
-        "moviebox",
+        "4khdhub",
         "mb_new",
         "Newest Pick",
         1,
@@ -130,7 +131,7 @@ async fn test_favorites_virtual_list_orders_newest_first() {
         3000,
     ));
     app.state_mut().favorites.items.push(dummy_favorite(
-        "moviebox",
+        "4khdhub",
         "mb_mid",
         "Middle Pick",
         1,
@@ -177,7 +178,7 @@ async fn test_toggle_favorite_action_on_home_selected_result() {
         cover_url: None,
         season: 0,
         episode: 0,
-        provider: ProviderKind::MovieBox,
+        provider: ProviderKind::FourKHdHub,
     }];
     app.state_mut().search_list_state.select(Some(0));
 
@@ -194,7 +195,7 @@ async fn test_open_favorite_navigates_to_details_screen() {
     let mut app = App::new();
     app.state_mut().favorites.clear();
     app.state_mut().favorites.items.push(dummy_favorite(
-        "moviebox", "mb_open", "Arrival", 1, "2016", 5000,
+        "4khdhub", "mb_open", "Arrival", 1, "2016", 5000,
     ));
 
     app.state_mut().active_screen = Screen::Home;

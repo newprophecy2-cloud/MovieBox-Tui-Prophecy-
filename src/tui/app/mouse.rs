@@ -1429,7 +1429,8 @@ mod tests {
         app.state.active_screen = crate::tui::state::Screen::Home;
         app.state.input_mode = crate::tui::state::InputMode::Normal;
         app.state.is_tv_mode = false;
-        app.state.active_provider = ProviderKind::MovieBox;
+        app.state.active_provider = ProviderKind::FourKHdHub;
+        app.state.installed_addons.clear();
         app.state.search_query.clear();
 
         let area = Rect::new(0, 0, 100, 30);

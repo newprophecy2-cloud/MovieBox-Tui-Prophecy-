@@ -231,6 +231,7 @@ async fn test_mode_switch_stale_response_protection() {
     let mut app = App::new();
     app.state_mut().update_available = None;
     app.state_mut().set_mode(AppMode::Streaming);
+    app.state_mut().addons_enabled = true;
 
     let streaming_generation = app.state().provider_generation;
     let streaming_context = RequestContext {

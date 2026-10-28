@@ -1559,7 +1559,7 @@ mod tests {
         state.streaming_enabled = true;
         assert!(!state.favorites_landing_visible());
         state.favorites.items.push(crate::favorites::FavoriteItem {
-            provider: "moviebox".to_string(),
+            provider: "4khdhub".to_string(),
             subject_id: "fav-1".to_string(),
             title: "Favorite Movie".to_string(),
             cover_url: None,

@@ -7037,7 +7037,7 @@ mod tests {
     async fn stream_proxy_validates_destination_before_unsupported_seek() {
         use tokio::io::AsyncReadExt;
 
-        let query = "url=http%3A%2F%2F127.0.0.1%3A1%2Fmedia.mp4&start_seconds=5";
+        let query = "url=not-a-url&start_seconds=5";
         let (mut client, mut server) = api_downstream_pair().await;
         let route = tokio::spawn(async move {
             let request_headers = HashMap::new();
@@ -7058,6 +7058,32 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 403"), "{response}");
         assert!(response.contains("SSRF_BLOCKED"), "{response}");
         assert!(!response.contains("SEEK_UNAVAILABLE"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn stream_proxy_returns_unsupported_seek_after_validating_destination() {
+        use tokio::io::AsyncReadExt;
+
+        let query = "url=http%3A%2F%2F127.0.0.1%3A1%2Fmedia.mp4&start_seconds=5";
+        let (mut client, mut server) = api_downstream_pair().await;
+        let route = tokio::spawn(async move {
+            let request_headers = HashMap::new();
+            stream_proxy_route(
+                &mut server,
+                query,
+                Arc::new(Semaphore::new(1)),
+                Duration::from_secs(5),
+                &request_headers,
+                false,
+            )
+            .await
+        });
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        route.await.unwrap().unwrap();
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 501"), "{response}");
+        assert!(response.contains("SEEK_UNAVAILABLE"), "{response}");
     }
 
     fn observe_mp4_atoms(tail: &mut Vec<u8>, chunk: &[u8], found: &mut [bool; 4]) {
