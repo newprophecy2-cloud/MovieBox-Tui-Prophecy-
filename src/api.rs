@@ -6229,19 +6229,61 @@ async fn transcode_source(
         }
     };
     if request_headers.contains_key("range") {
-        let (status, body) = err(
-            "SEEK_UNAVAILABLE",
-            "Byte-range seeking is unavailable for progressive remuxed media.",
-            None,
-            501,
+        if !request_headers
+            .get("range")
+            .is_some_and(|range| source_range_header_is_well_formed(range))
+        {
+            return write_headers(
+                stream,
+                416,
+                "video/mp4",
+                Some(
+                    "Accept-Ranges: bytes\r\nContent-Length: 0\r\nX-Media-Mode: remux\r\nX-Remux-Cache-State: bypassed\r\n",
+                ),
+            )
+            .await;
+        }
+        let cache_identity = format!(
+            "source-remux-v1:{source_id}:{}:{}",
+            validated_url,
+            playback
+                .headers
+                .iter()
+                .map(|(name, value)| format!("{name}={value}"))
+                .collect::<Vec<_>>()
+                .join("\u{1f}")
         );
-        return write_raw_json(
-            stream,
-            status,
-            &body,
-            Some("Accept-Ranges: none\r\nX-Remux-Cache-State: disabled\r\n"),
-        )
-        .await;
+        let cache_key = crate::remux_cache::cache_key(&cache_identity, REMUX_OUTPUT_PROFILE);
+        let build_cache = state.remux_cache.clone();
+        let build_key = cache_key.clone();
+        let build_url = validated_url.clone();
+        let build_headers = playback.headers.clone();
+        let lease = state
+            .remux_cache
+            .get_or_build(&cache_key, move |partial_path| async move {
+                build_cached_mp4(
+                    build_cache,
+                    build_key,
+                    build_url,
+                    build_headers,
+                    partial_path,
+                    false,
+                    false,
+                )
+                .await
+            })
+            .await;
+        return match lease {
+            Ok(lease) => {
+                write_cached_remux_response(stream, lease, Some(source_id), request_headers, false)
+                    .await
+            }
+            Err(error) => {
+                let (status, code, message) = cache_error_http(error);
+                let (status, body) = err(code, message, Some(source.provider), status);
+                write_raw_json(stream, status, &body, None).await
+            }
+        };
     }
     let _media_job = match state.remux_cache.try_acquire_job() {
         Ok(permit) => permit,
@@ -6300,6 +6342,37 @@ async fn transcode_source(
     }
 }
 
+fn source_range_header_is_well_formed(value: &str) -> bool {
+    let Some((unit, spec)) = value.trim().split_once('=') else {
+        return false;
+    };
+    if !unit.eq_ignore_ascii_case("bytes") || spec.contains(',') {
+        return false;
+    }
+    let Some((start, end)) = spec.split_once('-') else {
+        return false;
+    };
+    if start.is_empty() && end.is_empty() {
+        return false;
+    }
+    let start = if start.is_empty() {
+        None
+    } else {
+        Some(match start.parse::<u64>() {
+            Ok(value) => value,
+            Err(_) => return false,
+        })
+    };
+    let end = if end.is_empty() {
+        None
+    } else {
+        Some(match end.parse::<u64>() {
+            Ok(value) => value,
+            Err(_) => return false,
+        })
+    };
+    !matches!((start, end), (Some(start), Some(end)) if start > end)
+}
 fn parse_remux_seek_seconds(query: &str) -> Result<Option<f64>, (u16, &'static str, &'static str)> {
     let Some(raw) = query_value(query, "start_seconds").or_else(|| query_value(query, "start"))
     else {
@@ -7106,8 +7179,8 @@ fn openapi() -> serde_json::Value {
             "/api/v1/sources/{source_id}/audio-tracks": {"get": {"responses": {"200": {"description": "Confirmed embedded audio tracks"}, "415": {"description": "Source codec is blocked or unverified"}, "503": {"description": "Track discovery unavailable"}}}},
             "/api/v1/sources/{source_id}/subtitles": {"get": {"responses": {"200": {"description": "Confirmed embedded subtitle tracks"}, "415": {"description": "Source codec is blocked or unverified"}, "503": {"description": "Track discovery unavailable"}}}},
             "/api/v1/sources/{source_id}/subtitle-tracks": {"get": {"responses": {"200": {"description": "Confirmed embedded subtitle tracks"}, "415": {"description": "Source codec is blocked or unverified"}, "503": {"description": "Track discovery unavailable"}}}},
-            "/api/v1/sources/{source_id}/transcode": {"get": {"description": "Progressive fragmented-MP4 remux using bounded pipes. Optional start_seconds (or start) requests a non-negative timestamp in seconds when the verified upstream supports byte ranges; HTTP byte ranges remain unsupported and no complete video file is cached.", "responses": {"200": {"description": "Progressive fragmented-MP4 remux"}, "400": {"description": "Malformed, non-finite, negative, or excessive timestamp"}, "415": {"description": "Source codec is blocked or unverified"}, "429": {"description": "Media-job capacity is busy"}, "501": {"description": "Timestamp or byte-range seeking is unavailable"}, "502": {"description": "Remux startup or upstream failed"}, "503": {"description": "FFmpeg unavailable"}, "504": {"description": "Configured media-job or upstream timeout"}}}},
-            "/api/v1/sources/{source_id}/remux": {"get": {"description": "Progressive fragmented-MP4 remux using bounded pipes. Optional start_seconds (or start) requests a non-negative timestamp in seconds when the verified upstream supports byte ranges; HTTP byte ranges remain unsupported and no complete video file is cached.", "responses": {"200": {"description": "Progressive fragmented-MP4 remux"}, "400": {"description": "Malformed, non-finite, negative, or excessive timestamp"}, "415": {"description": "Source codec is blocked or unverified"}, "429": {"description": "Media-job capacity is busy"}, "501": {"description": "Timestamp or byte-range seeking is unavailable"}, "502": {"description": "Remux startup or upstream failed"}, "503": {"description": "FFmpeg unavailable"}, "504": {"description": "Configured media-job or upstream timeout"}}}},
+            "/api/v1/sources/{source_id}/transcode": {"get": {"description": "Progressive fragmented-MP4 remux using bounded pipes. Ordinary requests stream progressively; an explicit HTTP byte range uses the bounded validated remux cache and returns exact cached MP4 bytes. Optional start_seconds (or start) requests a non-negative timestamp in seconds when the verified upstream supports byte ranges.", "responses": {"200": {"description": "Progressive fragmented-MP4 remux"}, "206": {"description": "Exact byte range from validated cached remux"}, "400": {"description": "Malformed, non-finite, negative, or excessive timestamp"}, "415": {"description": "Source codec is blocked or unverified"}, "416": {"description": "Unsatisfiable byte range"}, "429": {"description": "Media-job capacity is busy"}, "502": {"description": "Remux startup or upstream failed"}, "503": {"description": "FFmpeg unavailable"}, "504": {"description": "Configured media-job or upstream timeout"}}}},
+            "/api/v1/sources/{source_id}/remux": {"get": {"description": "Progressive fragmented-MP4 remux using bounded pipes. Ordinary requests stream progressively; an explicit HTTP byte range uses the bounded validated remux cache and returns exact cached MP4 bytes. Optional start_seconds (or start) requests a non-negative timestamp in seconds when the verified upstream supports byte ranges.", "responses": {"200": {"description": "Progressive fragmented-MP4 remux"}, "206": {"description": "Exact byte range from validated cached remux"}, "400": {"description": "Malformed, non-finite, negative, or excessive timestamp"}, "415": {"description": "Source codec is blocked or unverified"}, "416": {"description": "Unsatisfiable byte range"}, "429": {"description": "Media-job capacity is busy"}, "502": {"description": "Remux startup or upstream failed"}, "503": {"description": "FFmpeg unavailable"}, "504": {"description": "Configured media-job or upstream timeout"}}}},
             "/api/v1/sources/{source_id}/playback": {"get": {"responses": {"200": {"description": "Playback descriptor; verified compatible MP4 sources use direct byte-range streaming, HLS/DASH uses native streaming, and other verified sources use progressive fragmented-MP4 remux without arbitrary byte-range seeking"}, "415": {"description": "Source codec or playback format is blocked or unverified"}, "429": {"description": "Media-job capacity is busy"}, "502": {"description": "Playback resolution failed"}, "504": {"description": "Playback resolution timed out"}}}},
             "/api/v1/sources/{source_id}/native/{token}": {"get": {"description": "Opaque source-scoped HLS/DASH manifest or media resource; child URIs are rewritten from the final upstream manifest URL and media bytes stream progressively with Range passthrough.", "responses": {"200": {"description": "Native manifest or media body"}, "206": {"description": "Exact upstream byte range"}, "400": {"description": "Invalid token path or unsupported manifest range"}, "403": {"description": "Private or unsafe upstream destination rejected"}, "404": {"description": "Expired or invalid source-scoped token"}, "413": {"description": "Configured segment size ceiling exceeded"}, "503": {"description": "Native stream capacity is busy"}, "504": {"description": "Upstream request timeout"}}}, "head": {"responses": {"200": {"description": "Native resource headers"}, "404": {"description": "Expired or invalid source-scoped token"}}}},
             "/api/v1/sources/{source_id}/watch": {"get": {"responses": {"200": {"description": "Watch descriptor; verified direct-compatible media uses range passthrough, native HLS/DASH stays native, and other verified media uses progressive fragmented-MP4 remux"}, "415": {"description": "Source codec is blocked or unverified"}, "502": {"description": "Watch resolution failed"}, "504": {"description": "Watch resolution timed out"}}}},
@@ -7197,6 +7270,23 @@ mod tests {
     }
 
     #[test]
+    fn source_remux_range_syntax_rejects_invalid_and_multi_ranges() {
+        for value in ["bytes=0-1023", "Bytes=0-", "bytes=-512"] {
+            assert!(source_range_header_is_well_formed(value), "{value}");
+        }
+        for value in [
+            "bytes=",
+            "bytes=abc-10",
+            "bytes=10-9",
+            "bytes=0-1,4-5",
+            "items=0-1",
+            "not-a-range",
+        ] {
+            assert!(!source_range_header_is_well_formed(value), "{value}");
+        }
+    }
+
+    #[test]
     fn remux_timestamp_seek_is_bounded_and_uses_seconds() {
         assert_eq!(
             parse_remux_seek_seconds("start_seconds=120.5").unwrap(),
@@ -7268,6 +7358,31 @@ mod tests {
         assert!(response_headers.contains("Content-Range: bytes 3-6/10"));
         assert!(response_headers.contains("Content-Length: 4"));
         assert_eq!(&response[boundary + 4..], b"3456");
+
+        let lease = cache
+            .get_or_build(&key, |_path| async {
+                panic!("the exact-range fixture should be served from cache")
+            })
+            .await
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(address).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        let mut headers = HashMap::new();
+        headers.insert("range".into(), "bytes=99-100".into());
+        write_cached_remux_response(&mut server, lease, None, &headers, false)
+            .await
+            .unwrap();
+        server.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        let response_headers = String::from_utf8_lossy(&response);
+        assert!(response_headers.starts_with("HTTP/1.1 416"));
+        assert!(response_headers.contains("Accept-Ranges: bytes"));
+        assert!(response_headers.contains("Content-Range: bytes */10"));
+        assert!(response_headers.contains("Content-Length: 0"));
+        assert!(response.ends_with(b"\r\n\r\n"));
     }
 
     #[test]
