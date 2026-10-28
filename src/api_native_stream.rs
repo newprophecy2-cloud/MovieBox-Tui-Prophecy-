@@ -266,14 +266,16 @@ impl NativeStreamProxy {
             return write_error_head(
                 stream,
                 404,
-                "The native playback reference is invalid or expired.", head_only)
+                "The native playback reference is invalid or expired.",
+                head_only,
+            )
             .await;
         };
         let target = match resolve_claim_target(&claims, suffix, query) {
             Ok(target) => target,
             Err(message) => return write_error_head(stream, 400, message, head_only).await,
         };
-        if request_headers.contains_key("range") && is_native_manifest_url(&target) {
+        if !head_only && request_headers.contains_key("range") && is_native_manifest_url(&target) {
             return write_error_head(
                 stream,
                 400,
@@ -284,16 +286,28 @@ impl NativeStreamProxy {
         }
         let _permit = match self.slots.clone().try_acquire_owned() {
             Ok(permit) => permit,
-            Err(_) => return write_error_head(stream, 503, "Native media capacity is busy.", head_only).await,
-        };
-
-        let range = match request_headers.get("range") {
-            Some(value) if valid_single_byte_range(value) => Some(value.as_str()),
-            Some(_) => {
-                return write_error_head(stream, 400, "Only valid single byte ranges are supported.", head_only)
+            Err(_) => {
+                return write_error_head(stream, 503, "Native media capacity is busy.", head_only)
                     .await;
             }
-            None => None,
+        };
+
+        let range = if head_only {
+            None
+        } else {
+            match request_headers.get("range") {
+                Some(value) if valid_single_byte_range(value) => Some(value.as_str()),
+                Some(_) => {
+                    return write_error_head(
+                        stream,
+                        400,
+                        "Only valid single byte ranges are supported.",
+                        head_only,
+                    )
+                    .await;
+                }
+                None => None,
+            }
         };
         let response = match self
             .send_upstream(
@@ -304,13 +318,15 @@ impl NativeStreamProxy {
                 UpstreamRequestOptions {
                     range,
                     head_only,
-                    require_range: true,
+                    require_range: !head_only,
                 },
             )
             .await
         {
             Ok(response) => response,
-            Err((status, message)) => return write_error_head(stream, status, message, head_only).await,
+            Err((status, message)) => {
+                return write_error_head(stream, status, message, head_only).await;
+            }
         };
         let final_url = response.url().clone();
         let content_type = response
@@ -352,11 +368,26 @@ impl NativeStreamProxy {
             || is_manifest_response(&claims.target_url, &content_type);
         let manifest_is_hls =
             is_hls(&final_url, &content_type) || is_hls(&claims.target_url, &content_type);
+        if is_manifest && status.is_success() && head_only {
+            let media_type = if manifest_is_hls {
+                "application/vnd.apple.mpegurl"
+            } else {
+                "application/dash+xml"
+            };
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {media_type}\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(headers.as_bytes()).await?;
+            stream.flush().await?;
+            return Ok(());
+        }
         if is_manifest && range.is_some() {
             return write_error_head(
                 stream,
                 400,
-                "Byte ranges are not supported for rewritten manifests.", head_only)
+                "Byte ranges are not supported for rewritten manifests.",
+                head_only,
+            )
             .await;
         }
         if is_manifest && status.is_success() && !head_only {
@@ -367,7 +398,13 @@ impl NativeStreamProxy {
             let manifest = match String::from_utf8(body) {
                 Ok(manifest) => manifest,
                 Err(_) => {
-                    return write_error_head(stream, 502, "The upstream manifest is not UTF-8.", head_only).await;
+                    return write_error_head(
+                        stream,
+                        502,
+                        "The upstream manifest is not UTF-8.",
+                        head_only,
+                    )
+                    .await;
                 }
             };
             let rewritten = if manifest_is_hls {
@@ -395,7 +432,9 @@ impl NativeStreamProxy {
                     return write_error_head(
                         stream,
                         502,
-                        "The upstream manifest could not be safely rewritten.", head_only)
+                        "The upstream manifest could not be safely rewritten.",
+                        head_only,
+                    )
                     .await;
                 }
             };
@@ -432,18 +471,28 @@ impl NativeStreamProxy {
             return write_error_head(
                 stream,
                 404,
-                "The direct playback reference is invalid or expired.", head_only)
+                "The direct playback reference is invalid or expired.",
+                head_only,
+            )
             .await;
         };
         let _permit = match self.slots.clone().try_acquire_owned() {
             Ok(permit) => permit,
-            Err(_) => return write_error_head(stream, 503, "Direct media capacity is busy.", head_only).await,
+            Err(_) => {
+                return write_error_head(stream, 503, "Direct media capacity is busy.", head_only)
+                    .await;
+            }
         };
         let range = match request_headers.get("range") {
             Some(value) if valid_single_byte_range(value) => Some(value.as_str()),
             Some(_) => {
-                return write_error_head(stream, 400, "Only valid single byte ranges are supported.", head_only)
-                    .await;
+                return write_error_head(
+                    stream,
+                    400,
+                    "Only valid single byte ranges are supported.",
+                    head_only,
+                )
+                .await;
             }
             None => None,
         };
@@ -462,7 +511,9 @@ impl NativeStreamProxy {
             .await
         {
             Ok(response) => response,
-            Err((status, message)) => return write_error_head(stream, status, message, head_only).await,
+            Err((status, message)) => {
+                return write_error_head(stream, status, message, head_only).await;
+            }
         };
         self.relay_direct_response(stream, response, head_only, range)
             .await
@@ -592,7 +643,9 @@ impl NativeStreamProxy {
             return write_error_head(
                 stream,
                 413,
-                "The media segment exceeds the configured stream limit.", head_only)
+                "The media segment exceeds the configured stream limit.",
+                head_only,
+            )
             .await;
         }
         if !status.is_success()
@@ -601,7 +654,9 @@ impl NativeStreamProxy {
             return write_error_head(
                 stream,
                 502,
-                "The upstream media server returned an oversized error.", head_only)
+                "The upstream media server returned an oversized error.",
+                head_only,
+            )
             .await;
         }
         let mut header = format!(
@@ -722,7 +777,9 @@ impl NativeStreamProxy {
             return write_error_head(
                 stream,
                 502,
-                "The upstream media server rejected the request.", head_only)
+                "The upstream media server rejected the request.",
+                head_only,
+            )
             .await;
         }
         if !status.is_success()
@@ -733,7 +790,9 @@ impl NativeStreamProxy {
             return write_error_head(
                 stream,
                 502,
-                "The upstream media server returned an oversized error.", head_only)
+                "The upstream media server returned an oversized error.",
+                head_only,
+            )
             .await;
         }
         if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
@@ -749,7 +808,9 @@ impl NativeStreamProxy {
                 return write_error_head(
                     stream,
                     502,
-                    "The upstream server returned an invalid unsatisfied range.", head_only)
+                    "The upstream server returned an invalid unsatisfied range.",
+                    head_only,
+                )
                 .await;
             }
         }
@@ -764,7 +825,9 @@ impl NativeStreamProxy {
                 return write_error_head(
                     stream,
                     502,
-                    "The upstream server returned an unsolicited byte range.", head_only)
+                    "The upstream server returned an unsolicited byte range.",
+                    head_only,
+                )
                 .await;
             };
             let expected = response
@@ -776,7 +839,9 @@ impl NativeStreamProxy {
                 return write_error_head(
                     stream,
                     502,
-                    "The upstream server returned an invalid byte range.", head_only)
+                    "The upstream server returned an invalid byte range.",
+                    head_only,
+                )
                 .await;
             };
             Some(expected)
@@ -1958,7 +2023,11 @@ mod tests {
         assert!(result.is_err());
         let relayed_text = String::from_utf8_lossy(&relayed);
         assert!(relayed_text.starts_with("HTTP/1.1 200 OK"));
-        assert!(relayed_text.contains("Content-Length: 10"));
+        assert!(
+            relayed_text
+                .to_ascii_lowercase()
+                .contains("content-length: 10")
+        );
         assert!(relayed_text.ends_with("\r\n\r\nabc"));
     }
 
@@ -1972,7 +2041,11 @@ mod tests {
         assert!(result.is_err());
         let relayed_text = String::from_utf8_lossy(&relayed);
         assert!(relayed_text.starts_with("HTTP/1.1 200 OK"));
-        assert!(relayed_text.contains("Content-Length: 10"));
+        assert!(
+            relayed_text
+                .to_ascii_lowercase()
+                .contains("content-length: 10")
+        );
         assert!(relayed_text.ends_with("\r\n\r\nabc"));
     }
 
@@ -2069,6 +2142,143 @@ mod tests {
                 .contains("content-range: bytes 2-4/5")
         );
         assert!(response.ends_with("\r\n\r\ncde"));
+        handler.await.unwrap();
+        upstream_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_head_ignores_range_and_uses_rewritten_manifest_metadata() {
+        let proxy = proxy();
+        for (path, content_type, expected_type) in [
+            (
+                "master.m3u8",
+                "application/vnd.apple.mpegurl",
+                "application/vnd.apple.mpegurl",
+            ),
+            (
+                "manifest.mpd",
+                "application/dash+xml",
+                "application/dash+xml",
+            ),
+        ] {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let upstream_address = upstream.local_addr().unwrap();
+            let upstream_task = tokio::spawn(async move {
+                let (mut socket, _) = upstream.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0u8; 1];
+                while !request.ends_with(b"\r\n\r\n") {
+                    socket.read_exact(&mut byte).await.unwrap();
+                    request.push(byte[0]);
+                }
+                let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                assert!(request.starts_with("head "));
+                assert!(!request.contains("range:"));
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: 99\r\nConnection: close\r\n\r\n"
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.flush().await.unwrap();
+            });
+
+            let target = Url::parse(&format!("http://{upstream_address}/{path}")).unwrap();
+            let token_path = proxy
+                .issue_url(
+                    "source-1",
+                    &target,
+                    target.clone(),
+                    TokenKind::Resource,
+                    &[],
+                    Vec::new(),
+                )
+                .unwrap();
+            let token = token_path.rsplit('/').next().unwrap().to_string();
+            let downstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let downstream_address = downstream.local_addr().unwrap();
+            let request_proxy = proxy.clone();
+            let request_headers = HashMap::from([("range".to_string(), "bytes=0-4".to_string())]);
+            let handler = tokio::spawn(async move {
+                let (mut socket, _) = downstream.accept().await.unwrap();
+                request_proxy
+                    .serve(
+                        &mut socket,
+                        "source-1",
+                        &token,
+                        &[],
+                        "",
+                        &request_headers,
+                        true,
+                    )
+                    .await
+                    .unwrap();
+            });
+            let mut client = TcpStream::connect(downstream_address).await.unwrap();
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).await.unwrap();
+            let response = String::from_utf8(response).unwrap();
+            let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+            assert!(headers.starts_with("HTTP/1.1 200 OK"));
+            assert!(headers.contains(&format!("Content-Type: {expected_type}")));
+            assert!(!headers.to_ascii_lowercase().contains("content-length:"));
+            assert!(body.is_empty());
+            handler.await.unwrap();
+            upstream_task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_head_preserves_headers_without_returning_a_body() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut socket, _) = upstream.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+            }
+            let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+            assert!(request.starts_with("head "));
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: 5\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            socket.flush().await.unwrap();
+        });
+        let proxy = proxy();
+        let direct_url = proxy
+            .direct_playback_url(
+                "source-1",
+                &format!("http://{upstream_address}/video.mp4"),
+                &[],
+            )
+            .unwrap();
+        let token = direct_url.rsplit('/').next().unwrap().to_string();
+        let downstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let downstream_address = downstream.local_addr().unwrap();
+        let handler = tokio::spawn(async move {
+            let (mut socket, _) = downstream.accept().await.unwrap();
+            proxy
+                .serve_direct(&mut socket, "source-1", &token, &HashMap::new(), true)
+                .await
+                .unwrap();
+        });
+        let mut client = TcpStream::connect(downstream_address).await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+        assert!(headers.starts_with("HTTP/1.1 200 OK"));
+        assert!(headers.to_ascii_lowercase().contains("content-length: 5"));
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains("accept-ranges: bytes")
+        );
+        assert!(body.is_empty());
         handler.await.unwrap();
         upstream_task.await.unwrap();
     }

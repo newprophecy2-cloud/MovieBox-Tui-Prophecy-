@@ -652,9 +652,8 @@ impl App {
                 } else if current_mode == crate::tui::state::AppMode::Streaming
                     && self.state.active_provider != crate::providers::models::ProviderKind::Addons
                 {
-                    self.state.set_status_long(
-                        "Browse is available only with the Addons provider.",
-                    );
+                    self.state
+                        .set_status_long("Browse is available only with the Addons provider.");
                 } else {
                     self.reset_transient_overlays();
                     self.state.show_browse_popup = true;

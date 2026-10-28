@@ -436,7 +436,7 @@ struct ProbeStream {
     disposition: Option<ProbeDisposition>,
     tags: Option<HashMap<String, String>>,
 }
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ProbeDisposition {
     #[serde(default)]
     default: i32,
@@ -1290,6 +1290,15 @@ fn web_playback_query(query: &str, request: &WebPlaybackRequest) -> String {
     let mut pairs = url::form_urlencoded::parse(query.as_bytes())
         .map(|(name, value)| (name.into_owned(), value.into_owned()))
         .collect::<Vec<_>>();
+    let language_overridden = request.audio_language.is_some();
+    let index_overridden = request.audio_track_index.is_some();
+    pairs.retain(|(name, _)| {
+        !(language_overridden
+            && (name.eq_ignore_ascii_case("audio_language") || name.eq_ignore_ascii_case("audio")))
+            && !(index_overridden
+                && (name.eq_ignore_ascii_case("audio_track_index")
+                    || name.eq_ignore_ascii_case("track_index")))
+    });
     if let Some(language) = request
         .audio_language
         .as_deref()
@@ -4341,7 +4350,10 @@ fn source_remux_url(source_id: &str) -> String {
 }
 
 fn source_remux_audio_url(source_id: &str, stream_index: u32) -> String {
-    format!("{}?audio_track_index={stream_index}", source_remux_url(source_id))
+    format!(
+        "{}?audio_track_index={stream_index}",
+        source_remux_url(source_id)
+    )
 }
 
 fn source_playback_url(
@@ -5238,8 +5250,8 @@ struct AudioSelectionRequest {
 
 fn parse_audio_selection(query: &str) -> Result<Option<AudioSelectionRequest>, &'static str> {
     let language = query_value(query, "audio_language").or_else(|| query_value(query, "audio"));
-    let stream_index = query_value(query, "audio_track_index")
-        .or_else(|| query_value(query, "track_index"));
+    let stream_index =
+        query_value(query, "audio_track_index").or_else(|| query_value(query, "track_index"));
     let language = language
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
@@ -5279,7 +5291,10 @@ fn select_audio_stream<'a>(
         let Some(index) = track.index else {
             return false;
         };
-        if selection.stream_index.is_some_and(|requested| requested != index) {
+        if selection
+            .stream_index
+            .is_some_and(|requested| requested != index)
+        {
             return false;
         }
         if let Some(requested_language) = selection.language.as_deref() {
@@ -5938,43 +5953,45 @@ async fn write_verified_playback_response(
                 };
                 backend_playback.url = source_remux_audio_url(source_id, index);
             } else {
-            match crate::playback_planner::plan_playback(&backend_playback.url, Some(&capabilities))
-            {
-                crate::playback_planner::PlaybackStrategy::DirectRangePassthrough => {
-                    backend_playback.url = state
-                        .native_stream
-                        .direct_playback_url(
-                            source_id,
-                            &backend_playback.url,
-                            &backend_playback.headers,
-                        )
-                        .unwrap_or_else(|| {
-                            source_playback_url(
-                                state,
+                match crate::playback_planner::plan_playback(
+                    &backend_playback.url,
+                    Some(&capabilities),
+                ) {
+                    crate::playback_planner::PlaybackStrategy::DirectRangePassthrough => {
+                        backend_playback.url = state
+                            .native_stream
+                            .direct_playback_url(
                                 source_id,
                                 &backend_playback.url,
                                 &backend_playback.headers,
                             )
-                        });
+                            .unwrap_or_else(|| {
+                                source_playback_url(
+                                    state,
+                                    source_id,
+                                    &backend_playback.url,
+                                    &backend_playback.headers,
+                                )
+                            });
+                    }
+                    crate::playback_planner::PlaybackStrategy::RemuxRequired => {
+                        backend_playback.url = source_playback_url(
+                            state,
+                            source_id,
+                            &backend_playback.url,
+                            &backend_playback.headers,
+                        );
+                    }
+                    _ => {
+                        let (status, body) = err(
+                            "CODEC_UNVERIFIED",
+                            "The media format or playback capabilities could not be positively verified.",
+                            Some(provider),
+                            415,
+                        );
+                        return write_raw_json(stream, status, &body, None).await;
+                    }
                 }
-                crate::playback_planner::PlaybackStrategy::RemuxRequired => {
-                    backend_playback.url = source_playback_url(
-                        state,
-                        source_id,
-                        &backend_playback.url,
-                        &backend_playback.headers,
-                    );
-                }
-                _ => {
-                    let (status, body) = err(
-                        "CODEC_UNVERIFIED",
-                        "The media format or playback capabilities could not be positively verified.",
-                        Some(provider),
-                        415,
-                    );
-                    return write_raw_json(stream, status, &body, None).await;
-                }
-            }
             }
             backend_playback.headers.clear();
             let mut response = playback_json(&backend_playback);
@@ -6166,7 +6183,12 @@ async fn transcode_source(
     let audio_selection = match parse_audio_selection(query) {
         Ok(selection) => selection,
         Err(message) => {
-            let (status, body) = err("INVALID_AUDIO_SELECTION", message, Some(source.provider), 400);
+            let (status, body) = err(
+                "INVALID_AUDIO_SELECTION",
+                message,
+                Some(source.provider),
+                400,
+            );
             return write_raw_json(stream, status, &body, None).await;
         }
     };
@@ -6344,13 +6366,6 @@ async fn stream_proxy_route(
     request_headers: &HashMap<String, String>,
     head_only: bool,
 ) -> std::io::Result<()> {
-    let seek_seconds = match parse_remux_seek_seconds(query) {
-        Ok(value) => value,
-        Err((status, code, message)) => {
-            let (status, body) = err(code, message, None, status);
-            return write_raw_json(stream, status, &body, Some("Accept-Ranges: none\r\n")).await;
-        }
-    };
     let (url, referer) = match validated_media_url(query).await {
         Ok(value) => value,
         Err((status, message)) => {
@@ -6365,6 +6380,13 @@ async fn stream_proxy_route(
                 status,
             );
             return write_raw_json(stream, status, &body, None).await;
+        }
+    };
+    let seek_seconds = match parse_remux_seek_seconds(query) {
+        Ok(value) => value,
+        Err((status, code, message)) => {
+            let (status, body) = err(code, message, None, status);
+            return write_raw_json(stream, status, &body, Some("Accept-Ranges: none\r\n")).await;
         }
     };
     if timestamp_requires_upstream_seek(seek_seconds) {
@@ -6445,7 +6467,8 @@ async fn remux_media_url(
         upstream_headers.push(("Referer".to_string(), referer.to_string()));
     }
     let debug_id = REMUX_DEBUG_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    crate::progressive_remux::serve(stream, url, &upstream_headers, job_timeout, debug_id, None).await
+    crate::progressive_remux::serve(stream, url, &upstream_headers, job_timeout, debug_id, None)
+        .await
 }
 
 async fn media_info_route(
@@ -7813,6 +7836,22 @@ mod tests {
     }
 
     #[test]
+    fn web_playback_body_audio_selection_overrides_query_selection() {
+        let request = WebPlaybackRequest {
+            source_id: None,
+            audio_language: Some("English".into()),
+            audio_track_index: Some(2),
+        };
+        let query = web_playback_query(
+            "audio_language=hi&audio_track_index=1&audio=bn&track_index=3&quality=1080p",
+            &request,
+        );
+        let selected = parse_audio_selection(&query).unwrap().unwrap();
+        assert_eq!(selected.language.as_deref(), Some("en"));
+        assert_eq!(selected.stream_index, Some(2));
+        assert_eq!(query_value(&query, "quality").as_deref(), Some("1080p"));
+    }
+    #[test]
     fn track_language_normalization_preserves_original_tags() {
         assert_eq!(
             normalized_language(Some("hin")),
@@ -7953,6 +7992,74 @@ mod tests {
                 "unrecognized codec must fail closed: {codec:?}"
             );
         }
+    }
+
+    #[test]
+    fn catalog_web_playback_maps_verified_fourk_movies_and_episodes_only() {
+        let release = Release {
+            provider: ProviderKind::FourKHdHub,
+            filename: "episode.mkv".into(),
+            quality: Some("1080p".into()),
+            codec: Some("H.264".into()),
+            language: None,
+            size_bytes: None,
+            season: Some(1),
+            episode: Some(2),
+            mirrors: vec![],
+            resource_id: Some("provider-title".into()),
+        };
+        let transport_ref = OpaqueRef {
+            p: ProviderKind::FourKHdHub,
+            v: "provider-title".into(),
+            s: 1,
+            e: 2,
+        };
+        let episode_source_id = source_ref_for_content(&release, &transport_ref, 0, None);
+        let episode = serde_json::json!({
+            "provider_key": "fourkhdhub",
+            "provider_source_id": episode_source_id,
+            "video_codec": "H.264"
+        });
+        assert_eq!(
+            catalog_live_source_path(&episode, "playback").unwrap(),
+            Some(format!("/api/v1/sources/{episode_source_id}/playback"))
+        );
+
+        let movie_transport_ref = OpaqueRef {
+            p: ProviderKind::FourKHdHub,
+            v: "provider-title".into(),
+            s: 0,
+            e: 0,
+        };
+        let movie_source_id =
+            source_ref_for_content(&release, &movie_transport_ref, 0, Some("movie"));
+        let movie = serde_json::json!({
+            "provider_key": "fourkhdhub",
+            "provider_source_id": movie_source_id,
+            "title_id": "00000000-0000-0000-0000-000000000001",
+            "video_codec": "H.264"
+        });
+        assert_eq!(
+            catalog_live_source_path(&movie, "playback").unwrap(),
+            Some(format!("/api/v1/sources/{movie_source_id}/playback"))
+        );
+
+        let unsupported_provider = serde_json::json!({
+            "provider_key": "moviebox",
+            "provider_source_id": movie_source_id,
+            "title_id": "00000000-0000-0000-0000-000000000001",
+            "video_codec": "H.264"
+        });
+        assert_eq!(
+            catalog_live_source_path(&unsupported_provider, "playback").unwrap(),
+            None
+        );
+        let malformed_mapping = serde_json::json!({
+            "provider_key": "fourkhdhub",
+            "provider_source_id": "not-a-provider-source-id",
+            "video_codec": "H.264"
+        });
+        assert!(catalog_live_source_path(&malformed_mapping, "playback").is_err());
     }
 
     #[test]
@@ -8169,6 +8276,27 @@ mod tests {
             .filter_map(|stream| tag_value(stream.tags.as_ref(), "language"))
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(languages, ["eng", "hin", "kor"].into_iter().collect());
+        for (language, expected_index) in [("hi", 1), ("en", 2), ("ko", 3)] {
+            let selected = select_audio_stream(
+                &parsed,
+                &AudioSelectionRequest {
+                    language: Some(language.into()),
+                    stream_index: None,
+                },
+            )
+            .expect("requested language is present in the verified fixture");
+            assert_eq!(selected.index, Some(expected_index));
+        }
+        assert!(
+            select_audio_stream(
+                &parsed,
+                &AudioSelectionRequest {
+                    language: Some("hi".into()),
+                    stream_index: Some(2),
+                }
+            )
+            .is_none()
+        );
     }
 
     #[test]

@@ -1416,10 +1416,7 @@ mod tests {
             fourkhdhub_enabled: true,
             ..Default::default()
         };
-        for (provider, id) in [
-            ("moviebox", "old-moviebox"),
-            ("4khdhub", "active"),
-        ] {
+        for (provider, id) in [("moviebox", "old-moviebox"), ("4khdhub", "active")] {
             state.favorites.items.push(crate::favorites::FavoriteItem {
                 provider: provider.to_string(),
                 subject_id: id.to_string(),

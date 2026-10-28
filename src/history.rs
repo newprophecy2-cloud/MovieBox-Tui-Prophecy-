@@ -699,12 +699,16 @@ mod tests {
 
     #[test]
     fn saved_history_conversion_never_falls_back_to_moviebox() {
-        assert!(dummy_item("moviebox", "old-id", "Old title", 1, "2020", 0, 0)
-            .to_search_result()
-            .is_none());
-        assert!(dummy_item("unknown", "old-id", "Old title", 1, "2020", 0, 0)
-            .to_search_result()
-            .is_none());
+        assert!(
+            dummy_item("moviebox", "old-id", "Old title", 1, "2020", 0, 0)
+                .to_search_result()
+                .is_none()
+        );
+        assert!(
+            dummy_item("unknown", "old-id", "Old title", 1, "2020", 0, 0)
+                .to_search_result()
+                .is_none()
+        );
         assert_eq!(
             dummy_item("4khdhub", "id", "Title", 1, "2020", 0, 0)
                 .to_search_result()

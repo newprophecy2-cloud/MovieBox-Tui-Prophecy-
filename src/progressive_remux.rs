@@ -225,27 +225,24 @@ async fn serve_with_program(
 
 fn progressive_ffmpeg_command(executable: &OsStr, selected_audio_stream: Option<u32>) -> Command {
     let mut command = Command::new(executable);
-    command
-        .env_clear()
-        .env("LC_ALL", "C")
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-nostdin",
-            "-probesize",
-            "5M",
-            "-analyzeduration",
-            "5M",
-            "-fflags",
-            "+nobuffer",
-            "-protocol_whitelist",
-            "pipe,crypto,data",
-            "-i",
-            "pipe:0",
-            "-map",
-            "0:v:0",
-        ]);
+    command.env_clear().env("LC_ALL", "C").args([
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-probesize",
+        "5M",
+        "-analyzeduration",
+        "5M",
+        "-fflags",
+        "+nobuffer",
+        "-protocol_whitelist",
+        "pipe,crypto,data",
+        "-i",
+        "pipe:0",
+        "-map",
+        "0:v:0",
+    ]);
     if let Some(index) = selected_audio_stream {
         command.arg("-map").arg(format!("0:{index}"));
     } else {
@@ -991,7 +988,15 @@ mod tests {
         let url = Url::parse(&format!("http://{address}/stalled.mkv")).unwrap();
         let (mut client, mut server) = downstream_pair().await;
         let serve_task = tokio::spawn(async move {
-            serve(&mut server, &url, &[], Duration::from_millis(150), 7005, None).await
+            serve(
+                &mut server,
+                &url,
+                &[],
+                Duration::from_millis(150),
+                7005,
+                None,
+            )
+            .await
         });
         let mut response = Vec::new();
         timeout(Duration::from_secs(3), client.read_to_end(&mut response))
