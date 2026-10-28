@@ -17,6 +17,7 @@ pub struct Config {
     pub active_mode: String,
     pub active_provider: ProviderKind,
     pub active_theme: String,
+    #[serde(skip_deserializing)]
     pub moviebox_enabled: bool,
     pub fourkhdhub_enabled: bool,
     pub dramachi_enabled: bool,
@@ -46,9 +47,9 @@ impl Default for Config {
             auto_update: true,
             last_update_check: 0,
             active_mode: "streaming".to_string(),
-            active_provider: ProviderKind::MovieBox,
+            active_provider: ProviderKind::FourKHdHub,
             active_theme: String::new(),
-            moviebox_enabled: true,
+            moviebox_enabled: false,
             fourkhdhub_enabled: true,
             dramachi_enabled: true,
             bdix_circleftp_enabled: false,
@@ -84,6 +85,19 @@ pub struct MediaSettings {
 }
 
 impl Config {
+    pub fn validate_media_job_settings(&self) -> Result<(usize, std::time::Duration), String> {
+        if !(1..=4).contains(&self.max_concurrent_media_jobs) {
+            return Err("max_concurrent_media_jobs must be between 1 and 4".into());
+        }
+        if !(60..=86_400).contains(&self.media_job_timeout_seconds) {
+            return Err("media_job_timeout_seconds must be between 60 and 86400".into());
+        }
+        Ok((
+            self.max_concurrent_media_jobs,
+            std::time::Duration::from_secs(self.media_job_timeout_seconds),
+        ))
+    }
+
     pub fn validate_hls_chunk_settings(&self) -> Result<(), String> {
         if !(HLS_CHUNK_CACHE_MIN_BYTES..=HLS_CHUNK_CACHE_MAX_BYTES)
             .contains(&self.hls_chunk_cache_max_bytes)
@@ -108,12 +122,7 @@ impl Config {
         if !(1_048_576..=1_099_511_627_776).contains(&self.remux_cache_max_bytes) {
             return Err("remux_cache_max_bytes must be between 1048576 and 1099511627776".into());
         }
-        if !(1..=4).contains(&self.max_concurrent_media_jobs) {
-            return Err("max_concurrent_media_jobs must be between 1 and 4".into());
-        }
-        if !(60..=86_400).contains(&self.media_job_timeout_seconds) {
-            return Err("media_job_timeout_seconds must be between 60 and 86400".into());
-        }
+        let (max_concurrent_jobs, job_timeout) = self.validate_media_job_settings()?;
 
         let configured_cache_dir = match self
             .media_cache_directory
@@ -151,8 +160,8 @@ impl Config {
             cache_dir: canonical_cache_dir,
             cache_ttl: std::time::Duration::from_secs(self.remux_cache_ttl_seconds),
             cache_max_bytes: self.remux_cache_max_bytes,
-            max_concurrent_jobs: self.max_concurrent_media_jobs,
-            job_timeout: std::time::Duration::from_secs(self.media_job_timeout_seconds),
+            max_concurrent_jobs,
+            job_timeout,
         })
     }
 }
@@ -359,9 +368,13 @@ pub fn load() -> Config {
                 obj.remove("bdix_enabled");
             }
             if let Ok(mut config) = serde_json::from_value::<Config>(val) {
+                config.moviebox_enabled = false;
                 if old_bdix {
                     config.bdix_circleftp_enabled = true;
                     config.bdix_dhakaflix_enabled = true;
+                }
+                if config.active_provider == ProviderKind::MovieBox {
+                    config.active_provider = ProviderKind::FourKHdHub;
                 }
                 return config;
             }
@@ -378,7 +391,9 @@ pub fn save(config: &Config) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Ok(json) = serde_json::to_string_pretty(config) {
+    let mut safe_config = config.clone();
+    safe_config.moviebox_enabled = false;
+    if let Ok(json) = serde_json::to_string_pretty(&safe_config) {
         if let Err(error) = crate::cache::atomic_write_file(&path, json.as_bytes()) {
             log::warn!("failed to write config: {error}");
         }
@@ -465,7 +480,8 @@ mod tests {
     fn config_defaults_and_serde() {
         let config = Config::default();
         assert!(config.auto_update);
-        assert_eq!(config.active_provider, ProviderKind::MovieBox);
+        assert_eq!(config.active_provider, ProviderKind::FourKHdHub);
+        assert!(!config.moviebox_enabled);
         assert_eq!(config.remux_cache_ttl_seconds, 3_600);
         assert_eq!(config.remux_cache_max_bytes, 512 * 1024 * 1024);
         assert_eq!(config.max_concurrent_media_jobs, 1);
@@ -483,6 +499,10 @@ mod tests {
         assert_eq!(old_config.hls_chunk_cache_max_bytes, 512 * 1024 * 1024);
         assert_eq!(old_config.hls_max_segment_bytes, 1024 * 1024 * 1024);
         assert_eq!(old_config.hls_prefetch_depth, 2);
+        let legacy_moviebox_config: Config =
+            serde_json::from_str(r#"{"moviebox_enabled":true,"active_provider":"moviebox"}"#)
+                .expect("legacy MovieBox settings remain readable");
+        assert!(!legacy_moviebox_config.moviebox_enabled);
     }
 
     #[test]

@@ -1015,7 +1015,7 @@ impl App {
                 .available_providers()
                 .into_iter()
                 .next()
-                .unwrap_or(crate::providers::models::ProviderKind::MovieBox);
+                .unwrap_or(crate::providers::models::ProviderKind::FourKHdHub);
             self.switch_provider(next);
         }
         self.persist_config();

@@ -46,7 +46,13 @@ impl MovieBoxService {
 
     pub fn capabilities(&self, provider: ProviderKind) -> crate::providers::ProviderCapabilities {
         match provider {
-            ProviderKind::MovieBox => Provider::capabilities(&self.client),
+            ProviderKind::MovieBox => crate::providers::ProviderCapabilities {
+                supports_search: false,
+                supports_pagination: false,
+                supports_series: false,
+                supports_subtitles: false,
+                supports_homepage: false,
+            },
             ProviderKind::FourKHdHub => self
                 .fourk_client
                 .as_ref()
@@ -59,13 +65,8 @@ impl MovieBoxService {
         }
     }
 
-    pub async fn suggest(&self, query: &str) -> Result<Vec<String>, String> {
-        let payload = self
-            .client
-            .suggest(query)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(crate::providers::moviebox::adapt::moviebox_suggest_json_to_strings(&payload))
+    pub async fn suggest(&self, _query: &str) -> Result<Vec<String>, String> {
+        Err("MovieBox is disabled".to_string())
     }
 
     pub async fn search_typed(
@@ -74,6 +75,11 @@ impl MovieBoxService {
         query: &str,
         page: usize,
     ) -> Result<Vec<CatalogItem>, ProviderError> {
+        if provider == ProviderKind::MovieBox {
+            return Err(ProviderError::Unavailable(
+                "MovieBox is disabled".to_string(),
+            ));
+        }
         match provider {
             ProviderKind::MovieBox => Provider::search(&self.client, query, page).await,
             ProviderKind::FourKHdHub => {
@@ -166,6 +172,11 @@ impl MovieBoxService {
         provider: ProviderKind,
         subject_id: &str,
     ) -> Result<MediaDetails, ProviderError> {
+        if provider == ProviderKind::MovieBox {
+            return Err(ProviderError::Unavailable(
+                "MovieBox is disabled".to_string(),
+            ));
+        }
         match provider {
             ProviderKind::MovieBox => Provider::details(&self.client, subject_id).await,
             ProviderKind::FourKHdHub => {
@@ -187,8 +198,8 @@ impl MovieBoxService {
 
     pub async fn homepage(
         &self,
-        tab_id: &str,
-        page: usize,
+        _tab_id: &str,
+        _page: usize,
     ) -> Result<
         (
             Vec<CatalogItem>,
@@ -196,166 +207,34 @@ impl MovieBoxService {
         ),
         String,
     > {
-        let payload = self
-            .client
-            .get_homepage(tab_id, page)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(crate::providers::moviebox::adapt::moviebox_homepage_json_to_catalog(&payload))
+        Err("MovieBox is disabled".to_string())
     }
 
     pub async fn moviebox_classification_metadata(
         &self,
-        subject_id: &str,
+        _subject_id: &str,
     ) -> Option<(Option<String>, Option<String>, Option<String>)> {
-        let payload = self.client.get_details(subject_id).await.ok()?;
-        let text = |keys: &[&str]| {
-            keys.iter().find_map(|key| {
-                payload
-                    .get(*key)
-                    .and_then(|value| value.as_str())
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(ToOwned::to_owned)
-            })
-        };
-        Some((
-            text(&["category", "contentType", "mediaType", "kind"]),
-            text(&["country", "countries", "region", "area"]),
-            text(&["originalLanguage", "original_language", "language", "lang"]),
-        ))
+        None
     }
 
-    pub async fn fetch_collection_resolutions(&self, subject_id: &str) -> Result<Vec<u32>, String> {
-        self.client
-            .fetch_collection_resolutions(subject_id)
-            .await
-            .map_err(|e| e.to_string())
+    pub async fn fetch_collection_resolutions(
+        &self,
+        _subject_id: &str,
+    ) -> Result<Vec<u32>, String> {
+        Err("MovieBox is disabled".to_string())
     }
 
     pub async fn get_ext_captions(
         &self,
-        subject_id: &str,
-        resource_id: &str,
-        sibling_ids: &[String],
-        season: usize,
-        episode: usize,
+        _subject_id: &str,
+        _resource_id: &str,
+        _sibling_ids: &[String],
+        _season: usize,
+        _episode: usize,
     ) -> Result<Vec<crate::providers::models::SubtitleOption>, String> {
-        if !subject_id.is_empty() && !resource_id.is_empty() {
-            let sid = subject_id.to_string();
-            let rid = resource_id.to_string();
-            if let Ok(Some(cached)) = tokio::task::spawn_blocking(move || {
-                crate::cache::get_captions_cache_typed(&sid, &rid)
-            })
-            .await
-            {
-                if !cached.is_empty() || sibling_ids.is_empty() {
-                    return Ok(cached);
-                }
-            }
-        }
-
-        let mut all_captions = Vec::new();
-        let mut seen_urls = std::collections::HashSet::new();
-
-        let primary_fut = self.client.get_ext_captions(subject_id, resource_id);
-        let mut sibling_futs = Vec::new();
-        for sib in sibling_ids.iter().take(3) {
-            if !sib.is_empty() && sib != subject_id {
-                let client = &self.client;
-                sibling_futs.push(async move {
-                    tokio::time::timeout(std::time::Duration::from_secs(6), async move {
-                        let page = if episode > 0 { (episode - 1) / 20 + 1 } else { 1 };
-                        if let Ok((items, _)) =
-                            client.fetch_resource_page(sib, season, episode, 0, page).await
-                        {
-                            let matched_item = find_matching_resource_item(&items, season, episode);
-                            if let Some(item) = matched_item {
-                                let item_rid = item
-                                    .get("resourceId")
-                                    .or_else(|| item.get("id"))
-                                    .and_then(|v| {
-                                        if let Some(n) = v.as_i64() {
-                                            Some(n.to_string())
-                                        } else if let Some(n) = v.as_u64() {
-                                            Some(n.to_string())
-                                        } else {
-                                            v.as_str().map(|s| s.to_string())
-                                        }
-                                    });
-                                if let Some(rid) = item_rid {
-                                    if let Ok(res_payload) = client.get_ext_captions(sib, &rid).await
-                                    {
-                                        return crate::providers::moviebox::adapt::captions_json_to_options(
-                                            &res_payload,
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        Vec::new()
-                    })
-                    .await
-                    .unwrap_or_default()
-                });
-            }
-        }
-
-        let (primary_res, sibling_results) =
-            tokio::join!(primary_fut, futures::future::join_all(sibling_futs));
-        if let Ok(payload) = primary_res {
-            Self::append_unique_captions(
-                &mut all_captions,
-                &mut seen_urls,
-                crate::providers::moviebox::adapt::captions_json_to_options(&payload),
-            );
-        }
-        for res in sibling_results {
-            Self::append_unique_captions(&mut all_captions, &mut seen_urls, res);
-        }
-        let mut deduplicated: Vec<crate::providers::models::SubtitleOption> = Vec::new();
-        let mut seen_languages = std::collections::HashSet::new();
-        for sub in all_captions {
-            let sanitized_lang = crate::tui::text::sanitize_language_label(&sub.name);
-            if seen_languages.insert(sanitized_lang) {
-                deduplicated.push(sub);
-            }
-        }
-
-        deduplicated.sort_by(|a, b| {
-            let clean_a = crate::tui::text::sanitize_language_label(&a.name);
-            let clean_b = crate::tui::text::sanitize_language_label(&b.name);
-            if clean_a.eq_ignore_ascii_case("english") {
-                std::cmp::Ordering::Less
-            } else if clean_b.eq_ignore_ascii_case("english") {
-                std::cmp::Ordering::Greater
-            } else {
-                clean_a.cmp(&clean_b)
-            }
-        });
-        if !subject_id.is_empty() && !resource_id.is_empty() && !deduplicated.is_empty() {
-            let sid = subject_id.to_string();
-            let rid = resource_id.to_string();
-            let to_cache = deduplicated.clone();
-            tokio::task::spawn_blocking(move || {
-                crate::cache::set_captions_cache_typed(&sid, &rid, &to_cache);
-            });
-        }
-
-        Ok(deduplicated)
+        Err("MovieBox is disabled".to_string())
     }
 
-    fn append_unique_captions(
-        target: &mut Vec<crate::providers::models::SubtitleOption>,
-        seen_urls: &mut std::collections::HashSet<String>,
-        opts: Vec<crate::providers::models::SubtitleOption>,
-    ) {
-        for opt in opts {
-            if seen_urls.insert(opt.url.clone()) {
-                target.push(opt);
-            }
-        }
-    }
     pub async fn fetch_poster_bytes(&self, url: &str) -> Option<Vec<u8>> {
         const MAX_POSTER_BYTES: usize = 5 * 1024 * 1024;
         if crate::net::validate_public_url(url, true).await.is_err() {
@@ -710,6 +589,43 @@ pub fn find_matching_resource_item(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn typed_moviebox_dispatch_is_rejected_without_provider_requests() {
+        let service = MovieBoxService::new();
+        assert_eq!(
+            service.suggest("must not be sent").await.unwrap_err(),
+            "MovieBox is disabled"
+        );
+        assert!(service.homepage("2", 1).await.is_err());
+        assert!(
+            service
+                .moviebox_classification_metadata("must not be sent")
+                .await
+                .is_none()
+        );
+        assert!(
+            service
+                .fetch_collection_resolutions("must not be sent")
+                .await
+                .is_err()
+        );
+        assert!(
+            service
+                .get_ext_captions("must not be sent", "id", &[], 0, 0)
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            service.search_typed(ProviderKind::MovieBox, "must not be sent", 0).await,
+            Err(ProviderError::Unavailable(message)) if message == "MovieBox is disabled"
+        ));
+        assert!(matches!(
+            service.details_typed(ProviderKind::MovieBox, "must not be sent").await,
+            Err(ProviderError::Unavailable(message)) if message == "MovieBox is disabled"
+        ));
+        assert!(!service.capabilities(ProviderKind::MovieBox).supports_search);
+    }
 
     #[tokio::test]
     async fn test_decode_poster_caps_dimensions() {

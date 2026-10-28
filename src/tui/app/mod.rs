@@ -212,7 +212,7 @@ impl App {
                 .available_providers()
                 .into_iter()
                 .next()
-                .unwrap_or(crate::providers::models::ProviderKind::MovieBox)
+                .unwrap_or(crate::providers::models::ProviderKind::FourKHdHub)
         } else {
             config.active_provider
         };
@@ -234,7 +234,7 @@ impl App {
         if !state.addons_enabled
             && state.active_provider == crate::providers::models::ProviderKind::Addons
         {
-            state.active_provider = crate::providers::models::ProviderKind::MovieBox;
+            state.active_provider = crate::providers::models::ProviderKind::FourKHdHub;
         }
         state.active_theme_kind = config.active_theme;
         state.default_player = config.default_player;
@@ -328,7 +328,7 @@ impl App {
             active_mode: active_mode.to_string(),
             active_provider: self.state.active_provider,
             active_theme: self.state.active_theme_kind.clone(),
-            moviebox_enabled: self.state.moviebox_enabled,
+            moviebox_enabled: false,
             fourkhdhub_enabled: self.state.fourkhdhub_enabled,
             dramachi_enabled: self.state.dramachi_enabled,
             bdix_circleftp_enabled: self.state.bdix_circleftp_enabled,

@@ -106,114 +106,6 @@ pub(crate) async fn serve(
     .await
 }
 
-/// Stream a remux beginning near a validated media timestamp. The source and
-/// output remain pipes; FFmpeg performs input-side seeking against the
-/// validated URL and may issue bounded upstream range requests.
-pub(crate) async fn serve_from_timestamp(
-    stream: &mut TcpStream,
-    url: &Url,
-    provider_headers: &[(String, String)],
-    seek_seconds: f64,
-    timeout_budget: Duration,
-    debug_id: u64,
-) -> io::Result<()> {
-    let deadline = Instant::now() + timeout_budget;
-    let response = match open_upstream(url, provider_headers, deadline).await {
-        Ok(response) => response,
-        Err(UpstreamFailure::UnsafeDestination) => {
-            return write_error(
-                stream,
-                403,
-                "SSRF_BLOCKED",
-                "The media destination is not a permitted public URL.",
-            )
-            .await;
-        }
-        Err(UpstreamFailure::Timeout) => {
-            return write_error(
-                stream,
-                504,
-                "UPSTREAM_TIMEOUT",
-                "The upstream media request timed out.",
-            )
-            .await;
-        }
-        Err(_) => {
-            return write_error(
-                stream,
-                502,
-                "UPSTREAM_UNAVAILABLE",
-                "The upstream media request failed.",
-            )
-            .await;
-        }
-    };
-    let mut child = match timestamp_ffmpeg_command(OsStr::new("ffmpeg"), seek_seconds).spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            log::warn!("timestamp remux process start failed id={debug_id}: {error}");
-            return write_error(stream, 503, "REMUX_UNAVAILABLE", "FFmpeg is unavailable.").await;
-        }
-    };
-    let Some(stdin) = child.stdin.take() else {
-        let _ = child.kill().await;
-        let _ = child.wait().await;
-        return write_error(
-            stream,
-            503,
-            "REMUX_UNAVAILABLE",
-            "FFmpeg could not open the remux input stream.",
-        )
-        .await;
-    };
-    let Some(stdout) = child.stdout.take() else {
-        let _ = child.kill().await;
-        let _ = child.wait().await;
-        return write_error(
-            stream,
-            503,
-            "REMUX_UNAVAILABLE",
-            "FFmpeg could not open the remux output stream.",
-        )
-        .await;
-    };
-    let stderr_task = child.stderr.take().map(|mut stderr| {
-        tokio::spawn(async move {
-            let mut sink = tokio::io::sink();
-            let _ = tokio::io::copy(&mut stderr, &mut sink).await;
-        })
-    });
-    let input_task = tokio::spawn(pipe_upstream(response, stdin, deadline));
-    let mut input_task = InputTask::new(input_task);
-    let mut response_started = false;
-    let result = stream_child_output(
-        stream,
-        &mut child,
-        stdout,
-        &mut input_task,
-        deadline,
-        &mut response_started,
-    )
-    .await;
-    if result.is_err() {
-        let _ = child.kill().await;
-        let _ = child.wait().await;
-        input_task.abort().await;
-    }
-    if let Some(task) = stderr_task {
-        let _ = task.await;
-    }
-    match result {
-        Ok(()) => Ok(()),
-        Err(error) if !response_started => {
-            log::warn!("timestamp remux startup failed id={debug_id} category={error:?}");
-            let (status, code, message) = public_startup_error(error);
-            write_error(stream, status, code, message).await
-        }
-        Err(_) => Err(io::Error::other("progressive media stream ended early")),
-    }
-}
-
 async fn serve_with_program(
     stream: &mut TcpStream,
     url: &Url,
@@ -362,65 +254,6 @@ fn progressive_ffmpeg_command(executable: &OsStr) -> Command {
             "2",
             "-sn",
             "-dn",
-            "-max_interleave_delta",
-            "0",
-            "-movflags",
-            "+frag_keyframe+empty_moov+default_base_moof",
-            "-flush_packets",
-            "1",
-            "-f",
-            "mp4",
-            "pipe:1",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    command
-}
-
-fn timestamp_ffmpeg_command(executable: &OsStr, seek_seconds: f64) -> Command {
-    let mut command = Command::new(executable);
-    command
-        .env_clear()
-        .env("LC_ALL", "C")
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-nostdin",
-            "-i",
-            "pipe:0",
-        ])
-        .args([
-            "-map",
-            "0:v:0",
-            "-map",
-            "0:a?",
-            "-filter:v",
-            &format!("trim=start={seek_seconds:.3},setpts=PTS-STARTPTS"),
-            "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            "-g",
-            "30",
-            "-keyint_min",
-            "30",
-            "-force_key_frames",
-            "expr:gte(t,n_forced*1)",
-            "-c:a",
-            "aac",
-            "-filter:a",
-            &format!("atrim=start={seek_seconds:.3},asetpts=PTS-STARTPTS"),
-            "-b:a",
-            "192k",
-            "-ac",
-            "2",
-            "-sn",
-            "-dn",
-            "-avoid_negative_ts",
-            "make_zero",
             "-max_interleave_delta",
             "0",
             "-movflags",
@@ -929,40 +762,6 @@ mod tests {
     }
 
     #[test]
-    fn timestamp_command_trims_pipe_input_and_uses_pipe_output() {
-        let command = timestamp_ffmpeg_command(OsStr::new("ffmpeg"), 120.5);
-        let args = command
-            .as_std()
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        let input = args.iter().position(|arg| arg == "-i").unwrap();
-        let video_filter = args.iter().position(|arg| arg == "-filter:v").unwrap();
-        let audio_filter = args.iter().position(|arg| arg == "-filter:a").unwrap();
-        assert!(input < video_filter);
-        assert_eq!(
-            args[video_filter + 1],
-            "trim=start=120.500,setpts=PTS-STARTPTS"
-        );
-        assert_eq!(
-            args[audio_filter + 1],
-            "atrim=start=120.500,asetpts=PTS-STARTPTS"
-        );
-        assert!(args.windows(2).any(|pair| pair == ["-g", "30"]));
-        assert!(args.windows(2).any(|pair| pair == ["-keyint_min", "30"]));
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["-force_key_frames", "expr:gte(t,n_forced*1)"])
-        );
-        assert_eq!(args[input + 1], "pipe:0");
-        assert_eq!(args.last().map(String::as_str), Some("pipe:1"));
-        assert_eq!(
-            args.iter().filter(|arg| arg.as_str() == "pipe:0").count(),
-            1
-        );
-    }
-
-    #[test]
     fn provider_headers_are_bounded_and_sensitive_headers_are_not_forwarded_across_origins() {
         let headers = vec![
             ("Authorization".into(), "secret-token".into()),
@@ -1028,7 +827,22 @@ mod tests {
         assert!(initial_body.windows(4).any(|atom| atom == b"moof"));
         assert!(!upstream_complete.load(Ordering::Acquire));
 
-        let mut response_body = initial_body;
+        fn scan_atoms(tail: &mut Vec<u8>, bytes: &[u8], seen: &mut [bool; 4]) {
+            let atoms = [*b"ftyp", *b"moov", *b"moof", *b"mdat"];
+            tail.extend_from_slice(bytes);
+            for window in tail.windows(4) {
+                for (index, atom) in atoms.iter().enumerate() {
+                    seen[index] |= window == atom;
+                }
+            }
+            if tail.len() > 3 {
+                tail.drain(..tail.len() - 3);
+            }
+        }
+
+        let mut seen_atoms = [false; 4];
+        let mut tail = Vec::with_capacity(8192 + 3);
+        scan_atoms(&mut tail, &initial_body, &mut seen_atoms);
         let mut read_count = 0usize;
         let mut buffer = [0u8; 8192];
         loop {
@@ -1040,12 +854,10 @@ mod tests {
                 break;
             }
             read_count += 1;
-            response_body.extend_from_slice(&buffer[..length]);
+            scan_atoms(&mut tail, &buffer[..length], &mut seen_atoms);
         }
         assert!(read_count >= 2, "media did not arrive in multiple reads");
-        assert!(response_body.windows(4).any(|atom| atom == b"ftyp"));
-        assert!(response_body.windows(4).any(|atom| atom == b"moov"));
-        assert!(response_body.windows(4).any(|atom| atom == b"mdat"));
+        assert!(seen_atoms.into_iter().all(|seen| seen));
         serve_task.await.unwrap().unwrap();
         upstream_task.await.unwrap();
         assert!(upstream_complete.load(Ordering::Acquire));
@@ -1199,5 +1011,13 @@ mod tests {
             args.iter().filter(|arg| arg.as_str() == "pipe:1").count(),
             1
         );
+        assert_eq!(args.last().map(String::as_str), Some("pipe:1"));
+        assert!(args.windows(2).any(|pair| pair == ["-i", "pipe:0"]));
+        assert!(!args.iter().any(|arg| {
+            [".mp4", ".mkv", ".webm", ".part"]
+                .iter()
+                .any(|extension| arg.ends_with(extension))
+        }));
+        assert_eq!(MAX_STARTUP_BUFFER_BYTES, 4 * 1024 * 1024);
     }
 }

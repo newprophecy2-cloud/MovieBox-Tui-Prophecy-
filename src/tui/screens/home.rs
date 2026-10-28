@@ -3076,8 +3076,8 @@ mod tests {
             rendered.push('\n');
         }
         assert!(rendered.contains("Providers"));
-        assert!(rendered.contains("  ✓ MovieBox"));
-        assert!(rendered.contains("    4KHDHub"));
+        assert!(rendered.contains("  ✓ 4KHDHub"));
+        assert!(!rendered.contains("MovieBox"));
         assert!(rendered.contains("    Dramachi"));
         assert!(!rendered.contains('●'));
         assert!(!rendered.contains('○'));
@@ -3484,7 +3484,7 @@ mod tests {
         }
         assert!(rendered.contains('❯'));
         assert!(rendered.contains("Search movies, series & anime…"));
-        assert!(rendered.contains("[MovieBox"));
+        assert!(rendered.contains("[4KHDHub"));
         assert!(rendered.contains(crate::tui::text::CTRL_P_STR));
 
         assert!(!rendered.contains("Stream"));
@@ -3677,8 +3677,8 @@ mod tests {
 
         assert!(content.contains("deewaniyat"));
         assert!(content.contains("0 results"));
-        assert!(content.contains("No results for “deewaniyat” on MovieBox"));
-        assert!(content.contains("Try on 4KHDHub"));
+        assert!(content.contains("No results for “deewaniyat” on 4KHDHub"));
+        assert!(content.contains("Try on Dramachi"));
         assert!(content.contains("Clear Search"));
     }
 

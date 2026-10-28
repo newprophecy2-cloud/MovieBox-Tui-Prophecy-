@@ -332,7 +332,7 @@ pub struct AppState {
 impl Default for AppState {
     fn default() -> Self {
         Self {
-            active_provider: ProviderKind::MovieBox,
+            active_provider: ProviderKind::FourKHdHub,
             provider_generation: 0,
             active_screen: Screen::Home,
             dirty: true,
@@ -470,7 +470,7 @@ impl Default for AppState {
             overview_modal_scroll: 0,
             overview_modal_title: String::new(),
             overview_modal_content: String::new(),
-            moviebox_enabled: true,
+            moviebox_enabled: false,
             fourkhdhub_enabled: true,
             dramachi_enabled: true,
             bdix_circleftp_enabled: false,
@@ -598,7 +598,7 @@ impl AppState {
 
     pub fn provider_enabled(&self, p: ProviderKind) -> bool {
         match p {
-            ProviderKind::MovieBox => self.moviebox_enabled,
+            ProviderKind::MovieBox => false,
             ProviderKind::FourKHdHub => self.fourkhdhub_enabled,
             ProviderKind::Dramachi => self.dramachi_enabled,
             ProviderKind::BdixCircleFtp => self.bdix_circleftp_enabled,
@@ -609,7 +609,7 @@ impl AppState {
 
     pub fn set_provider_enabled(&mut self, p: ProviderKind, enabled: bool) {
         match p {
-            ProviderKind::MovieBox => self.moviebox_enabled = enabled,
+            ProviderKind::MovieBox => self.moviebox_enabled = false,
             ProviderKind::FourKHdHub => self.fourkhdhub_enabled = enabled,
             ProviderKind::Dramachi => self.dramachi_enabled = enabled,
             ProviderKind::BdixCircleFtp => self.bdix_circleftp_enabled = enabled,
@@ -1371,6 +1371,20 @@ mod tests {
         assert!(s.available_providers().contains(&ProviderKind::Addons));
         s.addons_enabled = false;
         assert!(!s.available_providers().contains(&ProviderKind::Addons));
+    }
+
+    #[test]
+    fn moviebox_cannot_be_enabled_or_selected() {
+        let mut state = AppState::default();
+        assert_eq!(state.active_provider, ProviderKind::FourKHdHub);
+        state.set_provider_enabled(ProviderKind::MovieBox, true);
+        assert!(!state.provider_enabled(ProviderKind::MovieBox));
+        assert!(
+            !state
+                .available_providers()
+                .contains(&ProviderKind::MovieBox)
+        );
+        assert!(!ProviderKind::ENABLED.contains(&ProviderKind::MovieBox));
     }
 
     #[test]

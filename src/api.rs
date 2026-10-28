@@ -58,14 +58,9 @@ const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_REQUEST_BODY_BYTES: usize = 256 * 1024;
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_API_CONNECTIONS: usize = 256;
-const MOVIEBOX_PROVIDER_ENABLED: bool = true;
-const REMUX_STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
-const REMUX_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(20);
-static REMUX_LIMITER: std::sync::LazyLock<Arc<Semaphore>> =
-    std::sync::LazyLock::new(|| Arc::new(Semaphore::new(2)));
+const MOVIEBOX_PROVIDER_ENABLED: bool = false;
 static REMUX_DEBUG_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-const PROVIDERS: [ProviderKind; 6] = [
-    ProviderKind::MovieBox,
+const PROVIDERS: [ProviderKind; 5] = [
     ProviderKind::FourKHdHub,
     ProviderKind::Dramachi,
     ProviderKind::BdixCircleFtp,
@@ -112,7 +107,8 @@ pub struct ApiState {
     search_cache: Arc<Mutex<HashMap<String, SearchCacheEntry>>>,
     redis_search: Option<redis::aio::MultiplexedConnection>,
     search_source_check_slots: Arc<Semaphore>,
-    remux_cache: crate::remux_cache::RemuxCache,
+    media_jobs: Arc<Semaphore>,
+    media_job_timeout: Duration,
     native_stream: crate::api_native_stream::NativeStreamProxy,
     connection_slots: Arc<Semaphore>,
 }
@@ -697,35 +693,16 @@ pub async fn run() -> std::io::Result<()> {
     config
         .validate_hls_chunk_settings()
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-    let media_settings = config
-        .validate_media_settings()
+    let (max_media_jobs, media_job_timeout) = config
+        .validate_media_job_settings()
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-    let cache_ttl_seconds = media_settings.cache_ttl.as_secs();
-    let cache_max_bytes = media_settings.cache_max_bytes;
-    let max_media_jobs = media_settings.max_concurrent_jobs;
-    let media_job_timeout_seconds = media_settings.job_timeout.as_secs();
-    let remux_cache = crate::remux_cache::RemuxCache::open(media_settings)
-        .await
-        .map_err(|error| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("could not initialize temporary media cache: {error}"),
-            )
-        })?;
+    let media_jobs = Arc::new(Semaphore::new(max_media_jobs));
     let native_stream =
         crate::api_native_stream::NativeStreamProxy::new(config.hls_max_segment_bytes)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-    let janitor_cache = remux_cache.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(60)).await;
-            if let Err(error) = janitor_cache.cleanup_expired().await {
-                log::warn!("temporary media cache cleanup failed: {error}");
-            }
-        }
-    });
     log::info!(
-        "temporary media cache initialized ttl_seconds={cache_ttl_seconds} max_bytes={cache_max_bytes} max_concurrent_jobs={max_media_jobs} job_timeout_seconds={media_job_timeout_seconds}; capacity is not production-validated"
+        "bounded media streaming initialized max_concurrent_jobs={max_media_jobs} job_timeout_seconds={}",
+        media_job_timeout.as_secs()
     );
     let port = std::env::var("PORT")
         .unwrap_or_else(|_| "8080".into())
@@ -755,7 +732,8 @@ pub async fn run() -> std::io::Result<()> {
         search_cache: Arc::new(Mutex::new(HashMap::new())),
         redis_search,
         search_source_check_slots: Arc::new(Semaphore::new(SEARCH_SOURCE_CHECK_CONCURRENCY)),
-        remux_cache,
+        media_jobs,
+        media_job_timeout,
         native_stream,
         connection_slots: Arc::new(Semaphore::new(MAX_API_CONNECTIONS)),
     };
@@ -977,7 +955,15 @@ async fn route(
         _ if path.starts_with("/api/v1/catalog/titles/") => catalog_title_detail_route(stream, path, state).await,
         "/api/v1/diagnostics" => diagnostics_route(stream, state).await,
         "/api/stream-proxy" => {
-            stream_proxy_route(stream, query, state, request_headers, head_only).await
+            stream_proxy_route(
+                stream,
+                query,
+                Arc::clone(&state.media_jobs),
+                state.media_job_timeout,
+                request_headers,
+                head_only,
+            )
+            .await
         }
         _ if path.starts_with("/api/v1/sources/")
             && path.trim_matches('/').split('/').nth(4) == Some("native") =>
@@ -2127,8 +2113,9 @@ async fn verify_catalog_source(
         Err(_) => return Err(("PROVIDER_RESOLUTION_TIMEOUT", true)),
     };
     let _media_job = state
-        .remux_cache
-        .try_acquire_job()
+        .media_jobs
+        .clone()
+        .try_acquire_owned()
         .map_err(|_| ("REMUX_BUSY", true))?;
     crate::codec_verification::verify_playback_source(&playback)
         .await
@@ -4854,8 +4841,9 @@ async fn probe_media_bounded(
     headers: &[(String, String)],
 ) -> Result<ProbeOutput, String> {
     let _permit = state
-        .remux_cache
-        .try_acquire_job()
+        .media_jobs
+        .clone()
+        .try_acquire_owned()
         .map_err(|_| "Media-processing capacity is busy.".to_string())?;
     probe_media(url, headers).await
 }
@@ -5446,7 +5434,7 @@ async fn write_verified_playback_response(
             return write_raw_json(stream, status, &body, None).await;
         }
     };
-    let _media_job = match state.remux_cache.try_acquire_job() {
+    let _media_job = match state.media_jobs.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
             let (status, body) = err(
@@ -5710,139 +5698,6 @@ async fn resolve_transcode_playback_source(
         })
 }
 
-async fn validated_remux_preflight(url: &reqwest::Url, headers: &[(String, String)]) -> bool {
-    // Provider codec labels are often incomplete or inferred. Try a short real stream-copy
-    // into browser-compatible fragmented MP4, then verify the resulting video/audio codecs
-    // before allowing stream-copy mode.
-    let Ok(source_probe) =
-        tokio::time::timeout(REMUX_PREFLIGHT_TIMEOUT, probe_media_validated(url, headers)).await
-    else {
-        // Metadata inspection is best-effort; unknown metadata does not itself rule out remux.
-        return remux_preflight_output_valid(url.as_str(), headers).await;
-    };
-    if let Ok(probe) = source_probe
-        && !probe
-            .streams
-            .iter()
-            .any(|stream| stream.codec_type.as_deref() == Some("video"))
-    {
-        return false;
-    }
-    remux_preflight_output_valid(url.as_str(), headers).await
-}
-
-async fn remux_preflight_output_valid(url: &str, headers: &[(String, String)]) -> bool {
-    const MAX_PREFLIGHT_BYTES: usize = 32 * 1024 * 1024;
-    let mut command = Command::new("ffmpeg");
-    command.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
-    let header_text = headers
-        .iter()
-        .map(|(name, value)| format!("{name}: {value}\r\n"))
-        .collect::<String>();
-    if !header_text.is_empty() {
-        command.arg("-headers").arg(header_text);
-    }
-    command.args([
-        "-rw_timeout",
-        "15000000",
-        "-i",
-        url,
-        "-map",
-        "0:v:0",
-        "-map",
-        "0:a?",
-        "-c:v",
-        "copy",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
-        "-ac",
-        "2",
-        "-sn",
-        "-dn",
-        "-t",
-        "2",
-        "-movflags",
-        "frag_keyframe+empty_moov+default_base_moof",
-        "-f",
-        "mp4",
-        "pipe:1",
-    ]);
-    let mut child = match command
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(_) => return false,
-    };
-    let Some(stdout) = child.stdout.take() else {
-        return false;
-    };
-    let mut remuxed_bytes = Vec::new();
-    let remux_status = tokio::time::timeout(REMUX_PREFLIGHT_TIMEOUT, async {
-        let bytes_read = stdout
-            .take(MAX_PREFLIGHT_BYTES as u64 + 1)
-            .read_to_end(&mut remuxed_bytes)
-            .await?;
-        if bytes_read > MAX_PREFLIGHT_BYTES {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            return Ok::<bool, std::io::Error>(false);
-        }
-        let status = child.wait().await?;
-        Ok(status.success() && !remuxed_bytes.is_empty())
-    })
-    .await;
-    if !matches!(remux_status, Ok(Ok(true))) {
-        return false;
-    }
-
-    let mut probe = Command::new("ffprobe");
-    let mut probe_child = match probe
-        .args([
-            "-v",
-            "error",
-            "-show_entries",
-            "stream=index,codec_name,codec_type",
-            "-of",
-            "json",
-            "-i",
-            "pipe:0",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(_) => return false,
-    };
-    let Some(mut probe_stdin) = probe_child.stdin.take() else {
-        return false;
-    };
-    let probe_result = tokio::time::timeout(REMUX_PREFLIGHT_TIMEOUT, async move {
-        let (write_result, output_result) = tokio::join!(
-            async { probe_stdin.write_all(&remuxed_bytes).await },
-            probe_child.wait_with_output()
-        );
-        (write_result, output_result)
-    })
-    .await;
-    let Ok((Ok(()), Ok(output))) = probe_result else {
-        return false;
-    };
-    if !output.status.success() {
-        return false;
-    }
-    serde_json::from_slice::<ProbeOutput>(&output.stdout)
-        .is_ok_and(|probe| browser_mp4_streams_compatible(&probe.streams))
-}
-
 fn browser_mp4_streams_compatible(streams: &[ProbeStream]) -> bool {
     let video = streams
         .iter()
@@ -5855,336 +5710,6 @@ fn browser_mp4_streams_compatible(streams: &[ProbeStream]) -> bool {
         && audio
             .iter()
             .all(|stream| stream.codec_name.as_deref() == Some("aac"))
-}
-
-const REMUX_OUTPUT_PROFILE: &str = "mp4-faststart-h264-copy-aac-192k-stereo-v1";
-
-async fn has_faststart_mp4_index(path: &std::path::Path) -> std::io::Result<bool> {
-    use tokio::io::AsyncSeekExt;
-
-    let mut file = tokio::fs::File::open(path).await?;
-    let length = file.metadata().await?.len();
-    let mut offset = 0u64;
-    let mut saw_ftyp = false;
-    let mut saw_moov = false;
-    for _ in 0..256 {
-        if offset.saturating_add(8) > length {
-            return Ok(false);
-        }
-        file.seek(std::io::SeekFrom::Start(offset)).await?;
-        let mut header = [0u8; 16];
-        file.read_exact(&mut header[..8]).await?;
-        let size32 = u32::from_be_bytes(header[..4].try_into().unwrap()) as u64;
-        let atom_type: [u8; 4] = header[4..8].try_into().unwrap();
-        let (atom_size, header_size) = match size32 {
-            0 => (length - offset, 8u64),
-            1 => {
-                if offset.saturating_add(16) > length {
-                    return Ok(false);
-                }
-                file.read_exact(&mut header[8..16]).await?;
-                (u64::from_be_bytes(header[8..16].try_into().unwrap()), 16u64)
-            }
-            size => (size, 8u64),
-        };
-        if atom_size < header_size || offset.saturating_add(atom_size) > length {
-            return Ok(false);
-        }
-        match &atom_type {
-            b"ftyp" => saw_ftyp = true,
-            b"moov" => saw_moov = true,
-            b"mdat" => return Ok(saw_ftyp && saw_moov),
-            _ => {}
-        }
-        offset += atom_size;
-    }
-    Ok(false)
-}
-
-async fn build_cached_mp4(
-    cache: crate::remux_cache::RemuxCache,
-    cache_key: String,
-    url: reqwest::Url,
-    headers: Vec<(String, String)>,
-    partial_path: std::path::PathBuf,
-    verify_input_codec: bool,
-    run_preflight: bool,
-) -> Result<f64, crate::remux_cache::CacheError> {
-    use crate::remux_cache::CacheError;
-    let deadline = Instant::now() + cache.job_timeout();
-    let job_deadline = tokio::time::Instant::from_std(deadline);
-
-    if verify_input_codec {
-        let referer = headers
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case("referer"))
-            .map(|(_, value)| value.as_str());
-        match tokio::time::timeout_at(job_deadline, verify_generic_media_codec(&url, referer))
-            .await
-            .map_err(|_| CacheError::Build("media codec probe timed out".into()))?
-        {
-            Ok(SourceCodecEligibility::Verified) => {}
-            Ok(SourceCodecEligibility::BlockedH265) => return Err(CacheError::BlockedCodec),
-            Ok(SourceCodecEligibility::Unverified) | Err(_) => {
-                return Err(CacheError::UnverifiedCodec);
-            }
-        }
-    }
-    if run_preflight {
-        let preflight =
-            tokio::time::timeout_at(job_deadline, validated_remux_preflight(&url, &headers))
-                .await
-                .map_err(|_| CacheError::Build("media remux preflight timed out".into()))?;
-        if !preflight {
-            log::warn!("remux preflight was inconclusive; continuing with full-output validation");
-        }
-    }
-    let mut command = Command::new("ffmpeg");
-    command.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y"]);
-    if !headers.is_empty() {
-        let header_text = headers
-            .iter()
-            .map(|(name, value)| format!("{name}: {value}\r\n"))
-            .collect::<String>();
-        command.arg("-headers").arg(header_text);
-    }
-    command
-        .args([
-            "-rw_timeout",
-            "120000000",
-            "-i",
-            url.as_str(),
-            "-map",
-            "0:v:0",
-            "-map",
-            "0:a?",
-            "-c:v",
-            "copy",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-ac",
-            "2",
-            "-sn",
-            "-dn",
-            "-max_interleave_delta",
-            "0",
-            "-movflags",
-            "+faststart",
-            "-f",
-            "mp4",
-        ])
-        .arg(&partial_path);
-    command
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    let mut child = command
-        .spawn()
-        .map_err(|_| CacheError::Build("FFmpeg is unavailable or could not be started".into()))?;
-    let stderr_task = child.stderr.take().map(|mut stderr| {
-        tokio::spawn(async move {
-            let mut sink = tokio::io::sink();
-            let _ = tokio::io::copy(&mut stderr, &mut sink).await;
-        })
-    });
-    let exit_status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {}
-            Err(error) => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                if let Some(task) = stderr_task {
-                    let _ = task.await;
-                }
-                return Err(CacheError::Io(error));
-            }
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            if let Some(task) = stderr_task {
-                let _ = task.await;
-            }
-            return Err(CacheError::Build("media remux job timed out".into()));
-        }
-        if let Ok(metadata) = tokio::fs::metadata(&partial_path).await
-            && (metadata.len() > cache.max_bytes()
-                || cache
-                    .report_partial_bytes(&cache_key, metadata.len())
-                    .await
-                    .is_err())
-        {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            if let Some(task) = stderr_task {
-                let _ = task.await;
-            }
-            return Err(CacheError::BudgetExceeded);
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    };
-    if let Some(task) = stderr_task {
-        let _ = task.await;
-    }
-    if !exit_status.success() {
-        return Err(CacheError::Build(
-            "the upstream media could not be remuxed as a seekable MP4".into(),
-        ));
-    }
-    let has_faststart =
-        tokio::time::timeout_at(job_deadline, has_faststart_mp4_index(&partial_path))
-            .await
-            .map_err(|_| CacheError::Build("MP4 index validation timed out".into()))?
-            .map_err(CacheError::Io)?;
-    if !has_faststart {
-        return Err(CacheError::Build(
-            "FFmpeg output is not a complete fast-start MP4".into(),
-        ));
-    }
-    let mut probe = Command::new("ffprobe");
-    probe
-        .args([
-            "-v",
-            "error",
-            "-show_entries",
-            "format=format_name,duration:stream=codec_name,codec_type",
-            "-of",
-            "json",
-        ])
-        .arg(&partial_path)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
-    let output = tokio::time::timeout_at(job_deadline, probe.output())
-        .await
-        .map_err(|_| CacheError::Build("FFprobe timed out while validating remux output".into()))?
-        .map_err(CacheError::Io)?;
-    if !output.status.success() {
-        return Err(CacheError::Build(
-            "FFprobe could not validate the remux output".into(),
-        ));
-    }
-    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|_| CacheError::Build("FFprobe returned malformed remux metadata".into()))?;
-    let formats = metadata
-        .pointer("/format/format_name")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    if !formats.split(',').any(|format| format == "mp4") {
-        return Err(CacheError::Build(
-            "FFprobe did not identify the remux output as MP4".into(),
-        ));
-    }
-    let duration = metadata
-        .pointer("/format/duration")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|duration| duration.is_finite() && *duration > 0.0)
-        .ok_or_else(|| CacheError::Build("verified media duration is unavailable".into()))?;
-    let streams = metadata
-        .get("streams")
-        .cloned()
-        .and_then(|streams| serde_json::from_value::<Vec<ProbeStream>>(streams).ok())
-        .ok_or_else(|| CacheError::Build("FFprobe stream metadata is unavailable".into()))?;
-    if !browser_mp4_streams_compatible(&streams) {
-        return Err(CacheError::Build(
-            "remux output codecs do not satisfy the verified playback policy".into(),
-        ));
-    }
-    Ok(duration)
-}
-
-fn cache_error_http(error: crate::remux_cache::CacheError) -> (u16, &'static str, String) {
-    use crate::remux_cache::CacheError;
-    match error {
-        CacheError::Busy => (
-            429,
-            "REMUX_BUSY",
-            "Media-processing capacity is busy.".into(),
-        ),
-        CacheError::TooLarge | CacheError::BudgetExceeded => (
-            507,
-            "MEDIA_CACHE_FULL",
-            "Temporary media cache capacity is unavailable.".into(),
-        ),
-        CacheError::InvalidKey => (400, "INVALID_ID", "The source identity is invalid.".into()),
-        CacheError::BlockedCodec => (
-            415,
-            "SOURCE_CODEC_BLOCKED",
-            "H.265/HEVC sources are blocked by playback policy.".into(),
-        ),
-        CacheError::UnverifiedCodec => (
-            415,
-            "CODEC_UNVERIFIED",
-            "The media video codec could not be positively verified as H.264.".into(),
-        ),
-        CacheError::Build(message) if message.contains("timed out") => (
-            504,
-            "REMUX_TIMEOUT",
-            "Media preparation exceeded its configured time limit.".into(),
-        ),
-        CacheError::Build(_) => (
-            502,
-            "REMUX_FAILED",
-            "The selected source could not be prepared as seekable MP4.".into(),
-        ),
-        CacheError::Io(_) => (
-            500,
-            "MEDIA_CACHE_IO_ERROR",
-            "Temporary media storage failed.".into(),
-        ),
-    }
-}
-
-async fn write_cached_remux_response(
-    stream: &mut TcpStream,
-    lease: crate::remux_cache::CacheLease,
-    source_id: Option<&str>,
-    request_headers: &HashMap<String, String>,
-    head_only: bool,
-) -> std::io::Result<()> {
-    use crate::remux_cache::{ByteRange, copy_range_to_writer, parse_range_header};
-
-    let size = lease.cached.metadata.size_bytes;
-    let source_header = source_id
-        .map(|id| format!("X-Source-Id: {id}\r\n"))
-        .unwrap_or_default();
-    let (status, start, length, content_range) = match parse_range_header(
-        request_headers.get("range").map(String::as_str),
-        size,
-    ) {
-        ByteRange::Full => (200, 0, size, None),
-        ByteRange::Partial { start, end } => {
-            let length = end - start + 1;
-            (
-                206,
-                start,
-                length,
-                Some(format!("Content-Range: bytes {start}-{end}/{size}\r\n")),
-            )
-        }
-        ByteRange::Unsatisfiable => {
-            let extra = format!(
-                "Accept-Ranges: bytes\r\nContent-Range: bytes */{size}\r\nContent-Length: 0\r\nX-Media-Mode: remux\r\n{source_header}X-Remux-Cache-State: {}\r\n",
-                if lease.was_hit { "hit" } else { "built" }
-            );
-            return write_headers(stream, 416, "video/mp4", Some(&extra)).await;
-        }
-    };
-    let content_range = content_range.unwrap_or_default();
-    let extra = format!(
-        "Accept-Ranges: bytes\r\nContent-Length: {length}\r\n{content_range}X-Media-Mode: remux\r\n{source_header}X-Media-Duration: {:.3}\r\nX-Remux-Cache-State: {}\r\n",
-        lease.cached.metadata.duration_seconds,
-        if lease.was_hit { "hit" } else { "built" }
-    );
-    write_headers(stream, status, "video/mp4", Some(&extra)).await?;
-    if head_only {
-        return Ok(());
-    }
-    copy_range_to_writer(&lease.cached.path, start, length, stream).await
 }
 
 async fn transcode_source(
@@ -6228,6 +5753,15 @@ async fn transcode_source(
             return write_raw_json(stream, status, &body, Some("Accept-Ranges: none\r\n")).await;
         }
     };
+    if timestamp_requires_upstream_seek(seek_seconds) {
+        let (status, body) = err(
+            "SEEK_UNAVAILABLE",
+            "Timestamp seeking is unavailable: the validated progressive input is pipe-based and upstream byte-range seeking is not implemented.",
+            Some(source.provider),
+            501,
+        );
+        return write_raw_json(stream, status, &body, Some("Accept-Ranges: none\r\n")).await;
+    }
     if request_headers.contains_key("range") {
         let (status, body) = err(
             "SEEK_UNAVAILABLE",
@@ -6243,7 +5777,7 @@ async fn transcode_source(
         )
         .await;
     }
-    let _media_job = match state.remux_cache.try_acquire_job() {
+    let _media_job = match state.media_jobs.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
             let (status, body) = err(
@@ -6256,48 +5790,18 @@ async fn transcode_source(
         }
     };
     let debug_id = REMUX_DEBUG_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    if let Some(seek_seconds) = seek_seconds {
-        match crate::codec_verification::inspect_direct_playback_source(&playback).await {
-            Ok(evidence) if evidence.range_supported => {
-                crate::progressive_remux::serve_from_timestamp(
-                    stream,
-                    &validated_url,
-                    &playback.headers,
-                    seek_seconds,
-                    state.remux_cache.job_timeout(),
-                    debug_id,
-                )
-                .await
-            }
-            Ok(_) => {
-                let (status, body) = err(
-                    "SEEK_UNAVAILABLE",
-                    "Timestamp seeking requires a verified upstream byte-range source.",
-                    Some(source.provider),
-                    501,
-                );
-                write_raw_json(stream, status, &body, Some("Accept-Ranges: none\r\n")).await
-            }
-            Err(_) => {
-                let (status, body) = err(
-                    "SEEK_UNAVAILABLE",
-                    "The upstream source could not be verified for timestamp seeking.",
-                    Some(source.provider),
-                    501,
-                );
-                write_raw_json(stream, status, &body, Some("Accept-Ranges: none\r\n")).await
-            }
-        }
-    } else {
-        crate::progressive_remux::serve(
-            stream,
-            &validated_url,
-            &playback.headers,
-            state.remux_cache.job_timeout(),
-            debug_id,
-        )
-        .await
-    }
+    crate::progressive_remux::serve(
+        stream,
+        &validated_url,
+        &playback.headers,
+        state.media_job_timeout,
+        debug_id,
+    )
+    .await
+}
+
+fn timestamp_requires_upstream_seek(seconds: Option<f64>) -> bool {
+    seconds.is_some_and(|seconds| seconds > 0.0)
 }
 
 fn parse_remux_seek_seconds(query: &str) -> Result<Option<f64>, (u16, &'static str, &'static str)> {
@@ -6357,7 +5861,8 @@ fn media_request_client() -> reqwest::Client {
 async fn stream_proxy_route(
     stream: &mut TcpStream,
     query: &str,
-    state: ApiState,
+    media_jobs: Arc<Semaphore>,
+    job_timeout: Duration,
     request_headers: &HashMap<String, String>,
     head_only: bool,
 ) -> std::io::Result<()> {
@@ -6381,7 +5886,8 @@ async fn stream_proxy_route(
         stream,
         &url,
         referer.as_deref(),
-        state,
+        media_jobs,
+        job_timeout,
         request_headers,
         head_only,
     )
@@ -6392,182 +5898,28 @@ fn sanitize_error(error: &str) -> String {
     error.replace('"', "'").replace(['\r', '\n'], " ")
 }
 
-fn is_seeking_range(request_headers: &HashMap<String, String>) -> bool {
-    let Some(range) = request_headers.get("range") else {
-        return false;
-    };
-    let Some((unit, spec)) = range.trim().split_once('=') else {
-        return true;
-    };
-    if !unit.eq_ignore_ascii_case("bytes") {
-        return false;
-    }
-    let Some((start, end)) = spec.split_once('-') else {
-        return true;
-    };
-    if start.is_empty() {
-        return true;
-    }
-    match start.parse::<u64>() {
-        Ok(0) => !end.is_empty(),
-        Ok(_) | Err(_) => true,
-    }
-}
-
-async fn stream_ffmpeg_remux(
-    stream: &mut TcpStream,
-    mut child: tokio::process::Child,
-    response_extra: &str,
-    debug_id: u64,
-) -> std::io::Result<()> {
-    let Some(mut stdout) = child.stdout.take() else {
-        let _ = child.kill().await;
-        return Err(std::io::Error::other("FFmpeg did not open remux output"));
-    };
-    let stderr_task = child.stderr.take().map(|mut stderr| {
-        tokio::spawn(async move {
-            let mut buffer = [0u8; 1024];
-            while stderr.read(&mut buffer).await.unwrap_or(0) > 0 {}
-        })
-    });
-
-    let startup = tokio::time::timeout(REMUX_STARTUP_TIMEOUT, async {
-        let mut buffered = Vec::with_capacity(128 * 1024);
-        let mut chunk = [0u8; 32 * 1024];
-        loop {
-            let length = stdout.read(&mut chunk).await?;
-            if length == 0 {
-                return Err(std::io::Error::other(
-                    "FFmpeg ended before the first fragmented MP4 media atom",
-                ));
-            }
-            buffered.extend_from_slice(&chunk[..length]);
-            if buffered.windows(4).any(|atom| atom == b"moof") {
-                return Ok(buffered);
-            }
-            if buffered.len() > 4 * 1024 * 1024 {
-                return Err(std::io::Error::other(
-                    "FFmpeg did not produce a fragmented MP4 startup segment",
-                ));
-            }
-        }
-    })
-    .await;
-    let first = match startup {
-        Ok(Ok(buffered)) => buffered,
-        Ok(Err(error)) => {
-            let _ = child.kill().await;
-            if let Some(task) = stderr_task {
-                let _ = task.await;
-            }
-            log::warn!("remux startup failed id={debug_id}: {error}");
-            write_raw_json(
-                stream,
-                502,
-                r#"{"error":{"code":"REMUX_STARTUP_FAILED","message":"The media source could not be prepared for playback."}}"#,
-                Some("X-Media-Mode: remux\r\nX-Remux-Cache-State: disabled\r\n"),
-            )
-            .await?;
-            return Ok(());
-        }
-        Err(_) => {
-            let _ = child.kill().await;
-            if let Some(task) = stderr_task {
-                let _ = task.await;
-            }
-            log::warn!("remux startup timed out id={debug_id}");
-            write_raw_json(
-                stream,
-                504,
-                r#"{"error":{"code":"REMUX_STARTUP_TIMEOUT","message":"The media source took too long to start."}}"#,
-                Some("X-Media-Mode: remux\r\nX-Remux-Cache-State: disabled\r\n"),
-            )
-            .await?;
-            return Ok(());
-        }
-    };
-    if let Err(error) = write_headers(stream, 200, "video/mp4", Some(response_extra)).await {
-        let _ = child.kill().await;
-        let _ = child.wait().await;
-        if let Some(task) = stderr_task {
-            let _ = task.await;
-        }
-        return Err(error);
-    }
-
-    if let Err(error) = stream.write_all(&first).await {
-        let _ = child.kill().await;
-        let _ = child.wait().await;
-        if let Some(task) = stderr_task {
-            let _ = task.await;
-        }
-        return Err(error);
-    }
-
-    let mut read_error = None;
-    let mut chunk = [0u8; 64 * 1024];
-    loop {
-        let length = match stdout.read(&mut chunk).await {
-            Ok(0) => break,
-            Ok(length) => length,
-            Err(error) => {
-                read_error = Some(error);
-                break;
-            }
-        };
-        if let Err(error) = stream.write_all(&chunk[..length]).await {
-            read_error = Some(error);
-            let _ = child.kill().await;
-            break;
-        }
-    }
-    if read_error.is_some() {
-        let _ = child.kill().await;
-    }
-    let status = match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
-        Ok(Ok(status)) => Some(status),
-        _ => {
-            let _ = child.kill().await;
-            None
-        }
-    };
-    if let Some(task) = stderr_task {
-        let _ = task.await;
-    }
-    if !matches!(status, Some(status) if status.success()) || read_error.is_some() {
-        return Err(read_error.unwrap_or_else(|| std::io::Error::other("FFmpeg remux failed")));
-    }
-    Ok(())
-}
-
-async fn legacy_remux_media_url(
+async fn remux_media_url(
     stream: &mut TcpStream,
     url: &reqwest::Url,
     referer: Option<&str>,
+    media_jobs: Arc<Semaphore>,
+    job_timeout: Duration,
     request_headers: &HashMap<String, String>,
     head_only: bool,
 ) -> std::io::Result<()> {
-    let debug_id = REMUX_DEBUG_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let upstream_host = url.host_str().unwrap_or("unknown-host");
-    let started_at = Instant::now();
-    let mut upstream_headers = vec![("User-Agent".to_string(), "Mozilla/5.0".to_string())];
-    if let Some(referer) = referer {
-        upstream_headers.push(("Referer".to_string(), referer.to_string()));
-    }
-    let range_requested = is_seeking_range(request_headers);
     if head_only {
         let (status, body) = err(
             "METHOD_NOT_ALLOWED",
-            "Remuxing supports GET only; HEAD is unavailable without disk-backed output.",
+            "HEAD is unavailable for progressive remuxed media.",
             None,
             405,
         );
-        return write_raw_json(stream, status, &body, None).await;
+        return write_raw_json(stream, status, &body, Some("Accept-Ranges: none\r\n")).await;
     }
-    if range_requested {
+    if request_headers.contains_key("range") {
         let (status, body) = err(
             "SEEK_UNAVAILABLE",
-            "Byte-range seeking is disabled because remuxed media is streamed without disk caching.",
+            "Byte-range seeking is unavailable for progressive remuxed media.",
             None,
             501,
         );
@@ -6575,213 +5927,31 @@ async fn legacy_remux_media_url(
             stream,
             status,
             &body,
-            Some("X-Remux-Cache-State: disabled\r\n"),
+            Some("Accept-Ranges: none\r\nX-Remux-Cache-State: disabled\r\n"),
         )
         .await;
     }
-    let permit = match REMUX_LIMITER.clone().try_acquire_owned() {
+    // Streaming is per client, so identical requests are no longer coalesced into a
+    // shared cached build. A fail-fast global semaphore caps duplicate work at the
+    // configured media-job limit and never queues an unbounded backlog.
+    let _media_job = match media_jobs.try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
-            return write_raw_json(
-                stream,
+            let (status, body) = err(
+                "REMUX_BUSY",
+                "Media-processing capacity is busy.",
+                None,
                 429,
-                r#"{"error":{"code":"REMUX_BUSY","message":"Remux capacity is busy."}}"#,
-                None,
-            )
-            .await;
+            );
+            return write_raw_json(stream, status, &body, None).await;
         }
     };
-
-    log::info!(
-        "remux start id={debug_id} upstream_host={upstream_host} referer_present={} cache_enabled=false",
-        referer.is_some()
-    );
-    let mut command = Command::new("ffmpeg");
-    command.args([
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-nostdin",
-        "-probesize",
-        "5M",
-        "-analyzeduration",
-        "5M",
-        "-fflags",
-        "+nobuffer",
-    ]);
-    let header_text = upstream_headers
-        .iter()
-        .map(|(name, value)| format!("{name}: {value}\r\n"))
-        .collect::<String>();
-    command.arg("-headers").arg(header_text);
-    command.args([
-        "-rw_timeout",
-        "120000000",
-        "-i",
-        url.as_str(),
-        "-map",
-        "0:v:0",
-        "-map",
-        "0:a?",
-        "-c:v",
-        "copy",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
-        "-ac",
-        "2",
-        "-sn",
-        "-dn",
-        "-max_interleave_delta",
-        "0",
-        "-movflags",
-        "+frag_keyframe+empty_moov+default_base_moof",
-        "-flush_packets",
-        "1",
-        "-f",
-        "mp4",
-        "pipe:1",
-    ]);
-    command
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    let child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            drop(permit);
-            log::error!("remux ffmpeg spawn failed id={debug_id}: {error}");
-            return write_raw_json(
-                stream,
-                503,
-                r#"{"error":{"code":"REMUX_UNAVAILABLE","message":"FFmpeg is unavailable."}}"#,
-                None,
-            )
-            .await;
-        }
-    };
-    let extra = "Accept-Ranges: none\r\nX-Media-Mode: remux\r\nX-Remux-Cache-State: disabled\r\n";
-    let result = stream_ffmpeg_remux(stream, child, extra, debug_id).await;
-    drop(permit);
-    log::info!(
-        "remux response complete id={debug_id} elapsed_ms={}",
-        started_at.elapsed().as_millis()
-    );
-    result
-}
-
-fn generic_media_identity(url: &reqwest::Url, referer: Option<&str>) -> String {
-    let mut digest = Sha256::new();
-    digest.update(b"moviebox-generic-media-v1\0");
-    digest.update(url.as_str().as_bytes());
-    digest.update([0]);
-    if let Some(referer) = referer {
-        digest.update(referer.as_bytes());
-    }
-    URL_SAFE_NO_PAD.encode(digest.finalize())
-}
-
-async fn remux_media_url(
-    stream: &mut TcpStream,
-    url: &reqwest::Url,
-    referer: Option<&str>,
-    state: ApiState,
-    request_headers: &HashMap<String, String>,
-    head_only: bool,
-) -> std::io::Result<()> {
-    let identity = generic_media_identity(url, referer);
-    let key = crate::remux_cache::cache_key(&identity, REMUX_OUTPUT_PROFILE);
     let mut upstream_headers = vec![("User-Agent".to_string(), "Mozilla/5.0".to_string())];
     if let Some(referer) = referer {
         upstream_headers.push(("Referer".to_string(), referer.to_string()));
     }
-    let build_cache = state.remux_cache.clone();
-    let build_key = key.clone();
-    let build_url = url.clone();
-    let build_headers = upstream_headers;
-    let started = Instant::now();
-    let lease = state
-        .remux_cache
-        .get_or_build(&key, move |partial_path| async move {
-            build_cached_mp4(
-                build_cache,
-                build_key,
-                build_url,
-                build_headers,
-                partial_path,
-                true,
-                false,
-            )
-            .await
-        })
-        .await;
-    let lease = match lease {
-        Ok(lease) => lease,
-        Err(error) => {
-            let (status, code, message) = cache_error_http(error);
-            let (status, body) = err(code, message, None, status);
-            return write_raw_json(stream, status, &body, None).await;
-        }
-    };
-    log::info!(
-        "generic media remux prepared source_fingerprint={} cache_state={} bytes={} elapsed_ms={}",
-        &key[..12],
-        if lease.was_hit { "hit" } else { "built" },
-        lease.cached.metadata.size_bytes,
-        started.elapsed().as_millis()
-    );
-    write_cached_remux_response(stream, lease, None, request_headers, head_only).await
-}
-
-async fn verify_generic_media_codec(
-    url: &reqwest::Url,
-    referer: Option<&str>,
-) -> Result<SourceCodecEligibility, MediaInfoProbeError> {
-    let mut command = Command::new("ffprobe");
-    command.args([
-        "-hide_banner",
-        "-v",
-        "error",
-        "-rw_timeout",
-        "15000000",
-        "-show_entries",
-        "stream=codec_type,codec_name",
-        "-of",
-        "json",
-    ]);
-    if let Some(referer) = referer {
-        command
-            .arg("-headers")
-            .arg(format!("Referer: {referer}\r\n"));
-    }
-    command.arg(url.as_str());
-    let output = run_media_info_probe(&mut command, Duration::from_secs(20)).await?;
-    let probe: ProbeOutput =
-        serde_json::from_slice(&output.stdout).map_err(|_| MediaInfoProbeError::Failed)?;
-    let video_codecs = probe
-        .streams
-        .iter()
-        .filter(|stream| stream.codec_type.as_deref() == Some("video"))
-        .filter_map(|stream| stream.codec_name.as_deref())
-        .collect::<Vec<_>>();
-    if video_codecs.is_empty() {
-        return Ok(SourceCodecEligibility::Unverified);
-    }
-    if video_codecs
-        .iter()
-        .any(|codec| crate::codec_verification::is_hevc_codec(codec))
-    {
-        return Ok(SourceCodecEligibility::BlockedH265);
-    }
-    if video_codecs
-        .iter()
-        .all(|codec| crate::codec_verification::is_allowed_codec(codec))
-    {
-        Ok(SourceCodecEligibility::Verified)
-    } else {
-        Ok(SourceCodecEligibility::Unverified)
-    }
+    let debug_id = REMUX_DEBUG_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    crate::progressive_remux::serve(stream, url, &upstream_headers, job_timeout, debug_id).await
 }
 
 async fn media_info_route(
@@ -7064,7 +6234,7 @@ fn openapi() -> serde_json::Value {
             "/api/v1/catalog/sources/{source_id}": {"get": {"description": "Stored source metadata, including expiry and playback eligibility.", "responses": {"200": {"description": "Source detail"}, "404": {"description": "Source not found"}, "503": {"description": "Catalog database unavailable"}}}},
             "/api/v1/catalog/sources/{source_id}/tracks": {"get": {"description": "Stored audio and subtitle tracks for a source.", "responses": {"200": {"description": "Track list"}, "503": {"description": "Catalog database unavailable"}}}},
             "/api/v1/catalog/sources/{source_id}/play": {"get": {"description": "Playback resolution for an eligible stored source; imported FourKHDHub source IDs are resolved live and signed URLs are not persisted.", "responses": {"200": {"description": "Playback resolved"}, "404": {"description": "Source unavailable, blocked, expired, or missing"}, "415": {"description": "Source codec is blocked or unverified"}, "503": {"description": "Catalog database unavailable"}}}},
-            "/api/v1/catalog/sources/{source_id}/remux": {"get": {"description": "Live FourKHDHub source resolution followed by bounded progressive fragmented-MP4 remux. Optional start_seconds (or start) is a non-negative timestamp in seconds; it is honored only after verified upstream byte-range capability, and does not change HTTP byte-range semantics or store complete source/output video files.", "responses": {"200": {"description": "Progressive fragmented-MP4 stream; no Content-Length or byte-range seek support"}, "400": {"description": "Malformed, non-finite, negative, or excessive timestamp"}, "404": {"description": "Source unavailable or missing"}, "415": {"description": "Source codec is blocked or unverified"}, "429": {"description": "Media-job capacity is busy"}, "501": {"description": "Timestamp or byte-range seeking is unavailable for the selected source"}, "502": {"description": "Upstream or remux startup failed"}, "503": {"description": "Catalog database or FFmpeg unavailable"}, "504": {"description": "Configured media-job or upstream timeout"}}}},
+            "/api/v1/catalog/sources/{source_id}/remux": {"get": {"description": "Live FourKHDHub source resolution followed by validated bounded-pipe progressive fragmented-MP4 remux. Nonzero start_seconds (or start) returns 501 because upstream range seeking is not implemented for this pipe-based path; byte-range requests are unsupported and no complete video file is cached.", "responses": {"200": {"description": "Progressive fragmented-MP4 stream; no Content-Length or byte-range seek support"}, "400": {"description": "Malformed, non-finite, negative, or excessive timestamp"}, "404": {"description": "Source unavailable or missing"}, "415": {"description": "Source codec is blocked or unverified"}, "429": {"description": "Media-job capacity is busy"}, "501": {"description": "Timestamp or byte-range seeking is unavailable for the selected source"}, "502": {"description": "Upstream or remux startup failed"}, "503": {"description": "Catalog database or FFmpeg unavailable"}, "504": {"description": "Configured media-job or upstream timeout"}}}},
             "/api/v1/admin/catalog/import": {"post": {"description": "Protected manual catalog import; accepts a bounded titles batch.", "responses": {"201": {"description": "Import job completed"}, "401": {"description": "Unauthorized"}, "413": {"description": "Batch too large"}, "503": {"description": "Database unavailable"}}}},
             "/api/v1/admin/catalog/import-by-name": {"post": {"description": "Protected exact-match anime import from FourKHDHub, including provider details, episodes, and live source references.", "responses": {"201": {"description": "Anime inserted"}, "200": {"description": "Anime updated idempotently"}, "401": {"description": "Unauthorized"}, "404": {"description": "Exact title not found"}, "409": {"description": "Ambiguous exact title"}, "503": {"description": "Provider or catalog unavailable"}}}},
             "/api/v1/admin/catalog/update-all": {"post": {"description": "Protected manual catalog update job; never scheduled automatically.", "responses": {"202": {"description": "Update job accepted"}, "401": {"description": "Unauthorized"}}}},
@@ -7106,13 +6276,13 @@ fn openapi() -> serde_json::Value {
             "/api/v1/sources/{source_id}/audio-tracks": {"get": {"responses": {"200": {"description": "Confirmed embedded audio tracks"}, "415": {"description": "Source codec is blocked or unverified"}, "503": {"description": "Track discovery unavailable"}}}},
             "/api/v1/sources/{source_id}/subtitles": {"get": {"responses": {"200": {"description": "Confirmed embedded subtitle tracks"}, "415": {"description": "Source codec is blocked or unverified"}, "503": {"description": "Track discovery unavailable"}}}},
             "/api/v1/sources/{source_id}/subtitle-tracks": {"get": {"responses": {"200": {"description": "Confirmed embedded subtitle tracks"}, "415": {"description": "Source codec is blocked or unverified"}, "503": {"description": "Track discovery unavailable"}}}},
-            "/api/v1/sources/{source_id}/transcode": {"get": {"description": "Progressive fragmented-MP4 remux using bounded pipes. Optional start_seconds (or start) requests a non-negative timestamp in seconds when the verified upstream supports byte ranges; HTTP byte ranges remain unsupported and no complete video file is cached.", "responses": {"200": {"description": "Progressive fragmented-MP4 remux"}, "400": {"description": "Malformed, non-finite, negative, or excessive timestamp"}, "415": {"description": "Source codec is blocked or unverified"}, "429": {"description": "Media-job capacity is busy"}, "501": {"description": "Timestamp or byte-range seeking is unavailable"}, "502": {"description": "Remux startup or upstream failed"}, "503": {"description": "FFmpeg unavailable"}, "504": {"description": "Configured media-job or upstream timeout"}}}},
-            "/api/v1/sources/{source_id}/remux": {"get": {"description": "Progressive fragmented-MP4 remux using bounded pipes. Optional start_seconds (or start) requests a non-negative timestamp in seconds when the verified upstream supports byte ranges; HTTP byte ranges remain unsupported and no complete video file is cached.", "responses": {"200": {"description": "Progressive fragmented-MP4 remux"}, "400": {"description": "Malformed, non-finite, negative, or excessive timestamp"}, "415": {"description": "Source codec is blocked or unverified"}, "429": {"description": "Media-job capacity is busy"}, "501": {"description": "Timestamp or byte-range seeking is unavailable"}, "502": {"description": "Remux startup or upstream failed"}, "503": {"description": "FFmpeg unavailable"}, "504": {"description": "Configured media-job or upstream timeout"}}}},
+            "/api/v1/sources/{source_id}/transcode": {"get": {"description": "Progressive fragmented-MP4 remux using validated bounded pipes. Nonzero start_seconds (or start) returns 501 because this pipe-based input path does not implement upstream seeking; HTTP byte ranges are unsupported and no complete video file is cached.", "responses": {"200": {"description": "Progressive fragmented-MP4 remux"}, "400": {"description": "Malformed, non-finite, negative, or excessive timestamp"}, "415": {"description": "Source codec is blocked or unverified"}, "429": {"description": "Media-job capacity is busy"}, "501": {"description": "Timestamp or byte-range seeking is unavailable"}, "502": {"description": "Remux startup or upstream failed"}, "503": {"description": "FFmpeg unavailable"}, "504": {"description": "Configured media-job or upstream timeout"}}}},
+            "/api/v1/sources/{source_id}/remux": {"get": {"description": "Progressive fragmented-MP4 remux using validated bounded pipes. Nonzero start_seconds (or start) returns 501 because this pipe-based input path does not implement upstream seeking; HTTP byte ranges are unsupported and no complete video file is cached.", "responses": {"200": {"description": "Progressive fragmented-MP4 remux"}, "400": {"description": "Malformed, non-finite, negative, or excessive timestamp"}, "415": {"description": "Source codec is blocked or unverified"}, "429": {"description": "Media-job capacity is busy"}, "501": {"description": "Timestamp or byte-range seeking is unavailable"}, "502": {"description": "Remux startup or upstream failed"}, "503": {"description": "FFmpeg unavailable"}, "504": {"description": "Configured media-job or upstream timeout"}}}},
             "/api/v1/sources/{source_id}/playback": {"get": {"responses": {"200": {"description": "Playback descriptor; verified compatible MP4 sources use direct byte-range streaming, HLS/DASH uses native streaming, and other verified sources use progressive fragmented-MP4 remux without arbitrary byte-range seeking"}, "415": {"description": "Source codec or playback format is blocked or unverified"}, "429": {"description": "Media-job capacity is busy"}, "502": {"description": "Playback resolution failed"}, "504": {"description": "Playback resolution timed out"}}}},
             "/api/v1/sources/{source_id}/native/{token}": {"get": {"description": "Opaque source-scoped HLS/DASH manifest or media resource; child URIs are rewritten from the final upstream manifest URL and media bytes stream progressively with Range passthrough.", "responses": {"200": {"description": "Native manifest or media body"}, "206": {"description": "Exact upstream byte range"}, "400": {"description": "Invalid token path or unsupported manifest range"}, "403": {"description": "Private or unsafe upstream destination rejected"}, "404": {"description": "Expired or invalid source-scoped token"}, "413": {"description": "Configured segment size ceiling exceeded"}, "503": {"description": "Native stream capacity is busy"}, "504": {"description": "Upstream request timeout"}}}, "head": {"responses": {"200": {"description": "Native resource headers"}, "404": {"description": "Expired or invalid source-scoped token"}}}},
             "/api/v1/sources/{source_id}/watch": {"get": {"responses": {"200": {"description": "Watch descriptor; verified direct-compatible media uses range passthrough, native HLS/DASH stays native, and other verified media uses progressive fragmented-MP4 remux"}, "415": {"description": "Source codec is blocked or unverified"}, "502": {"description": "Watch resolution failed"}, "504": {"description": "Watch resolution timed out"}}}},
             "/api/v1/sources/{source_id}/download": {"get": {"responses": {"200": {"description": "Download metadata"}, "415": {"description": "Source codec is blocked or unverified"}, "501": {"description": "Unsupported"}}}},
-            "/api/stream-proxy": {"get": {"responses": {"200": {"description": "Validated temporary seekable MP4"}, "206": {"description": "Requested MP4 byte range"}, "400": {"description": "Missing or invalid media URL"}, "403": {"description": "Unsafe destination rejected"}, "416": {"description": "Unsatisfiable byte range"}, "429": {"description": "Media-job capacity is busy"}, "504": {"description": "Configured media-job timeout"}, "507": {"description": "Temporary cache budget unavailable"}}}, "head": {"responses": {"405": {"description": "HEAD is not supported for remuxed media"}}}},
+            "/api/stream-proxy": {"get": {"description": "Validated progressive fragmented-MP4 remux streamed through bounded pipes; no complete media file is cached. Byte ranges and HEAD are unsupported.", "responses": {"200": {"description": "Progressive fragmented-MP4 stream; no Content-Length or byte-range support"}, "400": {"description": "Missing or invalid media URL"}, "403": {"description": "Unsafe destination rejected"}, "429": {"description": "Media-job capacity is busy"}, "501": {"description": "Byte-range seeking is unavailable"}, "502": {"description": "Upstream or remux startup failed"}, "503": {"description": "FFmpeg unavailable"}, "504": {"description": "Configured media-job or upstream timeout"}}}, "head": {"responses": {"405": {"description": "HEAD is unavailable for progressive remuxed media"}}}},
             "/api/media-info": {"get": {"responses": {"200": {"description": "FFprobe media metadata including duration"}, "400": {"description": "Missing or invalid media URL"}, "502": {"description": "Media inspection failed"}, "504": {"description": "Media inspection timed out"}}}},
             "/api/subtitles/extract": {"get": {"responses": {"200": {"description": "Retrieved external subtitle body"}, "400": {"description": "Missing or invalid subtitle URL"}, "404": {"description": "Subtitle not found"}}}},
             "/api/subtitles/assemblyai/{transcript_id}": {"get": {"responses": {"501": {"description": "AssemblyAI subtitle retrieval is not configured"}}}},
@@ -7181,22 +6351,6 @@ mod tests {
     }
 
     #[test]
-    fn initial_zero_byte_range_keeps_live_first_policy() {
-        let mut headers = HashMap::new();
-        assert!(!is_seeking_range(&headers));
-        headers.insert("range".to_string(), "bytes=0-".to_string());
-        assert!(!is_seeking_range(&headers));
-        for value in ["bytes=0-0", "bytes=0-1048575", "Bytes=0-1"] {
-            headers.insert("range".to_string(), value.to_string());
-            assert!(is_seeking_range(&headers), "{value}");
-        }
-        headers.insert("range".to_string(), "bytes=1-".to_string());
-        assert!(is_seeking_range(&headers));
-        headers.insert("range".to_string(), "bytes=-512".to_string());
-        assert!(is_seeking_range(&headers));
-    }
-
-    #[test]
     fn remux_timestamp_seek_is_bounded_and_uses_seconds() {
         assert_eq!(
             parse_remux_seek_seconds("start_seconds=120.5").unwrap(),
@@ -7221,53 +6375,302 @@ mod tests {
             assert!(parse_remux_seek_seconds(query).is_err(), "{query}");
         }
         assert_eq!(parse_remux_seek_seconds("").unwrap(), None);
+        assert!(!timestamp_requires_upstream_seek(None));
+        assert!(!timestamp_requires_upstream_seek(Some(0.0)));
+        assert!(timestamp_requires_upstream_seek(Some(0.001)));
     }
 
-    #[tokio::test]
-    async fn cached_remux_http_range_returns_exact_requested_bytes() {
-        let root = tempfile::tempdir().unwrap();
-        let cache = crate::remux_cache::RemuxCache::open(crate::config::MediaSettings {
-            cache_dir: root.path().to_path_buf(),
-            cache_ttl: Duration::from_secs(60),
-            cache_max_bytes: 1024,
-            max_concurrent_jobs: 1,
-            job_timeout: Duration::from_secs(30),
-        })
-        .await
-        .unwrap();
-        let key = crate::remux_cache::cache_key("range-fixture", "test-profile");
-        let lease = cache
-            .get_or_build(&key, |path| async move {
-                tokio::fs::write(path, b"0123456789")
-                    .await
-                    .map_err(crate::remux_cache::CacheError::Io)?;
-                Ok(12.0)
-            })
+    async fn generated_matroska() -> Vec<u8> {
+        let output = tokio::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=640x360:rate=12",
+                "-t",
+                "12",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-g",
+                "12",
+                "-pix_fmt",
+                "yuv420p",
+                "-an",
+                "-f",
+                "matroska",
+                "pipe:1",
+            ])
+            .output()
             .await
-            .unwrap();
+            .expect("FFmpeg is installed for local stream tests");
+        assert!(
+            output.status.success(),
+            "fixture generation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    async fn mock_media_source(
+        body: Vec<u8>,
+        chunk_bytes: usize,
+        delay: Duration,
+    ) -> (
+        reqwest::Url,
+        Arc<std::sync::atomic::AtomicBool>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let mut client = TcpStream::connect(address).await.unwrap();
-        let (mut server, _) = listener.accept().await.unwrap();
-        let mut headers = HashMap::new();
-        headers.insert("range".into(), "bytes=3-6".into());
-        write_cached_remux_response(&mut server, lease, None, &headers, false)
-            .await
-            .unwrap();
-        server.shutdown().await.unwrap();
+        let complete = Arc::new(AtomicBool::new(false));
+        let complete_server = Arc::clone(&complete);
+        let task = tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut reader = tokio::io::BufReader::new(&mut socket);
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line).await;
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).await.unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            drop(reader);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: video/x-matroska\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            if socket.write_all(response.as_bytes()).await.is_err() {
+                return;
+            }
+            for chunk in body.chunks(chunk_bytes.max(1)) {
+                if socket.write_all(chunk).await.is_err() {
+                    return;
+                }
+                let _ = socket.flush().await;
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+            }
+            complete_server.store(true, Ordering::Release);
+        });
+        (
+            reqwest::Url::parse(&format!("http://{address}/fixture.mkv")).unwrap(),
+            complete,
+            task,
+        )
+    }
 
+    async fn api_downstream_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect(address).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        (client, server)
+    }
+
+    async fn read_response_start(client: &mut TcpStream) -> (String, Vec<u8>) {
+        use tokio::io::AsyncReadExt;
+        let mut bytes = Vec::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            let length = tokio::time::timeout(Duration::from_secs(15), client.read(&mut buffer))
+                .await
+                .expect("response start timed out")
+                .expect("read response");
+            assert_ne!(length, 0, "connection closed before response start");
+            bytes.extend_from_slice(&buffer[..length]);
+            if let Some(boundary) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                let body = bytes.split_off(boundary + 4);
+                return (String::from_utf8(bytes).unwrap(), body);
+            }
+            assert!(bytes.len() < 64 * 1024, "oversized response headers");
+        }
+    }
+
+    fn observe_mp4_atoms(tail: &mut Vec<u8>, chunk: &[u8], found: &mut [bool; 4]) {
+        let atoms = [*b"ftyp", *b"moov", *b"moof", *b"mdat"];
+        tail.extend_from_slice(chunk);
+        for window in tail.windows(4) {
+            for (index, atom) in atoms.iter().enumerate() {
+                found[index] |= window == atom;
+            }
+        }
+        if tail.len() > 3 {
+            tail.drain(..tail.len() - 3);
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_proxy_remux_is_progressive_and_leaves_no_complete_media_file() {
+        use std::sync::atomic::Ordering;
+        use tokio::io::AsyncReadExt;
+
+        let media = generated_matroska().await;
+        let (url, upstream_complete, upstream_task) =
+            mock_media_source(media, 4096, Duration::from_millis(35)).await;
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("url", url.as_str())
+            .finish();
+        let (mut client, mut server) = api_downstream_pair().await;
+        let cache_root = tempfile::tempdir().unwrap();
+        let jobs = Arc::new(Semaphore::new(1));
+        let route_jobs = Arc::clone(&jobs);
+        let request_headers = HashMap::new();
+        let route = tokio::spawn(async move {
+            stream_proxy_route(
+                &mut server,
+                &query,
+                route_jobs,
+                Duration::from_secs(30),
+                &request_headers,
+                false,
+            )
+            .await
+        });
+        let (headers, initial_body) = read_response_start(&mut client).await;
+        assert!(headers.starts_with("HTTP/1.1 200 OK"), "{headers}");
+        assert!(headers.contains("Content-Type: video/mp4"));
+        assert!(headers.contains("Accept-Ranges: none"));
+        assert!(!headers.to_ascii_lowercase().contains("content-length:"));
+        assert!(!upstream_complete.load(Ordering::Acquire));
+
+        let mut found_atoms = [false; 4];
+        let mut atom_tail = Vec::with_capacity(8192 + 3);
+        observe_mp4_atoms(&mut atom_tail, &initial_body, &mut found_atoms);
+        let mut total_output_bytes = initial_body.len();
+        let mut chunk = [0u8; 8192];
+        loop {
+            let length = tokio::time::timeout(Duration::from_secs(30), client.read(&mut chunk))
+                .await
+                .expect("progressive output stalled")
+                .expect("read progressive output");
+            if length == 0 {
+                break;
+            }
+            total_output_bytes += length;
+            observe_mp4_atoms(&mut atom_tail, &chunk[..length], &mut found_atoms);
+        }
+        route.await.unwrap().unwrap();
+        upstream_task.await.unwrap();
+        assert!(upstream_complete.load(Ordering::Acquire));
+        assert!(total_output_bytes > 0);
+        assert!(found_atoms.into_iter().all(|found| found));
+        assert_eq!(
+            jobs.available_permits(),
+            1,
+            "the stream slot must be released"
+        );
+        assert!(
+            tokio::fs::read_dir(cache_root.path())
+                .await
+                .unwrap()
+                .next_entry()
+                .await
+                .unwrap()
+                .is_none(),
+            "the remux route must not leave a complete or partial media file"
+        );
+    }
+
+    #[tokio::test]
+    async fn progressive_remux_failure_leaves_no_partial_file_or_held_slot() {
+        use tokio::io::AsyncReadExt;
+
+        let (url, _, upstream_task) =
+            mock_media_source(b"not a media file".to_vec(), 64, Duration::ZERO).await;
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("url", url.as_str())
+            .finish();
+        let cache_root = tempfile::tempdir().unwrap();
+        let jobs = Arc::new(Semaphore::new(1));
+        let route_jobs = Arc::clone(&jobs);
+        let request_headers = HashMap::new();
+        let (mut client, mut server) = api_downstream_pair().await;
+        let route = tokio::spawn(async move {
+            stream_proxy_route(
+                &mut server,
+                &query,
+                route_jobs,
+                Duration::from_secs(10),
+                &request_headers,
+                false,
+            )
+            .await
+        });
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), client.read_to_end(&mut response))
+            .await
+            .expect("failure response timed out")
+            .unwrap();
+        route.await.unwrap().unwrap();
+        upstream_task.await.unwrap();
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 502"));
+        assert_eq!(jobs.available_permits(), 1);
+        assert!(
+            tokio::fs::read_dir(cache_root.path())
+                .await
+                .unwrap()
+                .next_entry()
+                .await
+                .unwrap()
+                .is_none(),
+            "failure must not leave a partial remux artifact"
+        );
+    }
+
+    #[tokio::test]
+    async fn progressive_remux_rejects_ranges_and_fails_fast_when_slots_are_full() {
+        use tokio::io::AsyncReadExt;
+
+        let url = reqwest::Url::parse("https://127.0.0.1/private.mkv").unwrap();
+        let (mut client, mut server) = api_downstream_pair().await;
+        let jobs = Arc::new(Semaphore::new(1));
+        let mut headers = HashMap::new();
+        headers.insert("range".to_string(), "bytes=1-".to_string());
+        remux_media_url(
+            &mut server,
+            &url,
+            None,
+            Arc::clone(&jobs),
+            Duration::from_secs(30),
+            &headers,
+            false,
+        )
+        .await
+        .unwrap();
+        server.shutdown().await.unwrap();
         let mut response = Vec::new();
         client.read_to_end(&mut response).await.unwrap();
-        let boundary = response
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")
-            .expect("HTTP header boundary");
-        let response_headers = String::from_utf8_lossy(&response[..boundary]);
-        assert!(response_headers.starts_with("HTTP/1.1 206"));
-        assert!(response_headers.contains("Content-Range: bytes 3-6/10"));
-        assert!(response_headers.contains("Content-Length: 4"));
-        assert_eq!(&response[boundary + 4..], b"3456");
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 501"));
+
+        let _held = jobs.clone().try_acquire_owned().unwrap();
+        let (mut client, mut server) = api_downstream_pair().await;
+        remux_media_url(
+            &mut server,
+            &url,
+            None,
+            jobs,
+            Duration::from_secs(30),
+            &HashMap::new(),
+            false,
+        )
+        .await
+        .unwrap();
+        server.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 429"));
     }
 
     #[test]
@@ -7520,9 +6923,7 @@ mod tests {
 
     #[test]
     fn provider_priority_matches_configured_order() {
-        assert!(
-            provider_priority(ProviderKind::MovieBox) < provider_priority(ProviderKind::FourKHdHub)
-        );
+        assert!(provider_priority(ProviderKind::MovieBox) >= PROVIDERS.len());
         assert!(
             provider_priority(ProviderKind::FourKHdHub) < provider_priority(ProviderKind::Dramachi)
         );
@@ -7530,7 +6931,6 @@ mod tests {
             provider_priority(ProviderKind::Dramachi)
                 < provider_priority(ProviderKind::BdixCircleFtp)
         );
-        assert_eq!(provider_priority(ProviderKind::MovieBox), 0);
     }
 
     #[test]

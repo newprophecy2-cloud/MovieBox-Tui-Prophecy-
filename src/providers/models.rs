@@ -3,9 +3,9 @@ use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum ProviderKind {
-    #[default]
     #[serde(rename = "moviebox", alias = "movie_box")]
     MovieBox,
+    #[default]
     #[serde(rename = "fourkhdhub", alias = "four_k_hd_hub", alias = "4khdhub")]
     FourKHdHub,
     #[serde(rename = "bdix_circleftp", alias = "bdix_circle_ftp")]
@@ -19,8 +19,7 @@ pub enum ProviderKind {
 }
 
 impl ProviderKind {
-    pub const ENABLED: [Self; 5] = [
-        Self::MovieBox,
+    pub const ENABLED: [Self; 4] = [
         Self::FourKHdHub,
         Self::Dramachi,
         Self::BdixCircleFtp,

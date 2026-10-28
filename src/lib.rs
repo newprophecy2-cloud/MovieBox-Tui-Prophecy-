@@ -1,4 +1,4 @@
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 pub mod api;
 pub(crate) mod api_native_stream;
@@ -19,7 +19,12 @@ pub mod player;
 pub(crate) mod progressive_remux;
 pub mod providers;
 pub mod proxy;
-pub mod remux_cache;
+#[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "the legacy disk-cache module is compiled only for its regression tests"
+)]
+mod remux_cache;
 pub mod service;
 pub mod tui;
 pub mod updater;
