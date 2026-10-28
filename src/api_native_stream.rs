@@ -263,26 +263,34 @@ impl NativeStreamProxy {
         head_only: bool,
     ) -> io::Result<()> {
         let Some(claims) = self.claims(source_id, token) else {
-            return write_error(
+            return write_error_head(
                 stream,
                 404,
-                "The native playback reference is invalid or expired.",
-            )
+                "The native playback reference is invalid or expired.", head_only)
             .await;
         };
         let target = match resolve_claim_target(&claims, suffix, query) {
             Ok(target) => target,
-            Err(message) => return write_error(stream, 400, message).await,
+            Err(message) => return write_error_head(stream, 400, message, head_only).await,
         };
+        if request_headers.contains_key("range") && is_native_manifest_url(&target) {
+            return write_error_head(
+                stream,
+                400,
+                "Byte ranges are not supported for rewritten manifests.",
+                head_only,
+            )
+            .await;
+        }
         let _permit = match self.slots.clone().try_acquire_owned() {
             Ok(permit) => permit,
-            Err(_) => return write_error(stream, 503, "Native media capacity is busy.").await,
+            Err(_) => return write_error_head(stream, 503, "Native media capacity is busy.", head_only).await,
         };
 
         let range = match request_headers.get("range") {
             Some(value) if valid_single_byte_range(value) => Some(value.as_str()),
             Some(_) => {
-                return write_error(stream, 400, "Only valid single byte ranges are supported.")
+                return write_error_head(stream, 400, "Only valid single byte ranges are supported.", head_only)
                     .await;
             }
             None => None,
@@ -302,7 +310,7 @@ impl NativeStreamProxy {
             .await
         {
             Ok(response) => response,
-            Err((status, message)) => return write_error(stream, status, message).await,
+            Err((status, message)) => return write_error_head(stream, status, message, head_only).await,
         };
         let final_url = response.url().clone();
         let content_type = response
@@ -312,6 +320,25 @@ impl NativeStreamProxy {
             .unwrap_or("application/octet-stream")
             .to_string();
         let status = response.status();
+        if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+            let valid_range = range.is_some_and(|range| {
+                response
+                    .headers()
+                    .get(reqwest::header::CONTENT_RANGE)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(unsatisfied_range_total)
+                    .is_some_and(|total| request_range_is_unsatisfiable(range, total))
+            });
+            if !valid_range {
+                return write_error_head(
+                    stream,
+                    502,
+                    "The upstream server returned an invalid unsatisfied range.",
+                    head_only,
+                )
+                .await;
+            }
+        }
         let expected_range_bytes = range.and_then(|range| {
             response
                 .headers()
@@ -326,22 +353,21 @@ impl NativeStreamProxy {
         let manifest_is_hls =
             is_hls(&final_url, &content_type) || is_hls(&claims.target_url, &content_type);
         if is_manifest && range.is_some() {
-            return write_error(
+            return write_error_head(
                 stream,
                 400,
-                "Byte ranges are not supported for rewritten manifests.",
-            )
+                "Byte ranges are not supported for rewritten manifests.", head_only)
             .await;
         }
         if is_manifest && status.is_success() && !head_only {
             let body = match read_limited(response, MAX_MANIFEST_BYTES).await {
                 Ok(body) => body,
-                Err(message) => return write_error(stream, 502, message).await,
+                Err(message) => return write_error_head(stream, 502, message, head_only).await,
             };
             let manifest = match String::from_utf8(body) {
                 Ok(manifest) => manifest,
                 Err(_) => {
-                    return write_error(stream, 502, "The upstream manifest is not UTF-8.").await;
+                    return write_error_head(stream, 502, "The upstream manifest is not UTF-8.", head_only).await;
                 }
             };
             let rewritten = if manifest_is_hls {
@@ -366,11 +392,10 @@ impl NativeStreamProxy {
             let rewritten = match rewritten {
                 Ok(value) => value,
                 Err(_) => {
-                    return write_error(
+                    return write_error_head(
                         stream,
                         502,
-                        "The upstream manifest could not be safely rewritten.",
-                    )
+                        "The upstream manifest could not be safely rewritten.", head_only)
                     .await;
                 }
             };
@@ -404,21 +429,20 @@ impl NativeStreamProxy {
             .claims(source_id, token)
             .filter(|claims| claims.kind == TokenKind::Direct)
         else {
-            return write_error(
+            return write_error_head(
                 stream,
                 404,
-                "The direct playback reference is invalid or expired.",
-            )
+                "The direct playback reference is invalid or expired.", head_only)
             .await;
         };
         let _permit = match self.slots.clone().try_acquire_owned() {
             Ok(permit) => permit,
-            Err(_) => return write_error(stream, 503, "Direct media capacity is busy.").await,
+            Err(_) => return write_error_head(stream, 503, "Direct media capacity is busy.", head_only).await,
         };
         let range = match request_headers.get("range") {
             Some(value) if valid_single_byte_range(value) => Some(value.as_str()),
             Some(_) => {
-                return write_error(stream, 400, "Only valid single byte ranges are supported.")
+                return write_error_head(stream, 400, "Only valid single byte ranges are supported.", head_only)
                     .await;
             }
             None => None,
@@ -438,7 +462,7 @@ impl NativeStreamProxy {
             .await
         {
             Ok(response) => response,
-            Err((status, message)) => return write_error(stream, status, message).await,
+            Err((status, message)) => return write_error_head(stream, status, message, head_only).await,
         };
         self.relay_direct_response(stream, response, head_only, range)
             .await
@@ -561,28 +585,23 @@ impl NativeStreamProxy {
             .unwrap_or("application/octet-stream");
         let content_length = response.content_length();
         let chunked = !head_only
-            && !status.is_informational()
-            && status != reqwest::StatusCode::NO_CONTENT
-            && status != reqwest::StatusCode::RESET_CONTENT
-            && status != reqwest::StatusCode::NOT_MODIFIED
+            && status_has_body(status)
             && content_length.is_none()
             && expected_range_bytes.is_none();
         if status.is_success() && content_length.is_some_and(|size| size > self.max_segment_bytes) {
-            return write_error(
+            return write_error_head(
                 stream,
                 413,
-                "The media segment exceeds the configured stream limit.",
-            )
+                "The media segment exceeds the configured stream limit.", head_only)
             .await;
         }
         if !status.is_success()
             && content_length.is_some_and(|size| size > MAX_ERROR_BODY_BYTES as u64)
         {
-            return write_error(
+            return write_error_head(
                 stream,
                 502,
-                "The upstream media server returned an oversized error.",
-            )
+                "The upstream media server returned an oversized error.", head_only)
             .await;
         }
         let mut header = format!(
@@ -621,7 +640,7 @@ impl NativeStreamProxy {
         header.push_str("\r\n");
         stream.write_all(header.as_bytes()).await?;
         stream.flush().await?;
-        if head_only {
+        if head_only || !status_has_body(status) {
             return Ok(());
         }
         let mut total = 0u64;
@@ -700,11 +719,10 @@ impl NativeStreamProxy {
     ) -> io::Result<()> {
         let status = response.status();
         if !(status.is_success() || status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE) {
-            return write_error(
+            return write_error_head(
                 stream,
                 502,
-                "The upstream media server rejected the request.",
-            )
+                "The upstream media server rejected the request.", head_only)
             .await;
         }
         if !status.is_success()
@@ -712,11 +730,10 @@ impl NativeStreamProxy {
                 .content_length()
                 .is_some_and(|length| length > MAX_ERROR_BODY_BYTES as u64)
         {
-            return write_error(
+            return write_error_head(
                 stream,
                 502,
-                "The upstream media server returned an oversized error.",
-            )
+                "The upstream media server returned an oversized error.", head_only)
             .await;
         }
         if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
@@ -729,11 +746,10 @@ impl NativeStreamProxy {
                     .is_some_and(|total| request_range_is_unsatisfiable(request_range, total))
             });
             if !valid_range {
-                return write_error(
+                return write_error_head(
                     stream,
                     502,
-                    "The upstream server returned an invalid unsatisfied range.",
-                )
+                    "The upstream server returned an invalid unsatisfied range.", head_only)
                 .await;
             }
         }
@@ -745,11 +761,10 @@ impl NativeStreamProxy {
         let content_length = response.content_length();
         let expected_range_bytes = if status == reqwest::StatusCode::PARTIAL_CONTENT {
             let Some(request_range) = request_range else {
-                return write_error(
+                return write_error_head(
                     stream,
                     502,
-                    "The upstream server returned an unsolicited byte range.",
-                )
+                    "The upstream server returned an unsolicited byte range.", head_only)
                 .await;
             };
             let expected = response
@@ -758,11 +773,10 @@ impl NativeStreamProxy {
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| expected_range_length(request_range, value, content_length));
             let Some(expected) = expected else {
-                return write_error(
+                return write_error_head(
                     stream,
                     502,
-                    "The upstream server returned an invalid byte range.",
-                )
+                    "The upstream server returned an invalid byte range.", head_only)
                 .await;
             };
             Some(expected)
@@ -770,10 +784,7 @@ impl NativeStreamProxy {
             None
         };
         let chunked = !head_only
-            && !status.is_informational()
-            && status != reqwest::StatusCode::NO_CONTENT
-            && status != reqwest::StatusCode::RESET_CONTENT
-            && status != reqwest::StatusCode::NOT_MODIFIED
+            && status_has_body(status)
             && content_length.is_none()
             && expected_range_bytes.is_none();
         let mut header = format!(
@@ -813,7 +824,7 @@ impl NativeStreamProxy {
         header.push_str("\r\n");
         stream.write_all(header.as_bytes()).await?;
         stream.flush().await?;
-        if head_only {
+        if head_only || !status_has_body(status) {
             return Ok(());
         }
         let mut total = 0u64;
@@ -906,6 +917,16 @@ fn request_range_is_unsatisfiable(request_range: &str, total: u64) -> bool {
     } else {
         start.parse::<u64>().is_ok_and(|start| start >= total)
     }
+}
+
+fn status_has_body(status: reqwest::StatusCode) -> bool {
+    !status.is_informational()
+        && !matches!(
+            status,
+            reqwest::StatusCode::NO_CONTENT
+                | reqwest::StatusCode::RESET_CONTENT
+                | reqwest::StatusCode::NOT_MODIFIED
+        )
 }
 
 fn safe_provider_header(name: &str) -> bool {
@@ -1544,6 +1565,35 @@ async fn write_error(stream: &mut TcpStream, status: u16, message: &str) -> io::
     writer.write_all(body).await?;
     writer.flush().await?;
     Ok(())
+}
+
+async fn write_error_head(
+    stream: &mut TcpStream,
+    status: u16,
+    message: &str,
+    head_only: bool,
+) -> io::Result<()> {
+    if !head_only {
+        return write_error(stream, status, message).await;
+    }
+    let reason = match status {
+        400 => "Bad Request",
+        403 => "Forbidden",
+        404 => "Not Found",
+        413 => "Payload Too Large",
+        416 => "Range Not Satisfiable",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        _ => "Bad Gateway",
+    };
+    let header = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
+        message.len()
+    );
+    let mut writer = BufWriter::new(stream);
+    writer.write_all(header.as_bytes()).await?;
+    writer.flush().await
 }
 
 #[cfg(test)]

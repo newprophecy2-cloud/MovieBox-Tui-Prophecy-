@@ -646,6 +646,16 @@ impl CatalogStore {
             .filter(source_is_playback_eligible)
             .collect())
     }
+    pub async fn list_title_sources(&self, id: &str) -> Result<Vec<Value>, CatalogError> {
+        let r = self.client.lock().await.query(
+            "SELECT ps.id::text AS id,ps.title_id::text AS title_id,ps.provider_source_id,pr.provider_key,ps.source_reference,ps.quality_label,ps.video_codec,ps.audio_codec,ps.container_format,ps.resolution_width,ps.resolution_height,ps.source_status,ps.codec_verification_status,ps.expires_at::text AS expires_at,(ps.expires_at IS NULL OR ps.expires_at>now()) AS source_not_expired FROM provider_sources ps JOIN provider_registry pr ON pr.id=ps.provider_id WHERE ps.title_id=$1::text::uuid AND ps.source_status NOT IN('blocked','invalid') AND (ps.expires_at IS NULL OR ps.expires_at>now()) ORDER BY ps.resolution_height DESC NULLS LAST",
+            &[&id],
+        ).await?;
+        Ok(r.iter()
+            .map(row_json)
+            .filter(source_is_playback_eligible)
+            .collect())
+    }
     pub async fn get_source(&self, id: &str) -> Result<Option<Value>, CatalogError> {
         let r=self.client.lock().await.query_opt("SELECT ps.id::text AS id,ps.episode_id::text AS episode_id,ps.title_id::text AS title_id,ps.provider_source_id,pr.provider_key,ps.source_reference,ps.quality_label,ps.video_codec,ps.audio_codec,ps.container_format,ps.resolution_width,ps.resolution_height,ps.source_status,ps.codec_verification_status,ps.last_error_code,ps.expires_at::text AS expires_at,(ps.expires_at IS NULL OR ps.expires_at>now()) AS source_not_expired FROM provider_sources ps JOIN provider_registry pr ON pr.id=ps.provider_id WHERE ps.id::text=$1", &[&id]).await?;
         Ok(r.as_ref().map(|row| {

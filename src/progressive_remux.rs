@@ -94,6 +94,7 @@ pub(crate) async fn serve(
     provider_headers: &[(String, String)],
     timeout_budget: Duration,
     debug_id: u64,
+    selected_audio_stream: Option<u32>,
 ) -> io::Result<()> {
     serve_with_program(
         stream,
@@ -101,6 +102,7 @@ pub(crate) async fn serve(
         provider_headers,
         timeout_budget,
         debug_id,
+        selected_audio_stream,
         OsStr::new("ffmpeg"),
     )
     .await
@@ -112,6 +114,7 @@ async fn serve_with_program(
     provider_headers: &[(String, String)],
     timeout_budget: Duration,
     debug_id: u64,
+    selected_audio_stream: Option<u32>,
     ffmpeg: &OsStr,
 ) -> io::Result<()> {
     let deadline = Instant::now() + timeout_budget;
@@ -146,7 +149,7 @@ async fn serve_with_program(
         }
     };
 
-    let mut child = match progressive_ffmpeg_command(ffmpeg).spawn() {
+    let mut child = match progressive_ffmpeg_command(ffmpeg, selected_audio_stream).spawn() {
         Ok(child) => child,
         Err(error) => {
             log::warn!("progressive remux process start failed id={debug_id}: {error}");
@@ -220,7 +223,7 @@ async fn serve_with_program(
     }
 }
 
-fn progressive_ffmpeg_command(executable: &OsStr) -> Command {
+fn progressive_ffmpeg_command(executable: &OsStr, selected_audio_stream: Option<u32>) -> Command {
     let mut command = Command::new(executable);
     command
         .env_clear()
@@ -242,8 +245,14 @@ fn progressive_ffmpeg_command(executable: &OsStr) -> Command {
             "pipe:0",
             "-map",
             "0:v:0",
-            "-map",
-            "0:a?",
+        ]);
+    if let Some(index) = selected_audio_stream {
+        command.arg("-map").arg(format!("0:{index}"));
+    } else {
+        command.args(["-map", "0:a?"]);
+    }
+    command
+        .args([
             "-c:v",
             "copy",
             "-c:a",
@@ -739,7 +748,7 @@ mod tests {
 
     #[test]
     fn ffmpeg_reads_and_writes_pipes_with_fragmented_mp4_flags() {
-        let command = progressive_ffmpeg_command(OsStr::new("ffmpeg"));
+        let command = progressive_ffmpeg_command(OsStr::new("ffmpeg"), None);
         let args = command
             .as_std()
             .get_args()
@@ -816,7 +825,7 @@ mod tests {
             mock_source(media, 4096, Duration::from_millis(35)).await;
         let (mut client, mut server) = downstream_pair().await;
         let serve_task = tokio::spawn(async move {
-            serve(&mut server, &url, &[], Duration::from_secs(30), 7001).await
+            serve(&mut server, &url, &[], Duration::from_secs(30), 7001, None).await
         });
         let (headers, initial_body) = response_header_and_initial_body(&mut client).await;
         assert!(headers.starts_with("HTTP/1.1 200 OK"));
@@ -870,7 +879,7 @@ mod tests {
             mock_source(media, 4096, Duration::from_millis(35)).await;
         let (client, mut server) = downstream_pair().await;
         let serve_task = tokio::spawn(async move {
-            serve(&mut server, &url, &[], Duration::from_secs(20), 7007).await
+            serve(&mut server, &url, &[], Duration::from_secs(20), 7007, None).await
         });
         drop(client);
 
@@ -904,7 +913,7 @@ mod tests {
         let url = Url::parse(&format!("http://{address}/private")).unwrap();
         let (mut client, mut server) = downstream_pair().await;
         let serve_task = tokio::spawn(async move {
-            serve(&mut server, &url, &[], Duration::from_secs(5), 7002).await
+            serve(&mut server, &url, &[], Duration::from_secs(5), 7002, None).await
         });
         let mut response = Vec::new();
         timeout(Duration::from_secs(5), client.read_to_end(&mut response))
@@ -931,6 +940,7 @@ mod tests {
                 &[],
                 Duration::from_secs(5),
                 7003,
+                None,
                 OsStr::new("/nonexistent/test-ffmpeg"),
             )
             .await
@@ -951,7 +961,7 @@ mod tests {
             mock_source(b"not a video".to_vec(), 64, Duration::ZERO).await;
         let (mut client, mut server) = downstream_pair().await;
         let serve_task = tokio::spawn(async move {
-            serve(&mut server, &url, &[], Duration::from_secs(10), 7004).await
+            serve(&mut server, &url, &[], Duration::from_secs(10), 7004, None).await
         });
         let mut response = Vec::new();
         timeout(Duration::from_secs(10), client.read_to_end(&mut response))
@@ -981,7 +991,7 @@ mod tests {
         let url = Url::parse(&format!("http://{address}/stalled.mkv")).unwrap();
         let (mut client, mut server) = downstream_pair().await;
         let serve_task = tokio::spawn(async move {
-            serve(&mut server, &url, &[], Duration::from_millis(150), 7005).await
+            serve(&mut server, &url, &[], Duration::from_millis(150), 7005, None).await
         });
         let mut response = Vec::new();
         timeout(Duration::from_secs(3), client.read_to_end(&mut response))
@@ -997,7 +1007,7 @@ mod tests {
     fn pipe_limits_and_no_file_arguments_are_explicit() {
         assert_eq!(INPUT_CHUNK_BYTES, 32 * 1024);
         assert_eq!(OUTPUT_CHUNK_BYTES, 64 * 1024);
-        let command = progressive_ffmpeg_command(OsStr::new("ffmpeg"));
+        let command = progressive_ffmpeg_command(OsStr::new("ffmpeg"), None);
         let args = command
             .as_std()
             .get_args()
@@ -1019,5 +1029,18 @@ mod tests {
                 .any(|extension| arg.ends_with(extension))
         }));
         assert_eq!(MAX_STARTUP_BUFFER_BYTES, 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn selected_audio_uses_the_verified_global_stream_index() {
+        let command = progressive_ffmpeg_command(OsStr::new("ffmpeg"), Some(7));
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args.windows(2).any(|pair| pair == ["-map", "0:7"]));
+        assert!(!args.windows(2).any(|pair| pair == ["-map", "0:a?"]));
+        assert!(args.windows(2).any(|pair| pair == ["-map", "0:v:0"]));
     }
 }

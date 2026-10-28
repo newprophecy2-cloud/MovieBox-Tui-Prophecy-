@@ -421,7 +421,13 @@ struct ProbeOutput {
     #[serde(default)]
     streams: Vec<ProbeStream>,
 }
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
+struct WebPlaybackRequest {
+    source_id: Option<String>,
+    audio_language: Option<String>,
+    audio_track_index: Option<u32>,
+}
+#[derive(Debug, Clone, Deserialize)]
 struct ProbeStream {
     index: Option<u32>,
     codec_name: Option<String>,
@@ -929,7 +935,18 @@ async fn route(
         "/openapi.json" => write_json(stream, 200, &openapi(), None).await,
         "/docs" => write_text(stream, 200, "text/html; charset=utf-8", "<!doctype html><html><head><title>MovieBox API</title></head><body><h1>MovieBox API</h1><p>OpenAPI: <a href=\"/openapi.json\">/openapi.json</a></p><p>Swagger UI can load this document from a local or trusted client.</p></body></html>", None).await,
         "/api/v1/search" if method == "GET" => catalog_search_route(stream, query, state).await,
-        _ if path.starts_with("/api/v1/web/") => web_playback_contract_route(stream, path, state).await,
+        _ if path.starts_with("/api/v1/web/") => {
+            web_playback_contract_route(
+                stream,
+                path,
+                query,
+                state,
+                request_headers,
+                body,
+                method,
+            )
+            .await
+        }
         _ if path.starts_with("/api/v1/android/") => android_playback_contract_route(stream, path, state).await,
         "/api/v1/admin/catalog/import" if method == "POST" => admin_catalog_import_route(stream, state, request_headers, body).await,
         "/api/v1/admin/catalog/import-by-name" if method == "POST" => admin_catalog_import_by_name_route(stream, state, request_headers, body).await,
@@ -1064,23 +1081,229 @@ async fn readiness_route(stream: &mut TcpStream, state: ApiState) -> std::io::Re
 async fn web_playback_contract_route(
     stream: &mut TcpStream,
     path: &str,
+    query: &str,
     state: ApiState,
+    request_headers: &HashMap<String, String>,
+    body: &[u8],
+    method: &str,
 ) -> std::io::Result<()> {
-    let database_missing = state.catalog.is_none();
-    let (status, code, message) = if database_missing {
-        (
+    if method != "POST" {
+        return write_json(
+            stream,
+            405,
+            &serde_json::json!({"success":false,"error":{"code":"METHOD_NOT_ALLOWED","message":"Web playback requires POST.","retryable":false}}),
+            Some("Allow: POST\r\n"),
+        )
+        .await;
+    }
+    let Some(catalog) = state.catalog.clone() else {
+        return write_json(
+            stream,
             503,
-            "DATABASE_UNAVAILABLE",
-            "The catalog database is not configured.",
+            &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","message":"The catalog database is not configured.","retryable":true}}),
+            None,
         )
-    } else {
-        (
-            404,
-            "NO_COMPATIBLE_SOURCE",
-            "No verified non-HEVC stored source is available for this Web session.",
-        )
+        .await;
     };
-    write_json(stream, status, &serde_json::json!({"success":false,"error":{"code":code,"message":message,"retryable":false},"meta":{"request_id":request_id(),"route":path,"policy":"web_live_remux_requires_verified_stored_source"}}), None).await
+    let (content_id, is_movie) = if let Some(id) = path
+        .strip_prefix("/api/v1/web/episodes/")
+        .and_then(|rest| rest.strip_suffix("/play"))
+        .filter(|id| !id.is_empty() && !id.contains('/'))
+    {
+        (id, false)
+    } else if let Some(id) = path
+        .strip_prefix("/api/v1/web/movies/")
+        .and_then(|rest| rest.strip_suffix("/play"))
+        .filter(|id| !id.is_empty() && !id.contains('/'))
+    {
+        (id, true)
+    } else {
+        return write_json(
+            stream,
+            404,
+            &serde_json::json!({"success":false,"error":{"code":"ROUTE_NOT_FOUND","message":"The Web playback route was not found.","retryable":false}}),
+            None,
+        )
+        .await;
+    };
+    if uuid::Uuid::parse_str(content_id).is_err() {
+        return write_json(
+            stream,
+            400,
+            &serde_json::json!({"success":false,"error":{"code":"INVALID_ID","message":"A valid catalog identifier is required.","retryable":false}}),
+            None,
+        )
+        .await;
+    }
+    let request: WebPlaybackRequest = if body.is_empty() {
+        WebPlaybackRequest::default()
+    } else {
+        match serde_json::from_slice(body) {
+            Ok(request) => request,
+            Err(_) => {
+                return write_json(
+                    stream,
+                    400,
+                    &serde_json::json!({"success":false,"error":{"code":"INVALID_REQUEST","message":"The Web playback request body must be a valid JSON object.","retryable":false}}),
+                    None,
+                )
+                .await;
+            }
+        }
+    };
+    if let Some(source_id) = request.source_id.as_deref()
+        && uuid::Uuid::parse_str(source_id).is_err()
+    {
+        return write_json(
+            stream,
+            400,
+            &serde_json::json!({"success":false,"error":{"code":"INVALID_ID","message":"source_id must be a catalog source identifier.","retryable":false}}),
+            None,
+        )
+        .await;
+    }
+
+    let sources = if is_movie {
+        match catalog.get_title(content_id).await {
+            Ok(Some(title)) if title.content_type == "movie" => {
+                match catalog.list_title_sources(content_id).await {
+                    Ok(sources) => sources,
+                    Err(_) => {
+                        return write_json(
+                            stream,
+                            503,
+                            &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","message":"The catalog database is unavailable.","retryable":true}}),
+                            None,
+                        )
+                        .await;
+                    }
+                }
+            }
+            Ok(Some(_)) => {
+                return write_json(
+                    stream,
+                    400,
+                    &serde_json::json!({"success":false,"error":{"code":"NOT_A_MOVIE","message":"The catalog title is not a movie.","retryable":false}}),
+                    None,
+                )
+                .await;
+            }
+            Ok(None) => {
+                return write_json(
+                    stream,
+                    404,
+                    &serde_json::json!({"success":false,"error":{"code":"TITLE_NOT_FOUND","message":"The catalog movie was not found.","retryable":false}}),
+                    None,
+                )
+                .await;
+            }
+            Err(_) => {
+                return write_json(
+                    stream,
+                    503,
+                    &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","message":"The catalog database is unavailable.","retryable":true}}),
+                    None,
+                )
+                .await;
+            }
+        }
+    } else {
+        match catalog.get_episode(content_id).await {
+            Ok(Some(_)) => match catalog.list_sources(content_id).await {
+                Ok(sources) => sources,
+                Err(_) => {
+                    return write_json(
+                        stream,
+                        503,
+                        &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","message":"The catalog database is unavailable.","retryable":true}}),
+                        None,
+                    )
+                    .await;
+                }
+            },
+            Ok(None) => {
+                return write_json(
+                    stream,
+                    404,
+                    &serde_json::json!({"success":false,"error":{"code":"EPISODE_NOT_FOUND","message":"The catalog episode was not found.","retryable":false}}),
+                    None,
+                )
+                .await;
+            }
+            Err(_) => {
+                return write_json(
+                    stream,
+                    503,
+                    &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","message":"The catalog database is unavailable.","retryable":true}}),
+                    None,
+                )
+                .await;
+            }
+        }
+    };
+
+    let mut selected = None;
+    for source in &sources {
+        let Some(source_id) = source.get("id").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if request
+            .source_id
+            .as_deref()
+            .is_some_and(|requested| requested != source_id)
+        {
+            continue;
+        }
+        match catalog_live_source_path(source, "playback") {
+            Ok(Some(live_path)) => {
+                selected = Some(live_path);
+                break;
+            }
+            Err((status, response)) if request.source_id.is_some() => {
+                return write_raw_json(stream, status, &response, None).await;
+            }
+            _ => {}
+        }
+    }
+    let Some(live_path) = selected else {
+        return write_json(
+            stream,
+            404,
+            &serde_json::json!({"success":false,"error":{"code":"NO_COMPATIBLE_SOURCE","message":"No verified stored source can be resolved for Web playback.","retryable":false}}),
+            None,
+        )
+        .await;
+    };
+    let playback_query = web_playback_query(query, &request);
+    source_route(
+        stream,
+        &live_path,
+        &playback_query,
+        state,
+        request_headers,
+        false,
+    )
+    .await
+}
+
+fn web_playback_query(query: &str, request: &WebPlaybackRequest) -> String {
+    let mut pairs = url::form_urlencoded::parse(query.as_bytes())
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    if let Some(language) = request
+        .audio_language
+        .as_deref()
+        .map(str::trim)
+        .filter(|language| !language.is_empty())
+    {
+        pairs.push(("audio_language".to_string(), language.to_string()));
+    }
+    if let Some(index) = request.audio_track_index {
+        pairs.push(("audio_track_index".to_string(), index.to_string()));
+    }
+    url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(pairs)
+        .finish()
 }
 
 async fn android_playback_contract_route(
@@ -3218,7 +3441,6 @@ async fn direct_watch_route(
     let mut title = None;
     let mut season = None;
     let mut episode = None;
-    let mut audio = "hindi".to_string();
     for pair in query.split('&') {
         let Some((key, value)) = pair.split_once('=') else {
             continue;
@@ -3228,10 +3450,25 @@ async fn direct_watch_route(
             "title" => title = Some(value),
             "season" => season = value.parse::<usize>().ok(),
             "episode" => episode = value.parse::<usize>().ok(),
-            "audio" => audio = value.trim().to_ascii_lowercase(),
             _ => {}
         }
     }
+    let audio_selection = match parse_audio_selection(query) {
+        Ok(selection) => selection,
+        Err(message) => {
+            let (status, body) = err("INVALID_AUDIO_SELECTION", message, None, 400);
+            return write_raw_json(stream, status, &body, None).await;
+        }
+    };
+    let audio_explicit = audio_selection.is_some();
+    let audio = audio_selection
+        .as_ref()
+        .and_then(|selection| selection.language.as_deref())
+        .unwrap_or(if audio_explicit { "auto" } else { "hi" })
+        .to_string();
+    let audio_track_index = audio_selection
+        .as_ref()
+        .and_then(|selection| selection.stream_index);
     let Some(title) = title.filter(|v| !v.trim().is_empty() && v.chars().count() <= MAX_QUERY)
     else {
         let (status, body) = err(
@@ -3255,15 +3492,6 @@ async fn direct_watch_route(
         let (status, body) = err(
             "INVALID_QUERY",
             "season and episode must be positive integers.",
-            None,
-            400,
-        );
-        return write_raw_json(stream, status, &body, None).await;
-    }
-    if !matches!(audio.as_str(), "hindi" | "hi" | "hin") {
-        let (status, body) = err(
-            "UNSUPPORTED_AUDIO_LANGUAGE",
-            "This direct watch route currently supports audio=hindi only.",
             None,
             400,
         );
@@ -3353,6 +3581,8 @@ async fn direct_watch_route(
                             anime_details,
                             state,
                             &audio,
+                            audio_explicit,
+                            audio_track_index,
                         )
                         .await;
                     }
@@ -3919,6 +4149,8 @@ async fn movie_route(
                 details_result,
                 state,
                 "auto",
+                false,
+                None,
             )
             .await
         }
@@ -3963,22 +4195,22 @@ async fn anime_route(
         return anime_episode_full_route(stream, parts[3], parts[5], r, d, state).await;
     }
     if parts.len() == 7 && parts[4] == "episodes" && parts[6] == "stream" {
-        let audio = query
-            .split('&')
-            .find_map(|pair| {
-                let (key, value) = pair.split_once('=')?;
-                (key == "audio").then(|| percent_decode(value).trim().to_ascii_lowercase())
-            })
-            .unwrap_or_else(|| "hindi".to_string());
-        if !matches!(audio.as_str(), "hindi" | "hi" | "hin") {
-            let (status, body) = err(
-                "UNSUPPORTED_AUDIO_LANGUAGE",
-                "This stream route currently supports audio=hindi only.",
-                Some(r.p),
-                400,
-            );
-            return write_raw_json(stream, status, &body, None).await;
-        }
+        let audio_selection = match parse_audio_selection(query) {
+            Ok(selection) => selection,
+            Err(message) => {
+                let (status, body) = err("INVALID_AUDIO_SELECTION", message, Some(r.p), 400);
+                return write_raw_json(stream, status, &body, None).await;
+            }
+        };
+        let audio_explicit = audio_selection.is_some();
+        let audio = audio_selection
+            .as_ref()
+            .and_then(|selection| selection.language.as_deref())
+            .unwrap_or(if audio_explicit { "auto" } else { "hi" })
+            .to_string();
+        let audio_track_index = audio_selection
+            .as_ref()
+            .and_then(|selection| selection.stream_index);
         return playback_route(
             stream,
             PlaybackIdentity::Episode {
@@ -3989,6 +4221,8 @@ async fn anime_route(
             d,
             state,
             &audio,
+            audio_explicit,
+            audio_track_index,
         )
         .await;
     }
@@ -4106,6 +4340,10 @@ fn source_remux_url(source_id: &str) -> String {
     format!("/api/v1/sources/{source_id}/remux")
 }
 
+fn source_remux_audio_url(source_id: &str, stream_index: u32) -> String {
+    format!("{}?audio_track_index={stream_index}", source_remux_url(source_id))
+}
+
 fn source_playback_url(
     state: &ApiState,
     source_id: &str,
@@ -4124,6 +4362,8 @@ async fn playback_route(
     media_details: MediaDetails,
     state: ApiState,
     requested_audio: &str,
+    audio_explicit: bool,
+    requested_audio_track: Option<u32>,
 ) -> std::io::Result<()> {
     let source_ref = match &identity {
         PlaybackIdentity::Episode {
@@ -4226,13 +4466,10 @@ async fn playback_route(
                 return write_raw_json(stream, status, &body, None).await;
             }
         };
-    let is_hindi = |value: &str| {
-        let normalized = value.to_ascii_lowercase();
-        normalized == "hi"
-            || normalized == "hin"
-            || normalized.contains("hindi")
-            || normalized.contains("हिन्दी")
-            || normalized.contains("हिंदी")
+    let requested_language = if requested_audio.eq_ignore_ascii_case("auto") {
+        None
+    } else {
+        Some(normalized_language(Some(requested_audio)).0)
     };
     let codec_eligible_releases = releases
         .iter()
@@ -4245,7 +4482,14 @@ async fn playback_route(
     let mut candidates: Vec<&Release> = codec_eligible_releases
         .iter()
         .copied()
-        .filter(|release| release.language.as_deref().is_some_and(is_hindi))
+        .filter(|release| {
+            requested_language.as_deref().is_some_and(|requested| {
+                release
+                    .language
+                    .as_deref()
+                    .is_some_and(|language| normalized_language(Some(language)).0 == requested)
+            })
+        })
         .collect();
     let language_metadata_match = !candidates.is_empty();
     // Dual/multi-audio sources may have no language tag until the actual media is probed.
@@ -4312,7 +4556,7 @@ async fn playback_route(
             Err(_) => {
                 let (status, body) = err(
                     "PLAYBACK_RESOLUTION_TIMEOUT",
-                    "Hindi stream resolution timed out.",
+                    "Stream resolution timed out.",
                     Some(release.provider),
                     504,
                 );
@@ -4338,7 +4582,7 @@ async fn playback_route(
     } else {
         let (status, body) = err(
             "PLAYBACK_RESOLUTION_FAILED",
-            "The Hindi source does not expose a playable URL.",
+            "The source does not expose a playable URL.",
             Some(release.provider),
             502,
         );
@@ -4357,36 +4601,72 @@ async fn playback_route(
             }
         }
     );
-    let audio_tracks = match probe_result {
-        Ok(probe) => probe
-            .streams
-            .into_iter()
-            .filter(|track| {
-                track
-                    .codec_type
-                    .as_deref()
-                    .is_some_and(|kind| kind.eq_ignore_ascii_case("audio"))
-            })
-            .map(|track| {
-                let raw_language = tag_value(track.tags.as_ref(), "language");
-                let (language, language_label, raw_tag) = normalized_language(raw_language);
-                let label = tag_value(track.tags.as_ref(), "title")
-                    .or_else(|| tag_value(track.tags.as_ref(), "handler_name"))
-                    .map(str::to_string)
-                    .unwrap_or(language_label);
-                serde_json::json!({
-                    "index": track.index,
-                    "language": language,
-                    "label": label,
-                    "codec": track.codec_name,
-                    "channels": track.channels,
-                    "default": track.disposition.as_ref().is_some_and(|d| d.default != 0),
-                    "raw_language": raw_tag
+    let audio_probe = probe_result.ok();
+    let audio_tracks = audio_probe
+        .as_ref()
+        .map(|probe| {
+            probe
+                .streams
+                .iter()
+                .filter(|track| track.codec_type.as_deref() == Some("audio"))
+                .map(|track| {
+                    let raw_language = tag_value(track.tags.as_ref(), "language");
+                    let (language, language_label, raw_tag) = normalized_language(raw_language);
+                    let label = tag_value(track.tags.as_ref(), "title")
+                        .or_else(|| tag_value(track.tags.as_ref(), "handler_name"))
+                        .map(str::to_string)
+                        .unwrap_or(language_label);
+                    serde_json::json!({
+                        "index": track.index,
+                        "language": language,
+                        "label": label,
+                        "codec": track.codec_name,
+                        "channels": track.channels,
+                        "default": track.disposition.as_ref().is_some_and(|d| d.default != 0),
+                        "raw_language": raw_tag
+                    })
                 })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let requested_selection = requested_audio_track.map_or_else(
+        || {
+            requested_language
+                .clone()
+                .map(|language| AudioSelectionRequest {
+                    language: Some(language),
+                    stream_index: None,
+                })
+        },
+        |stream_index| {
+            Some(AudioSelectionRequest {
+                language: requested_language.clone(),
+                stream_index: Some(stream_index),
             })
-            .collect::<Vec<_>>(),
-        Err(_) => Vec::new(),
+        },
+    );
+    let selected_audio_track = match (&audio_probe, requested_selection.as_ref()) {
+        (Some(probe), Some(selection)) => select_audio_stream(probe, selection).cloned(),
+        (None, Some(_)) if audio_explicit => {
+            let (status, body) = err(
+                "AUDIO_TRACK_DISCOVERY_UNAVAILABLE",
+                "The resolved media could not be probed to verify the requested audio track.",
+                Some(source_ref.p),
+                503,
+            );
+            return write_raw_json(stream, status, &body, None).await;
+        }
+        _ => None,
     };
+    if audio_explicit && requested_selection.is_some() && selected_audio_track.is_none() {
+        let (status, body) = err(
+            "AUDIO_TRACK_NOT_FOUND",
+            "The requested audio language or stream index is not present in the resolved media.",
+            Some(source_ref.p),
+            404,
+        );
+        return write_raw_json(stream, status, &body, None).await;
+    }
     let mut playback = playback;
     if native_candidate {
         match native_codec_result
@@ -4415,7 +4695,22 @@ async fn playback_route(
             }
         }
     }
-    playback.url = source_playback_url(&state, &source_id, &playback.url, &playback.headers);
+    if native_candidate && audio_explicit && selected_audio_track.is_some() {
+        let (status, body) = err(
+            "AUDIO_SELECTION_UNAVAILABLE",
+            "The requested track exists, but native HLS/DASH track choice is controlled by the player and cannot be forced by this backend.",
+            Some(source_ref.p),
+            501,
+        );
+        return write_raw_json(stream, status, &body, None).await;
+    }
+    if !native_candidate
+        && let Some(index) = selected_audio_track.as_ref().and_then(|track| track.index)
+    {
+        playback.url = source_remux_audio_url(&source_id, index);
+    } else {
+        playback.url = source_playback_url(&state, &source_id, &playback.url, &playback.headers);
+    }
     playback.headers.clear();
     let mut body = playback_json(&playback);
     if let Some(object) = body.as_object_mut() {
@@ -4424,12 +4719,19 @@ async fn playback_route(
         object.insert("audio_tracks".into(), serde_json::json!(audio_tracks));
         object.insert(
             "language_match".into(),
-            serde_json::json!(if language_metadata_match {
-                "provider_metadata"
+            serde_json::json!(if selected_audio_track.is_some() {
+                "confirmed_embedded_track"
+            } else if native_candidate && !audio_tracks.is_empty() {
+                "player_controlled_native_tracks"
+            } else if language_metadata_match {
+                "provider_metadata_only"
             } else {
                 "unverified_media_tracks"
             }),
         );
+        if let Some(track) = selected_audio_track.as_ref() {
+            object.insert("audio_selection".into(), audio_track_descriptor(track));
+        }
         object.insert("resolved".into(), serde_json::json!(true));
     }
     write_json(stream, 200, &body, None).await
@@ -4928,6 +5230,82 @@ fn normalized_language(raw: Option<&str>) -> (String, String, Option<String>) {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct AudioSelectionRequest {
+    language: Option<String>,
+    stream_index: Option<u32>,
+}
+
+fn parse_audio_selection(query: &str) -> Result<Option<AudioSelectionRequest>, &'static str> {
+    let language = query_value(query, "audio_language").or_else(|| query_value(query, "audio"));
+    let stream_index = query_value(query, "audio_track_index")
+        .or_else(|| query_value(query, "track_index"));
+    let language = language
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if language.as_ref().is_some_and(|value| value.len() > 64) {
+        return Err("The requested audio language must be at most 64 characters.");
+    }
+    let language = language.map(|value| normalized_language(Some(&value)).0);
+    let language = language.filter(|language| language != "auto");
+    if language.as_deref() == Some("und") {
+        return Err("Unknown or untagged audio is not a selectable language.");
+    }
+    let stream_index = match stream_index {
+        Some(value) => Some(
+            value
+                .parse::<u32>()
+                .map_err(|_| "audio_track_index must be an unsigned ffprobe stream index.")?,
+        ),
+        None => None,
+    };
+    if language.is_none() && stream_index.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(AudioSelectionRequest {
+        language,
+        stream_index,
+    }))
+}
+
+fn select_audio_stream<'a>(
+    probe: &'a ProbeOutput,
+    selection: &AudioSelectionRequest,
+) -> Option<&'a ProbeStream> {
+    probe.streams.iter().find(|track| {
+        if track.codec_type.as_deref() != Some("audio") {
+            return false;
+        }
+        let Some(index) = track.index else {
+            return false;
+        };
+        if selection.stream_index.is_some_and(|requested| requested != index) {
+            return false;
+        }
+        if let Some(requested_language) = selection.language.as_deref() {
+            let actual_language = normalized_language(tag_value(track.tags.as_ref(), "language")).0;
+            if actual_language == "und" || actual_language != requested_language {
+                return false;
+            }
+        }
+        true
+    })
+}
+
+fn audio_track_descriptor(track: &ProbeStream) -> serde_json::Value {
+    let (language_code, language_name, original_language) =
+        normalized_language(tag_value(track.tags.as_ref(), "language"));
+    serde_json::json!({
+        "track_index": track.index,
+        "language_code": language_code,
+        "language_name": language_name,
+        "original_language": original_language,
+        "codec": track.codec_name,
+        "channels": track.channels,
+        "is_default": track.disposition.as_ref().is_some_and(|disposition| disposition.default > 0)
+    })
+}
+
 async fn write_track_response(
     stream: &mut TcpStream,
     source_id: &str,
@@ -5157,10 +5535,10 @@ async fn source_route(
         parts.get(4),
         Some(&"playback") | Some(&"play") | Some(&"watch")
     ) {
-        return write_verified_playback_response(stream, id, rel, &state, sr.p).await;
+        return write_verified_playback_response(stream, id, rel, &state, sr.p, query).await;
     }
     if sr.p == ProviderKind::FourKHdHub {
-        return write_verified_playback_response(stream, id, rel, &state, sr.p).await;
+        return write_verified_playback_response(stream, id, rel, &state, sr.p, query).await;
     }
     let (status, body) = err(
         "CODEC_UNVERIFIED",
@@ -5416,7 +5794,15 @@ async fn write_verified_playback_response(
     release: &Release,
     state: &ApiState,
     provider: ProviderKind,
+    query: &str,
 ) -> std::io::Result<()> {
+    let audio_selection = match parse_audio_selection(query) {
+        Ok(selection) => selection,
+        Err(message) => {
+            let (status, body) = err("INVALID_AUDIO_SELECTION", message, Some(provider), 400);
+            return write_raw_json(stream, status, &body, None).await;
+        }
+    };
     let playback = match cached_playback_source(source_id, release, state).await {
         Ok(playback) => playback,
         Err(message) => {
@@ -5445,6 +5831,43 @@ async fn write_verified_playback_response(
             );
             return write_raw_json(stream, status, &body, None).await;
         }
+    };
+    let selected_audio_track = if let Some(selection) = audio_selection.as_ref() {
+        if state.native_stream.supports_url(&playback.url) {
+            let (status, body) = err(
+                "AUDIO_SELECTION_UNAVAILABLE",
+                "Audio selection is player-controlled for native HLS/DASH and cannot be applied by this backend route.",
+                Some(provider),
+                501,
+            );
+            return write_raw_json(stream, status, &body, None).await;
+        }
+        let probe = match probe_media(&playback.url, &playback.headers).await {
+            Ok(probe) => probe,
+            Err(message) => {
+                let (status, body) = err(
+                    "AUDIO_TRACK_DISCOVERY_UNAVAILABLE",
+                    message,
+                    Some(provider),
+                    503,
+                );
+                return write_raw_json(stream, status, &body, None).await;
+            }
+        };
+        match select_audio_stream(&probe, selection) {
+            Some(track) => Some(track.clone()),
+            None => {
+                let (status, body) = err(
+                    "AUDIO_TRACK_NOT_FOUND",
+                    "The requested audio language or stream index is not present in the resolved media.",
+                    Some(provider),
+                    404,
+                );
+                return write_raw_json(stream, status, &body, None).await;
+            }
+        }
+    } else {
+        None
     };
     if state.native_stream.supports_url(&playback.url) {
         return match crate::codec_verification::verify_playback_source(&playback).await {
@@ -5503,6 +5926,18 @@ async fn write_verified_playback_response(
                 audio_codecs: evidence.audio_codecs,
                 range_supported: evidence.range_supported,
             };
+            if let Some(track) = selected_audio_track.as_ref() {
+                let Some(index) = track.index else {
+                    let (status, body) = err(
+                        "AUDIO_TRACK_NOT_FOUND",
+                        "The selected audio stream has no stable ffprobe index.",
+                        Some(provider),
+                        404,
+                    );
+                    return write_raw_json(stream, status, &body, None).await;
+                };
+                backend_playback.url = source_remux_audio_url(source_id, index);
+            } else {
             match crate::playback_planner::plan_playback(&backend_playback.url, Some(&capabilities))
             {
                 crate::playback_planner::PlaybackStrategy::DirectRangePassthrough => {
@@ -5540,8 +5975,15 @@ async fn write_verified_playback_response(
                     return write_raw_json(stream, status, &body, None).await;
                 }
             }
+            }
             backend_playback.headers.clear();
-            write_json(stream, 200, &playback_json(&backend_playback), None).await
+            let mut response = playback_json(&backend_playback);
+            if let (Some(track), Some(object)) =
+                (selected_audio_track.as_ref(), response.as_object_mut())
+            {
+                object.insert("audio_selection".into(), audio_track_descriptor(track));
+            }
+            write_json(stream, 200, &response, None).await
         }
         crate::codec_verification::CodecProbeResult::BlockedHevc(_) => {
             let (status, body) = err(
@@ -5721,6 +6163,13 @@ async fn transcode_source(
     request_headers: &HashMap<String, String>,
     head_only: bool,
 ) -> std::io::Result<()> {
+    let audio_selection = match parse_audio_selection(query) {
+        Ok(selection) => selection,
+        Err(message) => {
+            let (status, body) = err("INVALID_AUDIO_SELECTION", message, Some(source.provider), 400);
+            return write_raw_json(stream, status, &body, None).await;
+        }
+    };
     let playback = match resolve_transcode_playback_source(source_id, source, state).await {
         Ok(playback) => playback,
         Err((code, message, status)) => {
@@ -5744,7 +6193,7 @@ async fn transcode_source(
             Some(source.provider),
             405,
         );
-        return write_raw_json(stream, status, &body, None).await;
+        return write_raw_json_head_aware(stream, status, &body, None, true).await;
     }
     let seek_seconds = match parse_remux_seek_seconds(query) {
         Ok(value) => value,
@@ -5789,6 +6238,34 @@ async fn transcode_source(
             return write_raw_json(stream, status, &body, None).await;
         }
     };
+    let selected_audio_stream = if let Some(selection) = audio_selection.as_ref() {
+        let probe = match probe_media_validated(&validated_url, &playback.headers).await {
+            Ok(probe) => probe,
+            Err(message) => {
+                let (status, body) = err(
+                    "AUDIO_TRACK_DISCOVERY_UNAVAILABLE",
+                    message,
+                    Some(source.provider),
+                    503,
+                );
+                return write_raw_json(stream, status, &body, None).await;
+            }
+        };
+        match select_audio_stream(&probe, selection) {
+            Some(track) => track.index,
+            None => {
+                let (status, body) = err(
+                    "AUDIO_TRACK_NOT_FOUND",
+                    "The requested audio language or stream index is not present in the resolved media.",
+                    Some(source.provider),
+                    404,
+                );
+                return write_raw_json(stream, status, &body, None).await;
+            }
+        }
+    } else {
+        None
+    };
     let debug_id = REMUX_DEBUG_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     crate::progressive_remux::serve(
         stream,
@@ -5796,6 +6273,7 @@ async fn transcode_source(
         &playback.headers,
         state.media_job_timeout,
         debug_id,
+        selected_audio_stream,
     )
     .await
 }
@@ -5967,7 +6445,7 @@ async fn remux_media_url(
         upstream_headers.push(("Referer".to_string(), referer.to_string()));
     }
     let debug_id = REMUX_DEBUG_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    crate::progressive_remux::serve(stream, url, &upstream_headers, job_timeout, debug_id).await
+    crate::progressive_remux::serve(stream, url, &upstream_headers, job_timeout, debug_id, None).await
 }
 
 async fn media_info_route(
@@ -6211,6 +6689,23 @@ async fn write_raw_json(
     write_headers(stream, status, "application/json", extra).await?;
     stream.write_all(body.as_bytes()).await
 }
+async fn write_raw_json_head_aware(
+    stream: &mut TcpStream,
+    status: u16,
+    body: &str,
+    extra: Option<&str>,
+    head_only: bool,
+) -> std::io::Result<()> {
+    if !head_only {
+        return write_raw_json(stream, status, body, extra).await;
+    }
+    let extra = format!(
+        "Content-Length: {}\r\n{}",
+        body.len(),
+        extra.unwrap_or_default()
+    );
+    write_headers(stream, status, "application/json", Some(&extra)).await
+}
 async fn write_text(
     stream: &mut TcpStream,
     status: u16,
@@ -6257,7 +6752,8 @@ fn openapi() -> serde_json::Value {
             "/api/v1/admin/catalog/titles/upsert": {"post": {"description": "Protected idempotent catalog title upsert.", "responses": {"200": {"description": "Updated"}, "201": {"description": "Inserted"}, "401": {"description": "Unauthorized"}, "422": {"description": "Validation failed"}}}},
             "/api/v1/admin/catalog/inspect": {"get": {"description": "Protected catalog inspection.", "responses": {"200": {"description": "Catalog records"}, "401": {"description": "Unauthorized"}}}},
             "/api/v1/admin/catalog/jobs/{job_id}": {"get": {"description": "Protected import or update job status and persisted counters.", "responses": {"200": {"description": "Job status"}, "401": {"description": "Unauthorized"}, "404": {"description": "Job not found"}, "503": {"description": "Catalog database unavailable"}}}},
-            "/api/v1/web/episodes/{episode_id}/play": {"post": {"description": "Web playback contract; requires a verified stored non-HEVC source and never performs provider discovery.", "responses": {"404": {"description": "No compatible stored source"}, "503": {"description": "Database unavailable"}}}},
+            "/api/v1/web/episodes/{episode_id}/play": {"post": {"description": "Selects an eligible stored episode source and re-resolves that exact supported provider mapping; does not run provider search or discover new sources. MovieBox remains disabled.", "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"source_id": {"type": "string", "format": "uuid", "description": "Optional catalog source UUID; omitted selects the highest-ranked supported eligible source."}, "audio_language": {"type": "string", "description": "Optional language code/name matched only against the resolved media's probed audio tags."}, "audio_track_index": {"type": "integer", "minimum": 0, "description": "Optional ffprobe stream index; must identify an audio stream in the resolved source."}}}}}}, "responses": {"200": {"description": "Verified playback descriptor."}, "400": {"description": "Invalid request or catalog identifier."}, "404": {"description": "Episode or compatible stored source not found."}, "415": {"description": "Source codec is blocked or unverified."}, "501": {"description": "Requested audio selection is unsupported for native HLS/DASH."}, "503": {"description": "Database unavailable."}}}},
+            "/api/v1/web/movies/{movie_id}/play": {"post": {"description": "Movie equivalent of the Web episode playback contract; uses only an eligible stored movie source and re-resolves its exact supported provider mapping. MovieBox remains disabled.", "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"source_id": {"type": "string", "format": "uuid"}, "audio_language": {"type": "string"}, "audio_track_index": {"type": "integer", "minimum": 0}}}}}}, "responses": {"200": {"description": "Verified playback descriptor."}, "400": {"description": "Invalid request or title identifier."}, "404": {"description": "Movie or compatible stored source not found."}, "415": {"description": "Source codec is blocked or unverified."}, "501": {"description": "Requested audio selection is unsupported for native HLS/DASH."}, "503": {"description": "Database unavailable."}}}},
             "/api/v1/android/episodes/{episode_id}/play": {"post": {"description": "Android direct-play contract; server-side HEVC transcoding is forbidden.", "responses": {"404": {"description": "No compatible stored source"}, "503": {"description": "Database unavailable"}}}},
             "/api/v1/home": {"get": {"parameters": [{"name": "page", "in": "query", "schema": {"type": "integer", "minimum": 1}}, {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 100}}], "responses": {"200": {"description": "MovieBox homepage sections"}, "503": {"description": "Provider unavailable"}}}},
             "/api/v1/home/featured": {"get": {"responses": {"200": {"description": "MovieBox homepage featured section"}}}},
