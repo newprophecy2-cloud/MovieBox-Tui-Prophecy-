@@ -118,10 +118,9 @@ pub(crate) async fn serve_from_timestamp(
     debug_id: u64,
 ) -> io::Result<()> {
     let deadline = Instant::now() + timeout_budget;
-    let allow_http = crate::config::is_test_environment();
-    let validated_url = match crate::net::validate_public_url(url.as_str(), allow_http).await {
-        Ok(url) if url.scheme() == "https" || allow_http => url,
-        _ => {
+    let response = match open_upstream(url, provider_headers, deadline).await {
+        Ok(response) => response,
+        Err(UpstreamFailure::UnsafeDestination) => {
             return write_error(
                 stream,
                 403,
@@ -130,20 +129,42 @@ pub(crate) async fn serve_from_timestamp(
             )
             .await;
         }
+        Err(UpstreamFailure::Timeout) => {
+            return write_error(
+                stream,
+                504,
+                "UPSTREAM_TIMEOUT",
+                "The upstream media request timed out.",
+            )
+            .await;
+        }
+        Err(_) => {
+            return write_error(
+                stream,
+                502,
+                "UPSTREAM_UNAVAILABLE",
+                "The upstream media request failed.",
+            )
+            .await;
+        }
     };
-    let mut child = match timestamp_ffmpeg_command(
-        OsStr::new("ffmpeg"),
-        &validated_url,
-        provider_headers,
-        seek_seconds,
-    )
-    .spawn()
-    {
+    let mut child = match timestamp_ffmpeg_command(OsStr::new("ffmpeg"), seek_seconds).spawn() {
         Ok(child) => child,
         Err(error) => {
             log::warn!("timestamp remux process start failed id={debug_id}: {error}");
             return write_error(stream, 503, "REMUX_UNAVAILABLE", "FFmpeg is unavailable.").await;
         }
+    };
+    let Some(stdin) = child.stdin.take() else {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        return write_error(
+            stream,
+            503,
+            "REMUX_UNAVAILABLE",
+            "FFmpeg could not open the remux input stream.",
+        )
+        .await;
     };
     let Some(stdout) = child.stdout.take() else {
         let _ = child.kill().await;
@@ -162,7 +183,8 @@ pub(crate) async fn serve_from_timestamp(
             let _ = tokio::io::copy(&mut stderr, &mut sink).await;
         })
     });
-    let mut input_task = InputTask::new(tokio::spawn(async { Ok::<(), UpstreamFailure>(()) }));
+    let input_task = tokio::spawn(pipe_upstream(response, stdin, deadline));
+    let mut input_task = InputTask::new(input_task);
     let mut response_started = false;
     let result = stream_child_output(
         stream,
@@ -176,6 +198,7 @@ pub(crate) async fn serve_from_timestamp(
     if result.is_err() {
         let _ = child.kill().await;
         let _ = child.wait().await;
+        input_task.abort().await;
     }
     if let Some(task) = stderr_task {
         let _ = task.await;
@@ -356,44 +379,40 @@ fn progressive_ffmpeg_command(executable: &OsStr) -> Command {
     command
 }
 
-fn timestamp_ffmpeg_command(
-    executable: &OsStr,
-    url: &Url,
-    provider_headers: &[(String, String)],
-    seek_seconds: f64,
-) -> Command {
+fn timestamp_ffmpeg_command(executable: &OsStr, seek_seconds: f64) -> Command {
     let mut command = Command::new(executable);
     command
         .env_clear()
         .env("LC_ALL", "C")
-        .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-ss"])
-        .arg(format!("{seek_seconds:.3}"));
-    let headers = forwarded_headers(provider_headers, true);
-    if !headers.is_empty() {
-        let value = headers
-            .into_iter()
-            .map(|(name, value)| {
-                format!(
-                    "{}: {}\r\n",
-                    name.as_str(),
-                    value.to_str().unwrap_or_default()
-                )
-            })
-            .collect::<String>();
-        command.args(["-headers", &value]);
-    }
-    command
         .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
             "-i",
-            url.as_str(),
+            "pipe:0",
+        ])
+        .args([
             "-map",
             "0:v:0",
             "-map",
             "0:a?",
+            "-filter:v",
+            &format!("trim=start={seek_seconds:.3},setpts=PTS-STARTPTS"),
             "-c:v",
-            "copy",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-g",
+            "30",
+            "-keyint_min",
+            "30",
+            "-force_key_frames",
+            "expr:gte(t,n_forced*1)",
             "-c:a",
             "aac",
+            "-filter:a",
+            &format!("atrim=start={seek_seconds:.3},asetpts=PTS-STARTPTS"),
             "-b:a",
             "192k",
             "-ac",
@@ -412,7 +431,7 @@ fn timestamp_ffmpeg_command(
             "mp4",
             "pipe:1",
         ])
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -910,24 +929,37 @@ mod tests {
     }
 
     #[test]
-    fn timestamp_command_seeks_before_input_and_uses_pipe_output() {
-        let command = timestamp_ffmpeg_command(
-            OsStr::new("ffmpeg"),
-            &Url::parse("https://media.example/video.mp4").unwrap(),
-            &[],
-            120.5,
-        );
+    fn timestamp_command_trims_pipe_input_and_uses_pipe_output() {
+        let command = timestamp_ffmpeg_command(OsStr::new("ffmpeg"), 120.5);
         let args = command
             .as_std()
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
-        let seek = args.iter().position(|arg| arg == "-ss").unwrap();
         let input = args.iter().position(|arg| arg == "-i").unwrap();
-        assert!(seek < input);
-        assert_eq!(args[seek + 1], "120.500");
-        assert_eq!(args[input + 1], "https://media.example/video.mp4");
+        let video_filter = args.iter().position(|arg| arg == "-filter:v").unwrap();
+        let audio_filter = args.iter().position(|arg| arg == "-filter:a").unwrap();
+        assert!(input < video_filter);
+        assert_eq!(
+            args[video_filter + 1],
+            "trim=start=120.500,setpts=PTS-STARTPTS"
+        );
+        assert_eq!(
+            args[audio_filter + 1],
+            "atrim=start=120.500,asetpts=PTS-STARTPTS"
+        );
+        assert!(args.windows(2).any(|pair| pair == ["-g", "30"]));
+        assert!(args.windows(2).any(|pair| pair == ["-keyint_min", "30"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-force_key_frames", "expr:gte(t,n_forced*1)"])
+        );
+        assert_eq!(args[input + 1], "pipe:0");
         assert_eq!(args.last().map(String::as_str), Some("pipe:1"));
+        assert_eq!(
+            args.iter().filter(|arg| arg.as_str() == "pipe:0").count(),
+            1
+        );
     }
 
     #[test]
