@@ -560,6 +560,13 @@ impl NativeStreamProxy {
             .and_then(|value| value.to_str().ok())
             .unwrap_or("application/octet-stream");
         let content_length = response.content_length();
+        let chunked = !head_only
+            && !status.is_informational()
+            && status != reqwest::StatusCode::NO_CONTENT
+            && status != reqwest::StatusCode::RESET_CONTENT
+            && status != reqwest::StatusCode::NOT_MODIFIED
+            && content_length.is_none()
+            && expected_range_bytes.is_none();
         if status.is_success() && content_length.is_some_and(|size| size > self.max_segment_bytes) {
             return write_error(
                 stream,
@@ -608,6 +615,9 @@ impl NativeStreamProxy {
         {
             header.push_str(&format!("Content-Length: {length}\r\n"));
         }
+        if chunked {
+            header.push_str("Transfer-Encoding: chunked\r\n");
+        }
         header.push_str("\r\n");
         stream.write_all(header.as_bytes()).await?;
         stream.flush().await?;
@@ -619,29 +629,63 @@ impl NativeStreamProxy {
         loop {
             let next = tokio::time::timeout(STREAM_IDLE_TIMEOUT, body.next()).await;
             let chunk = match next {
-                Err(_) => return Ok(()),
+                Err(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "upstream media stream stalled",
+                    ));
+                }
                 Ok(None) => break,
-                Ok(Some(Err(_))) => return Ok(()),
+                Ok(Some(Err(_))) => {
+                    return Err(io::Error::other("upstream media body failed"));
+                }
                 Ok(Some(Ok(chunk))) => chunk,
             };
             total = total.saturating_add(chunk.len() as u64);
-            if let Some(expected) = expected_range_bytes
-                && total > expected
-            {
-                let allowed = chunk.len() as u64 - (total - expected);
-                if allowed > 0 {
-                    stream.write_all(&chunk[..allowed as usize]).await?;
-                    stream.flush().await?;
-                }
-                return Ok(());
+            if expected_range_bytes.is_some_and(|expected| total > expected) {
+                return Err(io::Error::other(
+                    "upstream media range exceeded its declared length",
+                ));
             }
             if status.is_success() && total > self.max_segment_bytes {
-                return Ok(());
+                return Err(io::Error::other(
+                    "upstream media segment exceeded its configured limit",
+                ));
             }
             if !status.is_success() && total > MAX_ERROR_BODY_BYTES as u64 {
-                return Ok(());
+                return Err(io::Error::other(
+                    "upstream error body exceeded its configured limit",
+                ));
             }
-            stream.write_all(&chunk).await?;
+            if chunked {
+                stream
+                    .write_all(format!("{:X}\r\n", chunk.len()).as_bytes())
+                    .await?;
+                stream.write_all(&chunk).await?;
+                stream.write_all(b"\r\n").await?;
+            } else {
+                stream.write_all(&chunk).await?;
+            }
+            stream.flush().await?;
+        }
+        if let Some(expected) = expected_range_bytes
+            && total != expected
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "upstream media range ended early",
+            ));
+        }
+        if let Some(expected) = content_length
+            && total != expected
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "upstream media body ended early",
+            ));
+        }
+        if chunked {
+            stream.write_all(b"0\r\n\r\n").await?;
             stream.flush().await?;
         }
         Ok(())
@@ -725,6 +769,13 @@ impl NativeStreamProxy {
         } else {
             None
         };
+        let chunked = !head_only
+            && !status.is_informational()
+            && status != reqwest::StatusCode::NO_CONTENT
+            && status != reqwest::StatusCode::RESET_CONTENT
+            && status != reqwest::StatusCode::NOT_MODIFIED
+            && content_length.is_none()
+            && expected_range_bytes.is_none();
         let mut header = format!(
             "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n",
             status.as_u16(),
@@ -756,6 +807,9 @@ impl NativeStreamProxy {
         {
             header.push_str(&format!("Content-Length: {length}\r\n"));
         }
+        if chunked {
+            header.push_str("Transfer-Encoding: chunked\r\n");
+        }
         header.push_str("\r\n");
         stream.write_all(header.as_bytes()).await?;
         stream.flush().await?;
@@ -767,27 +821,61 @@ impl NativeStreamProxy {
         loop {
             let next = tokio::time::timeout(STREAM_IDLE_TIMEOUT, body.next()).await;
             let chunk = match next {
-                Err(_) | Ok(None) => return Ok(()),
-                Ok(Some(Err(_))) => return Ok(()),
+                Err(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "upstream direct stream stalled",
+                    ));
+                }
+                Ok(None) => break,
+                Ok(Some(Err(_))) => {
+                    return Err(io::Error::other("upstream direct body failed"));
+                }
                 Ok(Some(Ok(chunk))) => chunk,
             };
             total = total.saturating_add(chunk.len() as u64);
             if !status.is_success() && total > MAX_ERROR_BODY_BYTES as u64 {
-                return Ok(());
+                return Err(io::Error::other(
+                    "upstream error body exceeded its configured limit",
+                ));
             }
-            if let Some(expected) = expected_range_bytes
-                && total > expected
-            {
-                let allowed = chunk.len() as u64 - (total - expected);
-                if allowed > 0 {
-                    stream.write_all(&chunk[..allowed as usize]).await?;
-                    stream.flush().await?;
-                }
-                return Ok(());
+            if expected_range_bytes.is_some_and(|expected| total > expected) {
+                return Err(io::Error::other(
+                    "upstream direct range exceeded its declared length",
+                ));
             }
-            stream.write_all(&chunk).await?;
+            if chunked {
+                stream
+                    .write_all(format!("{:X}\r\n", chunk.len()).as_bytes())
+                    .await?;
+                stream.write_all(&chunk).await?;
+                stream.write_all(b"\r\n").await?;
+            } else {
+                stream.write_all(&chunk).await?;
+            }
             stream.flush().await?;
         }
+        if let Some(expected) = expected_range_bytes
+            && total != expected
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "upstream direct range ended early",
+            ));
+        }
+        if let Some(expected) = content_length
+            && total != expected
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "upstream direct body ended early",
+            ));
+        }
+        if chunked {
+            stream.write_all(b"0\r\n\r\n").await?;
+            stream.flush().await?;
+        }
+        Ok(())
     }
 }
 
@@ -1746,6 +1834,96 @@ mod tests {
         client.read_to_end(&mut bytes).await.unwrap();
         task.await.unwrap();
         bytes
+    }
+
+    async fn relay_native_to_bytes(
+        response: reqwest::Response,
+        max_segment_bytes: u64,
+    ) -> (Vec<u8>, Result<(), String>) {
+        let downstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = downstream.local_addr().unwrap();
+        let proxy = NativeStreamProxy::new(max_segment_bytes).unwrap();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = downstream.accept().await.unwrap();
+            proxy
+                .relay_response(&mut socket, response, false, None)
+                .await
+                .map_err(|error| error.to_string())
+        });
+        let mut client = TcpStream::connect(address).await.unwrap();
+        let mut bytes = Vec::new();
+        client.read_to_end(&mut bytes).await.unwrap();
+        (bytes, task.await.unwrap())
+    }
+
+    async fn relay_direct_result_to_bytes(
+        response: reqwest::Response,
+    ) -> (Vec<u8>, Result<(), String>) {
+        let downstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = downstream.local_addr().unwrap();
+        let proxy = proxy();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = downstream.accept().await.unwrap();
+            proxy
+                .relay_direct_response(&mut socket, response, false, None)
+                .await
+                .map_err(|error| error.to_string())
+        });
+        let mut client = TcpStream::connect(address).await.unwrap();
+        let mut bytes = Vec::new();
+        client.read_to_end(&mut bytes).await.unwrap();
+        (bytes, task.await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn unknown_length_native_streams_are_chunked_and_limits_do_not_look_complete() {
+        let response = mock_http_response(
+            b"HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nConnection: close\r\n\r\nabc",
+        )
+        .await;
+        let (relayed, result) = relay_native_to_bytes(response, 3).await;
+        assert!(result.is_ok());
+        let relayed_text = String::from_utf8(relayed).unwrap();
+        assert!(relayed_text.contains("Transfer-Encoding: chunked"));
+        assert!(relayed_text.ends_with("\r\n\r\n3\r\nabc\r\n0\r\n\r\n"));
+
+        let response = mock_http_response(
+            b"HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nConnection: close\r\n\r\nabcd",
+        )
+        .await;
+        let (relayed, result) = relay_native_to_bytes(response, 3).await;
+        assert!(result.is_err());
+        let relayed_text = String::from_utf8_lossy(&relayed);
+        assert!(relayed_text.contains("Transfer-Encoding: chunked"));
+        assert!(!relayed_text.ends_with("0\r\n\r\n"));
+    }
+
+    #[tokio::test]
+    async fn native_relay_reports_upstream_content_length_truncation() {
+        let response = mock_http_response(
+            b"HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: 10\r\nConnection: close\r\n\r\nabc",
+        )
+        .await;
+        let (relayed, result) = relay_native_to_bytes(response, 100).await;
+        assert!(result.is_err());
+        let relayed_text = String::from_utf8_lossy(&relayed);
+        assert!(relayed_text.starts_with("HTTP/1.1 200 OK"));
+        assert!(relayed_text.contains("Content-Length: 10"));
+        assert!(relayed_text.ends_with("\r\n\r\nabc"));
+    }
+
+    #[tokio::test]
+    async fn direct_relay_reports_upstream_content_length_truncation() {
+        let response = mock_http_response(
+            b"HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: 10\r\nConnection: close\r\n\r\nabc",
+        )
+        .await;
+        let (relayed, result) = relay_direct_result_to_bytes(response).await;
+        assert!(result.is_err());
+        let relayed_text = String::from_utf8_lossy(&relayed);
+        assert!(relayed_text.starts_with("HTTP/1.1 200 OK"));
+        assert!(relayed_text.contains("Content-Length: 10"));
+        assert!(relayed_text.ends_with("\r\n\r\nabc"));
     }
 
     #[tokio::test]

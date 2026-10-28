@@ -1348,7 +1348,7 @@ mod tests {
         app.state.search_query.set_content("/history");
         app.state.history.recent.clear();
         let item = crate::history::WatchHistoryItem {
-            provider: "moviebox".to_string(),
+            provider: "4khdhub".to_string(),
             subject_id: "hist-1".to_string(),
             title: "History Movie".to_string(),
             cover_url: None,
@@ -1363,7 +1363,9 @@ mod tests {
             stream_filename: None,
         };
         app.state.history.record_start(&item, 50);
-        app.state.search_results.push(item.to_search_result());
+        app.state
+            .search_results
+            .push(item.to_search_result().expect("enabled provider"));
         app.state.search_list_state.select(Some(0));
         assert_eq!(app.state.search_results.len(), 1);
         assert_eq!(app.state.history.recent.len(), 1);

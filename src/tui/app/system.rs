@@ -650,14 +650,10 @@ impl App {
                         format!("Command /browse is available in Streaming Mode ({ctrl_s})."),
                     );
                 } else if current_mode == crate::tui::state::AppMode::Streaming
-                    && !matches!(
-                        self.state.active_provider,
-                        crate::providers::models::ProviderKind::MovieBox
-                            | crate::providers::models::ProviderKind::Addons
-                    )
+                    && self.state.active_provider != crate::providers::models::ProviderKind::Addons
                 {
                     self.state.set_status_long(
-                        "Browse is available only with the MovieBox or Addons provider.",
+                        "Browse is available only with the Addons provider.",
                     );
                 } else {
                     self.reset_transient_overlays();
@@ -959,13 +955,9 @@ impl App {
                 self.state.bdix_dhakaflix_enabled = dhakaflix || prev_d;
                 self.state.bdix_probed = true;
                 if !self.state.provider_enabled(self.state.active_provider) {
-                    let next = self
-                        .state
-                        .available_providers()
-                        .into_iter()
-                        .next()
-                        .unwrap_or(crate::providers::models::ProviderKind::MovieBox);
-                    self.switch_provider(next);
+                    if let Some(next) = self.state.available_providers().into_iter().next() {
+                        self.switch_provider(next);
+                    }
                 }
                 self.persist_config();
                 let newly_c = circleftp && !prev_c;

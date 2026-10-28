@@ -21,7 +21,7 @@ impl App {
     }
 
     pub(super) fn switch_provider(&mut self, provider: ProviderKind) {
-        if self.state.is_tv_mode {
+        if self.state.is_tv_mode || !self.state.provider_enabled(provider) {
             return;
         }
         let previous_query = if !self.state.search_query.trim().is_empty() {
@@ -977,6 +977,17 @@ mod tests {
     use crate::tui::action::Action;
     use crate::tui::app::App;
     use crate::tui::overlay::NotificationKind;
+
+    #[tokio::test]
+    async fn test_switch_provider_rejects_disabled_moviebox() {
+        let mut app = App::new();
+        let current_provider = app.state.active_provider;
+
+        app.switch_provider(ProviderKind::MovieBox);
+
+        assert_ne!(app.state.active_provider, ProviderKind::MovieBox);
+        assert_eq!(app.state.active_provider, current_provider);
+    }
 
     #[tokio::test]
     async fn test_switch_provider_preserves_active_download() {

@@ -494,7 +494,7 @@ pub(crate) fn render_landing_deck(frame: &mut Frame, area: Rect, state: &AppStat
 
     let tab = state.effective_home_deck_tab();
     let has_cw = state.continue_watching_available();
-    let has_fav = state.favorites_available() && !state.favorites.items.is_empty();
+    let has_fav = state.favorites_landing_visible();
 
     if !has_cw && !has_fav {
         return;
@@ -516,15 +516,12 @@ pub(crate) fn render_landing_deck(frame: &mut Frame, area: Rect, state: &AppStat
 
     let (item_count, total_count) = match tab {
         crate::tui::state::HomeDeckTab::ContinueWatching => {
-            let total = state
-                .history
-                .recent
-                .iter()
-                .filter(|i| i.is_in_progress())
-                .count();
+            let total = state.available_continue_watching_count();
             (cw_items.len(), total)
         }
-        crate::tui::state::HomeDeckTab::Favorites => (fav_items.len(), state.favorites.items.len()),
+        crate::tui::state::HomeDeckTab::Favorites => {
+            (fav_items.len(), state.available_favorite_count())
+        }
     };
 
     if item_count == 0 {

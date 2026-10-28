@@ -92,6 +92,13 @@ impl App {
         let Some(candidate) = self.current_favorite_candidate() else {
             return;
         };
+        let available_provider = ProviderKind::parse(&candidate.provider)
+            .is_some_and(|provider| self.state.provider_enabled(provider));
+        if !available_provider {
+            self.state
+                .set_status_long("The selected provider is disabled; this item was not saved.");
+            return;
+        }
         let title = candidate.title.clone();
         let now_favorited = self.state.favorites.toggle(candidate);
 
@@ -146,11 +153,16 @@ impl App {
         };
         let subject_id = item.subject_id.clone();
         let title = item.title.clone();
+        let Some(search_result) = item.to_search_result() else {
+            self.state
+                .set_status_long("This saved item belongs to an unavailable provider.");
+            return;
+        };
 
         self.state.active_screen = Screen::Details;
         self.state.active_subject_id = Some(subject_id.clone());
         self.state.selected_details = Some(crate::models::MediaDetails::from_search_result(
-            &item.to_search_result(),
+            &search_result,
             self.state.search_preview.as_ref(),
         ));
         self.state.selected_resources.clear();
@@ -188,7 +200,11 @@ impl App {
         };
         let subject_id = item.subject_id.clone();
         let title = item.title.clone();
-        let search_res = item.to_search_result();
+        let Some(search_res) = item.to_search_result() else {
+            self.state
+                .set_status_long("This watch-history item belongs to an unavailable provider.");
+            return;
+        };
 
         self.state.active_screen = Screen::Details;
         self.state.active_subject_id = Some(subject_id.clone());
@@ -275,13 +291,15 @@ impl App {
             items.sort_by_key(|item| std::cmp::Reverse(item.added_at));
 
             for item in items {
-                let provider = ProviderKind::parse(&item.provider).unwrap_or_else(|| {
+                let Some(provider) = ProviderKind::parse(&item.provider)
+                    .filter(|provider| *provider != ProviderKind::MovieBox)
+                else {
                     log::warn!(
-                        "unknown favorites provider '{}'; defaulting to MovieBox",
+                        "skipping favorite with unavailable provider '{}'",
                         item.provider
                     );
-                    ProviderKind::MovieBox
-                });
+                    continue;
+                };
                 self.state.search_results.push(SearchResult {
                     id: item.subject_id.clone(),
                     title: item.title.clone(),
@@ -294,8 +312,16 @@ impl App {
                 });
             }
 
-            self.state.search_list_state.select(Some(0));
-            self.prefetch_visible_posters();
+            if self.state.search_results.is_empty() {
+                self.state.notify(
+                    NotificationKind::Info,
+                    "Favorites",
+                    "No favorites belong to an available provider.",
+                );
+            } else {
+                self.state.search_list_state.select(Some(0));
+                self.prefetch_visible_posters();
+            }
         }
     }
 }

@@ -168,13 +168,15 @@ impl App {
 
                         for item in recent {
                             use crate::providers::models::ProviderKind;
-                            let provider = ProviderKind::parse(&item.provider).unwrap_or_else(|| {
+                            let Some(provider) = ProviderKind::parse(&item.provider)
+                                .filter(|provider| *provider != ProviderKind::MovieBox)
+                            else {
                                 log::warn!(
-                                    "unknown watch-history provider '{}'; defaulting to MovieBox",
+                                    "skipping watch-history item with unavailable provider '{}'",
                                     item.provider
                                 );
-                                ProviderKind::MovieBox
-                            });
+                                continue;
+                            };
                             self.state.search_results.push(SearchResult {
                                 id: item.subject_id.clone(),
                                 title: item.title.clone(),
@@ -187,8 +189,16 @@ impl App {
                             });
                         }
 
-                        self.state.search_list_state.select(Some(0));
-                        self.prefetch_visible_posters();
+                        if self.state.search_results.is_empty() {
+                            self.state.notify(
+                                crate::tui::overlay::NotificationKind::Info,
+                                "History",
+                                "No history entries belong to an available provider.",
+                            );
+                        } else {
+                            self.state.search_list_state.select(Some(0));
+                            self.prefetch_visible_posters();
+                        }
                     }
                     return None;
                 }
@@ -211,25 +221,28 @@ impl App {
                 self.run_search_request(query.clone(), force_refresh, context);
             }
 
-            Action::FetchHomepage { tab_id, page } => {
+            Action::FetchHomepage { .. } => {
                 if self.state.is_tv_mode {
                     return None;
                 }
-                if self.state.active_provider != ProviderKind::MovieBox {
-                    self.state.is_loading = false;
-                    self.state.set_status_long(
-                        "This provider exposes search, not a shared MovieBox homepage.",
-                    );
-                    return None;
-                }
-                self.prepare_homepage_request(&tab_id, page);
-                self.run_homepage_request(tab_id, page);
+                self.state.is_loading = false;
+                let message = if self.state.active_provider == ProviderKind::MovieBox {
+                    "MovieBox is disabled."
+                } else {
+                    "This provider does not expose a shared homepage."
+                };
+                self.state.set_status_long(message);
             }
 
             Action::SelectBrowse(preset) => {
+                if !self.state.provider_enabled(self.state.active_provider) {
+                    self.state
+                        .set_status_long("The selected provider is disabled.");
+                    return None;
+                }
                 if self.state.active_provider != ProviderKind::MovieBox {
                     self.state
-                        .set_status_long("Browse is available only with the MovieBox provider.");
+                        .set_status_long("Browse presets are unavailable for this provider.");
                     return None;
                 }
                 self.state.show_browse_popup = false;
@@ -1843,6 +1856,22 @@ mod tests {
     use super::*;
     use crate::providers::models::{ProviderKind, Release, SourceMirror};
     use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn moviebox_homepage_action_is_rejected_without_dispatch() {
+        let mut app = App::new();
+        app.state.active_provider = ProviderKind::MovieBox;
+        app.state.is_loading = true;
+
+        app.handle_requests(Action::FetchHomepage {
+            tab_id: "2".to_string(),
+            page: 1,
+        })
+        .await;
+
+        assert!(!app.state.is_loading);
+        assert!(app.request_tasks.homepage.is_none());
+    }
 
     #[tokio::test]
     async fn test_fourkhdhub_releases_not_collapsed_by_query_id() {

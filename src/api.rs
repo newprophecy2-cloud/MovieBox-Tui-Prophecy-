@@ -5873,15 +5873,6 @@ async fn stream_proxy_route(
             return write_raw_json(stream, status, &body, Some("Accept-Ranges: none\r\n")).await;
         }
     };
-    if timestamp_requires_upstream_seek(seek_seconds) {
-        let (status, body) = err(
-            "SEEK_UNAVAILABLE",
-            "Timestamp seeking is unavailable: the validated progressive input is pipe-based and upstream byte-range seeking is not implemented.",
-            None,
-            501,
-        );
-        return write_raw_json(stream, status, &body, Some("Accept-Ranges: none\r\n")).await;
-    }
     let (url, referer) = match validated_media_url(query).await {
         Ok(value) => value,
         Err((status, message)) => {
@@ -5898,6 +5889,15 @@ async fn stream_proxy_route(
             return write_raw_json(stream, status, &body, None).await;
         }
     };
+    if timestamp_requires_upstream_seek(seek_seconds) {
+        let (status, body) = err(
+            "SEEK_UNAVAILABLE",
+            "Timestamp seeking is unavailable: the validated progressive input is pipe-based and upstream byte-range seeking is not implemented.",
+            None,
+            501,
+        );
+        return write_raw_json(stream, status, &body, Some("Accept-Ranges: none\r\n")).await;
+    }
     remux_media_url(
         stream,
         &url,
@@ -6512,6 +6512,33 @@ mod tests {
             }
             assert!(bytes.len() < 64 * 1024, "oversized response headers");
         }
+    }
+
+    #[tokio::test]
+    async fn stream_proxy_validates_destination_before_unsupported_seek() {
+        use tokio::io::AsyncReadExt;
+
+        let query = "url=http%3A%2F%2F127.0.0.1%3A1%2Fmedia.mp4&start_seconds=5";
+        let (mut client, mut server) = api_downstream_pair().await;
+        let route = tokio::spawn(async move {
+            let request_headers = HashMap::new();
+            stream_proxy_route(
+                &mut server,
+                query,
+                Arc::new(Semaphore::new(1)),
+                Duration::from_secs(5),
+                &request_headers,
+                false,
+            )
+            .await
+        });
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        route.await.unwrap().unwrap();
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        assert!(response.contains("SSRF_BLOCKED"), "{response}");
+        assert!(!response.contains("SEEK_UNAVAILABLE"), "{response}");
     }
 
     fn observe_mp4_atoms(tail: &mut Vec<u8>, chunk: &[u8], found: &mut [bool; 4]) {

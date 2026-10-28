@@ -39,8 +39,10 @@ impl FavoriteItem {
         }
     }
 
-    pub fn to_search_result(&self) -> crate::models::SearchResult {
-        crate::models::SearchResult {
+    pub fn to_search_result(&self) -> Option<crate::models::SearchResult> {
+        let provider = crate::models::ProviderKind::parse(&self.provider)
+            .filter(|provider| *provider != crate::models::ProviderKind::MovieBox)?;
+        Some(crate::models::SearchResult {
             id: self.subject_id.clone(),
             title: self.title.clone(),
             stype: self.stype,
@@ -48,9 +50,8 @@ impl FavoriteItem {
             cover_url: self.cover_url.clone(),
             season: 0,
             episode: 1,
-            provider: crate::models::ProviderKind::parse(&self.provider)
-                .unwrap_or(crate::models::ProviderKind::MovieBox),
-        }
+            provider,
+        })
     }
 
     pub fn identity(&self) -> crate::models::SubjectIdentity<'_> {
@@ -196,6 +197,23 @@ mod tests {
             release_year: release_year.to_string(),
             added_at: 1700000000,
         }
+    }
+
+    #[test]
+    fn saved_favorite_conversion_never_falls_back_to_moviebox() {
+        assert!(dummy_item("moviebox", "old-id", "Old title", 1, "2020")
+            .to_search_result()
+            .is_none());
+        assert!(dummy_item("unknown", "old-id", "Old title", 1, "2020")
+            .to_search_result()
+            .is_none());
+        assert_eq!(
+            dummy_item("4khdhub", "id", "Title", 1, "2020")
+                .to_search_result()
+                .unwrap()
+                .provider,
+            crate::models::ProviderKind::FourKHdHub
+        );
     }
 
     #[test]

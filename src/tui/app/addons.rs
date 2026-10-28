@@ -10,7 +10,9 @@ impl App {
                 self.reset_mode_state();
                 self.state.set_mode(crate::tui::state::AppMode::Streaming);
                 if self.state.active_provider == crate::providers::models::ProviderKind::Addons {
-                    self.state.active_provider = crate::providers::models::ProviderKind::MovieBox;
+                    if let Some(provider) = self.state.available_providers().into_iter().next() {
+                        self.state.active_provider = provider;
+                    }
                 }
                 self.announce_mode();
                 self.persist_config();

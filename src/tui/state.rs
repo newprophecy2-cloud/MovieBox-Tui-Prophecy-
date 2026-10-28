@@ -629,6 +629,29 @@ impl AppState {
         providers
     }
 
+    fn saved_item_provider_enabled(&self, provider: &str) -> bool {
+        crate::models::ProviderKind::parse(provider)
+            .is_some_and(|provider| self.provider_enabled(provider))
+    }
+
+    pub fn available_favorite_count(&self) -> usize {
+        self.favorites
+            .items
+            .iter()
+            .filter(|item| self.saved_item_provider_enabled(&item.provider))
+            .count()
+    }
+
+    pub fn available_continue_watching_count(&self) -> usize {
+        self.history
+            .recent
+            .iter()
+            .filter(|item| {
+                item.is_in_progress() && self.saved_item_provider_enabled(&item.provider)
+            })
+            .count()
+    }
+
     pub fn next_provider(&self) -> ProviderKind {
         let available_providers = self.available_providers();
         if available_providers.is_empty() {
@@ -867,12 +890,17 @@ impl AppState {
 
     pub fn favorites_landing_visible(&self) -> bool {
         self.favorites_available()
-            && !self.favorites.items.is_empty()
+            && self.available_favorite_count() > 0
             && !(self.input_mode == InputMode::Editing && !self.search_suggestions.is_empty())
     }
 
     pub fn favorites_landing_items(&self) -> Vec<&crate::favorites::FavoriteItem> {
-        let mut items: Vec<&crate::favorites::FavoriteItem> = self.favorites.items.iter().collect();
+        let mut items: Vec<&crate::favorites::FavoriteItem> = self
+            .favorites
+            .items
+            .iter()
+            .filter(|item| self.saved_item_provider_enabled(&item.provider))
+            .collect();
         items.sort_by_key(|item| std::cmp::Reverse(item.added_at));
         items.truncate(5);
         items
@@ -883,7 +911,9 @@ impl AppState {
             .history
             .recent
             .iter()
-            .filter(|item| item.is_in_progress())
+            .filter(|item| {
+                item.is_in_progress() && self.saved_item_provider_enabled(&item.provider)
+            })
             .collect();
         items.sort_by_key(|item| std::cmp::Reverse(item.timestamp));
         items.truncate(5);
@@ -891,14 +921,12 @@ impl AppState {
     }
 
     pub fn continue_watching_available(&self) -> bool {
-        self.streaming_enabled
-            && !self.is_tv_mode
-            && self.history.recent.iter().any(|item| item.is_in_progress())
+        self.streaming_enabled && !self.is_tv_mode && self.available_continue_watching_count() > 0
     }
 
     pub fn effective_home_deck_tab(&self) -> HomeDeckTab {
         let cw_has = self.continue_watching_available();
-        let fav_has = self.favorites_available() && !self.favorites.items.is_empty();
+        let fav_has = self.favorites_available() && self.available_favorite_count() > 0;
         match self.home_deck_tab {
             HomeDeckTab::ContinueWatching => {
                 if cw_has {
@@ -935,19 +963,14 @@ impl AppState {
 
     pub fn landing_deck_total_items_count(&self) -> usize {
         match self.effective_home_deck_tab() {
-            HomeDeckTab::ContinueWatching => self
-                .history
-                .recent
-                .iter()
-                .filter(|i| i.is_in_progress())
-                .count(),
-            HomeDeckTab::Favorites => self.favorites.items.len(),
+            HomeDeckTab::ContinueWatching => self.available_continue_watching_count(),
+            HomeDeckTab::Favorites => self.available_favorite_count(),
         }
     }
 
     pub fn cycle_home_deck_tab(&mut self) {
         let cw_has = self.continue_watching_available();
-        let fav_has = self.favorites_available() && !self.favorites.items.is_empty();
+        let fav_has = self.favorites_available() && self.available_favorite_count() > 0;
         if cw_has && fav_has {
             self.home_deck_tab = match self.effective_home_deck_tab() {
                 HomeDeckTab::ContinueWatching => HomeDeckTab::Favorites,
@@ -1385,6 +1408,48 @@ mod tests {
                 .contains(&ProviderKind::MovieBox)
         );
         assert!(!ProviderKind::ENABLED.contains(&ProviderKind::MovieBox));
+    }
+
+    #[test]
+    fn home_deck_omits_saved_items_from_disabled_providers() {
+        let mut state = AppState {
+            fourkhdhub_enabled: true,
+            ..Default::default()
+        };
+        for (provider, id) in [
+            ("moviebox", "old-moviebox"),
+            ("4khdhub", "active"),
+        ] {
+            state.favorites.items.push(crate::favorites::FavoriteItem {
+                provider: provider.to_string(),
+                subject_id: id.to_string(),
+                title: id.to_string(),
+                cover_url: None,
+                stype: 1,
+                release_year: "2020".to_string(),
+                added_at: 1,
+            });
+            state.history.recent.push(crate::history::WatchHistoryItem {
+                provider: provider.to_string(),
+                subject_id: id.to_string(),
+                title: id.to_string(),
+                cover_url: None,
+                stype: 1,
+                release_year: "2020".to_string(),
+                season: 0,
+                episode: 0,
+                timestamp: 1,
+                duration_seconds: Some(500),
+                progress_seconds: 100,
+                completed: false,
+                stream_filename: None,
+            });
+        }
+
+        assert_eq!(state.available_favorite_count(), 1);
+        assert_eq!(state.available_continue_watching_count(), 1);
+        assert_eq!(state.favorites_landing_items()[0].provider, "4khdhub");
+        assert_eq!(state.continue_watching_items()[0].provider, "4khdhub");
     }
 
     #[test]
