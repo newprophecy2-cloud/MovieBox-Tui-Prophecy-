@@ -14,4 +14,4 @@ The progressive remux response has no `Content-Length` and does not advertise by
 
 This path is intended for sources FFmpeg can demux progressively from a non-seekable input. It does not guarantee that every container/source can start before FFmpeg finishes probing, a particular startup time, or future arbitrary seeking. Input containers that require seeking or place essential metadata at the end may fail before a playable fragment is produced. Seeking redesign and broader codec/audio/manifest policy remain out of scope.
 
-The generic `/api/stream-proxy` endpoint is separate and retains its pre-existing cache-backed seekable behavior for compatibility. Playback descriptors for sources requiring remux use the progressive source route above and do not fall back to that full-file cache.
+The generic `/api/stream-proxy` endpoint follows the same forward-only, no-persistent-media-cache behavior and rejects nonzero timestamp seeks because its validated input is pipe-based. Playback descriptors for sources requiring remux use the progressive source route above.

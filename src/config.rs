@@ -4,8 +4,6 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-const HLS_CHUNK_CACHE_MIN_BYTES: u64 = 512 * 1024 * 1024;
-const HLS_CHUNK_CACHE_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const HLS_SEGMENT_MIN_BYTES: u64 = 16 * 1024 * 1024;
 const HLS_SEGMENT_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
@@ -32,12 +30,8 @@ pub struct Config {
     pub vlc_path: Option<String>,
     pub mpv_path: Option<String>,
     pub iina_path: Option<String>,
-    pub media_cache_directory: Option<String>,
-    pub remux_cache_ttl_seconds: u64,
-    pub remux_cache_max_bytes: u64,
     pub max_concurrent_media_jobs: usize,
     pub media_job_timeout_seconds: u64,
-    pub hls_chunk_cache_max_bytes: u64,
     pub hls_max_segment_bytes: u64,
     pub hls_prefetch_depth: usize,
 }
@@ -63,25 +57,12 @@ impl Default for Config {
             vlc_path: None,
             mpv_path: None,
             iina_path: None,
-            media_cache_directory: None,
-            remux_cache_ttl_seconds: 3_600,
-            remux_cache_max_bytes: 512 * 1024 * 1024,
             max_concurrent_media_jobs: 1,
             media_job_timeout_seconds: 1_800,
-            hls_chunk_cache_max_bytes: HLS_CHUNK_CACHE_MIN_BYTES,
             hls_max_segment_bytes: 1024 * 1024 * 1024,
             hls_prefetch_depth: 2,
         }
     }
-}
-
-#[derive(Clone, Debug)]
-pub struct MediaSettings {
-    pub cache_dir: PathBuf,
-    pub cache_ttl: std::time::Duration,
-    pub cache_max_bytes: u64,
-    pub max_concurrent_jobs: usize,
-    pub job_timeout: std::time::Duration,
 }
 
 impl Config {
@@ -98,14 +79,7 @@ impl Config {
         ))
     }
 
-    pub fn validate_hls_chunk_settings(&self) -> Result<(), String> {
-        if !(HLS_CHUNK_CACHE_MIN_BYTES..=HLS_CHUNK_CACHE_MAX_BYTES)
-            .contains(&self.hls_chunk_cache_max_bytes)
-        {
-            return Err(
-                "hls_chunk_cache_max_bytes must be between 536870912 and 10737418240".into(),
-            );
-        }
+    pub fn validate_hls_settings(&self) -> Result<(), String> {
         if self.hls_prefetch_depth > 4 {
             return Err("hls_prefetch_depth must be between 0 and 4".into());
         }
@@ -113,56 +87,6 @@ impl Config {
             return Err("hls_max_segment_bytes must be between 16777216 and 10737418240".into());
         }
         Ok(())
-    }
-
-    pub fn validate_media_settings(&self) -> Result<MediaSettings, String> {
-        if !(60..=604_800).contains(&self.remux_cache_ttl_seconds) {
-            return Err("remux_cache_ttl_seconds must be between 60 and 604800".into());
-        }
-        if !(1_048_576..=1_099_511_627_776).contains(&self.remux_cache_max_bytes) {
-            return Err("remux_cache_max_bytes must be between 1048576 and 1099511627776".into());
-        }
-        let (max_concurrent_jobs, job_timeout) = self.validate_media_job_settings()?;
-
-        let configured_cache_dir = match self
-            .media_cache_directory
-            .as_deref()
-            .map(str::trim)
-            .filter(|path| !path.is_empty())
-        {
-            Some(path) => PathBuf::from(path),
-            None => cache_dir().join("remux"),
-        };
-        if !configured_cache_dir.is_absolute() {
-            return Err("the configured cache directory must be an absolute path".into());
-        }
-        std::fs::create_dir_all(&configured_cache_dir)
-            .map_err(|_| "the configured cache directory cannot be created".to_string())?;
-        let canonical_cache_dir = std::fs::canonicalize(&configured_cache_dir)
-            .map_err(|_| "the configured cache directory cannot be resolved".to_string())?;
-        if !canonical_cache_dir.is_dir() {
-            return Err("the configured cache path is not a directory".into());
-        }
-        let probe_path = canonical_cache_dir.join(format!(
-            ".moviebox-cache-check-{}-{}.tmp",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&probe_path)
-            .map_err(|_| "the configured cache directory is not writable".to_string())?;
-        std::fs::remove_file(&probe_path)
-            .map_err(|_| "the cache directory write-check file could not be removed".to_string())?;
-
-        Ok(MediaSettings {
-            cache_dir: canonical_cache_dir,
-            cache_ttl: std::time::Duration::from_secs(self.remux_cache_ttl_seconds),
-            cache_max_bytes: self.remux_cache_max_bytes,
-            max_concurrent_jobs,
-            job_timeout,
-        })
     }
 }
 
@@ -482,11 +406,8 @@ mod tests {
         assert!(config.auto_update);
         assert_eq!(config.active_provider, ProviderKind::FourKHdHub);
         assert!(!config.moviebox_enabled);
-        assert_eq!(config.remux_cache_ttl_seconds, 3_600);
-        assert_eq!(config.remux_cache_max_bytes, 512 * 1024 * 1024);
         assert_eq!(config.max_concurrent_media_jobs, 1);
         assert_eq!(config.media_job_timeout_seconds, 1_800);
-        assert_eq!(config.hls_chunk_cache_max_bytes, 512 * 1024 * 1024);
         assert_eq!(config.hls_max_segment_bytes, 1024 * 1024 * 1024);
         assert_eq!(config.hls_prefetch_depth, 2);
 
@@ -495,120 +416,11 @@ mod tests {
         assert_eq!(deserialized.active_mode, config.active_mode);
         let old_config: Config = serde_json::from_str(r#"{"auto_update":false}"#)
             .expect("older config without media settings remains compatible");
-        assert_eq!(old_config.remux_cache_ttl_seconds, 3_600);
-        assert_eq!(old_config.hls_chunk_cache_max_bytes, 512 * 1024 * 1024);
         assert_eq!(old_config.hls_max_segment_bytes, 1024 * 1024 * 1024);
         assert_eq!(old_config.hls_prefetch_depth, 2);
         let legacy_moviebox_config: Config =
             serde_json::from_str(r#"{"moviebox_enabled":true,"active_provider":"moviebox"}"#)
                 .expect("legacy MovieBox settings remain readable");
         assert!(!legacy_moviebox_config.moviebox_enabled);
-    }
-
-    #[test]
-    fn media_settings_validate_and_resolve_existing_cache_root() {
-        let settings = Config::default()
-            .validate_media_settings()
-            .expect("local test cache path is writable");
-        assert!(settings.cache_dir.is_absolute());
-        assert!(settings.cache_dir.ends_with("remux"));
-        assert_eq!(settings.max_concurrent_jobs, 1);
-    }
-
-    #[test]
-    fn media_settings_reject_out_of_range_values() {
-        let config = Config {
-            remux_cache_ttl_seconds: 59,
-            ..Config::default()
-        };
-        assert!(config.validate_media_settings().is_err());
-
-        let config = Config {
-            remux_cache_max_bytes: 1_048_575,
-            ..Config::default()
-        };
-        assert!(config.validate_media_settings().is_err());
-
-        let config = Config {
-            max_concurrent_media_jobs: 5,
-            ..Config::default()
-        };
-        assert!(config.validate_media_settings().is_err());
-
-        let config = Config {
-            media_job_timeout_seconds: 59,
-            ..Config::default()
-        };
-        assert!(config.validate_media_settings().is_err());
-    }
-
-    #[test]
-    fn hls_chunk_settings_reject_unbounded_values() {
-        let config = Config {
-            hls_chunk_cache_max_bytes: HLS_CHUNK_CACHE_MIN_BYTES - 1,
-            ..Config::default()
-        };
-        assert!(config.validate_hls_chunk_settings().is_err());
-
-        let config = Config {
-            hls_chunk_cache_max_bytes: HLS_CHUNK_CACHE_MAX_BYTES + 1,
-            ..Config::default()
-        };
-        assert!(config.validate_hls_chunk_settings().is_err());
-
-        for bytes in [HLS_CHUNK_CACHE_MIN_BYTES, HLS_CHUNK_CACHE_MAX_BYTES] {
-            let config = Config {
-                hls_chunk_cache_max_bytes: bytes,
-                ..Config::default()
-            };
-            assert!(config.validate_hls_chunk_settings().is_ok());
-        }
-
-        for bytes in [HLS_SEGMENT_MIN_BYTES - 1, HLS_SEGMENT_MAX_BYTES + 1] {
-            let config = Config {
-                hls_max_segment_bytes: bytes,
-                ..Config::default()
-            };
-            assert!(config.validate_hls_chunk_settings().is_err());
-        }
-        for bytes in [HLS_SEGMENT_MIN_BYTES, HLS_SEGMENT_MAX_BYTES] {
-            let config = Config {
-                hls_max_segment_bytes: bytes,
-                ..Config::default()
-            };
-            assert!(config.validate_hls_chunk_settings().is_ok());
-        }
-
-        let config = Config {
-            hls_prefetch_depth: 5,
-            ..Config::default()
-        };
-        assert!(config.validate_hls_chunk_settings().is_err());
-    }
-
-    #[test]
-    fn media_cache_directory_override_must_be_absolute_and_is_persisted() {
-        let root =
-            std::env::temp_dir().join(format!("moviebox-config-cache-{}", uuid::Uuid::new_v4()));
-        let config = Config {
-            media_cache_directory: Some(root.to_string_lossy().into_owned()),
-            ..Config::default()
-        };
-        let settings = config
-            .validate_media_settings()
-            .expect("absolute override is valid");
-        assert_eq!(settings.cache_dir, std::fs::canonicalize(&root).unwrap());
-
-        let invalid = Config {
-            media_cache_directory: Some("relative/cache".into()),
-            ..Config::default()
-        };
-        assert!(
-            invalid
-                .validate_media_settings()
-                .unwrap_err()
-                .contains("absolute path")
-        );
-        let _ = std::fs::remove_dir_all(root);
     }
 }

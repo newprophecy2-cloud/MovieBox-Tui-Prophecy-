@@ -691,7 +691,7 @@ async fn init_redis_search_cache() -> Option<redis::aio::MultiplexedConnection> 
 pub async fn run() -> std::io::Result<()> {
     let config = crate::config::load();
     config
-        .validate_hls_chunk_settings()
+        .validate_hls_settings()
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     let (max_media_jobs, media_job_timeout) = config
         .validate_media_job_settings()
@@ -5866,6 +5866,22 @@ async fn stream_proxy_route(
     request_headers: &HashMap<String, String>,
     head_only: bool,
 ) -> std::io::Result<()> {
+    let seek_seconds = match parse_remux_seek_seconds(query) {
+        Ok(value) => value,
+        Err((status, code, message)) => {
+            let (status, body) = err(code, message, None, status);
+            return write_raw_json(stream, status, &body, Some("Accept-Ranges: none\r\n")).await;
+        }
+    };
+    if timestamp_requires_upstream_seek(seek_seconds) {
+        let (status, body) = err(
+            "SEEK_UNAVAILABLE",
+            "Timestamp seeking is unavailable: the validated progressive input is pipe-based and upstream byte-range seeking is not implemented.",
+            None,
+            501,
+        );
+        return write_raw_json(stream, status, &body, Some("Accept-Ranges: none\r\n")).await;
+    }
     let (url, referer) = match validated_media_url(query).await {
         Ok(value) => value,
         Err((status, message)) => {

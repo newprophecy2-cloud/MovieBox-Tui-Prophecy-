@@ -309,8 +309,6 @@ struct SegmentCache {
     in_flight: Mutex<std::collections::HashMap<String, Arc<tokio::sync::Notify>>>,
     fetch_slots: Arc<tokio::sync::Semaphore>,
     prefetch_slots: Arc<tokio::sync::Semaphore>,
-    disk_cache: Option<Arc<crate::hls_chunk_cache::HlsChunkCache>>,
-    namespace: String,
     ttl: Duration,
 }
 
@@ -321,8 +319,6 @@ impl Default for SegmentCache {
             in_flight: Mutex::new(std::collections::HashMap::new()),
             fetch_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SEGMENT_FETCHES)),
             prefetch_slots: Arc::new(tokio::sync::Semaphore::new(1)),
-            disk_cache: None,
-            namespace: String::new(),
             ttl: HLS_CHUNK_TTL,
         }
     }
@@ -506,51 +502,18 @@ pub async fn run_sidecar(
     max_height: Option<u64>,
 ) {
     let config = crate::config::load();
-    if let Err(error) = config.validate_hls_chunk_settings() {
-        println!("ERROR invalid HLS chunk-cache configuration: {error}");
+    if let Err(error) = config.validate_hls_settings() {
+        println!("ERROR invalid HLS streaming configuration: {error}");
         use std::io::Write;
         let _ = std::io::stdout().flush();
         return;
     }
-    let disk_cache = match crate::hls_chunk_cache::HlsChunkCache::open(
-        &crate::config::cache_dir().join("hls-chunks"),
-        HLS_CHUNK_TTL,
-        config.hls_chunk_cache_max_bytes,
-    ) {
-        Ok(cache) => Some(Arc::new(cache)),
-        Err(error) => {
-            log::warn!("HLS chunk disk cache unavailable; using bounded memory cache: {error}");
-            None
-        }
-    };
-    let namespace_material = serde_json::to_vec(&headers).unwrap_or_default();
-    let namespace = crate::hls_chunk_cache::HlsChunkCache::key_for(
-        &target_url,
-        &String::from_utf8_lossy(&namespace_material),
-    );
-    let segment_cache = Arc::new(match disk_cache {
-        Some(cache) => SegmentCache {
-            disk_cache: Some(cache.clone()),
-            namespace,
-            ..SegmentCache::default()
-        },
-        None => SegmentCache::default(),
-    });
-    if let Some(cache) = segment_cache.disk_cache.clone() {
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(10)).await;
-                if let Err(error) = cache.cleanup_expired().await {
-                    log::warn!("HLS chunk TTL cleanup failed: {error}");
-                }
-            }
-        });
-    }
+    // Media segments are never persisted. The process-local cache is bounded by
+    // the segment count and byte limits in SegmentCache::insert.
+    let segment_cache = Arc::new(SegmentCache::default());
     log::info!(
-        "HLS sidecar cache ready ttl_seconds=120 budget_bytes={} prefetch_depth={} disk_enabled={}",
-        config.hls_chunk_cache_max_bytes,
-        config.hls_prefetch_depth,
-        segment_cache.disk_cache.is_some()
+        "HLS sidecar bounded in-memory segment cache ready ttl_seconds=120 prefetch_depth={}",
+        config.hls_prefetch_depth
     );
 
     let client = crate::net::http_client_builder_base()
@@ -1381,23 +1344,7 @@ fn cached_segment_range<'a>(
 }
 
 async fn get_cached_segment(cache: &Arc<SegmentCache>, url: &str) -> Option<(String, Arc<[u8]>)> {
-    if let Some((content_type, data)) = cache.get(url) {
-        return Some((content_type, data));
-    }
-    let disk = cache.disk_cache.as_ref()?;
-    match disk.get(&cache.namespace, url).await {
-        Ok(Some(lease)) => {
-            let content_type = lease.content_type.clone();
-            let data = Arc::clone(&lease.bytes);
-            cache.insert(url.to_string(), content_type.clone(), Arc::clone(&data));
-            Some((content_type, data))
-        }
-        Ok(None) => None,
-        Err(_) => {
-            log::warn!("HLS chunk cache read failed; using direct segment streaming");
-            None
-        }
-    }
+    cache.get(url)
 }
 
 async fn write_cached_segment<W: AsyncWrite + Unpin>(
@@ -1547,13 +1494,6 @@ async fn stream_segment_to_client<W: AsyncWrite + Unpin>(
     if cacheable && !cache_bytes.is_empty() {
         let data: Arc<[u8]> = Arc::from(cache_bytes);
         cache.insert(url.to_string(), content_type.clone(), Arc::clone(&data));
-        if let Some(disk) = cache.disk_cache.as_ref()
-            && let Err(error) = disk
-                .insert(&cache.namespace, url, &content_type, &data)
-                .await
-        {
-            log::warn!("HLS chunk cache write failed after successful stream: {error}");
-        }
     }
     Ok(keep_alive)
 }
@@ -1615,20 +1555,6 @@ async fn fetch_or_get_segment(
             log::debug!("media chunk cache hit layer=memory");
             return Ok((reqwest::StatusCode::OK, ct, data));
         }
-        if let Some(disk) = cache.disk_cache.as_ref() {
-            match disk.get(&cache.namespace, url).await {
-                Ok(Some(lease)) => {
-                    let content_type = lease.content_type.clone();
-                    let data = Arc::clone(&lease.bytes);
-                    cache.insert(url.to_string(), content_type.clone(), Arc::clone(&data));
-                    log::debug!("media chunk cache hit layer=disk");
-                    return Ok((reqwest::StatusCode::OK, content_type, data));
-                }
-                Ok(None) => {}
-                Err(_) => log::warn!("HLS chunk cache read failed; falling back to upstream"),
-            }
-        }
-
         let (is_owner, notify, notified_fut) = match cache.in_flight.lock() {
             Ok(mut lock) => {
                 if let Some(existing) = lock.get(url) {
@@ -1697,22 +1623,6 @@ async fn fetch_or_get_segment(
                 .map_err(|_| "media segment fetch timed out".to_string())??;
         if status.is_success() && !data.is_empty() && data.len() <= MAX_SEGMENT_BYTES {
             cache.insert(url.to_string(), content_type.clone(), Arc::clone(&data));
-            if let Some(disk) = cache.disk_cache.as_ref() {
-                match disk
-                    .insert(&cache.namespace, url, &content_type, &data)
-                    .await
-                {
-                    Ok(true) => log::debug!("media chunk persisted to bounded HLS cache"),
-                    Ok(false) => {
-                        log::debug!("media chunk not persisted category=cache_budget_or_size")
-                    }
-                    Err(_) => {
-                        log::warn!(
-                            "HLS chunk cache write failed; serving complete upstream segment"
-                        )
-                    }
-                }
-            }
         }
         return Ok((status, content_type, data));
     }
@@ -2726,85 +2636,6 @@ mod tests {
             .unwrap();
         assert_eq!(cached.as_ref(), payload.as_slice());
         assert_eq!(request_count.load(Ordering::Relaxed), 3);
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn hls_direct_segment_is_reused_from_disk_after_cache_reopen() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let dir = tempfile::tempdir().unwrap();
-        let request_count = Arc::new(AtomicUsize::new(0));
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let url = format!("http://127.0.0.1:{port}/movie/seg-000.ts");
-        let server_count = Arc::clone(&request_count);
-        let server = tokio::spawn(async move {
-            loop {
-                let Ok((mut socket, _)) = listener.accept().await else {
-                    break;
-                };
-                let count = Arc::clone(&server_count);
-                tokio::spawn(async move {
-                    let mut req = [0u8; 1024];
-                    if socket.read(&mut req).await.unwrap_or(0) == 0 {
-                        return;
-                    }
-                    count.fetch_add(1, Ordering::Relaxed);
-                    let body = b"first-playable-segment";
-                    let headers = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        body.len()
-                    );
-                    let _ = socket.write_all(headers.as_bytes()).await;
-                    let _ = socket.write_all(body).await;
-                });
-            }
-        });
-
-        let client = crate::net::http_client_builder_base().build().unwrap();
-        let disk1 = Arc::new(
-            crate::hls_chunk_cache::HlsChunkCache::open(dir.path(), HLS_CHUNK_TTL, 1024 * 1024)
-                .unwrap(),
-        );
-        let cache1 = Arc::new(SegmentCache {
-            disk_cache: Some(disk1),
-            namespace: "source-episode-audio-variant".into(),
-            ..SegmentCache::default()
-        });
-        let cold_started = Instant::now();
-        let (_, content_type, first) =
-            fetch_or_get_segment(&cache1, &client, &url, &[], true, false)
-                .await
-                .unwrap();
-        let cold_elapsed = cold_started.elapsed();
-        assert_eq!(content_type, "video/mp2t");
-        assert_eq!(first.as_ref(), b"first-playable-segment");
-        let persisted_bytes = cache1.disk_cache.as_ref().unwrap().disk_bytes();
-        drop(cache1);
-
-        let disk2 = Arc::new(
-            crate::hls_chunk_cache::HlsChunkCache::open(dir.path(), HLS_CHUNK_TTL, 1024 * 1024)
-                .unwrap(),
-        );
-        let cache2 = Arc::new(SegmentCache {
-            disk_cache: Some(disk2),
-            namespace: "source-episode-audio-variant".into(),
-            ..SegmentCache::default()
-        });
-        let warm_started = Instant::now();
-        let (_, _, warm) = fetch_or_get_segment(&cache2, &client, &url, &[], true, false)
-            .await
-            .unwrap();
-        let warm_elapsed = warm_started.elapsed();
-        assert_eq!(warm.as_ref(), b"first-playable-segment");
-        assert_eq!(request_count.load(Ordering::Relaxed), 1);
-        eprintln!(
-            "LOCAL_MOCK_HLS cold_first_segment_ms={} warm_disk_hit_ms={} persisted_bytes={} upstream_requests=1",
-            cold_elapsed.as_millis(),
-            warm_elapsed.as_millis(),
-            persisted_bytes
-        );
         server.abort();
     }
 

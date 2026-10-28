@@ -26,9 +26,9 @@ Playback, direct-watch, source-detail, audio/subtitle, download, and remux reque
 
 ## Media handling and seeking
 
-Source-scoped remuxed media is streamed from FFmpeg stdout to the client using progressive pipes; these routes do not create complete source or output video files. The short FFmpeg preflight is piped into FFprobe in memory and capped at 32 MiB; startup removes the application-owned legacy `cache/remux` directory from older versions when possible. The generic `/api/stream-proxy` endpoint is separate and retains its cache-backed seekable behavior for compatibility.
+Source-scoped remuxed media is streamed from FFmpeg stdout to the client using progressive pipes; these routes do not create complete source or output video files. The short FFmpeg preflight is piped into FFprobe in memory and capped at 32 MiB. The generic `/api/stream-proxy` endpoint follows the same no-persistent-media-cache behavior.
 
-The source-scoped remux endpoints `/api/v1/sources/{source_id}/transcode`, `/remux`, and `/api/v1/catalog/sources/{source_id}/remux` are progressive and do not support byte-range seeking. A `Range` request receives HTTP `501 SEEK_UNAVAILABLE`, with `Accept-Ranges: none`; ordinary GET streaming remains available when the source passes eligibility and remux checks. `HEAD` is not supported for these remux routes. The generic `/api/stream-proxy` endpoint remains a separate cache-backed, seekable compatibility route and is not used as a fallback by playback descriptors. Direct byte-range passthrough and native HLS/DASH behavior remain distinct.
+The source-scoped remux endpoints `/api/v1/sources/{source_id}/transcode`, `/remux`, and `/api/v1/catalog/sources/{source_id}/remux` are progressive and do not support byte-range or nonzero timestamp seeking. A `Range` request or nonzero `start_seconds`/`start` receives HTTP `501 SEEK_UNAVAILABLE`, with `Accept-Ranges: none`; malformed or out-of-bounds timestamps receive HTTP `400`. Ordinary GET streaming remains available when the source passes eligibility and remux checks. `HEAD` is not supported for these remux routes. The generic `/api/stream-proxy` endpoint follows the same forward-only, no-persistent-media-cache contract. Direct byte-range passthrough and native HLS/DASH behavior remain distinct.
 
 ## Compatibility and architecture limits
 

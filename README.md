@@ -31,7 +31,7 @@ The API supports both provider-backed compatibility routes and a PostgreSQL-back
 - **Episode metadata:** Fresh anime details, season lists, episode lists, and individual episode lookups.
 - **Source discovery:** Fresh source candidates with quality, codec, language, size, downloadability, and opaque source IDs.
 - **Automatic playback resolution:** FourKHDHub mirrors, including GreenMotors, HubCloud, and HubDrive chains, are resolved and preflighted to final playable streams.
-- **Playback validation:** Candidate mirrors are checked for public HTTPS destinations and media compatibility. Source-scoped remux output is streamed through bounded pipes without a complete video cache; byte-range seeking on those routes returns `501 SEEK_UNAVAILABLE`. The separate generic `/api/stream-proxy` compatibility endpoint retains its cache-backed seekable behavior and is not used as a playback fallback.
+- **Playback validation:** Candidate mirrors are checked for public HTTPS destinations and media compatibility. Remux output is streamed through bounded pipes without a complete video cache; byte-range seeking and nonzero timestamp seeks return `501 SEEK_UNAVAILABLE`.
 - **SSE responses:** Incremental search and source events for responsive clients.
 - **Audio and subtitles:** Provider-backed embedded audio/subtitle discovery where the resolved media exposes those tracks.
 - **Download metadata:** Direct-download capability is reported only when a provider source advertises an authorized direct file.
@@ -222,7 +222,7 @@ Audio and subtitle responses are only confirmed when the resolved media can be i
 
 Source-scoped remux produces a browser-oriented fragmented MP4 stream. H.264 video is copied; every selected source audio track is converted to AAC stereo at 192 kbps, and language metadata is preserved. This supports sources with multiple audio languages, including E-AC-3 inputs. Embedded subtitles are intentionally excluded from the Remux output (`-sn`); use the subtitle-track endpoint for confirmed embedded subtitle metadata.
 
-Source-scoped remux responses advertise `X-Media-Mode: remux`, `X-Remux-Cache-State: disabled`, and `Accept-Ranges: none`. This is a forward-only stream, so byte-range seeking and `HEAD` requests are not supported. A client disconnect stops the FFmpeg process rather than allowing work to continue in the background. The separate generic `/api/stream-proxy` endpoint keeps its legacy temporary seekable-cache contract.
+Source-scoped remux responses advertise `X-Media-Mode: remux`, `X-Remux-Cache-State: disabled`, and `Accept-Ranges: none`. This is a forward-only stream, so byte-range seeking and `HEAD` requests are not supported. A client disconnect stops the FFmpeg process rather than allowing work to continue in the background. The generic `/api/stream-proxy` endpoint follows the same no-persistent-media-cache contract and rejects nonzero timestamp seeks because its validated input is pipe-based.
 
 ## API routes
 
