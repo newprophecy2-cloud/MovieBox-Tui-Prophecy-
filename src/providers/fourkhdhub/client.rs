@@ -194,6 +194,31 @@ impl FourKHdHubClient {
                 Some(resolve_res) = resolve_tasks.next(), if !resolve_tasks.is_empty() => {
                     if let Ok(mut cand_list) = resolve_res {
                         cand_list.sort_by_key(|(url, label, _)| hubcloud::score(url, label, intent));
+                        if intent == ResolutionIntent::DirectPlayback {
+                            if let Some((url, label, headers)) = cand_list.first().cloned() {
+                                let mut safe_headers = headers;
+                                if !safe_headers
+                                    .iter()
+                                    .any(|(name, _)| name.eq_ignore_ascii_case("referer"))
+                                {
+                                    safe_headers.push(("Referer".to_string(), referer.clone()));
+                                }
+                                if !safe_headers
+                                    .iter()
+                                    .any(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+                                {
+                                    safe_headers.push(("User-Agent".to_string(), BROWSER_UA.to_string()));
+                                }
+                                return Ok(PlaybackSource {
+                                    provider: ProviderKind::FourKHdHub,
+                                    url,
+                                    headers: safe_headers,
+                                    subtitle: None,
+                                    source_label: label,
+                                    max_height: None,
+                                });
+                            }
+                        }
                         for (url, label, headers) in cand_list {
                             if spawned_preflights >= 6 || !seen.insert(url.clone()) {
                                 continue;

@@ -163,6 +163,11 @@ struct SearchQuery {
     limit: Option<usize>,
     cursor: Option<String>,
 }
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DirectPlayRequest {
+    source_id: String,
+}
 #[derive(Debug, Serialize)]
 struct ErrorBody {
     error: ApiError,
@@ -889,7 +894,8 @@ async fn handle(mut stream: TcpStream, state: ApiState) -> std::io::Result<()> {
     }
     let allowed_method = matches!(method, "GET" | "HEAD")
         || (method == "POST"
-            && (target == "/api/pretranscode/start"
+            && (target == "/api/v1/play/direct"
+                || target == "/api/pretranscode/start"
                 || target.starts_with("/api/v1/admin/")
                 || target.starts_with("/api/v1/web/")
                 || target.starts_with("/api/v1/android/")));
@@ -951,6 +957,9 @@ async fn route(
         "/openapi.json" => write_json(stream, 200, &openapi(), None).await,
         "/docs" => write_text(stream, 200, "text/html; charset=utf-8", "<!doctype html><html><head><title>MovieBox API</title></head><body><h1>MovieBox API</h1><p>OpenAPI: <a href=\"/openapi.json\">/openapi.json</a></p><p>Swagger UI can load this document from a local or trusted client.</p></body></html>", None).await,
         "/api/v1/search" if method == "GET" => catalog_search_route(stream, query, state).await,
+        "/api/v1/play/direct" if method == "POST" => {
+            direct_play_route(stream, state, body).await
+        }
         _ if path.starts_with("/api/v1/web/") => web_playback_contract_route(stream, path, state).await,
         _ if path.starts_with("/api/v1/android/") => android_playback_contract_route(stream, path, state).await,
         "/api/v1/admin/catalog/import" if method == "POST" => admin_catalog_import_route(stream, state, request_headers, body).await,
@@ -5183,6 +5192,205 @@ async fn source_route(
     write_raw_json(stream, status, &body, None).await
 }
 
+fn direct_safe_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter(|(name, _)| {
+            name.eq_ignore_ascii_case("referer") || name.eq_ignore_ascii_case("user-agent")
+        })
+        .cloned()
+        .collect()
+}
+
+fn direct_url_type(url: &reqwest::Url) -> Option<&'static str> {
+    let path = url.path().to_ascii_lowercase();
+    if path.ends_with(".m3u8") || path.ends_with(".m3u") {
+        Some("hls")
+    } else if path.ends_with(".mpd") {
+        Some("dash")
+    } else {
+        None
+    }
+}
+
+async fn resolve_direct_provider_source(
+    source: &Release,
+    state: &ApiState,
+) -> Result<PlaybackSource, String> {
+    if source.provider == ProviderKind::FourKHdHub {
+        let Some(client) = state.service.fourk_client.as_ref() else {
+            return Err("provider unavailable".to_string());
+        };
+        return match tokio::time::timeout(
+            PLAYBACK_RESOLUTION_TIMEOUT,
+            client.resolve_release(
+                source,
+                crate::providers::models::ResolutionIntent::DirectPlayback,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(playback)) => Ok(playback),
+            Ok(Err(error)) => Err(error.user_message().to_string()),
+            Err(_) => Err("resolution timed out".to_string()),
+        };
+    }
+    let Some(url) = source.direct_url() else {
+        return Err("no direct provider URL".to_string());
+    };
+    Ok(PlaybackSource {
+        provider: source.provider,
+        url: url.to_string(),
+        headers: source
+            .mirrors
+            .first()
+            .map(|mirror| mirror.headers.clone())
+            .unwrap_or_default(),
+        subtitle: None,
+        source_label: source.source_label().to_string(),
+        max_height: None,
+    })
+}
+
+async fn direct_play_route(
+    stream: &mut TcpStream,
+    state: ApiState,
+    body: &[u8],
+) -> std::io::Result<()> {
+    let request: DirectPlayRequest = match serde_json::from_slice::<DirectPlayRequest>(body) {
+        Ok(request) if !request.source_id.trim().is_empty() => request,
+        _ => {
+            return write_json(
+                stream,
+                400,
+                &serde_json::json!({"success":false,"error":{"code":"INVALID_REQUEST","message":"Expected an object containing only a non-empty source_id.","retryable":false},"meta":{"request_id":request_id(),"route":"/api/v1/play/direct"}}),
+                None,
+            )
+            .await;
+        }
+    };
+    let source_id = request.source_id.trim();
+    let source = match parse_source(source_id) {
+        Ok(source) => source,
+        Err((status, body)) => return write_raw_json(stream, status, &body, None).await,
+    };
+    if source.p == ProviderKind::MovieBox && !moviebox_provider_enabled() {
+        return moviebox_disabled(stream).await;
+    }
+    let reference = OpaqueRef {
+        p: source.p,
+        v: source.v.clone(),
+        s: source.s,
+        e: source.e,
+    };
+    let releases =
+        match tokio::time::timeout(SOURCE_TIMEOUT, cached_releases(&state, &reference)).await {
+            Ok(Ok(releases)) => releases,
+            Ok(Err(error)) => {
+                let (status, response) = provider_error(error, source.p);
+                return write_raw_json(stream, status, &response, None).await;
+            }
+            Err(_) => {
+                let (status, response) = err(
+                    "DIRECT_PLAY_RESOLUTION_TIMEOUT",
+                    "Direct provider URL resolution timed out.",
+                    Some(source.p),
+                    504,
+                );
+                return write_raw_json(stream, status, &response, None).await;
+            }
+        };
+    let release = match source.f.as_deref() {
+        Some(fingerprint) => releases
+            .iter()
+            .find(|release| release_fingerprint(release) == fingerprint),
+        None => releases.get(source.i),
+    };
+    let Some(release) = release else {
+        let (status, response) = err(
+            "SOURCE_NOT_FOUND",
+            "The source was not found.",
+            Some(source.p),
+            404,
+        );
+        return write_raw_json(stream, status, &response, None).await;
+    };
+    let started = Instant::now();
+    let playback = match resolve_direct_provider_source(release, &state).await {
+        Ok(playback) => playback,
+        Err(message) if message.contains("timed out") => {
+            let (status, response) = err(
+                "DIRECT_PLAY_RESOLUTION_TIMEOUT",
+                "Direct provider URL resolution timed out.",
+                Some(source.p),
+                504,
+            );
+            return write_raw_json(stream, status, &response, None).await;
+        }
+        Err(message) => {
+            let (status, response) = err(
+                "DIRECT_PLAY_RESOLUTION_FAILED",
+                if message == "provider unavailable" {
+                    "The provider is unavailable."
+                } else if message == "no direct provider URL" {
+                    "The provider did not return a direct media URL."
+                } else {
+                    "The provider could not resolve a direct media URL."
+                },
+                Some(source.p),
+                if message == "provider unavailable" {
+                    503
+                } else {
+                    502
+                },
+            );
+            return write_raw_json(stream, status, &response, None).await;
+        }
+    };
+    let validated_url = match crate::net::validate_public_url(&playback.url, false).await {
+        Ok(url) => url,
+        Err(_) => {
+            let (status, response) = err(
+                "DIRECT_URL_REJECTED",
+                "The resolved provider URL is not an allowed public HTTPS destination.",
+                Some(source.p),
+                403,
+            );
+            return write_raw_json(stream, status, &response, None).await;
+        }
+    };
+    let Some(url_type) = direct_url_type(&validated_url) else {
+        let (status, response) = err(
+            "DIRECT_PLAY_COMPATIBILITY_UNKNOWN",
+            "The provider URL was resolved, but direct playback compatibility could not be verified without media probing.",
+            Some(source.p),
+            415,
+        );
+        return write_raw_json(stream, status, &response, None).await;
+    };
+    let headers = direct_safe_headers(&playback.headers);
+    let response = serde_json::json!({
+        "success": true,
+        "data": {
+            "mode": "direct",
+            "source_id": source_id,
+            "playback_url": validated_url.to_string(),
+            "url_type": url_type,
+            "compatibility": "verified",
+            "content_type": null,
+            "expires_at": null,
+            "requires_headers": !headers.is_empty(),
+            "headers": headers,
+            "message": "Original provider playback URL resolved."
+        },
+        "meta": {
+            "request_id": request_id(),
+            "resolution_latency_ms": started.elapsed().as_millis()
+        }
+    });
+    write_json(stream, 200, &response, None).await
+}
+
 async fn native_stream_route(
     stream: &mut TcpStream,
     path: &str,
@@ -7120,6 +7328,35 @@ fn openapi() -> serde_json::Value {
             "/api/pretranscode/status": {"get": {"responses": {"501": {"description": "Background pretranscoding is not enabled"}}}}
         }
     });
+    document["paths"]["/api/v1/play/direct"] = serde_json::json!({
+        "post": {
+            "summary": "Resolve an original provider URL for direct playback",
+            "description": "Accepts only an existing opaque source_id. Returns the original provider HLS/DASH manifest URL when direct compatibility is established. This route never relays media, creates proxy tokens, invokes FFmpeg or FFprobe, remuxes, transcodes, or falls back to another playback route.",
+            "requestBody": {
+                "required": true,
+                "content": {
+                    "application/json": {
+                        "schema": {
+                            "type": "object",
+                            "required": ["source_id"],
+                            "additionalProperties": false,
+                            "properties": {"source_id": {"type": "string"}}
+                        }
+                    }
+                }
+            },
+            "responses": {
+                "200": {"description": "Original provider playback URL resolved"},
+                "400": {"description": "Invalid request or source ID"},
+                "403": {"description": "Resolved URL rejected by destination policy"},
+                "404": {"description": "Source not found"},
+                "415": {"description": "Direct playback compatibility is unverified or unsupported"},
+                "502": {"description": "Provider URL resolution failed"},
+                "503": {"description": "Provider unavailable"},
+                "504": {"description": "Provider URL resolution timed out"}
+            }
+        }
+    });
     document["paths"]["/api/v1/sources/{source_id}/direct/{token}"] = serde_json::json!({
         "get": {
             "description": "Opaque source-scoped progressive direct media stream for sources proven to have a compatible MP4-family format and upstream byte-range support; preserves upstream 200, 206, and 416 responses.",
@@ -7453,6 +7690,29 @@ mod tests {
         assert_eq!(public.len(), 2);
         assert!(public.iter().any(|(name, _)| name == "User-Agent"));
         assert!(public.iter().any(|(name, _)| name == "Referer"));
+    }
+    #[test]
+    fn direct_route_returns_only_safe_headers_and_manifest_types() {
+        let headers = vec![
+            ("User-Agent".into(), "player".into()),
+            ("Referer".into(), "https://provider.example/".into()),
+            ("Cookie".into(), "signed-cookie".into()),
+            ("Authorization".into(), "Bearer secret".into()),
+        ];
+        let safe = direct_safe_headers(&headers);
+        assert_eq!(safe.len(), 2);
+        assert_eq!(
+            direct_url_type(&reqwest::Url::parse("https://cdn.example/master.m3u8").unwrap()),
+            Some("hls")
+        );
+        assert_eq!(
+            direct_url_type(&reqwest::Url::parse("https://cdn.example/manifest.mpd").unwrap()),
+            Some("dash")
+        );
+        assert_eq!(
+            direct_url_type(&reqwest::Url::parse("https://cdn.example/video.mp4").unwrap()),
+            None
+        );
     }
 
     #[test]
@@ -8310,6 +8570,7 @@ mod tests {
             "/openapi.json",
             "/api/v1/diagnostics",
             "/api/v1/watch",
+            "/api/v1/play/direct",
             "/api/v1/anime/search/stream",
             "/api/v1/catalog/titles/{title_id}/seasons",
             "/api/v1/catalog/titles/{title_id}/seasons/{season_number}/episodes",

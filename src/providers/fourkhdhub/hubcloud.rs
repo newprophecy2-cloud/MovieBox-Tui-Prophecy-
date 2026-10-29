@@ -401,7 +401,7 @@ fn is_public_ip(address: IpAddr) -> bool {
 pub fn score(url: &str, label: &str, intent: ResolutionIntent) -> u8 {
     let value = format!("{} {}", url, label).to_ascii_lowercase();
     match intent {
-        ResolutionIntent::Playback => {
+        ResolutionIntent::Playback | ResolutionIntent::DirectPlayback => {
             if value.contains("pixel.hubcloud.")
                 || value.contains("googleusercontent.com")
                 || value.contains("googlevideo.com")

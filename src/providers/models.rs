@@ -217,6 +217,7 @@ impl MediaDetails {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResolutionIntent {
     Playback,
+    DirectPlayback,
     Download,
 }
 
