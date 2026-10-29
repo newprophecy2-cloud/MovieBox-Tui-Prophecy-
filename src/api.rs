@@ -5202,15 +5202,56 @@ fn direct_safe_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
         .collect()
 }
 
-fn direct_url_type(url: &reqwest::Url) -> Option<&'static str> {
+fn direct_url_type(
+    url: &reqwest::Url,
+    release: &Release,
+    declared_content_type: Option<&str>,
+) -> Option<&'static str> {
     let path = url.path().to_ascii_lowercase();
-    if path.ends_with(".m3u8") || path.ends_with(".m3u") {
+    let content_type = declared_content_type
+        .unwrap_or_default()
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if path.ends_with(".m3u8")
+        || content_type == "application/vnd.apple.mpegurl"
+        || content_type == "application/x-mpegurl"
+    {
         Some("hls")
-    } else if path.ends_with(".mpd") {
+    } else if path.ends_with(".mpd") || content_type == "application/dash+xml" {
         Some("dash")
+    } else if matches!(
+        content_type.as_str(),
+        "video/mp4" | "video/webm" | "video/x-matroska"
+    ) || (release
+        .codec
+        .as_deref()
+        .is_some_and(is_supported_direct_codec)
+        && (release.provider == ProviderKind::FourKHdHub
+            || release
+                .mirrors
+                .first()
+                .is_some_and(|mirror| mirror.direct_file)))
+    {
+        Some("direct")
     } else {
         None
     }
+}
+
+fn is_supported_direct_codec(codec: &str) -> bool {
+    let normalized: String = codec
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    normalized.contains("h264")
+        || normalized.contains("avc")
+        || normalized.contains("vp8")
+        || normalized.contains("vp9")
+        || normalized.contains("av1")
 }
 
 async fn resolve_direct_provider_source(
@@ -5359,7 +5400,8 @@ async fn direct_play_route(
             return write_raw_json(stream, status, &response, None).await;
         }
     };
-    let Some(url_type) = direct_url_type(&validated_url) else {
+    let Some(url_type) = direct_url_type(&validated_url, &release, source.content_type.as_deref())
+    else {
         let (status, response) = err(
             "DIRECT_PLAY_COMPATIBILITY_UNKNOWN",
             "The provider URL was resolved, but direct playback compatibility could not be verified without media probing.",
@@ -7331,7 +7373,7 @@ fn openapi() -> serde_json::Value {
     document["paths"]["/api/v1/play/direct"] = serde_json::json!({
         "post": {
             "summary": "Resolve an original provider URL for direct playback",
-            "description": "Accepts only an existing opaque source_id. Returns the original provider HLS/DASH manifest URL when direct compatibility is established. This route never relays media, creates proxy tokens, invokes FFmpeg or FFprobe, remuxes, transcodes, or falls back to another playback route.",
+            "description": "Accepts only an existing opaque source_id. Returns the original provider URL when compatibility is established from provider metadata and safe resolver evidence. Extensionless and signed URLs are supported when the provider marks the source as a direct file with a supported codec; ambiguous sources remain HTTP 415. This route never relays media, creates proxy tokens, invokes FFmpeg or FFprobe, remuxes, transcodes, or falls back to another playback route.",
             "requestBody": {
                 "required": true,
                 "content": {
@@ -7346,7 +7388,32 @@ fn openapi() -> serde_json::Value {
                 }
             },
             "responses": {
-                "200": {"description": "Original provider playback URL resolved"},
+                "200": {
+                    "description": "Original provider playback URL resolved",
+                    "content": {"application/json": {"schema": {
+                        "type": "object",
+                        "required": ["success", "data", "meta"],
+                        "properties": {
+                            "success": {"const": true},
+                            "data": {"type": "object", "required": ["mode", "source_id", "playback_url", "url_type", "compatibility", "requires_headers", "headers"], "properties": {
+                                "mode": {"const": "direct"},
+                                "source_id": {"type": "string"},
+                                "playback_url": {"type": "string", "format": "uri"},
+                                "url_type": {"type": "string", "enum": ["hls", "dash", "direct"]},
+                                "compatibility": {"const": "verified"},
+                                "content_type": {"type": ["string", "null"]},
+                                "expires_at": {"type": ["string", "null"]},
+                                "requires_headers": {"type": "boolean"},
+                                "headers": {"type": "array", "items": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "string"}}},
+                                "message": {"type": "string"}
+                            }},
+                            "meta": {"type": "object", "required": ["request_id", "resolution_latency_ms"], "properties": {
+                                "request_id": {"type": "string"},
+                                "resolution_latency_ms": {"type": "integer", "minimum": 0}
+                            }}
+                        }
+                    }}}
+                },
                 "400": {"description": "Invalid request or source ID"},
                 "403": {"description": "Resolved URL rejected by destination policy"},
                 "404": {"description": "Source not found"},
@@ -7702,15 +7769,134 @@ mod tests {
         let safe = direct_safe_headers(&headers);
         assert_eq!(safe.len(), 2);
         assert_eq!(
-            direct_url_type(&reqwest::Url::parse("https://cdn.example/master.m3u8").unwrap()),
+            direct_url_type(
+                &reqwest::Url::parse("https://cdn.example/master.m3u8").unwrap(),
+                &Release {
+                    provider: ProviderKind::Addons,
+                    filename: "master.m3u8".into(),
+                    quality: None,
+                    codec: None,
+                    language: None,
+                    size_bytes: None,
+                    season: None,
+                    episode: None,
+                    mirrors: vec![],
+                    resource_id: None,
+                },
+                None,
+            ),
             Some("hls")
         );
         assert_eq!(
-            direct_url_type(&reqwest::Url::parse("https://cdn.example/manifest.mpd").unwrap()),
+            direct_url_type(
+                &reqwest::Url::parse("https://cdn.example/manifest.mpd").unwrap(),
+                &Release {
+                    provider: ProviderKind::Addons,
+                    filename: "manifest.mpd".into(),
+                    quality: None,
+                    codec: None,
+                    language: None,
+                    size_bytes: None,
+                    season: None,
+                    episode: None,
+                    mirrors: vec![],
+                    resource_id: None,
+                },
+                None,
+            ),
             Some("dash")
         );
         assert_eq!(
-            direct_url_type(&reqwest::Url::parse("https://cdn.example/video.mp4").unwrap()),
+            direct_url_type(
+                &reqwest::Url::parse("https://cdn.example/video.mp4").unwrap(),
+                &Release {
+                    provider: ProviderKind::Addons,
+                    filename: "video.mp4".into(),
+                    quality: None,
+                    codec: None,
+                    language: None,
+                    size_bytes: None,
+                    season: None,
+                    episode: None,
+                    mirrors: vec![],
+                    resource_id: None,
+                },
+                Some("video/mp4"),
+            ),
+            Some("direct")
+        );
+    }
+
+    #[test]
+    fn direct_route_uses_metadata_for_extensionless_and_signed_video_urls() {
+        let release = Release {
+            provider: ProviderKind::FourKHdHub,
+            filename: "episode.mkv".into(),
+            quality: Some("1080p".into()),
+            codec: Some("H.264".into()),
+            language: None,
+            size_bytes: None,
+            season: Some(1),
+            episode: Some(1),
+            mirrors: vec![crate::providers::models::SourceMirror {
+                label: "Direct".into(),
+                resolver_url: "https://cdn.example/file?id=1".into(),
+                headers: vec![("Referer".into(), "https://provider.example/".into())],
+                direct_file: false,
+            }],
+            resource_id: None,
+        };
+        assert_eq!(
+            direct_url_type(
+                &reqwest::Url::parse("https://cdn.example/file?id=1").unwrap(),
+                &release,
+                None,
+            ),
+            Some("direct")
+        );
+        assert_eq!(
+            direct_url_type(
+                &reqwest::Url::parse("https://cdn.example/file?sig=abc").unwrap(),
+                &release,
+                Some("video/mp4; charset=binary"),
+            ),
+            Some("direct")
+        );
+    }
+
+    #[test]
+    fn direct_route_keeps_ambiguous_urls_unknown() {
+        let release = Release {
+            provider: ProviderKind::Addons,
+            filename: "episode.bin".into(),
+            quality: None,
+            codec: None,
+            language: None,
+            size_bytes: None,
+            season: None,
+            episode: None,
+            mirrors: vec![crate::providers::models::SourceMirror {
+                label: "Unknown".into(),
+                resolver_url: "https://cdn.example/file".into(),
+                headers: vec![],
+                direct_file: false,
+            }],
+            resource_id: None,
+        };
+        assert_eq!(
+            direct_url_type(
+                &reqwest::Url::parse("https://cdn.example/file").unwrap(),
+                &release,
+                None,
+            ),
+            None
+        );
+        assert_eq!(
+            direct_url_type(
+                &reqwest::Url::parse("https://cdn.example/playlist.m3u").unwrap(),
+                &release,
+                None,
+            ),
             None
         );
     }
