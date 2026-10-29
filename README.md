@@ -200,6 +200,17 @@ The resolved response includes fields such as:
 
 Temporary signed URLs may expire. Clients should request a fresh source resolution when playback fails because a provider URL has expired.
 
+Android clients that need the original provider URL without API proxying, remux, or transcoding should call the explicit direct-play resolver with the opaque source ID:
+
+```bash
+curl --fail-with-body -X POST \
+  -H 'Content-Type: application/json' \
+  -d "{\"source_id\":\"$SOURCE_ID\"}" \
+  http://127.0.0.1:8080/api/v1/play/direct
+```
+
+A successful response uses `data.mode: "direct"` and returns `data.playback_url` plus any required safe request headers. The URL is resolved from the provider and is not relayed by this API route. `POST` is required; other methods return HTTP `405` with `Allow: POST`.
+
 ### Source SSE
 
 ```bash
@@ -256,6 +267,7 @@ Source-scoped remux responses advertise `X-Media-Mode: remux`, `X-Remux-Cache-St
 | `GET` | `/api/v1/episodes/{episode_id}/sources/stream` | Incremental SSE source discovery |
 | `GET` | `/api/v1/sources/{source_id}` | Source metadata and automatic playback resolution |
 | `GET` | `/api/v1/sources/{source_id}/playback` | Explicit playback resolution |
+| `POST` | `/api/v1/play/direct` | Resolve the original provider URL for direct playback (`{"source_id":"…"}`) |
 | `GET` | `/api/v1/sources/{source_id}/play` | Playback alias |
 | `GET` | `/api/v1/sources/{source_id}/watch` | Watch/playback response |
 | `GET` | `/api/v1/sources/{source_id}/audio` | Embedded audio tracks |

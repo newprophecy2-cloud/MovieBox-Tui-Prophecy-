@@ -892,10 +892,11 @@ async fn handle(mut stream: TcpStream, state: ApiState) -> std::io::Result<()> {
         )
         .await;
     }
+    let target_path = target.split_once('?').map_or(target, |(path, _)| path);
     let allowed_method = matches!(method, "GET" | "HEAD")
+        || target_path == "/api/v1/play/direct"
         || (method == "POST"
-            && (target == "/api/v1/play/direct"
-                || target == "/api/pretranscode/start"
+            && (target == "/api/pretranscode/start"
                 || target.starts_with("/api/v1/admin/")
                 || target.starts_with("/api/v1/web/")
                 || target.starts_with("/api/v1/android/")));
@@ -957,9 +958,16 @@ async fn route(
         "/openapi.json" => write_json(stream, 200, &openapi(), None).await,
         "/docs" => write_text(stream, 200, "text/html; charset=utf-8", "<!doctype html><html><head><title>MovieBox API</title></head><body><h1>MovieBox API</h1><p>OpenAPI: <a href=\"/openapi.json\">/openapi.json</a></p><p>Swagger UI can load this document from a local or trusted client.</p></body></html>", None).await,
         "/api/v1/search" if method == "GET" => catalog_search_route(stream, query, state).await,
-        "/api/v1/play/direct" if method == "POST" => {
+        "/api/v1/play/direct" if direct_play_method(method) => {
             direct_play_route(stream, state, body).await
         }
+        "/api/v1/play/direct" => write_json(
+            stream,
+            405,
+            &serde_json::json!({"error":{"code":"METHOD_NOT_ALLOWED","message":"Use POST for direct playback."}}),
+            Some("Allow: POST\r\n"),
+        )
+        .await,
         _ if path.starts_with("/api/v1/web/") => web_playback_contract_route(stream, path, state).await,
         _ if path.starts_with("/api/v1/android/") => android_playback_contract_route(stream, path, state).await,
         "/api/v1/admin/catalog/import" if method == "POST" => admin_catalog_import_route(stream, state, request_headers, body).await,
@@ -5254,6 +5262,10 @@ fn is_supported_direct_codec(codec: &str) -> bool {
         || normalized.contains("av1")
 }
 
+fn direct_play_method(method: &str) -> bool {
+    method == "POST"
+}
+
 async fn resolve_direct_provider_source(
     source: &Release,
     state: &ApiState,
@@ -7420,7 +7432,8 @@ fn openapi() -> serde_json::Value {
                 "415": {"description": "Direct playback compatibility is unverified or unsupported"},
                 "502": {"description": "Provider URL resolution failed"},
                 "503": {"description": "Provider unavailable"},
-                "504": {"description": "Provider URL resolution timed out"}
+                "504": {"description": "Provider URL resolution timed out"},
+                "405": {"description": "Method not allowed; use POST. The response includes Allow: POST."}
             }
         }
     });
@@ -7451,6 +7464,52 @@ fn openapi() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn test_api_state(cache_dir: std::path::PathBuf) -> ApiState {
+        ApiState {
+            service: Arc::new(MovieBoxService::new()),
+            catalog: None,
+            release_cache: Arc::new(Mutex::new(HashMap::new())),
+            release_inflight: Arc::new(Mutex::new(HashMap::new())),
+            playback_cache: Arc::new(Mutex::new(HashMap::new())),
+            playback_inflight: Arc::new(Mutex::new(HashMap::new())),
+            search_cache: Arc::new(Mutex::new(HashMap::new())),
+            redis_search: None,
+            search_source_check_slots: Arc::new(Semaphore::new(SEARCH_SOURCE_CHECK_CONCURRENCY)),
+            remux_cache: crate::remux_cache::RemuxCache::open(crate::config::MediaSettings {
+                cache_dir,
+                cache_ttl: Duration::from_secs(60),
+                cache_max_bytes: 1024,
+                max_concurrent_jobs: 1,
+                job_timeout: Duration::from_secs(30),
+            })
+            .await
+            .unwrap(),
+            native_stream: crate::api_native_stream::NativeStreamProxy::new(1_073_741_824).unwrap(),
+            connection_slots: Arc::new(Semaphore::new(MAX_API_CONNECTIONS)),
+        }
+    }
+
+    async fn direct_play_http_response(state: ApiState, method: &str, body: &[u8]) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(address).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let server_task = tokio::spawn(async move { handle(server, state).await.unwrap() });
+
+        let request = format!(
+            "{method} /api/v1/play/direct HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        client.write_all(body).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        server_task.await.unwrap();
+        String::from_utf8_lossy(&response).into_owned()
+    }
 
     #[test]
     fn import_title_match_normalizes_case_and_punctuation_without_fuzzy_matching() {
@@ -8795,6 +8854,64 @@ mod tests {
         ] {
             assert!(paths.get(route).is_some(), "missing {route}");
         }
+    }
+
+    #[test]
+    fn direct_play_is_post_only_and_documents_method_not_allowed() {
+        assert!(direct_play_method("POST"));
+        for method in ["GET", "HEAD", "PUT", "DELETE", "PATCH"] {
+            assert!(
+                !direct_play_method(method),
+                "{method} must not invoke direct play"
+            );
+        }
+
+        let document = openapi();
+        let direct = &document["paths"]["/api/v1/play/direct"];
+        assert!(direct.get("post").is_some());
+        assert!(direct.get("get").is_none());
+        assert!(direct["post"]["responses"].get("405").is_some());
+        assert_eq!(
+            direct["post"]["requestBody"]["content"]["application/json"]["schema"]["required"][0],
+            "source_id"
+        );
+        let success = &direct["post"]["responses"]["200"]["content"]["application/json"]["schema"]
+            ["properties"];
+        assert_eq!(success["success"]["const"], true);
+        assert_eq!(success["data"]["properties"]["mode"]["const"], "direct");
+        assert_eq!(
+            success["data"]["properties"]["playback_url"]["format"],
+            "uri"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_play_http_requires_post_and_reaches_post_validation() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_api_state(root.path().to_path_buf()).await;
+
+        let get = direct_play_http_response(state.clone(), "GET", b"").await;
+        assert!(get.starts_with("HTTP/1.1 405"), "{get}");
+        assert!(get.contains("Allow: POST\r\n"), "{get}");
+        assert!(get.contains("METHOD_NOT_ALLOWED"), "{get}");
+
+        let put = direct_play_http_response(state.clone(), "PUT", b"").await;
+        assert!(put.starts_with("HTTP/1.1 405"), "{put}");
+        assert!(put.contains("Allow: POST\r\n"), "{put}");
+
+        let post = direct_play_http_response(state.clone(), "POST", b"{}").await;
+        assert!(post.starts_with("HTTP/1.1 400"), "{post}");
+        assert!(post.contains("INVALID_REQUEST"), "{post}");
+
+        let empty_id =
+            direct_play_http_response(state.clone(), "POST", br#"{"source_id":""}"#).await;
+        assert!(empty_id.starts_with("HTTP/1.1 400"), "{empty_id}");
+        assert!(empty_id.contains("INVALID_REQUEST"), "{empty_id}");
+
+        let invalid_id =
+            direct_play_http_response(state, "POST", br#"{"source_id":"not-a-source-id"}"#).await;
+        assert!(invalid_id.starts_with("HTTP/1.1 400"), "{invalid_id}");
+        assert!(invalid_id.contains("INVALID_ID"), "{invalid_id}");
     }
 
     #[test]
