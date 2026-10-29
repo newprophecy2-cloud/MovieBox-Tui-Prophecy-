@@ -6,7 +6,7 @@ This document describes the Rust API implementation in this repository, not a pr
 
 - `GET /api/v1/home` requests the MovieBox homepage and returns provider-backed sections: `featured`, `trending`, `popular`, `movies`, `anime`, and `kdramas`.
 - `GET /api/v1/home/featured`, `/api/v1/trending`, `/api/v1/trending/{anime|movies|k-dramas}`, and `/api/v1/popular` with the same subroutes return sections from upstream provider data. Ranking fields are provider-reported; these endpoints do not represent internal activity rankings.
-- `GET /api/v1/movies` lists MovieBox movie entries. `GET /api/v1/movies/{movie_id}` returns provider details. Movie source, stream, and playback subroutes are dispatched separately.
+- `GET /api/v1/movies` lists MovieBox movie entries. `GET /api/v1/movies/{movie_id}` returns provider details. With PostgreSQL enabled, the listing uses catalog UUIDs; the detail, sources, stream, and playback routes accept those UUIDs as well as legacy opaque provider movie IDs.
 - `GET /api/v1/k-dramas` returns series classified using provider metadata, not title-only guesses. `GET /api/v1/categories` returns supported categories and provider capabilities. K-Drama details (`/api/v1/k-dramas/{id}`) are not implemented and return `501 UNSUPPORTED_CATEGORY`.
 - `GET /api/v1/latest` returns `501 UNSUPPORTED_CATEGORY` because available providers do not expose reliable release-date metadata consistently.
 - `GET /api/v1/anime/search` and `/api/v1/anime/search/stream` perform live provider search (JSON and SSE). They are not database-backed catalog searches.
@@ -17,6 +17,12 @@ This document describes the Rust API implementation in this repository, not a pr
 - `GET /api/v1/watch` is a compatibility route that searches providers and resolves a playable source at request time.
 
 Listing routes that accept `page` and `limit` bound the requested limit in code. Provider failures return structured errors rather than fabricated catalog entries.
+
+## Movie detail and playback IDs
+
+`GET /api/v1/movies/{movie_id}` and its `/sources`, `/stream`, and `/playback` subroutes accept either a legacy opaque provider movie ID or a UUID returned by the PostgreSQL-backed `GET /api/v1/movies` listing. For a catalog UUID, the API loads the catalog title, requires `content_type: "movie"`, and resolves only a `match_status: "verified"` mapping for a supported movie provider (`moviebox` or `fourkhdhub`). Provider details must match that mapping and identify a standalone movie. The provider source resolver receives transport coordinates `season=0` and `episode=0`; these are not catalog season or episode records.
+
+`/stream` and its `/playback` alias return a JSON playback descriptor (`Content-Type: application/json`) through the existing provider resolver and playback pipeline. For catalog UUID requests, `movie_id` and `catalog_title_id` remain the catalog UUID; `provider_movie_id` is the corresponding opaque provider reference. An unrecognized ID returns `400 INVALID_ID`, a missing catalog title or verified mapping returns `404`, a non-movie title returns `400 NOT_A_MOVIE`, provider errors retain their structured status, and a confirmed absence of movie sources returns `404 NO_STREAM_SOURCE`. Codec eligibility, source resolution, native streaming, and remux behavior are unchanged; the descriptor is not proof of real playback until a permitted provider source is actually resolved.
 
 ## Source eligibility and codec policy
 

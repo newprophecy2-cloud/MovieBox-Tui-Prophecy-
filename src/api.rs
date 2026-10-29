@@ -658,9 +658,46 @@ fn provider_error(e: ProviderError, p: ProviderKind) -> (u16, String) {
         ),
     }
 }
+fn movie_source_error(e: ProviderError, p: ProviderKind) -> (u16, String) {
+    match e {
+        ProviderError::NotFound => err(
+            "NO_STREAM_SOURCE",
+            "No provider source is available for this movie.",
+            Some(p),
+            404,
+        ),
+        ProviderError::Unavailable(message) if message == "No stream sources available" => err(
+            "NO_STREAM_SOURCE",
+            "No provider source is available for this movie.",
+            Some(p),
+            404,
+        ),
+        other => provider_error(other, p),
+    }
+}
+
+fn request_deadline_error(message: &'static str, provider: ProviderKind) -> (u16, String) {
+    err("REQUEST_DEADLINE_EXCEEDED", message, Some(provider), 504)
+}
+
 fn parse_ref(value: &str) -> Result<OpaqueRef, (u16, String)> {
     decode(value).map_err(|_| err("INVALID_ID", "The identifier is invalid.", None, 400))
 }
+#[derive(Debug)]
+enum MovieRouteId {
+    Provider(OpaqueRef),
+    Catalog(uuid::Uuid),
+}
+
+fn parse_movie_route_id(value: &str) -> Result<MovieRouteId, (u16, String)> {
+    match parse_ref(value) {
+        Ok(reference) => Ok(MovieRouteId::Provider(reference)),
+        Err(provider_error) => uuid::Uuid::parse_str(value)
+            .map(MovieRouteId::Catalog)
+            .map_err(|_| provider_error),
+    }
+}
+
 fn parse_source(value: &str) -> Result<OpaqueSource, (u16, String)> {
     decode(value).map_err(|_| err("INVALID_ID", "The source identifier is invalid.", None, 400))
 }
@@ -1026,7 +1063,6 @@ async fn route(
         "/api/v1/movies" | "/api/v1/k-dramas" | "/api/v1/categories" if !moviebox_provider_enabled() => {
             moviebox_disabled(stream).await
         }
-        _ if path.starts_with("/api/v1/movies/") && !moviebox_provider_enabled() => moviebox_disabled(stream).await,
         _ if path.starts_with("/api/v1/movies/") => movie_route(stream, path, query, state).await,
         _ if path.starts_with("/api/v1/k-dramas/") => unsupported_catalog(stream, "K-Drama details require a verified item classification before lookup.").await,
         _ if path.starts_with("/api/v1/anime/") => anime_route(stream, path, query, state).await,
@@ -3850,10 +3886,59 @@ async fn movie_route(
         let (s, b) = err("INVALID_ID", "A movie identifier is required.", None, 400);
         return write_raw_json(stream, s, &b, None).await;
     }
-    let r = parse_ref(parts[3]);
-    let Ok(r) = r else {
-        let (s, b) = r.unwrap_err();
+    if parts.len() > 5 {
+        let (s, b) = err(
+            "INVALID_ROUTE",
+            "The movie route is not supported.",
+            None,
+            404,
+        );
         return write_raw_json(stream, s, &b, None).await;
+    }
+    let (r, catalog_title_id) = match parse_movie_route_id(parts[3]) {
+        Ok(MovieRouteId::Provider(reference)) => (reference, None),
+        Ok(MovieRouteId::Catalog(title_uuid)) => {
+            let Some(catalog) = state.catalog.clone() else {
+                let (status, body) = err(
+                    "DATABASE_UNAVAILABLE",
+                    "Catalog movie IDs cannot be resolved while the catalog is unavailable.",
+                    None,
+                    503,
+                );
+                return write_raw_json(stream, status, &body, None).await;
+            };
+            let canonical_id = title_uuid.to_string();
+            let detail = match catalog.get_title_detail(&canonical_id).await {
+                Ok(Some(detail)) => detail,
+                Ok(None) => {
+                    let (status, body) =
+                        catalog_movie_reference_error(CatalogMovieReferenceError::TitleNotFound);
+                    return write_raw_json(stream, status, &body, None).await;
+                }
+                Err(_) => {
+                    let (status, body) = err(
+                        "DATABASE_UNAVAILABLE",
+                        "The catalog database is unavailable.",
+                        None,
+                        503,
+                    );
+                    return write_raw_json(stream, status, &body, None).await;
+                }
+            };
+            let reference = match catalog_movie_reference_for_title(
+                Some(&detail.title.content_type),
+                &detail.provider_mappings,
+                moviebox_provider_enabled(),
+            ) {
+                Ok(reference) => reference,
+                Err(error) => {
+                    let (status, body) = catalog_movie_reference_error(error);
+                    return write_raw_json(stream, status, &body, None).await;
+                }
+            };
+            (reference, Some(canonical_id))
+        }
+        Err((status, body)) => return write_raw_json(stream, status, &body, None).await,
     };
     if r.p == ProviderKind::MovieBox && !moviebox_provider_enabled() {
         return moviebox_disabled(stream).await;
@@ -3866,12 +3951,7 @@ async fn movie_route(
                 return write_raw_json(stream, s, &b, None).await;
             }
             Err(_) => {
-                let (s, b) = err(
-                    "REQUEST_DEADLINE_EXCEEDED",
-                    "The movie details request timed out.",
-                    Some(r.p),
-                    504,
-                );
+                let (s, b) = request_deadline_error("The movie details request timed out.", r.p);
                 return write_raw_json(stream, s, &b, None).await;
             }
         };
@@ -3884,12 +3964,35 @@ async fn movie_route(
         );
         return write_raw_json(stream, s, &b, None).await;
     }
+    if catalog_title_id.is_some()
+        && (details_result.id.provider != r.p || details_result.id.value != r.v)
+    {
+        let (status, body) = err(
+            "MOVIE_PROVIDER_MAPPING_INVALID",
+            "The provider returned details that do not match the verified catalog mapping.",
+            Some(r.p),
+            409,
+        );
+        return write_raw_json(stream, status, &body, None).await;
+    }
     if parts.len() == 4 {
+        if let Some(catalog_title_id) = catalog_title_id.as_deref() {
+            let mut response = serde_json::to_value(details(details_result)).unwrap_or_default();
+            if let Some(object) = response.as_object_mut() {
+                object.insert(
+                    "catalog_title_id".into(),
+                    serde_json::json!(catalog_title_id),
+                );
+                object.insert("provider_movie_id".into(), serde_json::json!(encode(&r)));
+            }
+            return write_json(stream, 200, &response, None).await;
+        }
         return write_json(stream, 200, &details(details_result), None).await;
     }
     let movie_ref = MovieIdentity {
         provider: r.p,
         provider_id: r.v.clone(),
+        catalog_title_id: catalog_title_id.clone(),
     };
     let provider_lookup_ref = movie_ref.provider_lookup_ref();
     match parts.get(4).copied() {
@@ -3917,16 +4020,11 @@ async fn movie_route(
                     .await
                 }
                 Ok(Err(error)) => {
-                    let (s, b) = provider_error(error, r.p);
+                    let (s, b) = movie_source_error(error, r.p);
                     write_raw_json(stream, s, &b, None).await
                 }
                 Err(_) => {
-                    let (s, b) = err(
-                        "REQUEST_DEADLINE_EXCEEDED",
-                        "The movie source request timed out.",
-                        Some(r.p),
-                        504,
-                    );
+                    let (s, b) = request_deadline_error("The movie source request timed out.", r.p);
                     write_raw_json(stream, s, &b, None).await
                 }
             }
@@ -3935,7 +4033,9 @@ async fn movie_route(
             playback_route(
                 stream,
                 PlaybackIdentity::Movie {
-                    movie_id: parts[3].to_string(),
+                    movie_id: catalog_title_id
+                        .clone()
+                        .unwrap_or_else(|| parts[3].to_string()),
                     movie_ref,
                 },
                 details_result,
@@ -4071,6 +4171,58 @@ async fn anime_route(
 struct MovieIdentity {
     provider: ProviderKind,
     provider_id: String,
+    catalog_title_id: Option<String>,
+}
+
+fn catalog_movie_reference(
+    content_type: &str,
+    provider_mappings: &[serde_json::Value],
+    moviebox_enabled: bool,
+) -> Option<OpaqueRef> {
+    if content_type != "movie" {
+        return None;
+    }
+    let mut candidates = provider_mappings
+        .iter()
+        .filter_map(|mapping| {
+            if mapping.get("match_status").and_then(|value| value.as_str()) != Some("verified") {
+                return None;
+            }
+            let provider = ProviderKind::parse(mapping.get("provider_key")?.as_str()?)?;
+            if !matches!(provider, ProviderKind::MovieBox | ProviderKind::FourKHdHub) {
+                return None;
+            }
+            let provider_id = mapping
+                .get("provider_title_id")
+                .and_then(|value| value.as_str())?;
+            if provider_id.trim().is_empty()
+                || provider_id.len() > 512
+                || provider_id.chars().any(char::is_control)
+            {
+                return None;
+            }
+            Some((provider, provider_id.to_string()))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        let priority = |provider| {
+            if provider == ProviderKind::MovieBox && !moviebox_enabled {
+                PROVIDERS.len()
+            } else {
+                provider_priority(provider)
+            }
+        };
+        priority(left.0)
+            .cmp(&priority(right.0))
+            .then_with(|| left.1.cmp(&right.1))
+    });
+    let (provider, provider_id) = candidates.into_iter().next()?;
+    Some(OpaqueRef {
+        p: provider,
+        v: provider_id,
+        s: 0,
+        e: 0,
+    })
 }
 
 impl MovieIdentity {
@@ -4084,6 +4236,60 @@ impl MovieIdentity {
             s: 0,
             e: 0,
         }
+    }
+}
+
+fn movie_request_matches_provider_id(movie_id: &str, movie_ref: &MovieIdentity) -> bool {
+    decode::<OpaqueRef>(movie_id).is_ok_and(|reference| {
+        reference.p == movie_ref.provider
+            && reference.v == movie_ref.provider_id
+            && reference.s == 0
+            && reference.e == 0
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CatalogMovieReferenceError {
+    TitleNotFound,
+    NotMovie,
+    MappingNotFound,
+}
+
+fn catalog_movie_reference_for_title(
+    content_type: Option<&str>,
+    provider_mappings: &[serde_json::Value],
+    moviebox_enabled: bool,
+) -> Result<OpaqueRef, CatalogMovieReferenceError> {
+    let Some(content_type) = content_type else {
+        return Err(CatalogMovieReferenceError::TitleNotFound);
+    };
+    if content_type != "movie" {
+        return Err(CatalogMovieReferenceError::NotMovie);
+    }
+    catalog_movie_reference(content_type, provider_mappings, moviebox_enabled)
+        .ok_or(CatalogMovieReferenceError::MappingNotFound)
+}
+
+fn catalog_movie_reference_error(error: CatalogMovieReferenceError) -> (u16, String) {
+    match error {
+        CatalogMovieReferenceError::TitleNotFound => err(
+            "CATALOG_TITLE_NOT_FOUND",
+            "The catalog movie was not found.",
+            None,
+            404,
+        ),
+        CatalogMovieReferenceError::NotMovie => err(
+            "NOT_A_MOVIE",
+            "The requested catalog title is not a movie.",
+            None,
+            400,
+        ),
+        CatalogMovieReferenceError::MappingNotFound => err(
+            "MOVIE_PROVIDER_MAPPING_NOT_FOUND",
+            "No verified supported provider mapping is available for this movie.",
+            None,
+            404,
+        ),
     }
 }
 
@@ -4102,8 +4308,21 @@ enum PlaybackIdentity {
 impl PlaybackIdentity {
     fn add_response_fields(&self, object: &mut serde_json::Map<String, serde_json::Value>) {
         match self {
-            Self::Movie { movie_id, .. } => {
+            Self::Movie {
+                movie_id,
+                movie_ref,
+            } => {
                 object.insert("movie_id".into(), serde_json::json!(movie_id));
+                if let Some(catalog_title_id) = &movie_ref.catalog_title_id {
+                    object.insert(
+                        "catalog_title_id".into(),
+                        serde_json::json!(catalog_title_id),
+                    );
+                    object.insert(
+                        "provider_movie_id".into(),
+                        serde_json::json!(encode(&movie_ref.provider_lookup_ref())),
+                    );
+                }
             }
             Self::Episode {
                 anime_id,
@@ -4208,16 +4427,14 @@ async fn playback_route(
             movie_id,
             movie_ref,
         } => {
-            let transport_ref = decode::<OpaqueRef>(movie_id).ok();
+            let request_id_matches = match movie_ref.catalog_title_id.as_deref() {
+                Some(catalog_title_id) => movie_id == catalog_title_id,
+                None => movie_request_matches_provider_id(movie_id, movie_ref),
+            };
             if media_details.media_type != MediaType::Movie
                 || media_details.id.provider != movie_ref.provider
                 || media_details.id.value != movie_ref.provider_id
-                || !transport_ref.as_ref().is_some_and(|reference| {
-                    reference.p == movie_ref.provider
-                        && reference.v == movie_ref.provider_id
-                        && reference.s == 0
-                        && reference.e == 0
-                })
+                || !request_id_matches
             {
                 let (status, body) = err(
                     "INVALID_ID",
@@ -4235,16 +4452,16 @@ async fn playback_route(
         match tokio::time::timeout(OVERALL_TIMEOUT, cached_releases(&state, &source_ref)).await {
             Ok(Ok(releases)) => releases,
             Ok(Err(error)) => {
-                let (status, body) = provider_error(error, source_ref.p);
+                let (status, body) = if content_label == "movie" {
+                    movie_source_error(error, source_ref.p)
+                } else {
+                    provider_error(error, source_ref.p)
+                };
                 return write_raw_json(stream, status, &body, None).await;
             }
             Err(_) => {
-                let (status, body) = err(
-                    "REQUEST_DEADLINE_EXCEEDED",
-                    "The stream source request timed out.",
-                    Some(source_ref.p),
-                    504,
-                );
+                let (status, body) =
+                    request_deadline_error("The stream source request timed out.", source_ref.p);
                 return write_raw_json(stream, status, &body, None).await;
             }
         };
@@ -7335,10 +7552,10 @@ fn openapi() -> serde_json::Value {
             "/api/v1/popular/movies": {"get": {"responses": {"200": {"description": "Provider-backed popular movies"}}}},
             "/api/v1/popular/k-dramas": {"get": {"responses": {"200": {"description": "Metadata-backed popular K-Dramas"}}}},
             "/api/v1/movies": {"get": {"responses": {"200": {"description": "MovieBox movie catalogue"}}}},
-            "/api/v1/movies/{movie_id}": {"get": {"responses": {"200": {"description": "Movie details"}}}},
-            "/api/v1/movies/{movie_id}/sources": {"get": {"responses": {"200": {"description": "Movie source candidates"}, "502": {"description": "Movie source resolution failed"}}}},
-            "/api/v1/movies/{movie_id}/stream": {"get": {"responses": {"200": {"description": "Movie playback descriptor; verified compatible MP4 sources use direct range passthrough, native HLS/DASH stays native, and other verified sources use progressive fragmented-MP4 remux"}, "415": {"description": "Sources are blocked or have unverified codecs"}, "429": {"description": "Media-job capacity is busy"}, "502": {"description": "Movie playback resolution failed"}, "504": {"description": "Movie playback resolution timed out"}}}},
-            "/api/v1/movies/{movie_id}/playback": {"get": {"responses": {"200": {"description": "Alias for movie stream playback"}}}},
+            "/api/v1/movies/{movie_id}": {"get": {"description": "Accepts a catalog-title UUID or legacy opaque provider movie ID. Catalog UUIDs resolve only verified supported provider mappings.", "responses": {"200": {"description": "Movie details; catalog UUID responses also include catalog_title_id and provider_movie_id"}, "400": {"description": "Invalid ID or catalog title is not a movie"}, "404": {"description": "Catalog title or verified provider mapping not found"}, "503": {"description": "Catalog database unavailable"}}}},
+            "/api/v1/movies/{movie_id}/sources": {"get": {"description": "Accepts a catalog-title UUID or legacy opaque provider movie ID; source IDs use the existing opaque source contract.", "responses": {"200": {"description": "Movie source candidates"}, "400": {"description": "Invalid ID or catalog title is not a movie"}, "404": {"description": "No source, title, or verified provider mapping found"}, "502": {"description": "Movie source resolution failed"}, "503": {"description": "Provider or catalog unavailable"}, "504": {"description": "Movie source resolution timed out"}}}},
+            "/api/v1/movies/{movie_id}/stream": {"get": {"description": "Accepts a catalog-title UUID or legacy opaque provider movie ID. Returns a JSON playback descriptor through the existing movie resolver; verified compatible MP4 sources use direct range passthrough, native HLS/DASH stays native, and other verified sources use progressive fragmented-MP4 remux.", "responses": {"200": {"description": "Movie playback descriptor"}, "400": {"description": "Invalid ID or catalog title is not a movie"}, "404": {"description": "Catalog title, verified provider mapping, or source not found"}, "415": {"description": "Sources are blocked or have unverified codecs"}, "429": {"description": "Media-job capacity is busy"}, "502": {"description": "Movie playback resolution failed"}, "503": {"description": "Provider or catalog unavailable"}, "504": {"description": "Movie playback resolution timed out"}}}},
+            "/api/v1/movies/{movie_id}/playback": {"get": {"description": "Alias for movie stream playback; accepts the same catalog UUID and opaque provider movie ID forms.", "responses": {"200": {"description": "Movie playback descriptor"}, "400": {"description": "Invalid ID or catalog title is not a movie"}, "404": {"description": "Movie title, mapping, or source not found"}, "415": {"description": "Source codec blocked or unverified"}, "502": {"description": "Movie playback resolution failed"}, "503": {"description": "Provider or catalog unavailable"}, "504": {"description": "Movie playback resolution timed out"}}}},
             "/api/v1/k-dramas": {"get": {"responses": {"200": {"description": "Metadata-backed K-Drama catalogue"}}}},
             "/api/v1/k-dramas/{id}": {"get": {"responses": {"501": {"description": "Unsupported category"}}}},
             "/api/v1/categories": {"get": {"responses": {"200": {"description": "Supported content categories"}}}},
@@ -8795,6 +9012,12 @@ mod tests {
         ] {
             assert!(paths.get(route).is_some(), "missing {route}");
         }
+        let movie_stream_description =
+            paths["/api/v1/movies/{movie_id}/stream"]["get"]["description"]
+                .as_str()
+                .unwrap();
+        assert!(movie_stream_description.contains("catalog-title UUID"));
+        assert!(movie_stream_description.contains("opaque provider movie ID"));
     }
 
     #[test]
@@ -8825,22 +9048,197 @@ mod tests {
     }
 
     #[test]
+    fn movie_route_id_parser_distinguishes_catalog_legacy_and_invalid_ids() {
+        let legacy_id = encode(&OpaqueRef {
+            p: ProviderKind::MovieBox,
+            v: "movie-123".into(),
+            s: 0,
+            e: 0,
+        });
+        match parse_movie_route_id(&legacy_id).unwrap() {
+            MovieRouteId::Provider(reference) => {
+                assert_eq!(reference.p, ProviderKind::MovieBox);
+                assert_eq!(reference.v, "movie-123");
+                assert_eq!((reference.s, reference.e), (0, 0));
+            }
+            MovieRouteId::Catalog(_) => panic!("legacy ID was treated as catalog UUID"),
+        }
+
+        let catalog_id = "402cf608-976e-45c3-aae2-c0498d16a43e";
+        match parse_movie_route_id(catalog_id).unwrap() {
+            MovieRouteId::Catalog(id) => assert_eq!(id.to_string(), catalog_id),
+            MovieRouteId::Provider(_) => panic!("catalog UUID was treated as provider ID"),
+        }
+
+        let (status, body) = parse_movie_route_id("not-a-valid-movie-id").unwrap_err();
+        assert_eq!(status, 400);
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["error"]["code"], "INVALID_ID");
+    }
+
+    #[test]
+    fn catalog_movie_reference_uses_only_verified_supported_mappings() {
+        let mappings = vec![
+            serde_json::json!({
+                "provider_key": "fourkhdhub",
+                "provider_title_id": "/movie/example-1/",
+                "match_status": "unverified"
+            }),
+            serde_json::json!({
+                "provider_key": "addons",
+                "provider_title_id": "addon:movie-1",
+                "match_status": "verified"
+            }),
+            serde_json::json!({
+                "provider_key": "moviebox",
+                "provider_title_id": "movie-123",
+                "match_status": "verified"
+            }),
+            serde_json::json!({
+                "provider_key": "fourkhdhub",
+                "provider_title_id": "/movie/other-2/",
+                "match_status": "verified"
+            }),
+        ];
+        let reference = catalog_movie_reference("movie", &mappings, true).unwrap();
+        assert_eq!(reference.p, ProviderKind::MovieBox);
+        assert_eq!(reference.v, "movie-123");
+        assert_eq!((reference.s, reference.e), (0, 0));
+        assert!(catalog_movie_reference("anime", &mappings, true).is_none());
+        assert!(
+            catalog_movie_reference(
+                "movie",
+                &[serde_json::json!({
+                    "provider_key": "fourkhdhub",
+                    "provider_title_id": "/movie/example-1/",
+                    "match_status": "unverified"
+                })],
+                true
+            )
+            .is_none()
+        );
+        let disabled_reference = catalog_movie_reference("movie", &mappings, false).unwrap();
+        assert_eq!(disabled_reference.p, ProviderKind::FourKHdHub);
+        assert_eq!(disabled_reference.v, "/movie/other-2/");
+    }
+
+    #[test]
+    fn catalog_movie_missing_title_and_mapping_errors_have_distinct_statuses() {
+        let cases = [
+            (None, Vec::new(), 404, "CATALOG_TITLE_NOT_FOUND"),
+            (
+                Some("movie"),
+                Vec::new(),
+                404,
+                "MOVIE_PROVIDER_MAPPING_NOT_FOUND",
+            ),
+            (Some("series"), Vec::new(), 400, "NOT_A_MOVIE"),
+        ];
+
+        for (content_type, mappings, expected_status, expected_code) in cases {
+            let error =
+                catalog_movie_reference_for_title(content_type, &mappings, true).unwrap_err();
+            let (status, body) = catalog_movie_reference_error(error);
+            assert_eq!(status, expected_status);
+            let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(body["error"]["code"], expected_code);
+        }
+    }
+
+    #[test]
+    fn movie_no_source_is_distinct_from_provider_failure() {
+        let (status, body) = movie_source_error(
+            ProviderError::Unavailable("No stream sources available".into()),
+            ProviderKind::MovieBox,
+        );
+        assert_eq!(status, 404);
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["error"]["code"], "NO_STREAM_SOURCE");
+
+        let (status, body) = movie_source_error(
+            ProviderError::Network("controlled provider outage".into()),
+            ProviderKind::MovieBox,
+        );
+        assert_eq!(status, 503);
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["error"]["code"], "UPSTREAM_UNAVAILABLE");
+    }
+
+    #[test]
+    fn movie_provider_timeout_uses_gateway_timeout_contract() {
+        let (status, body) = request_deadline_error(
+            "The movie source request timed out.",
+            ProviderKind::FourKHdHub,
+        );
+        assert_eq!(status, 504);
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["error"]["code"], "REQUEST_DEADLINE_EXCEEDED");
+        assert_eq!(body["error"]["provider"], "4KHDHub");
+    }
+
+    #[test]
     fn movie_playback_identity_does_not_require_or_emit_episode_id() {
-        let identity = PlaybackIdentity::Movie {
-            movie_id: "opaque-movie-id".into(),
-            movie_ref: MovieIdentity {
-                provider: ProviderKind::MovieBox,
-                provider_id: "movie-123".into(),
-            },
+        let movie_ref = MovieIdentity {
+            provider: ProviderKind::MovieBox,
+            provider_id: "movie-123".into(),
+            catalog_title_id: None,
         };
+        let provider_movie_id = encode(&OpaqueRef {
+            p: ProviderKind::MovieBox,
+            v: "movie-123".into(),
+            s: 0,
+            e: 0,
+        });
+        let identity = PlaybackIdentity::Movie {
+            movie_id: provider_movie_id.clone(),
+            movie_ref: movie_ref.clone(),
+        };
+        assert!(movie_request_matches_provider_id(
+            &provider_movie_id,
+            &movie_ref
+        ));
         let mut fields = serde_json::Map::new();
         identity.add_response_fields(&mut fields);
 
         assert_eq!(
             fields.get("movie_id"),
-            Some(&serde_json::json!("opaque-movie-id"))
+            Some(&serde_json::json!(provider_movie_id))
         );
         assert!(!fields.contains_key("anime_id"));
+        assert!(!fields.contains_key("episode_id"));
+    }
+
+    #[test]
+    fn catalog_movie_playback_keeps_catalog_id_and_provider_transport_separate() {
+        let reference = catalog_movie_reference(
+            "movie",
+            &[serde_json::json!({
+                "provider_key": "fourkhdhub",
+                "provider_title_id": "/movie/example-1/",
+                "match_status": "verified"
+            })],
+            true,
+        )
+        .unwrap();
+        let catalog_title_id = "402cf608-976e-45c3-aae2-c0498d16a43e";
+        let identity = PlaybackIdentity::Movie {
+            movie_id: catalog_title_id.into(),
+            movie_ref: MovieIdentity {
+                provider: reference.p,
+                provider_id: reference.v.clone(),
+                catalog_title_id: Some(catalog_title_id.into()),
+            },
+        };
+        let mut fields = serde_json::Map::new();
+        identity.add_response_fields(&mut fields);
+
+        assert_eq!(fields["movie_id"], catalog_title_id);
+        assert_eq!(fields["catalog_title_id"], catalog_title_id);
+        let provider_movie_id = fields["provider_movie_id"].as_str().unwrap();
+        let decoded = decode::<OpaqueRef>(provider_movie_id).unwrap();
+        assert_eq!(decoded.p, ProviderKind::FourKHdHub);
+        assert_eq!(decoded.v, "/movie/example-1/");
+        assert_eq!((decoded.s, decoded.e), (0, 0));
         assert!(!fields.contains_key("episode_id"));
     }
 
