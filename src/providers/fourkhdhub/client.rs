@@ -7,6 +7,8 @@ use reqwest::Url;
 const DEFAULT_BASE_URL: &str = "https://4khdhub.one/";
 const BROWSER_UA: &str = crate::net::DEFAULT_BROWSER_USER_AGENT;
 const MIRROR_RESOLUTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(14);
+const PREFLIGHT_RANGE: &str = "bytes=0-1023";
+const PREFLIGHT_MAX_BYTES: usize = 1024;
 
 #[derive(thiserror::Error, Debug)]
 pub enum FourKHdHubError {
@@ -312,15 +314,16 @@ impl FourKHdHubClient {
             let mut request = self
                 .client
                 .get(&validated_url)
-                .header(reqwest::header::RANGE, "bytes=0-8191");
+                .header(reqwest::header::RANGE, PREFLIGHT_RANGE);
             for (name, value) in headers {
                 request = request.header(name, value);
             }
-            let response = request.send().await?.error_for_status()?;
+            let mut response = request.send().await?.error_for_status()?;
             let mut is_seekable = response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
             let mut final_url = response.url().clone();
             self.validate_public_playback_url(final_url.as_str())
                 .await?;
+            let prefix = read_preflight_prefix(&mut response).await?;
             let content_type = response
                 .headers()
                 .get(reqwest::header::CONTENT_TYPE)
@@ -330,21 +333,17 @@ impl FourKHdHubClient {
             if content_type.contains("text/html")
                 || content_type.contains("application/zip")
                 || content_type.contains("text/plain")
+                || looks_like_html_or_challenge(&prefix)
             {
-                let body_bytes = response.bytes().await.unwrap_or_default();
-                let body_lower = String::from_utf8_lossy(&body_bytes).to_ascii_lowercase();
-                if body_lower.contains("failed to extract link")
-                    || body_lower.contains("token expired")
-                    || body_lower.contains("file not found")
-                    || body_lower.contains("404 not found")
-                    || body_lower.contains("link has expired")
-                    || body_lower.contains("expired")
-                    || body_lower.contains("access denied")
-                    || body_lower.contains("downloadquotaexceeded")
-                    || body_lower.contains("generate link again")
-                {
+                let body_lower = String::from_utf8_lossy(&prefix).to_ascii_lowercase();
+                if is_expired_or_unavailable_page(&body_lower) {
                     return Err(FourKHdHubError::NoPlayableMirror(
                         "upstream mirror reported expired file link".into(),
+                    ));
+                }
+                if looks_like_html_or_challenge(&prefix) && !content_type.contains("text/html") {
+                    return Err(FourKHdHubError::NoPlayableMirror(
+                        "upstream mirror returned an HTML or challenge page".into(),
                     ));
                 }
 
@@ -362,15 +361,16 @@ impl FourKHdHubClient {
                 let mut wrapped_request = self
                     .client
                     .get(&wrapped)
-                    .header(reqwest::header::RANGE, "bytes=0-8191");
+                    .header(reqwest::header::RANGE, PREFLIGHT_RANGE);
                 for (name, value) in headers {
                     wrapped_request = wrapped_request.header(name, value);
                 }
-                let wrapped_response = wrapped_request.send().await?.error_for_status()?;
+                let mut wrapped_response = wrapped_request.send().await?.error_for_status()?;
                 is_seekable = wrapped_response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
                 final_url = wrapped_response.url().clone();
                 self.validate_public_playback_url(final_url.as_str())
                     .await?;
+                let wrapped_prefix = read_preflight_prefix(&mut wrapped_response).await?;
                 let wrapped_type = wrapped_response
                     .headers()
                     .get(reqwest::header::CONTENT_TYPE)
@@ -380,21 +380,18 @@ impl FourKHdHubClient {
                 if wrapped_type.contains("text/html")
                     || wrapped_type.contains("application/zip")
                     || wrapped_type.contains("text/plain")
+                    || looks_like_html_or_challenge(&wrapped_prefix)
                 {
-                    let wrapped_bytes = wrapped_response.bytes().await.unwrap_or_default();
                     let wrapped_lower =
-                        String::from_utf8_lossy(&wrapped_bytes).to_ascii_lowercase();
-                    if wrapped_lower.contains("failed to extract link")
-                        || wrapped_lower.contains("token expired")
-                        || wrapped_lower.contains("file not found")
-                        || wrapped_lower.contains("404 not found")
-                        || wrapped_lower.contains("expired")
-                        || wrapped_lower.contains("access denied")
-                        || wrapped_lower.contains("downloadquotaexceeded")
-                        || wrapped_lower.contains("generate link again")
-                    {
+                        String::from_utf8_lossy(&wrapped_prefix).to_ascii_lowercase();
+                    if is_expired_or_unavailable_page(&wrapped_lower) {
                         return Err(FourKHdHubError::NoPlayableMirror(
                             "upstream mirror reported expired file link".into(),
+                        ));
+                    }
+                    if looks_like_html_or_challenge(&wrapped_prefix) {
+                        return Err(FourKHdHubError::NoPlayableMirror(
+                            "upstream mirror returned an HTML or challenge page".into(),
                         ));
                     }
                     return Err(FourKHdHubError::NoPlayableMirror(format!(
@@ -435,6 +432,60 @@ impl FourKHdHubClient {
         }
         Ok(url)
     }
+}
+
+async fn read_preflight_prefix(
+    response: &mut reqwest::Response,
+) -> Result<Vec<u8>, reqwest::Error> {
+    let mut prefix = Vec::with_capacity(PREFLIGHT_MAX_BYTES);
+    while prefix.len() < PREFLIGHT_MAX_BYTES {
+        let Some(chunk) = response.chunk().await? else {
+            break;
+        };
+        let remaining = PREFLIGHT_MAX_BYTES - prefix.len();
+        prefix.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        if chunk.len() >= remaining {
+            break;
+        }
+    }
+    Ok(prefix)
+}
+
+fn is_expired_or_unavailable_page(body_lower: &str) -> bool {
+    [
+        "failed to extract link",
+        "token expired",
+        "file not found",
+        "404 not found",
+        "link has expired",
+        "expired",
+        "access denied",
+        "downloadquotaexceeded",
+        "generate link again",
+    ]
+    .iter()
+    .any(|marker| body_lower.contains(marker))
+}
+
+fn looks_like_html_or_challenge(prefix: &[u8]) -> bool {
+    let prefix = String::from_utf8_lossy(prefix).to_ascii_lowercase();
+    let prefix = prefix.trim_start();
+    [
+        "<!doctype html",
+        "<html",
+        "<head",
+        "<body",
+        "<script",
+        "captcha",
+        "cf-chl-",
+        "cloudflare ray id",
+        "just a moment",
+        "checking your browser",
+        "verify you are human",
+        "attention required",
+    ]
+    .iter()
+    .any(|marker| prefix.contains(marker))
 }
 
 fn build_client() -> Result<reqwest::Client, reqwest::Error> {
@@ -550,5 +601,153 @@ mod tests {
         assert_eq!(candidates[0].2, "https://pixeldrain.dev/seekable.mkv");
         assert_eq!(candidates[1].2, "https://r2.dev/unseekable.mkv");
         assert_eq!(candidates[2].2, "https://workers.dev/quota.mkv");
+    }
+
+    #[tokio::test]
+    async fn preflight_prefix_uses_exact_range_and_caps_bytes_from_mock_server() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 2048];
+            let length = stream.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..length]);
+            let body = vec![0x1a; PREFLIGHT_MAX_BYTES * 8];
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Type: video/x-matroska\r\nContent-Length: {}\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            stream.write_all(&body).await.unwrap();
+            request
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("range: bytes=0-1023"))
+        });
+
+        let mut response = reqwest::Client::new()
+            .get(format!("http://{address}/media"))
+            .header(reqwest::header::RANGE, PREFLIGHT_RANGE)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let prefix = read_preflight_prefix(&mut response).await.unwrap();
+
+        assert_eq!(prefix.len(), PREFLIGHT_MAX_BYTES);
+        assert!(
+            server.await.unwrap(),
+            "mock server must receive bytes=0-1023"
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_404_is_rejected_and_slow_response_times_out() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}/missing"))
+            .send()
+            .await
+            .unwrap();
+        let error = response
+            .error_for_status()
+            .expect_err("404 must fail closed");
+        assert_eq!(error.status().unwrap().as_u16(), 404);
+        server.await.unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request).await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ntest")
+                .await;
+        });
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(20))
+            .build()
+            .unwrap();
+        let error = client
+            .get(format!("http://{address}/slow"))
+            .send()
+            .await
+            .expect_err("slow mock response must time out");
+        assert!(error.is_timeout());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shared_redirect_policy_rejects_private_redirect_destinations() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_address = target.local_addr().unwrap();
+        let source = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_address = source.local_addr().unwrap();
+        let source_server = tokio::spawn(async move {
+            let (mut stream, _) = source.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request).await;
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{target_address}/private\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let client = crate::net::http_client_builder_base().build().unwrap();
+        assert!(
+            client
+                .get(format!("http://{source_address}/redirect"))
+                .send()
+                .await
+                .is_err()
+        );
+        source_server.await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), target.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_html_and_challenge_probe_prefixes_but_not_media_bytes() {
+        assert!(looks_like_html_or_challenge(
+            b" <!doctype html><title>login</title>"
+        ));
+        assert!(looks_like_html_or_challenge(
+            b"<html><body>Just a moment... cf-chl-abc"
+        ));
+        assert!(looks_like_html_or_challenge(
+            b"captcha verification required"
+        ));
+        assert!(!looks_like_html_or_challenge(b"\x1aE\xdf\xa3matroska"));
+        assert!(is_expired_or_unavailable_page("file not found"));
     }
 }

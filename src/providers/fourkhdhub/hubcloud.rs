@@ -560,6 +560,20 @@ mod tests {
     }
 
     #[test]
+    fn extracts_and_validates_supported_pixeldrain_script_mirror() {
+        let markup = r#"<script>const download = "https://pixeldrain.com/u/A1b2_C3";</script>"#;
+        let candidates = extract_script_pixeldrain_urls(markup);
+        assert_eq!(
+            candidates,
+            vec!["https://pixeldrain.com/api/file/A1b2_C3?download"]
+        );
+        assert_eq!(
+            validate_playback_url(&candidates[0]).unwrap(),
+            "https://pixeldrain.com/api/file/A1b2_C3?download"
+        );
+    }
+
+    #[test]
     fn decodes_greenmotors_payload_pipeline() {
         let payload = "Y214WE0xWjNZbXRhVUdwMmIxQldObFo2ZFRCeFZVOXRRbmxxYVV0UU9XRndla2w1YjNveGFYRlVPV3h3YkRWM2IxVkpka3RRT1dKdk1qRjViMVJUYUUxVVNXeExVRGgyV1ZCWGFWWjNZblpNU0hWR1dsUkJWa2RIVFZweVIzbHBUVk54V0c1NlYxVkNSMU51UkcxSmFreHRRVVZ4ZVdOV1JtRlBlRzlKU1RKTWJVRkNjbnBCYUVwaGVYbHZlWGswU25vMWVISktXbTFIZDFaMmMwUTlQUT09";
         let target = decode_greenmotors_payload(payload);

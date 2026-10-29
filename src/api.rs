@@ -5210,6 +5210,34 @@ fn direct_safe_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
         .collect()
 }
 
+fn direct_play_success_response(
+    source_id: &str,
+    url: &reqwest::Url,
+    url_type: &str,
+    headers: &[(String, String)],
+    latency_ms: u128,
+) -> serde_json::Value {
+    serde_json::json!({
+        "success": true,
+        "data": {
+            "mode": "direct",
+            "source_id": source_id,
+            "playback_url": url.as_str(),
+            "url_type": url_type,
+            "compatibility": "verified",
+            "content_type": null,
+            "expires_at": null,
+            "requires_headers": !headers.is_empty(),
+            "headers": headers,
+            "message": "Original provider playback URL resolved."
+        },
+        "meta": {
+            "request_id": request_id(),
+            "resolution_latency_ms": latency_ms
+        }
+    })
+}
+
 fn direct_url_type(
     url: &reqwest::Url,
     release: &Release,
@@ -5423,25 +5451,13 @@ async fn direct_play_route(
         return write_raw_json(stream, status, &response, None).await;
     };
     let headers = direct_safe_headers(&playback.headers);
-    let response = serde_json::json!({
-        "success": true,
-        "data": {
-            "mode": "direct",
-            "source_id": source_id,
-            "playback_url": validated_url.to_string(),
-            "url_type": url_type,
-            "compatibility": "verified",
-            "content_type": null,
-            "expires_at": null,
-            "requires_headers": !headers.is_empty(),
-            "headers": headers,
-            "message": "Original provider playback URL resolved."
-        },
-        "meta": {
-            "request_id": request_id(),
-            "resolution_latency_ms": started.elapsed().as_millis()
-        }
-    });
+    let response = direct_play_success_response(
+        source_id,
+        &validated_url,
+        url_type,
+        &headers,
+        started.elapsed().as_millis(),
+    );
     write_json(stream, 200, &response, None).await
 }
 
@@ -7924,6 +7940,51 @@ mod tests {
     }
 
     #[test]
+    fn direct_success_response_preserves_provider_url_and_safe_schema() {
+        let provider_url =
+            reqwest::Url::parse("https://pixeldrain.dev/api/file/opaque?download&token=signed")
+                .unwrap();
+        let raw_headers = vec![
+            ("Referer".into(), "https://provider.example/".into()),
+            ("User-Agent".into(), "player".into()),
+            ("Cookie".into(), "private-cookie".into()),
+            ("Authorization".into(), "Bearer private".into()),
+        ];
+        let headers = direct_safe_headers(&raw_headers);
+        let response =
+            direct_play_success_response("test-source-id", &provider_url, "direct", &headers, 12);
+
+        assert_eq!(response["success"], true);
+        assert_eq!(response["data"]["mode"], "direct");
+        assert_eq!(response["data"]["url_type"], "direct");
+        assert_eq!(response["data"]["compatibility"], "verified");
+        assert_eq!(response["data"]["playback_url"], provider_url.as_str());
+        assert!(
+            response["data"]["playback_url"]
+                .as_str()
+                .unwrap()
+                .contains("token=signed")
+        );
+        assert!(
+            !response["data"]["playback_url"]
+                .as_str()
+                .unwrap()
+                .contains("/api/stream-proxy")
+        );
+        assert_eq!(response["data"]["headers"].as_array().unwrap().len(), 2);
+        assert!(
+            !response["data"]["headers"]
+                .to_string()
+                .contains("private-cookie")
+        );
+        assert!(
+            !response["data"]["headers"]
+                .to_string()
+                .contains("Bearer private")
+        );
+    }
+
+    #[test]
     fn direct_route_keeps_ambiguous_urls_unknown() {
         let release = Release {
             provider: ProviderKind::Addons,
@@ -8912,6 +8973,8 @@ mod tests {
             direct_play_http_response(state, "POST", br#"{"source_id":"not-a-source-id"}"#).await;
         assert!(invalid_id.starts_with("HTTP/1.1 400"), "{invalid_id}");
         assert!(invalid_id.contains("INVALID_ID"), "{invalid_id}");
+        assert!(!invalid_id.contains("not-a-source-id"), "{invalid_id}");
+        assert!(!invalid_id.contains("http://"), "{invalid_id}");
     }
 
     #[test]
