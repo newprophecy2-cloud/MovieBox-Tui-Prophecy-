@@ -144,6 +144,17 @@ struct OpaqueRef {
     s: usize,
     e: usize,
 }
+const MOVIE_COMPATIBILITY_EPISODE_KIND: &str = "movie_episode_v1";
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct MovieCompatibilityEpisodeRef {
+    p: ProviderKind,
+    v: String,
+    s: usize,
+    e: usize,
+    #[serde(rename = "k")]
+    kind: String,
+}
 #[derive(Debug, Serialize, Deserialize)]
 struct OpaqueSource {
     p: ProviderKind,
@@ -478,6 +489,49 @@ fn provider_ref(id: &ProviderMediaId, s: usize, e: usize) -> String {
         e,
     })
 }
+fn movie_compatibility_episode_ref(id: &ProviderMediaId) -> MovieCompatibilityEpisodeRef {
+    MovieCompatibilityEpisodeRef {
+        p: id.provider,
+        v: id.value.clone(),
+        s: 1,
+        e: 1,
+        kind: MOVIE_COMPATIBILITY_EPISODE_KIND.to_string(),
+    }
+}
+fn movie_compatibility_episode_id(id: &ProviderMediaId) -> String {
+    encode(&movie_compatibility_episode_ref(id))
+}
+fn parse_movie_compatibility_episode_id(
+    value: &str,
+) -> Result<Option<MovieCompatibilityEpisodeRef>, ()> {
+    let payload = decode::<serde_json::Value>(value)?;
+    let Some(kind) = payload.get("k") else {
+        return Ok(None);
+    };
+    if kind.as_str() != Some(MOVIE_COMPATIBILITY_EPISODE_KIND) {
+        return Err(());
+    }
+    let episode: MovieCompatibilityEpisodeRef = serde_json::from_value(payload).map_err(|_| ())?;
+    if episode.v.trim().is_empty()
+        || episode.s != 1
+        || episode.e != 1
+        || encode(&episode) != value.trim_end_matches('=')
+    {
+        return Err(());
+    }
+    Ok(Some(episode))
+}
+fn movie_compatibility_episode_matches(
+    episode: &MovieCompatibilityEpisodeRef,
+    movie_ref: &OpaqueRef,
+    media_type: MediaType,
+) -> bool {
+    media_type == MediaType::Movie
+        && episode.p == movie_ref.p
+        && episode.v == movie_ref.v
+        && episode.s == 1
+        && episode.e == 1
+}
 fn release_fingerprint(r: &Release) -> String {
     let mut hasher = Sha256::new();
     let size = r
@@ -544,6 +598,23 @@ fn catalog(item: CatalogItem) -> ApiCatalogItem {
 }
 fn details(d: MediaDetails) -> ApiDetails {
     let provider_id = d.id.clone();
+    let seasons = if d.media_type == MediaType::Movie {
+        vec![ApiSeason {
+            number: 1,
+            episodes: vec![ApiEpisode {
+                id: movie_compatibility_episode_id(&provider_id),
+                season: 1,
+                number: 1,
+                title: Some("Full Movie".to_string()),
+                overview: None,
+            }],
+        }]
+    } else {
+        d.seasons
+            .into_iter()
+            .map(|s| season(s, &provider_id))
+            .collect()
+    };
     ApiDetails {
         id: provider_ref(&d.id, 0, 0),
         title: d.title,
@@ -559,11 +630,7 @@ fn details(d: MediaDetails) -> ApiDetails {
         poster_url: d.poster_url,
         duration: d.duration,
         genres: d.genres,
-        seasons: d
-            .seasons
-            .into_iter()
-            .map(|s| season(s, &provider_id))
-            .collect(),
+        seasons,
         audio: d.dubs,
     }
 }
@@ -662,7 +729,22 @@ fn parse_ref(value: &str) -> Result<OpaqueRef, (u16, String)> {
     decode(value).map_err(|_| err("INVALID_ID", "The identifier is invalid.", None, 400))
 }
 fn parse_source(value: &str) -> Result<OpaqueSource, (u16, String)> {
-    decode(value).map_err(|_| err("INVALID_ID", "The source identifier is invalid.", None, 400))
+    let source: OpaqueSource = decode(value)
+        .map_err(|_| err("INVALID_ID", "The source identifier is invalid.", None, 400))?;
+    if source
+        .content_type
+        .as_deref()
+        .is_some_and(|kind| kind != "movie")
+        || (source.content_type.as_deref() == Some("movie") && (source.s != 0 || source.e != 0))
+    {
+        return Err(err(
+            "INVALID_ID",
+            "The source identifier is invalid.",
+            None,
+            400,
+        ));
+    }
+    Ok(source)
 }
 
 async fn init_redis_search_cache() -> Option<redis::aio::MultiplexedConnection> {
@@ -4465,6 +4547,104 @@ async fn anime_episode_full_route(
     details_result: MediaDetails,
     state: ApiState,
 ) -> std::io::Result<()> {
+    let compatibility_episode = match parse_movie_compatibility_episode_id(episode_id) {
+        Ok(episode) => episode,
+        Err(_) => {
+            let (status, body) = err(
+                "INVALID_ID",
+                "The episode identifier is invalid.",
+                None,
+                400,
+            );
+            return write_raw_json(stream, status, &body, None).await;
+        }
+    };
+    let anime = details(details_result);
+    if anime.id != anime_id {
+        let (status, body) = err(
+            "INVALID_ID",
+            "The anime identifier does not match the requested item.",
+            Some(anime_ref.p),
+            400,
+        );
+        return write_raw_json(stream, status, &body, None).await;
+    }
+
+    if let Some(compatibility_episode) = compatibility_episode {
+        if !movie_compatibility_episode_matches(
+            &compatibility_episode,
+            &anime_ref,
+            anime.media_type,
+        ) {
+            let (status, body) = err(
+                "INVALID_ID",
+                "The Movie episode identifier does not belong to the requested Movie.",
+                Some(anime_ref.p),
+                400,
+            );
+            return write_raw_json(stream, status, &body, None).await;
+        }
+        let selected_episode = anime
+            .seasons
+            .iter()
+            .flat_map(|season| season.episodes.iter())
+            .find(|episode| {
+                episode.season == 1
+                    && episode.number == 1
+                    && episode.id.trim_end_matches('=') == episode_id.trim_end_matches('=')
+            })
+            .cloned();
+        let Some(selected_episode) = selected_episode else {
+            let (status, body) = err(
+                "EPISODE_NOT_FOUND",
+                "The Movie compatibility episode was not found.",
+                Some(anime_ref.p),
+                404,
+            );
+            return write_raw_json(stream, status, &body, None).await;
+        };
+
+        let movie_ref = MovieIdentity {
+            provider: compatibility_episode.p,
+            provider_id: compatibility_episode.v,
+        }
+        .provider_lookup_ref();
+        let (sources, sources_status, sources_partial, source_error) = match tokio::time::timeout(
+            OVERALL_TIMEOUT,
+            cached_releases(&state, &movie_ref),
+        )
+        .await
+        {
+            Ok(Ok(releases)) => movie_compatibility_sources(&releases, &movie_ref),
+            Ok(Err(error)) => movie_compatibility_source_error(error, &movie_ref),
+            Err(_) => movie_compatibility_source_timeout(&movie_ref),
+        };
+        return write_json(
+            stream,
+            200,
+            &AnimeEpisodeFullResponse {
+                anime,
+                selected_episode,
+                sources,
+                sources_status,
+                sources_partial,
+                source_error,
+            },
+            None,
+        )
+        .await;
+    }
+
+    if anime.media_type == MediaType::Movie {
+        let (status, body) = err(
+            "INVALID_ID",
+            "A Movie requires its server-generated compatibility episode identifier.",
+            Some(anime_ref.p),
+            400,
+        );
+        return write_raw_json(stream, status, &body, None).await;
+    }
+
     let episode_ref = match decode::<OpaqueRef>(episode_id) {
         Ok(episode) => episode,
         Err(_) => {
@@ -4487,16 +4667,6 @@ async fn anime_episode_full_route(
         return write_raw_json(stream, status, &body, None).await;
     }
 
-    let anime = details(details_result);
-    if anime.id != anime_id {
-        let (status, body) = err(
-            "INVALID_ID",
-            "The anime identifier does not match the requested item.",
-            Some(anime_ref.p),
-            400,
-        );
-        return write_raw_json(stream, status, &body, None).await;
-    }
     let selected_episode = anime
         .seasons
         .iter()
@@ -4693,6 +4863,88 @@ fn api_sources_for_content(
             expires_at: None,
         })
         .collect()
+}
+
+fn movie_compatibility_sources(
+    releases: &[Release],
+    movie_ref: &OpaqueRef,
+) -> (
+    Vec<ApiSource>,
+    &'static str,
+    bool,
+    Option<serde_json::Value>,
+) {
+    let sources = api_sources_for_content(releases, movie_ref, Some("movie"));
+    if sources.is_empty() {
+        let (_, body) = err(
+            "NO_STREAM_SOURCE",
+            "The Movie provider returned no verified playable sources.",
+            Some(movie_ref.p),
+            404,
+        );
+        (
+            sources,
+            "no_sources",
+            false,
+            serde_json::from_str(&body).ok(),
+        )
+    } else {
+        (sources, "ok", false, None)
+    }
+}
+
+fn movie_compatibility_source_error(
+    error: ProviderError,
+    movie_ref: &OpaqueRef,
+) -> (
+    Vec<ApiSource>,
+    &'static str,
+    bool,
+    Option<serde_json::Value>,
+) {
+    let (status, body) = match error {
+        ProviderError::NotFound => err(
+            "NO_STREAM_SOURCE",
+            "The Movie provider returned no stream sources.",
+            Some(movie_ref.p),
+            404,
+        ),
+        error => provider_error(error, movie_ref.p),
+    };
+    let sources_status = if status == 404 {
+        "no_sources"
+    } else {
+        "unavailable"
+    };
+    let sources_partial = sources_status == "unavailable";
+    (
+        Vec::new(),
+        sources_status,
+        sources_partial,
+        serde_json::from_str(&body).ok(),
+    )
+}
+
+fn movie_compatibility_source_timeout(
+    movie_ref: &OpaqueRef,
+) -> (
+    Vec<ApiSource>,
+    &'static str,
+    bool,
+    Option<serde_json::Value>,
+) {
+    let (_, body) = err(
+        "REQUEST_DEADLINE_EXCEEDED",
+        "The Movie source request deadline was exceeded.",
+        Some(movie_ref.p),
+        504,
+    );
+    (
+        Vec::new(),
+        "timeout",
+        true,
+        serde_json::from_str(&body).ok(),
+    )
 }
 
 fn api_episode_from_details(details: &MediaDetails, episode: &OpaqueRef) -> Option<ApiEpisode> {
@@ -5202,30 +5454,18 @@ fn direct_safe_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
         .collect()
 }
 
+/// `content_type` in an opaque source ID is a semantic label, never MIME evidence.
 fn direct_url_type(
     url: &reqwest::Url,
     release: &Release,
-    declared_content_type: Option<&str>,
+    _untrusted_content_type: Option<&str>,
 ) -> Option<&'static str> {
     let path = url.path().to_ascii_lowercase();
-    let content_type = declared_content_type
-        .unwrap_or_default()
-        .split(';')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase();
-    if path.ends_with(".m3u8")
-        || content_type == "application/vnd.apple.mpegurl"
-        || content_type == "application/x-mpegurl"
-    {
+    if path.ends_with(".m3u8") {
         Some("hls")
-    } else if path.ends_with(".mpd") || content_type == "application/dash+xml" {
+    } else if path.ends_with(".mpd") {
         Some("dash")
-    } else if matches!(
-        content_type.as_str(),
-        "video/mp4" | "video/webm" | "video/x-matroska"
-    ) || (release
+    } else if release
         .codec
         .as_deref()
         .is_some_and(is_supported_direct_codec)
@@ -5233,7 +5473,7 @@ fn direct_url_type(
             || release
                 .mirrors
                 .first()
-                .is_some_and(|mirror| mirror.direct_file)))
+                .is_some_and(|mirror| mirror.direct_file))
     {
         Some("direct")
     } else {
@@ -5400,8 +5640,7 @@ async fn direct_play_route(
             return write_raw_json(stream, status, &response, None).await;
         }
     };
-    let Some(url_type) = direct_url_type(&validated_url, &release, source.content_type.as_deref())
-    else {
+    let Some(url_type) = direct_url_type(&validated_url, release, None) else {
         let (status, response) = err(
             "DIRECT_PLAY_COMPATIBILITY_UNKNOWN",
             "The provider URL was resolved, but direct playback compatibility could not be verified without media probing.",
@@ -5419,7 +5658,14 @@ async fn direct_play_route(
             "playback_url": validated_url.to_string(),
             "url_type": url_type,
             "compatibility": "verified",
-            "content_type": null,
+            "content_type": if source.content_type.as_deref() == Some("movie")
+                && source.s == 0
+                && source.e == 0
+            {
+                Some("movie")
+            } else {
+                None::<&str>
+            },
             "expires_at": null,
             "requires_headers": !headers.is_empty(),
             "headers": headers,
@@ -7823,7 +8069,7 @@ mod tests {
                 },
                 Some("video/mp4"),
             ),
-            Some("direct")
+            None
         );
     }
 
@@ -8701,6 +8947,253 @@ mod tests {
         assert!(SEARCH_SOURCE_CHECK_TIMEOUT >= SOURCE_TIMEOUT);
     }
 
+    fn movie_details_fixture(provider: ProviderKind, value: &str) -> MediaDetails {
+        MediaDetails {
+            id: ProviderMediaId {
+                provider,
+                value: value.into(),
+            },
+            title: "Example Movie".into(),
+            media_type: MediaType::Movie,
+            year: Some("2026".into()),
+            description: Some("Real movie metadata stays unchanged.".into()),
+            tagline: None,
+            imdb_rating: None,
+            director: None,
+            stars: None,
+            prints: None,
+            audios: None,
+            poster_url: None,
+            duration: Some("120 min".into()),
+            genres: vec!["Drama".into()],
+            seasons: vec![],
+            dubs: vec![],
+        }
+    }
+
+    #[test]
+    fn movie_details_include_one_full_movie_compatibility_episode() {
+        let response = details(movie_details_fixture(
+            ProviderKind::FourKHdHub,
+            "/example-movie-123/",
+        ));
+
+        assert_eq!(response.media_type, MediaType::Movie);
+        assert_eq!(response.title, "Example Movie");
+        assert_eq!(response.year.as_deref(), Some("2026"));
+        assert_eq!(
+            response.description.as_deref(),
+            Some("Real movie metadata stays unchanged.")
+        );
+        assert_eq!(response.duration.as_deref(), Some("120 min"));
+        assert_eq!(response.genres, ["Drama"]);
+        assert_eq!(response.seasons.len(), 1);
+        assert_eq!(response.seasons[0].number, 1);
+        assert_eq!(response.seasons[0].episodes.len(), 1);
+        let episode = &response.seasons[0].episodes[0];
+        assert_eq!((episode.season, episode.number), (1, 1));
+        assert_eq!(episode.title.as_deref(), Some("Full Movie"));
+    }
+
+    #[test]
+    fn movie_compatibility_ids_are_stable_unique_and_bound_to_movie_identity() {
+        let first_movie = ProviderMediaId {
+            provider: ProviderKind::FourKHdHub,
+            value: "/movie-one/".into(),
+        };
+        let second_movie = ProviderMediaId {
+            provider: ProviderKind::FourKHdHub,
+            value: "/movie-two/".into(),
+        };
+        let same_value_other_provider = ProviderMediaId {
+            provider: ProviderKind::MovieBox,
+            value: first_movie.value.clone(),
+        };
+        let first_id = movie_compatibility_episode_id(&first_movie);
+
+        assert_eq!(first_id, movie_compatibility_episode_id(&first_movie));
+        assert_ne!(first_id, movie_compatibility_episode_id(&second_movie));
+        assert_ne!(
+            first_id,
+            movie_compatibility_episode_id(&same_value_other_provider)
+        );
+        let decoded = parse_movie_compatibility_episode_id(&first_id)
+            .unwrap()
+            .unwrap();
+        let first_ref = OpaqueRef {
+            p: first_movie.provider,
+            v: first_movie.value.clone(),
+            s: 0,
+            e: 0,
+        };
+        let second_ref = OpaqueRef {
+            p: second_movie.provider,
+            v: second_movie.value.clone(),
+            s: 0,
+            e: 0,
+        };
+        assert!(movie_compatibility_episode_matches(
+            &decoded,
+            &first_ref,
+            MediaType::Movie
+        ));
+        assert!(!movie_compatibility_episode_matches(
+            &decoded,
+            &second_ref,
+            MediaType::Movie
+        ));
+        assert!(!movie_compatibility_episode_matches(
+            &decoded,
+            &first_ref,
+            MediaType::Series
+        ));
+
+        let ordinary_episode_id = encode(&OpaqueRef {
+            p: first_movie.provider,
+            v: first_movie.value,
+            s: 1,
+            e: 1,
+        });
+        assert_ne!(first_id, ordinary_episode_id);
+        assert_eq!(
+            parse_movie_compatibility_episode_id(&ordinary_episode_id),
+            Ok(None)
+        );
+        assert!(parse_movie_compatibility_episode_id("not-a-valid-id").is_err());
+    }
+
+    #[test]
+    fn movie_episode_full_sources_keep_movie_provider_identity_and_empty_status() {
+        let movie_ref = MovieIdentity {
+            provider: ProviderKind::FourKHdHub,
+            provider_id: "/example-movie-123/".into(),
+        }
+        .provider_lookup_ref();
+        assert_eq!((movie_ref.s, movie_ref.e), (0, 0));
+
+        let release = Release {
+            provider: ProviderKind::FourKHdHub,
+            filename: "Example.Movie.2160p.mp4".into(),
+            quality: Some("2160p".into()),
+            codec: Some("H.264".into()),
+            language: None,
+            size_bytes: None,
+            season: Some(0),
+            episode: Some(0),
+            mirrors: vec![],
+            resource_id: Some("real-resource".into()),
+        };
+        let (sources, status, partial, error) = movie_compatibility_sources(&[release], &movie_ref);
+        assert_eq!(status, "ok");
+        assert!(!partial);
+        assert!(error.is_none());
+        assert_eq!(sources.len(), 1);
+        let source = decode::<OpaqueSource>(&sources[0].id).unwrap();
+        assert_eq!(source.p, ProviderKind::FourKHdHub);
+        assert_eq!(source.v, "/example-movie-123/");
+        assert_eq!((source.s, source.e), (0, 0));
+        assert_eq!(source.content_type.as_deref(), Some("movie"));
+        let direct_play_source = parse_source(&sources[0].id).unwrap();
+        assert_eq!(direct_play_source.content_type.as_deref(), Some("movie"));
+        let mut forged_source = decode::<OpaqueSource>(&sources[0].id).unwrap();
+        forged_source.content_type = Some("video/mp4".into());
+        assert!(parse_source(&encode(&forged_source)).is_err());
+        let serialized_source = serde_json::to_value(&sources[0]).unwrap();
+        assert_eq!(serialized_source["id"], sources[0].id);
+        assert!(serialized_source["label"].is_string());
+        assert!(serialized_source["quality"].is_string());
+        assert_eq!(serialized_source["codec"], "H.264");
+        assert!(serialized_source["downloadable"].is_boolean());
+
+        let (sources, status, partial, error) = movie_compatibility_sources(&[], &movie_ref);
+        assert!(sources.is_empty());
+        assert_eq!(status, "no_sources");
+        assert!(!partial);
+        assert_eq!(error.unwrap()["error"]["code"], "NO_STREAM_SOURCE");
+    }
+
+    #[test]
+    fn movie_episode_full_provider_failures_preserve_truthful_status_and_errors() {
+        let movie_ref = MovieIdentity {
+            provider: ProviderKind::FourKHdHub,
+            provider_id: "/example-movie-123/".into(),
+        }
+        .provider_lookup_ref();
+
+        let (sources, status, partial, error) =
+            movie_compatibility_source_error(ProviderError::NotFound, &movie_ref);
+        assert!(sources.is_empty());
+        assert_eq!(status, "no_sources");
+        assert!(!partial);
+        assert_eq!(error.unwrap()["error"]["code"], "NO_STREAM_SOURCE");
+
+        let (sources, status, partial, error) = movie_compatibility_source_error(
+            ProviderError::Unavailable("temporary provider failure".into()),
+            &movie_ref,
+        );
+        assert!(sources.is_empty());
+        assert_eq!(status, "unavailable");
+        assert!(partial);
+        assert_eq!(error.unwrap()["error"]["code"], "UPSTREAM_UNAVAILABLE");
+
+        let (sources, status, partial, error) = movie_compatibility_source_timeout(&movie_ref);
+        assert!(sources.is_empty());
+        assert_eq!(status, "timeout");
+        assert!(partial);
+        assert_eq!(error.unwrap()["error"]["code"], "REQUEST_DEADLINE_EXCEEDED");
+    }
+
+    #[test]
+    fn movie_episode_full_json_matches_existing_envelope_types() {
+        let anime = details(movie_details_fixture(
+            ProviderKind::FourKHdHub,
+            "/example-movie-123/",
+        ));
+        let selected_episode = anime.seasons[0].episodes[0].clone();
+        let movie_ref = MovieIdentity {
+            provider: ProviderKind::FourKHdHub,
+            provider_id: "/example-movie-123/".into(),
+        }
+        .provider_lookup_ref();
+        let (sources, sources_status, sources_partial, source_error) =
+            movie_compatibility_sources(&[], &movie_ref);
+        let response = serde_json::to_value(AnimeEpisodeFullResponse {
+            anime,
+            selected_episode,
+            sources,
+            sources_status,
+            sources_partial,
+            source_error,
+        })
+        .unwrap();
+
+        assert_eq!(
+            response
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            [
+                "anime",
+                "selected_episode",
+                "source_error",
+                "sources",
+                "sources_partial",
+                "sources_status"
+            ]
+        );
+        assert_eq!(response["anime"]["media_type"], "movie");
+        assert_eq!(response["anime"]["seasons"].as_array().unwrap().len(), 1);
+        assert_eq!(response["selected_episode"]["season"], 1);
+        assert_eq!(response["selected_episode"]["number"], 1);
+        assert_eq!(response["selected_episode"]["title"], "Full Movie");
+        assert!(response["sources"].is_array());
+        assert!(response["sources_status"].is_string());
+        assert!(response["sources_partial"].is_boolean());
+        assert!(response["source_error"].is_object());
+    }
+
     #[test]
     fn episode_reference_resolves_to_the_documented_episode_shape() {
         let details = MediaDetails {
@@ -8721,15 +9214,26 @@ mod tests {
             poster_url: None,
             duration: None,
             genres: vec![],
-            seasons: vec![Season {
-                number: 1,
-                episodes: vec![crate::providers::models::Episode {
-                    season: 1,
+            seasons: vec![
+                Season {
                     number: 1,
-                    title: Some("Enter: Naruto Uzumaki!".into()),
-                    overview: None,
-                }],
-            }],
+                    episodes: vec![crate::providers::models::Episode {
+                        season: 1,
+                        number: 1,
+                        title: Some("Enter: Naruto Uzumaki!".into()),
+                        overview: None,
+                    }],
+                },
+                Season {
+                    number: 2,
+                    episodes: vec![crate::providers::models::Episode {
+                        season: 2,
+                        number: 1,
+                        title: Some("The Second Season".into()),
+                        overview: None,
+                    }],
+                },
+            ],
             dubs: vec![],
         };
         let reference = OpaqueRef {
@@ -8738,6 +9242,15 @@ mod tests {
             s: 1,
             e: 1,
         };
+        let public_details = super::details(details.clone());
+        assert_eq!(public_details.seasons.len(), 2);
+        assert_eq!(public_details.seasons[0].episodes.len(), 1);
+        assert_eq!(public_details.seasons[1].number, 2);
+        assert_eq!(public_details.seasons[1].episodes[0].number, 1);
+        assert_eq!(
+            parse_movie_compatibility_episode_id(&public_details.seasons[0].episodes[0].id),
+            Ok(None)
+        );
         let episode = api_episode_from_details(&details, &reference).unwrap();
         assert_eq!(episode.season, 1);
         assert_eq!(episode.number, 1);
