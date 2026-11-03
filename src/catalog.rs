@@ -549,7 +549,14 @@ impl CatalogStore {
             return Err(CatalogError::Validation("q must not be empty".into()));
         }
         let p = format!("%{}%", normalize(q));
-        let rows=self.client.lock().await.query("SELECT id::text,mal_id,canonical_title,normalized_title,content_type,synopsis,release_year,poster_url,catalog_status FROM catalog_titles WHERE normalized_title LIKE $1 AND catalog_status <> 'deleted' ORDER BY canonical_title LIMIT $2 OFFSET $3",&[&p,&limit.clamp(1,100),&offset.max(0)]).await?;
+        let rows = self.client.lock().await.query(
+            "SELECT ct.id::text,ct.mal_id,ct.canonical_title,ct.normalized_title,ct.content_type,ct.synopsis,ct.release_year,ct.poster_url,ct.catalog_status
+             FROM catalog_titles ct
+             WHERE (ct.normalized_title LIKE $1 OR EXISTS (SELECT 1 FROM title_alternative_titles alt WHERE alt.title_id=ct.id AND alt.normalized_title LIKE $1))
+               AND ct.catalog_status <> 'deleted'
+             ORDER BY ct.canonical_title LIMIT $2 OFFSET $3",
+            &[&p, &limit.clamp(1, 100), &offset.max(0)],
+        ).await?;
         Ok(rows.iter().map(title_from_row).collect())
     }
     pub async fn enqueue_pending_import(&self, q: &str) -> Result<(), CatalogError> {
@@ -632,15 +639,37 @@ impl CatalogStore {
         title_id: &str,
         season: i32,
     ) -> Result<Vec<Value>, CatalogError> {
-        let r=self.client.lock().await.query("SELECT e.id::text AS id,e.episode_number,e.episode_title,e.overview,e.release_date::text AS release_date,e.thumbnail_url,s.season_number FROM episodes e JOIN seasons s ON s.id=e.season_id WHERE e.title_id=$1::text::uuid AND s.season_number=$2 ORDER BY e.episode_number",&[&title_id,&season]).await?;
+        let r = self.client.lock().await.query(
+            "SELECT e.id::text AS id,e.episode_number,e.episode_title,e.overview,e.release_date::text AS release_date,e.thumbnail_url,s.season_number,
+                COALESCE((SELECT jsonb_agg(jsonb_build_object('provider_key',pr.provider_key,'provider_episode_id',m.provider_episode_id,'provider_episode_number',m.provider_episode_number) ORDER BY pr.provider_key,m.provider_episode_id)
+                    FROM episode_provider_mappings m JOIN provider_registry pr ON pr.id=m.provider_id WHERE m.episode_id=e.id),'[]'::jsonb) AS provider_mappings,
+                COALESCE((SELECT jsonb_agg(DISTINCT st.language_code ORDER BY st.language_code) FILTER (WHERE st.language_code IS NOT NULL AND st.verified)
+                    FROM provider_sources ps JOIN source_tracks st ON st.source_id=ps.id WHERE ps.episode_id=e.id AND ps.source_status IN ('active','playable') AND (ps.expires_at IS NULL OR ps.expires_at>now()) AND st.track_type='audio'),'[]'::jsonb) AS verified_audio_languages
+             FROM episodes e JOIN seasons s ON s.id=e.season_id WHERE e.title_id=$1::text::uuid AND s.season_number=$2 ORDER BY e.episode_number",
+            &[&title_id, &season],
+        ).await?;
         Ok(r.iter().map(row_json).collect())
     }
     pub async fn get_episode(&self, id: &str) -> Result<Option<Value>, CatalogError> {
-        let r=self.client.lock().await.query_opt("SELECT e.id::text AS id,e.title_id::text AS title_id,e.season_id::text AS season_id,e.episode_number,e.episode_title,e.overview,e.release_date::text AS release_date,e.thumbnail_url,s.season_number FROM episodes e JOIN seasons s ON s.id=e.season_id WHERE e.id::text=$1", &[&id]).await?;
+        let r = self.client.lock().await.query_opt(
+            "SELECT e.id::text AS id,e.title_id::text AS title_id,e.season_id::text AS season_id,e.episode_number,e.episode_title,e.overview,e.release_date::text AS release_date,e.thumbnail_url,s.season_number,
+                COALESCE((SELECT jsonb_agg(jsonb_build_object('provider_key',pr.provider_key,'provider_episode_id',m.provider_episode_id,'provider_episode_number',m.provider_episode_number) ORDER BY pr.provider_key,m.provider_episode_id)
+                    FROM episode_provider_mappings m JOIN provider_registry pr ON pr.id=m.provider_id WHERE m.episode_id=e.id),'[]'::jsonb) AS provider_mappings,
+                COALESCE((SELECT jsonb_agg(DISTINCT st.language_code ORDER BY st.language_code) FILTER (WHERE st.language_code IS NOT NULL AND st.verified)
+                    FROM provider_sources ps JOIN source_tracks st ON st.source_id=ps.id WHERE ps.episode_id=e.id AND ps.source_status IN ('active','playable') AND (ps.expires_at IS NULL OR ps.expires_at>now()) AND st.track_type='audio'),'[]'::jsonb) AS verified_audio_languages
+             FROM episodes e JOIN seasons s ON s.id=e.season_id WHERE e.id::text=$1",
+            &[&id],
+        ).await?;
         Ok(r.as_ref().map(row_json))
     }
     pub async fn list_sources(&self, id: &str) -> Result<Vec<Value>, CatalogError> {
-        let r=self.client.lock().await.query("SELECT ps.id::text AS id,ps.episode_id::text AS episode_id,ps.provider_source_id,pr.provider_key,ps.source_reference,ps.quality_label,ps.video_codec,ps.audio_codec,ps.container_format,ps.resolution_width,ps.resolution_height,ps.source_status,ps.codec_verification_status,ps.expires_at::text AS expires_at FROM provider_sources ps JOIN provider_registry pr ON pr.id=ps.provider_id WHERE ps.episode_id=$1::text::uuid AND ps.source_status NOT IN('blocked','invalid') AND (ps.expires_at IS NULL OR ps.expires_at>now()) ORDER BY ps.resolution_height DESC NULLS LAST", &[&id]).await?;
+        let r = self.client.lock().await.query(
+            "SELECT ps.id::text AS id,ps.episode_id::text AS episode_id,ps.provider_source_id,pr.provider_key,ps.source_reference,ps.quality_label,ps.video_codec,ps.audio_codec,ps.container_format,ps.resolution_width,ps.resolution_height,ps.source_status,ps.codec_verification_status,ps.expires_at::text AS expires_at,
+                COALESCE((SELECT jsonb_agg(jsonb_build_object('language_code',st.language_code,'codec',st.codec,'format',st.format,'is_default',st.is_default,'is_forced',st.is_forced,'verified',st.verified,'metadata',st.track_metadata) ORDER BY st.language_code,st.codec)
+                    FROM source_tracks st WHERE st.source_id=ps.id AND st.track_type='audio'),'[]'::jsonb) AS audio_tracks
+             FROM provider_sources ps JOIN provider_registry pr ON pr.id=ps.provider_id WHERE ps.episode_id=$1::text::uuid AND ps.source_status NOT IN('blocked','invalid') AND (ps.expires_at IS NULL OR ps.expires_at>now()) ORDER BY ps.resolution_height DESC NULLS LAST",
+            &[&id],
+        ).await?;
         Ok(r.iter()
             .map(row_json)
             .filter(source_is_playback_eligible)
@@ -938,6 +967,20 @@ async fn upsert_title(c: &Client, i: &TitleUpsert) -> Result<(CatalogTitle, bool
     Ok((title_from_row(&r), r.get("inserted")))
 }
 async fn import_in_tx(c: &Client, i: &ImportTitle) -> Result<ImportSummary, CatalogError> {
+    let identity_lock = format!(
+        "{}|{}|{}",
+        normalize(&i.canonical_title),
+        i.content_type,
+        i.release_year
+            .map_or_else(|| "unknown".into(), |year| year.to_string())
+    );
+    // Serialize concurrent imports for the same conservative identity key so
+    // two workers cannot both observe a missing title and create duplicates.
+    c.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        &[&identity_lock],
+    )
+    .await?;
     let existing_provider_title = if i.mal_id.is_none() {
         if let Some(provider) = i.providers.first() {
             c.query_opt(
@@ -953,7 +996,7 @@ async fn import_in_tx(c: &Client, i: &ImportTitle) -> Result<ImportSummary, Cata
     let existing_compatible_title = if existing_provider_title.is_none() && i.mal_id.is_none() {
         let normalized = normalize(&i.canonical_title);
         c.query_opt(
-            "SELECT id::text AS id FROM catalog_titles WHERE normalized_title=$1 AND content_type=$2 AND catalog_status <> 'deleted' AND ($3::int IS NULL OR release_year IS NULL OR release_year=$3) ORDER BY (release_year IS NULL), updated_at DESC LIMIT 1",
+            "SELECT id::text AS id FROM catalog_titles WHERE content_type=$2 AND catalog_status <> 'deleted' AND ($3::int IS NULL OR release_year IS NULL OR release_year=$3) AND (normalized_title=$1 OR EXISTS (SELECT 1 FROM title_alternative_titles a WHERE a.title_id=catalog_titles.id AND a.normalized_title=$1)) ORDER BY (normalized_title=$1) DESC,(release_year IS NULL),updated_at DESC LIMIT 1",
             &[&normalized, &i.content_type, &i.release_year],
         )
         .await?
