@@ -4219,6 +4219,59 @@ async fn resolve_playback_candidate(
     })
 }
 
+/// Fetch the requested provider and enabled provider mappings for the same
+/// canonical episode. Provider failures are isolated and each release keeps
+/// the provider-owned episode reference required by the source endpoint.
+async fn cached_releases_with_catalog_fallback(
+    state: &ApiState,
+    primary: &OpaqueRef,
+) -> Result<Vec<(OpaqueRef, Release)>, ProviderError> {
+    let mut refs = vec![primary.clone()];
+    if let Some(catalog) = &state.catalog {
+        if let Ok(mappings) = catalog
+            .playback_episode_mappings(primary.p.cache_key(), &primary.v)
+            .await
+        {
+            refs.extend(
+                mappings
+                    .into_iter()
+                    .map(|(provider, id, season, episode)| OpaqueRef {
+                        p: provider,
+                        v: id,
+                        s: season.max(0) as usize,
+                        e: episode.max(0) as usize,
+                    }),
+            );
+        }
+    }
+    refs.sort_by_key(|reference| (reference.p.cache_key().to_string(), reference.v.clone()));
+    refs.dedup_by(|left, right| {
+        left.p == right.p && left.v == right.v && left.s == right.s && left.e == right.e
+    });
+    let mut releases = Vec::new();
+    let mut first_error = None;
+    for reference in refs {
+        match tokio::time::timeout(OVERALL_TIMEOUT, cached_releases(state, &reference)).await {
+            Ok(Ok(items)) => {
+                releases.extend(items.into_iter().map(|item| (reference.clone(), item)))
+            }
+            Ok(Err(error)) => {
+                first_error.get_or_insert(error);
+            }
+            Err(_) => {
+                first_error.get_or_insert(ProviderError::Unavailable(
+                    "provider source request timed out".into(),
+                ));
+            }
+        }
+    }
+    if releases.is_empty() {
+        Err(first_error.unwrap_or(ProviderError::NotFound))
+    } else {
+        Ok(releases)
+    }
+}
+
 async fn playback_route(
     stream: &mut TcpStream,
     identity: PlaybackIdentity,
@@ -4310,38 +4363,35 @@ async fn playback_route(
         }
     };
     let content_label = identity.content_label();
-    let releases =
-        match tokio::time::timeout(OVERALL_TIMEOUT, cached_releases(&state, &source_ref)).await {
-            Ok(Ok(releases)) => releases,
-            Ok(Err(error)) => {
-                let (status, body) = provider_error(error, source_ref.p);
-                return write_raw_json(stream, status, &body, None).await;
-            }
-            Err(_) => {
-                let (status, body) = err(
-                    "REQUEST_DEADLINE_EXCEEDED",
-                    "The stream source request timed out.",
-                    Some(source_ref.p),
-                    504,
-                );
-                return write_raw_json(stream, status, &body, None).await;
-            }
-        };
+    let release_batches = match cached_releases_with_catalog_fallback(&state, &source_ref).await {
+        Ok(releases) => releases,
+        Err(error) => {
+            let (status, body) = provider_error(error, source_ref.p);
+            return write_raw_json(stream, status, &body, None).await;
+        }
+    };
+    let releases = release_batches
+        .iter()
+        .map(|(_, release)| release)
+        .collect::<Vec<_>>();
+    let release_values = releases
+        .iter()
+        .map(|release| (*release).clone())
+        .collect::<Vec<_>>();
     let requested_language = (requested_audio != "auto")
         .then(|| crate::unified::normalize_language_code(requested_audio))
         .flatten();
-    let codec_eligible_releases = releases
+    let codec_eligible_releases = release_batches
         .iter()
-        .filter(|release| release_has_usable_source(release))
+        .filter(|(_, release)| release_has_usable_source(release))
         .collect::<Vec<_>>();
-    if let Some((code, message)) = codec_ineligibility_error(&releases) {
+    if let Some((code, message)) = codec_ineligibility_error(&release_values) {
         let (status, body) = err(code, message, Some(source_ref.p), 415);
         return write_raw_json(stream, status, &body, None).await;
     }
-    let mut candidates: Vec<&Release> = codec_eligible_releases
+    let mut candidates: Vec<&(OpaqueRef, Release)> = codec_eligible_releases
         .iter()
-        .copied()
-        .filter(|release| {
+        .filter(|(_, release)| {
             requested_language.as_deref().is_none_or(|requested| {
                 release
                     .language
@@ -4351,6 +4401,7 @@ async fn playback_route(
                     == Some(requested)
             })
         })
+        .copied()
         .collect();
     let language_metadata_match = !candidates.is_empty();
     // Automatic playback may use dual/multi-audio sources with no language tag.
@@ -4358,7 +4409,7 @@ async fn playback_route(
     if candidates.is_empty() && requested_language.is_none() {
         candidates = codec_eligible_releases;
     }
-    candidates.sort_by_key(|release| std::cmp::Reverse(release.resolution_u64()));
+    candidates.sort_by_key(|(_, release)| std::cmp::Reverse(release.resolution_u64()));
     let Some(_) = candidates.first().copied() else {
         if let Some(language) = requested_language {
             let (status, body) = err(
@@ -4378,8 +4429,9 @@ async fn playback_route(
         return write_raw_json(stream, status, &body, None).await;
     };
     let mut selected_release = None;
+    let mut selected_source_ref = source_ref.clone();
     let mut playback = None;
-    for candidate in candidates.iter().copied().take(3) {
+    for (candidate_ref, candidate) in candidates.iter().copied().take(3) {
         match tokio::time::timeout(
             OVERALL_TIMEOUT,
             resolve_playback_candidate(&state, candidate),
@@ -4388,6 +4440,7 @@ async fn playback_route(
         {
             Ok(Ok(resolved)) => {
                 selected_release = Some(candidate);
+                selected_source_ref = candidate_ref.clone();
                 playback = Some(resolved);
                 break;
             }
@@ -4420,7 +4473,7 @@ async fn playback_route(
     let playback = playback.expect("selected playback candidate always has a source");
     let source_id = match api_sources_for_content(
         std::slice::from_ref(release),
-        &source_ref,
+        &selected_source_ref,
         Some(content_label),
     )
     .first()
