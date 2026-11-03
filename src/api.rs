@@ -1349,13 +1349,15 @@ fn catalog_live_source_path(
     source: &serde_json::Value,
     action: &str,
 ) -> Result<Option<String>, (u16, String)> {
-    if source
+    let Some(provider_key) = source
         .get("provider_key")
         .and_then(serde_json::Value::as_str)
-        != Some("fourkhdhub")
-    {
+    else {
         return Ok(None);
-    }
+    };
+    let Some(provider) = ProviderKind::parse(provider_key) else {
+        return Ok(None);
+    };
     let codec = source
         .get("video_codec")
         .and_then(serde_json::Value::as_str)
@@ -1366,7 +1368,7 @@ fn catalog_live_source_path(
             return Err(err(
                 "SOURCE_CODEC_BLOCKED",
                 "H.265/HEVC sources are blocked by playback policy.",
-                Some(ProviderKind::FourKHdHub),
+                Some(provider),
                 415,
             ));
         }
@@ -1374,7 +1376,7 @@ fn catalog_live_source_path(
             return Err(err(
                 "CODEC_UNVERIFIED",
                 "The provider source has no recognized non-HEVC codec.",
-                Some(ProviderKind::FourKHdHub),
+                Some(provider),
                 415,
             ));
         }
@@ -1386,7 +1388,7 @@ fn catalog_live_source_path(
         return Err(err(
             "INVALID_SOURCE_MAPPING",
             "The stored provider source mapping is missing.",
-            Some(ProviderKind::FourKHdHub),
+            Some(provider),
             400,
         ));
     };
@@ -1396,7 +1398,7 @@ fn catalog_live_source_path(
         .is_some();
     match parse_source(id) {
         Ok(reference)
-            if reference.p == ProviderKind::FourKHdHub
+            if reference.p == provider
                 && if title_owned {
                     reference.content_type.as_deref() == Some("movie")
                         && reference.s == 0
@@ -1410,7 +1412,7 @@ fn catalog_live_source_path(
         _ => Err(err(
             "INVALID_SOURCE_MAPPING",
             "The stored provider source mapping is invalid.",
-            Some(ProviderKind::FourKHdHub),
+            Some(provider),
             400,
         )),
     }
@@ -8264,6 +8266,47 @@ mod tests {
         source.f = Some(release_fingerprint(&release));
         source.p = ProviderKind::MovieBox;
         assert!(exact_fourk_release(&[release], &source).is_none());
+    }
+
+    #[test]
+    fn catalog_live_source_path_dispatches_to_the_mapped_provider() {
+        for (provider, provider_key) in [
+            (ProviderKind::FourKHdHub, "fourkhdhub"),
+            (ProviderKind::Dramachi, "dramachi"),
+            (ProviderKind::MovieBox, "moviebox"),
+            (ProviderKind::BdixCircleFtp, "bdix_circleftp"),
+            (ProviderKind::BdixDhakaFlix, "bdix_dhakaflix"),
+            (ProviderKind::Addons, "addons"),
+        ] {
+            let reference = OpaqueSource {
+                p: provider,
+                v: "provider-title".into(),
+                s: 1,
+                e: 7,
+                content_type: None,
+                f: Some("fingerprint".into()),
+                i: 0,
+            };
+            let source = serde_json::json!({
+                "provider_key": provider_key,
+                "provider_source_id": encode(&reference),
+                "video_codec": "H.264"
+            });
+            assert_eq!(
+                catalog_live_source_path(&source, "playback").unwrap(),
+                Some(format!("/api/v1/sources/{}/playback", encode(&reference)))
+            );
+            let mut mismatched = source.clone();
+            mismatched["provider_key"] = serde_json::json!("dramachi");
+            if provider != ProviderKind::Dramachi {
+                assert_eq!(
+                    catalog_live_source_path(&mismatched, "playback")
+                        .unwrap_err()
+                        .0,
+                    400
+                );
+            }
+        }
     }
 
     #[test]
