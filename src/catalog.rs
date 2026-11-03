@@ -134,6 +134,8 @@ pub struct UnifiedAnimeProviderTitleInput {
     pub provider_url: Option<String>,
     #[serde(default)]
     pub metadata: Value,
+    #[serde(default)]
+    pub last_successful_resolution: bool,
 }
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct UnifiedAnimeSeasonInput {
@@ -1125,8 +1127,8 @@ async fn upsert_unified_anime_in_tx(
             provider.metadata.clone()
         };
         tx.execute(
-            "INSERT INTO provider_titles(title_id,provider_id,provider_title_id,provider_title,provider_url,metadata,match_status) VALUES($1,$2,$3,$4,$5,$6,'unverified') ON CONFLICT(provider_id,provider_title_id) DO UPDATE SET title_id=EXCLUDED.title_id,provider_title=COALESCE(NULLIF(EXCLUDED.provider_title,''),provider_titles.provider_title),provider_url=COALESCE(NULLIF(EXCLUDED.provider_url,''),provider_titles.provider_url),metadata=CASE WHEN EXCLUDED.metadata='{}'::jsonb THEN provider_titles.metadata ELSE EXCLUDED.metadata END,updated_at=now()",
-            &[&title_uuid, &provider_id, &provider.provider_title_id, &provider_title, &provider_url, &metadata],
+            "INSERT INTO provider_titles(title_id,provider_id,provider_title_id,provider_title,provider_url,metadata,match_status,last_checked_at) VALUES($1,$2,$3,$4,$5,$6,'unverified',CASE WHEN $7 THEN now() ELSE NULL END) ON CONFLICT(provider_id,provider_title_id) DO UPDATE SET title_id=EXCLUDED.title_id,provider_title=COALESCE(NULLIF(EXCLUDED.provider_title,''),provider_titles.provider_title),provider_url=COALESCE(NULLIF(EXCLUDED.provider_url,''),provider_titles.provider_url),metadata=CASE WHEN EXCLUDED.metadata='{}'::jsonb THEN provider_titles.metadata ELSE EXCLUDED.metadata END,last_checked_at=CASE WHEN $7 THEN now() ELSE provider_titles.last_checked_at END,updated_at=now()",
+            &[&title_uuid, &provider_id, &provider.provider_title_id, &provider_title, &provider_url, &metadata, &provider.last_successful_resolution],
         ).await?;
     }
 

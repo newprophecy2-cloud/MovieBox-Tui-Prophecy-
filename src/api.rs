@@ -3976,9 +3976,10 @@ async fn persist_search_group(
             provider_key: item.id.provider.cache_key().to_string(),
             display_name: Some(item.id.provider.label().to_string()),
             provider_title_id: item.id.value.clone(),
-            provider_title: Some(item.title.clone()),
-            provider_url: None,
-            metadata: serde_json::json!({
+                provider_title: Some(item.title.clone()),
+                provider_url: None,
+                last_successful_resolution: true,
+                metadata: serde_json::json!({
                 "year": item.year,
                 "media_type": item.media_type,
                 "season_count": item.season_count,
@@ -4429,6 +4430,7 @@ async fn persist_unified_details(
                 provider_title_id: mapping.value.clone(),
                 provider_title: provider_details.map(|details| details.title.clone()),
                 provider_url: None,
+                last_successful_resolution: provider_details.is_some(),
                 metadata: provider_details.map_or_else(
                     || serde_json::json!({}),
                     |details| {
