@@ -216,6 +216,202 @@ pub fn merge_episode_mappings(mappings: Vec<EpisodeMapping>) -> Vec<Vec<EpisodeM
         .collect()
 }
 
+/// A verified provider mapping attached to one canonical episode coordinate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalEpisodeMapping {
+    pub provider: ProviderKind,
+    pub provider_episode_id: String,
+    pub provider_episode_number: Option<usize>,
+}
+
+/// A provider's episode record used by the catalog reconciliation layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderEpisodeRecord {
+    pub provider: ProviderKind,
+    pub provider_episode_id: String,
+    pub season: usize,
+    pub episode: usize,
+    pub title: Option<String>,
+    pub overview: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalEpisode {
+    pub season: usize,
+    pub episode: usize,
+    pub title: Option<String>,
+    pub overview: Option<String>,
+    pub mappings: Vec<CanonicalEpisodeMapping>,
+    /// Provider records that could not be safely attached because their
+    /// metadata conflicts with the canonical coordinate.
+    pub unresolved_mappings: Vec<CanonicalEpisodeMapping>,
+}
+
+/// Merge provider episode lists without turning overlapping provider records
+/// into duplicate episodes. Conflicting titles remain unresolved rather than
+/// corrupting the canonical catalog.
+pub fn aggregate_episode_records(records: Vec<ProviderEpisodeRecord>) -> Vec<CanonicalEpisode> {
+    let mut result = Vec::new();
+    for record in records {
+        let mapping = CanonicalEpisodeMapping {
+            provider: record.provider,
+            provider_episode_id: record.provider_episode_id,
+            provider_episode_number: Some(record.episode),
+        };
+        let Some(existing) = result.iter_mut().find(|episode: &&mut CanonicalEpisode| {
+            episode.season == record.season && episode.episode == record.episode
+        }) else {
+            result.push(CanonicalEpisode {
+                season: record.season,
+                episode: record.episode,
+                title: record.title,
+                overview: record.overview,
+                mappings: vec![mapping],
+                unresolved_mappings: Vec::new(),
+            });
+            continue;
+        };
+        if episode_titles_compatible(existing.title.as_deref(), record.title.as_deref()) {
+            if existing.title.is_none() {
+                existing.title = record.title;
+            }
+            if existing.overview.is_none() {
+                existing.overview = record.overview;
+            }
+            if !existing.mappings.iter().any(|candidate| {
+                candidate.provider == mapping.provider
+                    && candidate.provider_episode_id == mapping.provider_episode_id
+            }) {
+                existing.mappings.push(mapping);
+            }
+        } else {
+            existing.unresolved_mappings.push(mapping);
+        }
+    }
+    result.sort_by_key(|episode| (episode.season, episode.episode));
+    result
+}
+
+pub fn missing_episode_numbers(
+    episodes: &[CanonicalEpisode],
+    season: usize,
+    expected_through: usize,
+) -> Vec<usize> {
+    let present: std::collections::HashSet<usize> = episodes
+        .iter()
+        .filter(|episode| episode.season == season)
+        .map(|episode| episode.episode)
+        .collect();
+    (1..=expected_through)
+        .filter(|number| !present.contains(number))
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedAudioTrack {
+    pub provider: ProviderKind,
+    pub source_id: String,
+    pub language_code: String,
+    pub codec: Option<String>,
+    pub channels: Option<u16>,
+    pub verified: bool,
+}
+
+pub fn normalize_language_code(value: &str) -> Option<String> {
+    let normalized = value.trim().replace('_', "-").to_ascii_lowercase();
+    let code = match normalized.as_str() {
+        "japanese" | "jp" | "jpn" | "ja" => "ja",
+        "english" | "eng" | "en" => "en",
+        "hindi" | "hin" | "hi" => "hi",
+        "bengali" | "bangla" | "ben" | "bn" => "bn",
+        "tamil" | "tam" | "ta" => "ta",
+        "telugu" | "tel" | "te" => "te",
+        "korean" | "kor" | "ko" => "ko",
+        "chinese" | "zho" | "zh" => "zh",
+        value if value.len() == 2 && value.bytes().all(|byte| byte.is_ascii_lowercase()) => value,
+        _ if normalized.len() >= 4
+            && normalized
+                .as_bytes()
+                .get(..2)
+                .is_some_and(|prefix| prefix.iter().all(u8::is_ascii_lowercase))
+            && normalized.as_bytes().get(2) == Some(&b'-') =>
+        {
+            normalized.as_str()
+        }
+        _ => return None,
+    };
+    Some(code.to_string())
+}
+
+pub fn aggregate_verified_audio_tracks(tracks: Vec<VerifiedAudioTrack>) -> Vec<VerifiedAudioTrack> {
+    let mut result = Vec::new();
+    for mut track in tracks {
+        let Some(language) = normalize_language_code(&track.language_code) else {
+            continue;
+        };
+        track.language_code = language;
+        if !track.verified {
+            continue;
+        }
+        if !result.iter().any(|existing: &VerifiedAudioTrack| {
+            existing.source_id == track.source_id && existing.language_code == track.language_code
+        }) {
+            result.push(track);
+        }
+    }
+    result.sort_by(|left, right| {
+        left.language_code
+            .cmp(&right.language_code)
+            .then_with(|| left.provider.cache_key().cmp(right.provider.cache_key()))
+            .then_with(|| left.source_id.cmp(&right.source_id))
+    });
+    result
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceRouteCandidate {
+    pub provider: ProviderKind,
+    pub source_id: String,
+    pub language_code: Option<String>,
+    pub codec: Option<String>,
+    pub verified: bool,
+    pub expired: bool,
+    pub provider_health: u8,
+    pub priority: usize,
+}
+
+pub fn choose_source_route(
+    candidates: &[SourceRouteCandidate],
+    requested_language: Option<&str>,
+    failed_source_ids: &std::collections::HashSet<String>,
+) -> Option<SourceRouteCandidate> {
+    let requested = requested_language.and_then(normalize_language_code);
+    candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.verified
+                && !candidate.expired
+                && !failed_source_ids.contains(&candidate.source_id)
+                && requested.as_deref().is_none_or(|language| {
+                    candidate
+                        .language_code
+                        .as_deref()
+                        .and_then(normalize_language_code)
+                        .as_deref()
+                        == Some(language)
+                })
+        })
+        .min_by_key(|candidate| {
+            (
+                candidate.priority,
+                std::cmp::Reverse(candidate.provider_health),
+                candidate.codec.is_none(),
+                candidate.source_id.clone(),
+            )
+        })
+        .cloned()
+}
+
 fn title_tokens_and_year(input: &str, remove_bracketed_years: bool) -> (Vec<String>, Option<i32>) {
     let chars: Vec<char> = input.chars().collect();
     let mut tokens = Vec::new();
@@ -468,5 +664,134 @@ mod tests {
             Some("Arrival"),
             Some("Departure")
         ));
+    }
+
+    #[test]
+    fn aggregate_episode_records_deduplicates_ranges_and_keeps_conflicts_unresolved() {
+        let records = (1..=51)
+            .map(|episode| ProviderEpisodeRecord {
+                provider: ProviderKind::FourKHdHub,
+                provider_episode_id: format!("a-{episode}"),
+                season: 1,
+                episode,
+                title: Some(format!("Episode {episode}")),
+                overview: None,
+            })
+            .chain((52..=100).map(|episode| ProviderEpisodeRecord {
+                provider: ProviderKind::Dramachi,
+                provider_episode_id: format!("b-{episode}"),
+                season: 1,
+                episode,
+                title: Some(format!("Episode {episode}")),
+                overview: None,
+            }))
+            .chain((80..=170).map(|episode| ProviderEpisodeRecord {
+                provider: ProviderKind::BdixCircleFtp,
+                provider_episode_id: format!("c-{episode}"),
+                season: 1,
+                episode,
+                title: Some(format!("Episode {episode}")),
+                overview: None,
+            }))
+            .chain([ProviderEpisodeRecord {
+                provider: ProviderKind::Addons,
+                provider_episode_id: "conflict".into(),
+                season: 1,
+                episode: 90,
+                title: Some("Different story".into()),
+                overview: None,
+            }])
+            .collect();
+        let episodes = aggregate_episode_records(records);
+        assert_eq!(episodes.len(), 170);
+        assert_eq!(episodes[0].mappings.len(), 1);
+        assert_eq!(episodes[89].mappings.len(), 2);
+        assert_eq!(episodes[89].unresolved_mappings.len(), 1);
+        assert!(missing_episode_numbers(&episodes, 1, 170).is_empty());
+    }
+
+    #[test]
+    fn audio_union_normalizes_and_discards_unverified_or_unknown_tracks() {
+        let tracks = aggregate_verified_audio_tracks(vec![
+            VerifiedAudioTrack {
+                provider: ProviderKind::FourKHdHub,
+                source_id: "a".into(),
+                language_code: "Japanese".into(),
+                codec: Some("aac".into()),
+                channels: Some(2),
+                verified: true,
+            },
+            VerifiedAudioTrack {
+                provider: ProviderKind::Dramachi,
+                source_id: "b".into(),
+                language_code: "hi-IN".into(),
+                codec: Some("aac".into()),
+                channels: None,
+                verified: true,
+            },
+            VerifiedAudioTrack {
+                provider: ProviderKind::Addons,
+                source_id: "unverified".into(),
+                language_code: "bn".into(),
+                codec: None,
+                channels: None,
+                verified: false,
+            },
+            VerifiedAudioTrack {
+                provider: ProviderKind::Addons,
+                source_id: "unknown".into(),
+                language_code: "Klingon".into(),
+                codec: None,
+                channels: None,
+                verified: true,
+            },
+        ]);
+        assert_eq!(
+            tracks
+                .iter()
+                .map(|track| track.language_code.as_str())
+                .collect::<Vec<_>>(),
+            ["hi-in", "ja"]
+        );
+    }
+
+    #[test]
+    fn source_route_respects_requested_language_and_skips_failed_sources() {
+        let candidates = vec![
+            SourceRouteCandidate {
+                provider: ProviderKind::FourKHdHub,
+                source_id: "failed-hi".into(),
+                language_code: Some("hi".into()),
+                codec: Some("h264".into()),
+                verified: true,
+                expired: false,
+                provider_health: 100,
+                priority: 0,
+            },
+            SourceRouteCandidate {
+                provider: ProviderKind::Dramachi,
+                source_id: "working-hi".into(),
+                language_code: Some("Hindi".into()),
+                codec: Some("h264".into()),
+                verified: true,
+                expired: false,
+                provider_health: 80,
+                priority: 1,
+            },
+            SourceRouteCandidate {
+                provider: ProviderKind::FourKHdHub,
+                source_id: "english".into(),
+                language_code: Some("en".into()),
+                codec: Some("h264".into()),
+                verified: true,
+                expired: false,
+                provider_health: 100,
+                priority: 0,
+            },
+        ];
+        let failed = std::collections::HashSet::from(["failed-hi".to_string()]);
+        let selected = choose_source_route(&candidates, Some("Hindi"), &failed).unwrap();
+        assert_eq!(selected.source_id, "working-hi");
+        assert_eq!(choose_source_route(&candidates, Some("bn"), &failed), None);
     }
 }

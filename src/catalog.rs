@@ -950,7 +950,18 @@ async fn import_in_tx(c: &Client, i: &ImportTitle) -> Result<ImportSummary, Cata
     } else {
         None
     };
-    let (t, ins) = if let Some(existing) = existing_provider_title {
+    let existing_compatible_title = if existing_provider_title.is_none() && i.mal_id.is_none() {
+        let normalized = normalize(&i.canonical_title);
+        c.query_opt(
+            "SELECT id::text AS id FROM catalog_titles WHERE normalized_title=$1 AND content_type=$2 AND catalog_status <> 'deleted' AND ($3::int IS NULL OR release_year IS NULL OR release_year=$3) ORDER BY (release_year IS NULL), updated_at DESC LIMIT 1",
+            &[&normalized, &i.content_type, &i.release_year],
+        )
+        .await?
+    } else {
+        None
+    };
+    let existing_title = existing_provider_title.or(existing_compatible_title);
+    let (t, ins) = if let Some(existing) = existing_title {
         let id: String = existing.get("id");
         let normalized = normalize(&i.canonical_title);
         let status = i.catalog_status.clone().unwrap_or_else(|| "active".into());
@@ -1138,7 +1149,11 @@ async fn map_movie_sources(
             ("subtitle", &source.subtitle_tracks),
         ] {
             for track in tracks {
-                let inserted = c.execute("INSERT INTO source_tracks(source_id,track_type,language_code,codec,format,is_default,is_forced,verified,track_metadata) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING", &[&source_uuid,&kind,&track.language_code,&track.codec,&track.format,&track.is_default,&track.is_forced,&track.verified,&track.metadata]).await?;
+                let language_code = track
+                    .language_code
+                    .as_deref()
+                    .and_then(crate::unified::normalize_language_code);
+                let inserted = c.execute("INSERT INTO source_tracks(source_id,track_type,language_code,codec,format,is_default,is_forced,verified,track_metadata) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING", &[&source_uuid,&kind,&language_code,&track.codec,&track.format,&track.is_default,&track.is_forced,&track.verified,&track.metadata]).await?;
                 summary.tracks += i64::from(inserted > 0);
             }
         }
@@ -1234,7 +1249,22 @@ async fn map_episode(
             ("subtitle", &src.subtitle_tracks),
         ] {
             for tr in tracks {
-                let inserted = c.execute("INSERT INTO source_tracks(source_id,track_type,language_code,codec,format,is_default,is_forced,verified,track_metadata) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING",&[&sid,&kind,&tr.language_code,&tr.codec,&tr.format,&tr.is_default,&tr.is_forced,&tr.verified,&tr.metadata]).await?;
+                let language_code = tr
+                    .language_code
+                    .as_deref()
+                    .and_then(crate::unified::normalize_language_code);
+                let params: [&(dyn tokio_postgres::types::ToSql + Sync); 9] = [
+                    &sid,
+                    &kind,
+                    &language_code,
+                    &tr.codec,
+                    &tr.format,
+                    &tr.is_default,
+                    &tr.is_forced,
+                    &tr.verified,
+                    &tr.metadata,
+                ];
+                let inserted = c.execute("INSERT INTO source_tracks(source_id,track_type,language_code,codec,format,is_default,is_forced,verified,track_metadata) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING", &params).await?;
                 s.tracks += i64::from(inserted > 0);
             }
         }

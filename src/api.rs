@@ -4027,10 +4027,10 @@ async fn anime_route(
                 (key == "audio").then(|| percent_decode(value).trim().to_ascii_lowercase())
             })
             .unwrap_or_else(|| "hindi".to_string());
-        if !matches!(audio.as_str(), "hindi" | "hi" | "hin") {
+        if crate::unified::normalize_language_code(&audio).is_none() {
             let (status, body) = err(
                 "UNSUPPORTED_AUDIO_LANGUAGE",
-                "This stream route currently supports audio=hindi only.",
+                "The requested audio language is not recognized.",
                 Some(r.p),
                 400,
             );
@@ -4175,6 +4175,48 @@ fn source_playback_url(
         .unwrap_or_else(|| source_remux_url(source_id))
 }
 
+async fn resolve_playback_candidate(
+    state: &ApiState,
+    release: &Release,
+) -> Result<crate::providers::models::PlaybackSource, String> {
+    if release.provider == ProviderKind::FourKHdHub {
+        let client = state
+            .service
+            .fourk_client
+            .as_ref()
+            .ok_or_else(|| "The playback provider is unavailable.".to_string())?;
+        return client
+            .resolve_release(
+                release,
+                crate::providers::models::ResolutionIntent::Playback,
+            )
+            .await
+            .map_err(|error| error.user_message().to_string());
+    }
+    let url = release
+        .direct_url()
+        .filter(|url| !url.trim().is_empty())
+        .ok_or_else(|| "The source does not expose a playable URL.".to_string())?;
+    crate::net::validate_public_url(url, true)
+        .await
+        .map_err(|_| "The source URL is not an allowed public destination.".to_string())?;
+    Ok(crate::providers::models::PlaybackSource {
+        provider: release.provider,
+        url: url.to_string(),
+        headers: release
+            .mirrors
+            .first()
+            .map(|mirror| mirror.headers.clone())
+            .unwrap_or_default(),
+        subtitle: None,
+        source_label: release.source_label().to_string(),
+        max_height: release
+            .quality
+            .as_deref()
+            .and_then(|quality| quality.trim_end_matches('p').parse().ok()),
+    })
+}
+
 async fn playback_route(
     stream: &mut TcpStream,
     identity: PlaybackIdentity,
@@ -4283,14 +4325,9 @@ async fn playback_route(
                 return write_raw_json(stream, status, &body, None).await;
             }
         };
-    let is_hindi = |value: &str| {
-        let normalized = value.to_ascii_lowercase();
-        normalized == "hi"
-            || normalized == "hin"
-            || normalized.contains("hindi")
-            || normalized.contains("हिन्दी")
-            || normalized.contains("हिंदी")
-    };
+    let requested_language = (requested_audio != "auto")
+        .then(|| crate::unified::normalize_language_code(requested_audio))
+        .flatten();
     let codec_eligible_releases = releases
         .iter()
         .filter(|release| release_has_usable_source(release))
@@ -4302,15 +4339,34 @@ async fn playback_route(
     let mut candidates: Vec<&Release> = codec_eligible_releases
         .iter()
         .copied()
-        .filter(|release| release.language.as_deref().is_some_and(is_hindi))
+        .filter(|release| {
+            requested_language.as_deref().is_none_or(|requested| {
+                release
+                    .language
+                    .as_deref()
+                    .and_then(crate::unified::normalize_language_code)
+                    .as_deref()
+                    == Some(requested)
+            })
+        })
         .collect();
     let language_metadata_match = !candidates.is_empty();
-    // Dual/multi-audio sources may have no language tag until the actual media is probed.
-    if candidates.is_empty() {
+    // Automatic playback may use dual/multi-audio sources with no language tag.
+    // A user-selected language must never silently fall back to another language.
+    if candidates.is_empty() && requested_language.is_none() {
         candidates = codec_eligible_releases;
     }
     candidates.sort_by_key(|release| std::cmp::Reverse(release.resolution_u64()));
-    let Some(release) = candidates.first().copied() else {
+    let Some(_) = candidates.first().copied() else {
+        if let Some(language) = requested_language {
+            let (status, body) = err(
+                "AUDIO_LANGUAGE_UNAVAILABLE",
+                format!("No verified playable source is available for audio language {language}."),
+                Some(source_ref.p),
+                404,
+            );
+            return write_raw_json(stream, status, &body, None).await;
+        }
         let (status, body) = err(
             "NO_STREAM_SOURCE",
             format!("The provider returned no stream sources for this {content_label}."),
@@ -4319,6 +4375,47 @@ async fn playback_route(
         );
         return write_raw_json(stream, status, &body, None).await;
     };
+    let mut selected_release = None;
+    let mut playback = None;
+    for candidate in candidates.iter().copied().take(3) {
+        match tokio::time::timeout(
+            OVERALL_TIMEOUT,
+            resolve_playback_candidate(&state, candidate),
+        )
+        .await
+        {
+            Ok(Ok(resolved)) => {
+                selected_release = Some(candidate);
+                playback = Some(resolved);
+                break;
+            }
+            Ok(Err(error)) => {
+                log::warn!(
+                    "playback candidate failed provider={} source={}: {}",
+                    candidate.provider,
+                    candidate.source_label(),
+                    error
+                );
+            }
+            Err(_) => {
+                log::warn!(
+                    "playback candidate timed out provider={} source={}",
+                    candidate.provider,
+                    candidate.source_label()
+                );
+            }
+        }
+    }
+    let Some(release) = selected_release else {
+        let (status, body) = err(
+            "PLAYBACK_RESOLUTION_FAILED",
+            "No eligible provider source could be resolved for the requested audio.",
+            Some(source_ref.p),
+            502,
+        );
+        return write_raw_json(stream, status, &body, None).await;
+    };
+    let playback = playback.expect("selected playback candidate always has a source");
     let source_id = match api_sources_for_content(
         std::slice::from_ref(release),
         &source_ref,
@@ -4336,70 +4433,6 @@ async fn playback_route(
             );
             return write_raw_json(stream, status, &body, None).await;
         }
-    };
-    let playback = if release.provider == ProviderKind::FourKHdHub {
-        let Some(client) = state.service.fourk_client.as_ref() else {
-            let (status, body) = err(
-                "UPSTREAM_UNAVAILABLE",
-                "The playback provider is unavailable.",
-                Some(release.provider),
-                503,
-            );
-            return write_raw_json(stream, status, &body, None).await;
-        };
-        match tokio::time::timeout(
-            OVERALL_TIMEOUT,
-            client.resolve_release(
-                release,
-                crate::providers::models::ResolutionIntent::Playback,
-            ),
-        )
-        .await
-        {
-            Ok(Ok(playback)) => playback,
-            Ok(Err(error)) => {
-                let (status, body) = err(
-                    "PLAYBACK_RESOLUTION_FAILED",
-                    error.user_message(),
-                    Some(release.provider),
-                    502,
-                );
-                return write_raw_json(stream, status, &body, None).await;
-            }
-            Err(_) => {
-                let (status, body) = err(
-                    "PLAYBACK_RESOLUTION_TIMEOUT",
-                    "Hindi stream resolution timed out.",
-                    Some(release.provider),
-                    504,
-                );
-                return write_raw_json(stream, status, &body, None).await;
-            }
-        }
-    } else if let Some(url) = release.direct_url() {
-        crate::providers::models::PlaybackSource {
-            provider: release.provider,
-            url: url.to_string(),
-            headers: release
-                .mirrors
-                .first()
-                .map(|mirror| mirror.headers.clone())
-                .unwrap_or_default(),
-            subtitle: None,
-            source_label: release.source_label().to_string(),
-            max_height: release
-                .quality
-                .as_deref()
-                .and_then(|quality| quality.trim_end_matches('p').parse().ok()),
-        }
-    } else {
-        let (status, body) = err(
-            "PLAYBACK_RESOLUTION_FAILED",
-            "The Hindi source does not expose a playable URL.",
-            Some(release.provider),
-            502,
-        );
-        return write_raw_json(stream, status, &body, None).await;
     };
     // Probe the resolved source for real audio tracks when possible. A failed probe
     // must not block playback (some HLS/DASH providers prevent ffprobe access).
