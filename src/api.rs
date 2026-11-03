@@ -46,6 +46,7 @@ const CLASSIFICATION_TIMEOUT: Duration = Duration::from_secs(1);
 const PLAYBACK_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(20);
 const SEARCH_SOURCE_CHECK_TIMEOUT: Duration = Duration::from_secs(45);
 const SEARCH_SOURCE_CHECK_CONCURRENCY: usize = 8;
+const SEARCH_PROVIDER_CONCURRENCY: usize = 3;
 const TRACK_PROBE_TIMEOUT: Duration = Duration::from_secs(45);
 const CODEC_VERIFICATION_WORKERS: usize = 2;
 const CODEC_VERIFICATION_LEASE_SECONDS: i32 = 120;
@@ -84,14 +85,21 @@ fn database_required() -> bool {
 }
 
 fn configured_search_providers() -> Vec<ProviderKind> {
-    // The HTTP anime API intentionally uses one deterministic provider.
-    // Keep the configuration fields for the desktop/TUI clients, but do not
-    // fan out web requests to providers that are not part of this deployment.
-    if crate::config::load().fourkhdhub_enabled {
-        vec![ProviderKind::FourKHdHub]
-    } else {
-        Vec::new()
+    let config = crate::config::load();
+    let mut providers = Vec::with_capacity(2);
+
+    // These providers expose the common anime search/details contract and are
+    // safe to use from the HTTP API. MovieBox remains intentionally excluded
+    // here because its restricted playback policy is enforced by provider-
+    // specific routes; BDIX and addons stay opt-in and are not enabled by
+    // default. They remain available to the existing explicit provider paths.
+    if config.fourkhdhub_enabled {
+        providers.push(ProviderKind::FourKHdHub);
     }
+    if config.dramachi_enabled {
+        providers.push(ProviderKind::Dramachi);
+    }
+    providers
 }
 
 fn provider_priority(provider: ProviderKind) -> usize {
@@ -3656,10 +3664,21 @@ async fn search_all(
     let requested_language = intent.language;
     let normalized_query = intent.title;
     let mut tasks = JoinSet::new();
+    let provider_slots = Arc::new(Semaphore::new(SEARCH_PROVIDER_CONCURRENCY));
     for p in configured_search_providers() {
         let svc = service.clone();
         let q = normalized_query.clone();
+        let slots = Arc::clone(&provider_slots);
         tasks.spawn(async move {
+            let permit = slots.acquire_owned().await;
+            if permit.is_err() {
+                return (
+                    p,
+                    Ok(Err(ProviderError::Unavailable(
+                        "provider search concurrency limit reached".to_string(),
+                    ))),
+                );
+            }
             (
                 p,
                 tokio::time::timeout(OVERALL_TIMEOUT, svc.search_typed(p, &q, 1)).await,
@@ -7975,9 +7994,13 @@ mod tests {
     }
 
     #[test]
-    fn configured_search_providers_use_only_fourkhdhub() {
+    fn configured_search_providers_include_safe_enabled_anime_providers() {
         let providers = configured_search_providers();
-        assert_eq!(providers, vec![ProviderKind::FourKHdHub]);
+        assert!(providers.contains(&ProviderKind::FourKHdHub));
+        assert!(providers.contains(&ProviderKind::Dramachi));
+        assert!(!providers.contains(&ProviderKind::BdixCircleFtp));
+        assert!(!providers.contains(&ProviderKind::BdixDhakaFlix));
+        assert!(!providers.contains(&ProviderKind::Addons));
     }
 
     #[test]
