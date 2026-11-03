@@ -22,4 +22,5 @@ pub mod proxy;
 pub mod remux_cache;
 pub mod service;
 pub mod tui;
+pub mod unified;
 pub mod updater;

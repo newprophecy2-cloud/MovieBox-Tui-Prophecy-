@@ -1000,6 +1000,24 @@ async fn import_in_tx(c: &Client, i: &ImportTitle) -> Result<ImportSummary, Cata
         let sid_uuid = parse_uuid(&sid)?;
         s.seasons += 1;
         for e in &season.episodes {
+            let existing_episode = c
+                .query_opt(
+                    "SELECT episode_title FROM episodes WHERE title_id=$1 AND season_id=$2 AND episode_number=$3",
+                    &[&title_uuid, &sid_uuid, &e.episode_number],
+                )
+                .await?;
+            if let Some(existing_episode) = existing_episode {
+                let existing_title: Option<String> = existing_episode.get("episode_title");
+                if !crate::unified::episode_titles_compatible(
+                    existing_title.as_deref(),
+                    e.episode_title.as_deref(),
+                ) {
+                    return Err(CatalogError::Validation(format!(
+                        "conflicting titles for anime season {} episode {}",
+                        season.season_number, e.episode_number
+                    )));
+                }
+            }
             let er=c.query_one("INSERT INTO episodes(title_id,season_id,episode_number,episode_title,overview,release_date,thumbnail_url) VALUES($1,$2,$3,$4,$5,$6::text::date,$7) ON CONFLICT(title_id,season_id,episode_number) DO UPDATE SET episode_title=EXCLUDED.episode_title,overview=EXCLUDED.overview,release_date=EXCLUDED.release_date,thumbnail_url=EXCLUDED.thumbnail_url,updated_at=now() RETURNING id::text",&[&title_uuid,&sid_uuid,&e.episode_number,&e.episode_title,&e.overview,&e.release_date,&e.thumbnail_url]).await?;
             let eid: String = er.get(0);
             s.episodes += 1;

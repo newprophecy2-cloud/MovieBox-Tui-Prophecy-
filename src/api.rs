@@ -301,6 +301,14 @@ struct ApiCatalogItem {
     year: Option<String>,
     poster_url: Option<String>,
     season_count: Option<usize>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    provider_mappings: Vec<ApiProviderMapping>,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiProviderMapping {
+    id: String,
+    provider: ProviderKind,
 }
 
 #[derive(Debug, Serialize)]
@@ -532,14 +540,22 @@ fn episode_ref(id: &ProviderMediaId, episode: &crate::providers::models::Episode
         e: episode.number,
     })
 }
-fn catalog(item: CatalogItem) -> ApiCatalogItem {
+fn catalog(item: crate::unified::UnifiedCatalogItem) -> ApiCatalogItem {
     ApiCatalogItem {
-        id: provider_ref(&item.id, 0, 0),
-        title: item.title,
-        media_type: item.media_type,
-        year: item.year,
-        poster_url: item.poster_url,
-        season_count: item.season_count,
+        id: provider_ref(&item.primary.id, 0, 0),
+        title: item.primary.title,
+        media_type: item.primary.media_type,
+        year: item.primary.year,
+        poster_url: item.primary.poster_url,
+        season_count: item.primary.season_count,
+        provider_mappings: item
+            .provider_mappings
+            .into_iter()
+            .map(|id| ApiProviderMapping {
+                id: provider_ref(&id, 0, 0),
+                provider: id.provider,
+            })
+            .collect(),
     }
 }
 fn details(d: MediaDetails) -> ApiDetails {
@@ -3473,7 +3489,7 @@ async fn search_json(stream: &mut TcpStream, query: &str, state: ApiState) -> st
         return write_raw_json(stream, s, &b, None).await;
     }
     let eligible = cached_search(&state, &qv).await;
-    let items = eligible.items;
+    let items = crate::unified::group_catalog_items(eligible.items);
     let failed = eligible.failed;
     let provider_status = eligible.provider_status;
     let offset = q
@@ -3486,7 +3502,7 @@ async fn search_json(stream: &mut TcpStream, query: &str, state: ApiState) -> st
         let label = format!("({})", language.result_label());
         items
             .iter()
-            .filter(|item| item.title.ends_with(&label))
+            .filter(|item| item.primary.title.ends_with(&label))
             .count()
     });
     let message = language_intent
@@ -3598,7 +3614,7 @@ async fn search_sse(stream: &mut TcpStream, query: &str, state: ApiState) -> std
     };
     let eligible = cached_search(&state, &qv).await;
     write_headers(stream, 200, "text/event-stream", None).await?;
-    for item in eligible.items {
+    for item in crate::unified::group_catalog_items(eligible.items) {
         let payload = serde_json::to_string(&serde_json::json!({"result":catalog(item)})).unwrap();
         send_event(stream, "search_result", &payload).await?;
     }
@@ -7303,7 +7319,7 @@ fn openapi() -> serde_json::Value {
             "/docs": {"get": {"responses": {"200": {"description": "API documentation"}}}},
             "/api/v1/diagnostics": {"get": {"responses": {"200": {"description": "Sanitized provider diagnostics"}}}},
             "/api/v1/watch": {"get": {"responses": {"200": {"description": "Episode playback descriptor; verified compatible MP4 sources use direct range passthrough, HLS/DASH remains native, and other verified sources use progressive fragmented-MP4 remux without arbitrary byte-range seeking"}, "400": {"description": "Invalid watch request"}, "415": {"description": "All discovered sources are blocked or have unverified codecs"}}}},
-            "/api/v1/anime/search": {"get": {"parameters": [{"name": "q", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 200}}, {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 100}}, {"name": "cursor", "in": "query", "schema": {"type": "string"}}], "responses": {"200": {"description": "Search results"}, "400": {"description": "Invalid query"}}}},
+            "/api/v1/anime/search": {"get": {"description": "Search cards include optional provider_mappings with API-generated provider-specific opaque IDs; the top-level id retains the primary legacy provider ID.", "parameters": [{"name": "q", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 200}}, {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 100}}, {"name": "cursor", "in": "query", "schema": {"type": "string"}}], "responses": {"200": {"description": "Search results"}, "400": {"description": "Invalid query"}}}},
             "/api/v1/search": {"get": {"description": "PostgreSQL-only catalog search; never performs live provider discovery.", "responses": {"200": {"description": "Catalog search results"}, "400": {"description": "Invalid query"}, "503": {"description": "Catalog database unavailable"}}}},
             "/api/v1/genres": {"get": {"description": "PostgreSQL-backed canonical genre list.", "responses": {"200": {"description": "Genres"}, "503": {"description": "Catalog database unavailable"}}}},
             "/api/v1/catalog/titles/{title_id}": {"get": {"description": "Canonical PostgreSQL catalog title detail; movie titles may include eligible title-owned movie_sources.", "responses": {"200": {"description": "Title detail"}, "404": {"description": "Title not found"}, "503": {"description": "Catalog database unavailable"}}}},
@@ -7962,6 +7978,38 @@ mod tests {
     fn configured_search_providers_use_only_fourkhdhub() {
         let providers = configured_search_providers();
         assert_eq!(providers, vec![ProviderKind::FourKHdHub]);
+    }
+
+    #[test]
+    fn unified_search_card_keeps_provider_specific_mapping_ids() {
+        let make_item = |provider, id: &str, title: &str| CatalogItem {
+            id: ProviderMediaId {
+                provider,
+                value: id.to_string(),
+            },
+            title: title.to_string(),
+            media_type: MediaType::Series,
+            year: Some("2017".to_string()),
+            poster_url: None,
+            season_count: Some(1),
+        };
+        let unified = crate::unified::group_catalog_items(vec![
+            make_item(ProviderKind::FourKHdHub, "black-clover", "Black Clover"),
+            make_item(
+                ProviderKind::Dramachi,
+                "black-clover-2017",
+                "Black Clover (2017)",
+            ),
+        ]);
+        assert_eq!(unified.len(), 1);
+
+        let response = catalog(unified.into_iter().next().unwrap());
+        let primary: OpaqueRef = decode(&response.id).unwrap();
+        assert_eq!(primary.p, ProviderKind::FourKHdHub);
+        assert_eq!(response.provider_mappings.len(), 1);
+        let secondary: OpaqueRef = decode(&response.provider_mappings[0].id).unwrap();
+        assert_eq!(secondary.p, ProviderKind::Dramachi);
+        assert_eq!(secondary.v, "black-clover-2017");
     }
 
     #[test]
