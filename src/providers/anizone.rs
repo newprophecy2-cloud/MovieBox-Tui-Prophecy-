@@ -48,6 +48,7 @@ struct EpisodePage {
     has_more: bool,
     csrf: String,
     cookies: HashMap<String, String>,
+    series_title: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -133,21 +134,36 @@ impl AniZoneClient {
             .await
     }
 
-    pub async fn search(
-        &self,
-        query: &str,
-        _page: usize,
-    ) -> Result<Vec<CatalogItem>, AniZoneError> {
+    pub async fn search(&self, query: &str, page: usize) -> Result<Vec<CatalogItem>, AniZoneError> {
         let query = query.trim();
         if query.is_empty() {
             return Ok(Vec::new());
         }
         let mut url = self.url("/anime");
         url.query_pairs_mut().append_pair("search", query);
-        let (html, _) = self
+        let (html, cookies) = self
             .fetch_text(url, &[("Referer", format!("{BASE_URL}/"))])
             .await?;
-        parse_search_items(&html)?
+        let mut state = initial_page(&html, &cookies)?;
+        let target_page = page.max(1);
+        let mut seen_cursors = HashSet::new();
+        for _ in 1..target_page {
+            if !state.has_more {
+                state.items.clear();
+                break;
+            }
+            let cursor = state
+                .cursor
+                .clone()
+                .ok_or_else(|| AniZoneError::Parse("missing search pagination cursor".into()))?;
+            if !seen_cursors.insert(cursor) {
+                return Err(AniZoneError::Parse(
+                    "repeated search pagination cursor".into(),
+                ));
+            }
+            state = self.load_page("/anime", state).await?;
+        }
+        parse_search_items_from_values(&state.items)?
             .into_iter()
             .map(|item| {
                 Ok(CatalogItem {
@@ -162,8 +178,8 @@ impl AniZoneClient {
                         MediaType::Series
                     },
                     year: item.year.map(|year| year.to_string()),
-                    poster_url: None,
-                    season_count: None,
+                    poster_url: item.cover,
+                    season_count: item.episode_count,
                 })
             })
             .collect()
@@ -172,11 +188,7 @@ impl AniZoneClient {
     pub async fn details(&self, slug: &str) -> Result<MediaDetails, AniZoneError> {
         let slug = validate_slug(slug)?;
         let data = self.scrape_series(slug).await?;
-        let title = data
-            .items
-            .first()
-            .and_then(|item| pick_title(item.get("title_list")))
-            .unwrap_or_else(|| slug.replace('-', " "));
+        let title = data.series_title.unwrap_or_else(|| slug.replace('-', " "));
         let episodes = parse_episodes(&data.items);
         Ok(MediaDetails {
             id: ProviderMediaId {
@@ -192,7 +204,7 @@ impl AniZoneClient {
             director: None,
             stars: None,
             prints: None,
-            audios: Some("Japanese".into()),
+            audios: None,
             poster_url: None,
             duration: None,
             genres: Vec::new(),
@@ -220,10 +232,20 @@ impl AniZoneClient {
         while state.has_more && state.cursor.is_some() && page_count < MAX_PAGES {
             let cursor = state.cursor.clone().unwrap_or_default();
             if !seen_cursors.insert(cursor) {
-                break;
+                return Err(AniZoneError::Parse(
+                    "repeated episode pagination cursor".into(),
+                ));
             }
-            state = self.load_page(slug, state).await?;
+            let previous_items = state.items.clone();
+            let mut next = self.load_page(&format!("/anime/{slug}"), state).await?;
+            next.items = merge_items(previous_items, next.items);
+            state = next;
             page_count += 1;
+        }
+        if state.has_more {
+            return Err(AniZoneError::Parse(
+                "episode pagination exceeded request limit".into(),
+            ));
         }
         if state.items.is_empty() {
             return Err(AniZoneError::NotFound);
@@ -231,7 +253,11 @@ impl AniZoneClient {
         Ok(state)
     }
 
-    async fn load_page(&self, slug: &str, state: EpisodePage) -> Result<EpisodePage, AniZoneError> {
+    async fn load_page(
+        &self,
+        referer_path: &str,
+        state: EpisodePage,
+    ) -> Result<EpisodePage, AniZoneError> {
         let cursor = state
             .cursor
             .clone()
@@ -247,7 +273,7 @@ impl AniZoneClient {
             .header("X-CSRF-TOKEN", &state.csrf)
             .header("X-Requested-With", "XMLHttpRequest")
             .header("Origin", BASE_URL)
-            .header("Referer", format!("{BASE_URL}/anime/{slug}"))
+            .header("Referer", format!("{BASE_URL}{referer_path}"))
             .header("Cookie", cookie_header(&state.cookies))
             .json(&body)
             .send()
@@ -307,15 +333,21 @@ impl AniZoneClient {
                 .unwrap_or(false),
             csrf: state.csrf,
             cookies,
+            series_title: state.series_title,
         })
     }
 
     pub async fn releases(
         &self,
         slug: &str,
-        _season: usize,
+        season: usize,
         episode: usize,
     ) -> Result<Vec<Release>, AniZoneError> {
+        if season != 1 {
+            return Err(AniZoneError::Parse(
+                "AniZone does not expose an explicit multi-season mapping".into(),
+            ));
+        }
         let slug = validate_slug(slug)?;
         let data = self.scrape_series(slug).await?;
         let source_number = parse_episodes(&data.items)
@@ -340,11 +372,11 @@ impl AniZoneClient {
         Ok(vec![Release {
             provider: ProviderKind::AniZone,
             filename: format!("{slug} Episode {episode}"),
-            quality: Some("multi".into()),
-            codec: Some("h264".into()),
-            language: Some("jpn".into()),
+            quality: None,
+            codec: None,
+            language: None,
             size_bytes: None,
-            season: Some(1),
+            season: Some(season),
             episode: Some(episode),
             mirrors: vec![SourceMirror {
                 label: "AniZone HLS".into(),
@@ -481,6 +513,8 @@ struct SearchItem {
     title: String,
     kind: String,
     year: Option<i64>,
+    cover: Option<String>,
+    episode_count: Option<usize>,
 }
 #[derive(Debug)]
 struct ParsedEpisode {
@@ -507,12 +541,17 @@ fn normalize_url(value: &str) -> Result<String, AniZoneError> {
     let url = crate::net::validate_url_syntax(&value, false).map_err(AniZoneError::Parse)?;
     Ok(url.to_string())
 }
+#[cfg(test)]
 fn parse_search_items(html: &str) -> Result<Vec<SearchItem>, AniZoneError> {
     let value = json_argument(html, "items")
         .ok_or_else(|| AniZoneError::Parse("search items payload not found".into()))?;
-    Ok(value
+    let items = value
         .as_array()
-        .unwrap_or(&Vec::new())
+        .ok_or_else(|| AniZoneError::Parse("search items payload is not an array".into()))?;
+    parse_search_items_from_values(items)
+}
+fn parse_search_items_from_values(items: &[Value]) -> Result<Vec<SearchItem>, AniZoneError> {
+    Ok(items
         .iter()
         .filter_map(|item| {
             let slug = item.get("slug")?.as_str()?.to_string();
@@ -536,6 +575,14 @@ fn parse_search_items(html: &str) -> Result<Vec<SearchItem>, AniZoneError> {
                     .unwrap_or_default()
                     .to_ascii_lowercase(),
                 year: item.get("start_year").and_then(Value::as_i64),
+                cover: item
+                    .get("cover")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                episode_count: item
+                    .get("episode_count")
+                    .and_then(Value::as_u64)
+                    .and_then(|count| usize::try_from(count).ok()),
             })
         })
         .collect())
@@ -583,30 +630,70 @@ fn parse_episodes(items: &[Value]) -> Vec<ParsedEpisode> {
     episodes.sort_by_key(|item| item.number);
     episodes
 }
+fn merge_items(existing: Vec<Value>, incoming: Vec<Value>) -> Vec<Value> {
+    let mut merged = existing;
+    let mut seen = merged
+        .iter()
+        .filter_map(episode_identity)
+        .collect::<HashSet<_>>();
+    for item in incoming {
+        if episode_identity(&item).is_none_or(|id| seen.insert(id)) {
+            merged.push(item);
+        }
+    }
+    merged
+}
+fn episode_identity(item: &Value) -> Option<String> {
+    item.get("slug")
+        .and_then(Value::as_str)
+        .or_else(|| item.get("url").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+}
 fn initial_page(html: &str, cookies: &[String]) -> Result<EpisodePage, AniZoneError> {
     let items = json_argument(html, "items")
         .and_then(|value| value.as_array().cloned())
         .ok_or_else(|| AniZoneError::Parse("episode items payload not found".into()))?;
-    let snapshot = html_attribute(html, "wire:snapshot")
+    let items_marker = html
+        .find("items: JSON.parse('")
+        .ok_or_else(|| AniZoneError::Parse("episode items marker not found".into()))?;
+    let snapshot = html_attribute_before(html, items_marker)
         .ok_or_else(|| AniZoneError::Parse("Livewire snapshot not found".into()))?;
     let csrf = html_attribute(html, "csrf-token")
         .ok_or_else(|| AniZoneError::Parse("CSRF token not found".into()))?;
     Ok(EpisodePage {
         items,
         snapshot,
-        cursor: html
-            .find("nextCursor:")
-            .and_then(|index| {
-                html[index..]
-                    .split('"')
-                    .nth(1)
-                    .or_else(|| html[index..].split('\'').nth(1))
-            })
-            .map(str::to_string),
-        has_more: html.contains("hasMore: true"),
+        cursor: js_property_string(html, "nextCursor"),
+        has_more: js_property_bool(html, "hasMore").unwrap_or(false),
         csrf,
         cookies: merge_cookies(HashMap::new(), cookies.iter().map(String::as_str)),
+        series_title: json_argument(html, "anmTitles").and_then(|value| pick_title(Some(&value))),
     })
+}
+fn js_property_string(html: &str, name: &str) -> Option<String> {
+    let marker = format!("{name}:");
+    let start = html.find(&marker)? + marker.len();
+    let value = html[start..].trim_start();
+    if value.starts_with("null") {
+        return None;
+    }
+    let quote = value.chars().next()?;
+    if quote != '\'' && quote != '"' {
+        return None;
+    }
+    let end = value[1..].find(quote)? + 1;
+    Some(decode_js_string(&value[1..end]))
+}
+fn js_property_bool(html: &str, name: &str) -> Option<bool> {
+    let marker = format!("{name}:");
+    let value = html[html.find(&marker)? + marker.len()..].trim_start();
+    if value.starts_with("true") {
+        Some(true)
+    } else if value.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
 }
 fn json_argument(html: &str, name: &str) -> Option<Value> {
     let marker = format!("{name}: JSON.parse('");
@@ -701,6 +788,13 @@ fn html_attribute(html: &str, name: &str) -> Option<String> {
     let end = html[start..].find('"')?;
     Some(html_decode(&html[start..start + end]))
 }
+fn html_attribute_before(html: &str, before: usize) -> Option<String> {
+    let prefix = &html[..before];
+    let marker = "wire:snapshot=\"";
+    let start = prefix.rfind(marker)? + marker.len();
+    let end = prefix[start..].find('"')?;
+    Some(html_decode(&prefix[start..start + end]))
+}
 fn html_decode(value: &str) -> String {
     value
         .replace("&quot;", "\"")
@@ -776,5 +870,37 @@ mod tests {
             player["src"].as_str(),
             Some("https://example.com/episode.m3u8")
         );
+    }
+
+    #[test]
+    fn parses_series_title_and_livewire_pagination_state() {
+        let html = r#"<meta name="csrf-token" content="csrf"><section wire:snapshot="{&quot;component&quot;:1}" x-data="{ anmTitles: JSON.parse('{\u00225\u0022:\u0022Black Clover (2017)\u0022}'), items: JSON.parse('[{\u0022slug\u0022:\u00221\u0022}]'), nextCursor: 'cursor-2', hasMore: true }">"#;
+        let page = initial_page(html, &[]).unwrap();
+        assert_eq!(page.series_title.as_deref(), Some("Black Clover (2017)"));
+        assert_eq!(page.cursor.as_deref(), Some("cursor-2"));
+        assert!(page.has_more);
+        assert_eq!(page.snapshot, "{\"component\":1}");
+    }
+
+    #[test]
+    fn episode_page_accumulation_deduplicates_by_provider_identity() {
+        let merged = merge_items(
+            vec![serde_json::json!({"slug":"1","title":"first"})],
+            vec![
+                serde_json::json!({"slug":"1","title":"duplicate"}),
+                serde_json::json!({"slug":"2","title":"second"}),
+            ],
+        );
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0]["title"], "first");
+        assert_eq!(merged[1]["slug"], "2");
+    }
+
+    #[test]
+    fn search_parser_preserves_cover_and_episode_count() {
+        let html = r#"items: JSON.parse('[{\"slug\":\"black-clover\",\"main_title\":\"Black Clover\",\"type\":\"TV Series\",\"start_year\":2017,\"cover\":\"https:\\/\\/example.com\\/cover.jpg\",\"episode_count\":170}]')"#;
+        let item = parse_search_items(html).unwrap().remove(0);
+        assert_eq!(item.cover.as_deref(), Some("https://example.com/cover.jpg"));
+        assert_eq!(item.episode_count, Some(170));
     }
 }

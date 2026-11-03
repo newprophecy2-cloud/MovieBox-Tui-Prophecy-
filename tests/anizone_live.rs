@@ -35,7 +35,10 @@ async fn live_anizone_search_details_and_fresh_stream() {
                     .direct_url()
                     .is_some_and(|url| url.ends_with(".m3u8") || url.contains("m3u8"))
             );
-            assert_eq!(releases[0].codec.as_deref(), Some("h264"));
+            assert_eq!(
+                releases[0].codec, None,
+                "AniZone codec metadata is not exposed by the provider payload"
+            );
         }
     }
 }
