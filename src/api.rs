@@ -5698,7 +5698,7 @@ fn watch_url(raw: &str) -> String {
 }
 fn playback_json(playback: &PlaybackSource) -> serde_json::Value {
     serde_json::json!({
-        "provider": playback.provider,
+        "provider": playback.provider.label(),
         "resolved": true,
         "mode": "watch",
         "url": watch_url(&playback.url),
@@ -7574,6 +7574,17 @@ fn openapi() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playback_response_reports_selected_provider_name() {
+        let playback = PlaybackSource::bare(
+            ProviderKind::FourKHdHub,
+            "https://example.com/stream.m3u8",
+            None,
+        );
+        let body = playback_json(&playback);
+        assert_eq!(body["provider"], serde_json::json!("4KHDHub"));
+    }
 
     #[test]
     fn import_title_match_normalizes_case_and_punctuation_without_fuzzy_matching() {
