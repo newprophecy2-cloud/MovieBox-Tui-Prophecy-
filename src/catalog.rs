@@ -13,6 +13,7 @@ const MIGRATION_001: &str = include_str!("../migrations/001_catalog.sql");
 const MIGRATION_002: &str = include_str!("../migrations/002_codec_verification.sql");
 const MIGRATION_003: &str = include_str!("../migrations/003_anime_import_jobs.sql");
 const MIGRATION_004: &str = include_str!("../migrations/004_movie_sources.sql");
+const MIGRATION_005: &str = include_str!("../migrations/005_unified_content_mappings.sql");
 
 #[derive(Clone)]
 pub struct CatalogStore {
@@ -111,6 +112,77 @@ pub struct EpisodeInput {
     pub thumbnail_url: Option<String>,
     #[serde(default)]
     pub provider_episode_ids: Vec<ProviderEpisodeInput>,
+}
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct UnifiedAnimeInput {
+    pub canonical_title: String,
+    pub synopsis: Option<String>,
+    pub release_year: Option<i32>,
+    pub poster_url: Option<String>,
+    pub catalog_status: Option<String>,
+    #[serde(default)]
+    pub provider_titles: Vec<UnifiedAnimeProviderTitleInput>,
+    #[serde(default)]
+    pub seasons: Vec<UnifiedAnimeSeasonInput>,
+}
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct UnifiedAnimeProviderTitleInput {
+    pub provider_key: String,
+    pub display_name: Option<String>,
+    pub provider_title_id: String,
+    pub provider_title: Option<String>,
+    pub provider_url: Option<String>,
+    #[serde(default)]
+    pub metadata: Value,
+}
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct UnifiedAnimeSeasonInput {
+    pub season_number: i32,
+    pub canonical_label: Option<String>,
+    pub episode_count_reported: Option<i32>,
+    #[serde(default)]
+    pub provider_seasons: Vec<UnifiedAnimeProviderSeasonInput>,
+    #[serde(default)]
+    pub episodes: Vec<UnifiedAnimeEpisodeInput>,
+}
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct UnifiedAnimeProviderSeasonInput {
+    pub provider_key: String,
+    pub provider_season_id: Option<String>,
+    pub provider_season_number: Option<i32>,
+    #[serde(default)]
+    pub metadata: Value,
+}
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct UnifiedAnimeEpisodeInput {
+    pub episode_number: i32,
+    pub episode_title: Option<String>,
+    pub overview: Option<String>,
+    pub release_date: Option<String>,
+    pub thumbnail_url: Option<String>,
+    #[serde(default)]
+    pub provider_episodes: Vec<UnifiedAnimeProviderEpisodeInput>,
+    #[serde(default)]
+    pub provider_lookups: Vec<UnifiedAnimeProviderLookupInput>,
+}
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct UnifiedAnimeProviderEpisodeInput {
+    pub provider_key: String,
+    pub provider_episode_id: String,
+    pub provider_episode_number: Option<i32>,
+    #[serde(default)]
+    pub metadata: Value,
+}
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct UnifiedAnimeProviderLookupInput {
+    pub provider_key: String,
+    pub provider_title_id: String,
+    pub provider_season_number: i32,
+    pub provider_episode_number: i32,
+    pub lookup_reference: String,
+    pub mapping_status: String,
+    #[serde(default)]
+    pub metadata: Value,
 }
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct ProviderSourceInput {
@@ -289,6 +361,7 @@ impl CatalogStore {
         client.batch_execute(MIGRATION_002).await?;
         client.batch_execute(MIGRATION_003).await?;
         client.batch_execute(MIGRATION_004).await?;
+        client.batch_execute(MIGRATION_005).await?;
         Ok(())
     }
 
@@ -785,6 +858,17 @@ impl CatalogStore {
         let c = self.client.lock().await;
         upsert_title(&c, &input).await
     }
+    pub async fn upsert_unified_anime(
+        &self,
+        input: UnifiedAnimeInput,
+    ) -> Result<String, CatalogError> {
+        validate_unified_anime(&input)?;
+        let mut client = self.client.lock().await;
+        let tx = client.transaction().await?;
+        let result = upsert_unified_anime_in_tx(&tx, &input).await?;
+        tx.commit().await?;
+        Ok(result)
+    }
     pub async fn import_title(&self, input: ImportTitle) -> Result<ImportSummary, CatalogError> {
         validate(&input.canonical_title, &input.content_type)?;
         let c = self.client.lock().await;
@@ -872,6 +956,271 @@ impl CatalogStore {
         }
     }
 }
+fn nonempty_text(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn validate_unified_anime(input: &UnifiedAnimeInput) -> Result<(), CatalogError> {
+    validate(&input.canonical_title, "anime")?;
+    if input.release_year.is_some_and(|year| !(1800..=3000).contains(&year)) {
+        return Err(CatalogError::Validation("release_year is out of range".into()));
+    }
+    if let Some(status) = nonempty_text(input.catalog_status.as_deref()) {
+        if !matches!(status, "active" | "pending" | "disabled" | "deleted") {
+            return Err(CatalogError::Validation("invalid catalog_status".into()));
+        }
+    }
+    for provider in &input.provider_titles {
+        if provider.provider_key.trim().is_empty()
+            || provider.provider_key.chars().count() > 200
+            || provider.provider_title_id.trim().is_empty()
+            || provider.provider_title_id.chars().count() > 500
+        {
+            return Err(CatalogError::Validation("invalid provider title mapping".into()));
+        }
+    }
+    for season in &input.seasons {
+        if season.season_number < 0 || season.episode_count_reported.is_some_and(|n| n < 0) {
+            return Err(CatalogError::Validation("invalid season metadata".into()));
+        }
+        for provider_season in &season.provider_seasons {
+            if provider_season.provider_key.trim().is_empty()
+                || (nonempty_text(provider_season.provider_season_id.as_deref()).is_none()
+                    && provider_season.provider_season_number.is_none())
+                || provider_season.provider_season_number.is_some_and(|n| n < 0)
+            {
+                return Err(CatalogError::Validation("invalid provider season mapping".into()));
+            }
+        }
+        for episode in &season.episodes {
+            if episode.episode_number <= 0 {
+                return Err(CatalogError::Validation("episode_number must be positive".into()));
+            }
+            if let Some(date) = nonempty_text(episode.release_date.as_deref()) {
+                let bytes = date.as_bytes();
+                if bytes.len() != 10
+                    || bytes[4] != b'-'
+                    || bytes[7] != b'-'
+                    || !bytes.iter().enumerate().all(|(index, byte)| {
+                        index == 4 || index == 7 || byte.is_ascii_digit()
+                    })
+                {
+                    return Err(CatalogError::Validation("release_date must use YYYY-MM-DD".into()));
+                }
+            }
+            for provider_episode in &episode.provider_episodes {
+                if provider_episode.provider_key.trim().is_empty()
+                    || provider_episode.provider_key.chars().count() > 200
+                    || provider_episode.provider_episode_id.trim().is_empty()
+                    || provider_episode.provider_episode_id.chars().count() > 500
+                    || provider_episode.provider_episode_number.is_some_and(|n| n <= 0)
+                {
+                    return Err(CatalogError::Validation("invalid provider episode mapping".into()));
+                }
+            }
+            for lookup in &episode.provider_lookups {
+                if lookup.provider_key.trim().is_empty()
+                    || lookup.provider_key.chars().count() > 200
+                    || lookup.provider_title_id.trim().is_empty()
+                    || lookup.provider_title_id.chars().count() > 500
+                    || lookup.provider_season_number < 0
+                    || lookup.provider_episode_number <= 0
+                    || lookup.lookup_reference.trim().is_empty()
+                    || lookup.lookup_reference.chars().count() > 2000
+                    || !matches!(lookup.mapping_status.as_str(), "resolved" | "unresolved")
+                {
+                    return Err(CatalogError::Validation(
+                        "invalid provider episode lookup mapping".into(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn ensure_unified_provider(
+    tx: &tokio_postgres::Transaction<'_>,
+    provider_key: &str,
+    display_name: Option<&str>,
+) -> Result<Uuid, CatalogError> {
+    let display_name = nonempty_text(display_name).unwrap_or(provider_key);
+    let row = tx.query_one(
+        "INSERT INTO provider_registry(provider_key,display_name,enabled) VALUES($1,$2,false) ON CONFLICT(provider_key) DO UPDATE SET display_name=CASE WHEN provider_registry.display_name='' THEN EXCLUDED.display_name ELSE provider_registry.display_name END RETURNING id::text",
+        &[&provider_key, &display_name],
+    ).await?;
+    parse_uuid(&row.get::<_, String>(0))
+}
+
+async fn upsert_unified_anime_in_tx(
+    tx: &tokio_postgres::Transaction<'_>,
+    input: &UnifiedAnimeInput,
+) -> Result<String, CatalogError> {
+    // A provider identity is stronger evidence than title text. Check every
+    // supplied identity before using the conservative normalized-title match.
+    let mut matched_id: Option<String> = None;
+    for provider in &input.provider_titles {
+        if let Some(row) = tx.query_opt(
+            "SELECT pt.title_id::text AS id FROM provider_titles pt JOIN provider_registry pr ON pr.id=pt.provider_id WHERE pr.provider_key=$1 AND pt.provider_title_id=$2 LIMIT 1",
+            &[&provider.provider_key, &provider.provider_title_id],
+        ).await? {
+            matched_id = Some(row.get("id"));
+            break;
+        }
+    }
+    if matched_id.is_none() {
+        'episode_mappings: for season in &input.seasons {
+            for episode in &season.episodes {
+                for mapping in &episode.provider_episodes {
+                    if let Some(row) = tx.query_opt(
+                        "SELECT e.title_id::text AS id FROM episode_provider_mappings epm JOIN provider_registry pr ON pr.id=epm.provider_id JOIN episodes e ON e.id=epm.episode_id WHERE pr.provider_key=$1 AND epm.provider_episode_id=$2 LIMIT 1",
+                        &[&mapping.provider_key, &mapping.provider_episode_id],
+                    ).await? {
+                        matched_id = Some(row.get("id"));
+                        break 'episode_mappings;
+                    }
+                }
+            }
+        }
+    }
+    if matched_id.is_none() {
+        let normalized = normalize(&input.canonical_title);
+        let row = tx.query_opt(
+            "SELECT id::text AS id FROM catalog_titles WHERE normalized_title=$1 AND content_type='anime' AND catalog_status<>'deleted' AND (release_year IS NULL OR $2::int IS NULL OR release_year=$2) ORDER BY (release_year IS NULL),updated_at DESC LIMIT 1 FOR UPDATE",
+            &[&normalized, &input.release_year],
+        ).await?;
+        matched_id = row.map(|row| row.get("id"));
+    }
+
+    let title_id = if let Some(id) = matched_id {
+        let normalized = normalize(&input.canonical_title);
+        let synopsis = nonempty_text(input.synopsis.as_deref());
+        let poster_url = nonempty_text(input.poster_url.as_deref());
+        let status = nonempty_text(input.catalog_status.as_deref());
+        let row = tx.query_one(
+            "UPDATE catalog_titles SET canonical_title=CASE WHEN canonical_title='' THEN $2 ELSE canonical_title END,normalized_title=CASE WHEN canonical_title='' THEN $3 ELSE normalized_title END,synopsis=COALESCE(NULLIF($4,''),synopsis),release_year=COALESCE($5,release_year),poster_url=COALESCE(NULLIF($6,''),poster_url),catalog_status=COALESCE($7,catalog_status),metadata_source='unified_import',metadata_updated_at=now(),updated_at=now() WHERE id=$1::text::uuid RETURNING id::text",
+            &[&id, &input.canonical_title, &normalized, &synopsis, &input.release_year, &poster_url, &status],
+        ).await?;
+        row.get::<_, String>(0)
+    } else {
+        let normalized = normalize(&input.canonical_title);
+        let synopsis = nonempty_text(input.synopsis.as_deref());
+        let poster_url = nonempty_text(input.poster_url.as_deref());
+        let status = nonempty_text(input.catalog_status.as_deref()).unwrap_or("active");
+        let row = tx.query_one(
+            "INSERT INTO catalog_titles(canonical_title,normalized_title,content_type,synopsis,release_year,poster_url,catalog_status,metadata_source,metadata_updated_at) VALUES($1,$2,'anime',$3,$4,$5,$6,'unified_import',now()) RETURNING id::text",
+            &[&input.canonical_title, &normalized, &synopsis, &input.release_year, &poster_url, &status],
+        ).await?;
+        row.get::<_, String>(0)
+    };
+    let title_uuid = parse_uuid(&title_id)?;
+
+    for provider in &input.provider_titles {
+        let provider_id = ensure_unified_provider(tx, &provider.provider_key, provider.display_name.as_deref()).await?;
+        let provider_title = nonempty_text(provider.provider_title.as_deref());
+        let provider_url = nonempty_text(provider.provider_url.as_deref());
+        let metadata = if provider.metadata.is_null() || provider.metadata.as_object().is_some_and(|object| object.is_empty()) {
+            serde_json::json!({})
+        } else {
+            provider.metadata.clone()
+        };
+        tx.execute(
+            "INSERT INTO provider_titles(title_id,provider_id,provider_title_id,provider_title,provider_url,metadata,match_status) VALUES($1,$2,$3,$4,$5,$6,'unverified') ON CONFLICT(provider_id,provider_title_id) DO UPDATE SET title_id=EXCLUDED.title_id,provider_title=COALESCE(NULLIF(EXCLUDED.provider_title,''),provider_titles.provider_title),provider_url=COALESCE(NULLIF(EXCLUDED.provider_url,''),provider_titles.provider_url),metadata=CASE WHEN EXCLUDED.metadata='{}'::jsonb THEN provider_titles.metadata ELSE EXCLUDED.metadata END,updated_at=now()",
+            &[&title_uuid, &provider_id, &provider.provider_title_id, &provider_title, &provider_url, &metadata],
+        ).await?;
+    }
+
+    for season in &input.seasons {
+        let label = nonempty_text(season.canonical_label.as_deref());
+        let row = tx.query_one(
+            "INSERT INTO seasons(title_id,season_number,canonical_label,episode_count_reported) VALUES($1,$2,$3,$4) ON CONFLICT(title_id,season_number) DO UPDATE SET canonical_label=COALESCE(NULLIF(EXCLUDED.canonical_label,''),seasons.canonical_label),episode_count_reported=COALESCE(EXCLUDED.episode_count_reported,seasons.episode_count_reported),updated_at=now() RETURNING id::text",
+            &[&title_uuid, &season.season_number, &label, &season.episode_count_reported],
+        ).await?;
+        let season_uuid = parse_uuid(&row.get::<_, String>(0))?;
+
+        for mapping in &season.provider_seasons {
+            let provider_id = ensure_unified_provider(tx, &mapping.provider_key, None).await?;
+            let provider_season_id = nonempty_text(mapping.provider_season_id.as_deref());
+            let metadata = if mapping.metadata.is_null() || mapping.metadata.as_object().is_some_and(|object| object.is_empty()) {
+                serde_json::json!({})
+            } else {
+                mapping.metadata.clone()
+            };
+            tx.execute(
+                "INSERT INTO provider_season_mappings(season_id,provider_id,provider_season_id,provider_season_number,metadata) VALUES($1,$2,$3,$4,$5) ON CONFLICT(provider_id,season_id) DO UPDATE SET provider_season_id=COALESCE(NULLIF(EXCLUDED.provider_season_id,''),provider_season_mappings.provider_season_id),provider_season_number=COALESCE(EXCLUDED.provider_season_number,provider_season_mappings.provider_season_number),metadata=CASE WHEN EXCLUDED.metadata='{}'::jsonb THEN provider_season_mappings.metadata ELSE provider_season_mappings.metadata||EXCLUDED.metadata END,updated_at=now()",
+                &[&season_uuid, &provider_id, &provider_season_id, &mapping.provider_season_number, &metadata],
+            ).await?;
+        }
+
+        for episode in &season.episodes {
+            let episode_title = nonempty_text(episode.episode_title.as_deref());
+            let overview = nonempty_text(episode.overview.as_deref());
+            let release_date = nonempty_text(episode.release_date.as_deref());
+            let thumbnail_url = nonempty_text(episode.thumbnail_url.as_deref());
+            let existing = tx.query_opt(
+                "SELECT id::text AS id,episode_title FROM episodes WHERE title_id=$1 AND season_id=$2 AND episode_number=$3 FOR UPDATE",
+                &[&title_uuid, &season_uuid, &episode.episode_number],
+            ).await?;
+            let (episode_id, conflict) = if let Some(existing) = existing {
+                let existing_title: Option<String> = existing.get("episode_title");
+                let conflict = !crate::unified::episode_titles_compatible(existing_title.as_deref(), episode_title);
+                let id: String = existing.get("id");
+                if !conflict {
+                    tx.execute(
+                        "UPDATE episodes SET episode_title=COALESCE(NULLIF($2,''),episode_title),overview=COALESCE(NULLIF($3,''),overview),release_date=COALESCE(NULLIF($4::text,'')::date,release_date),thumbnail_url=COALESCE(NULLIF($5,''),thumbnail_url),updated_at=now() WHERE id=$1::text::uuid",
+                        &[&id, &episode_title, &overview, &release_date, &thumbnail_url],
+                    ).await?;
+                }
+                (id, conflict)
+            } else {
+                let row = tx.query_one(
+                    "INSERT INTO episodes(title_id,season_id,episode_number,episode_title,overview,release_date,thumbnail_url) VALUES($1,$2,$3,$4,$5,NULLIF($6::text,'')::date,$7) RETURNING id::text",
+                    &[&title_uuid, &season_uuid, &episode.episode_number, &episode_title, &overview, &release_date, &thumbnail_url],
+                ).await?;
+                (row.get::<_, String>(0), false)
+            };
+            let episode_uuid = parse_uuid(&episode_id)?;
+
+            for mapping in &episode.provider_episodes {
+                let provider_id = ensure_unified_provider(tx, &mapping.provider_key, None).await?;
+                let provider_metadata = if mapping.metadata.is_null() {
+                    serde_json::json!({})
+                } else {
+                    mapping.metadata.clone()
+                };
+                let metadata = serde_json::json!({
+                    "season_number": season.season_number,
+                    "episode_number": episode.episode_number,
+                    "episode_title": episode_title,
+                    "overview": overview,
+                    "release_date": release_date,
+                    "thumbnail_url": thumbnail_url,
+                    "provider_metadata": provider_metadata
+                });
+                let mapping_status = if conflict { "unresolved" } else { "resolved" };
+                tx.execute(
+                    "INSERT INTO episode_provider_mappings(episode_id,provider_id,provider_episode_id,provider_episode_number,mapping_status,metadata) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(provider_id,provider_episode_id) DO UPDATE SET episode_id=CASE WHEN episode_provider_mappings.episode_id=EXCLUDED.episode_id THEN episode_provider_mappings.episode_id ELSE episode_provider_mappings.episode_id END,provider_episode_number=CASE WHEN episode_provider_mappings.episode_id=EXCLUDED.episode_id THEN COALESCE(EXCLUDED.provider_episode_number,episode_provider_mappings.provider_episode_number) ELSE episode_provider_mappings.provider_episode_number END,mapping_status=CASE WHEN episode_provider_mappings.episode_id<>EXCLUDED.episode_id OR episode_provider_mappings.mapping_status='unresolved' OR EXCLUDED.mapping_status='unresolved' THEN 'unresolved' ELSE 'resolved' END,metadata=episode_provider_mappings.metadata||EXCLUDED.metadata",
+                    &[&episode_uuid, &provider_id, &mapping.provider_episode_id, &mapping.provider_episode_number, &mapping_status, &metadata],
+                ).await?;
+            }
+            for lookup in &episode.provider_lookups {
+                let provider_id =
+                    ensure_unified_provider(tx, &lookup.provider_key, None).await?;
+                let metadata = if lookup.metadata.is_null() {
+                    serde_json::json!({})
+                } else {
+                    lookup.metadata.clone()
+                };
+                tx.execute(
+                    "INSERT INTO episode_provider_lookup_mappings(episode_id,provider_id,provider_title_id,provider_season_number,provider_episode_number,lookup_reference,mapping_status,metadata) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(provider_id,provider_title_id,provider_season_number,provider_episode_number,episode_id) DO UPDATE SET lookup_reference=EXCLUDED.lookup_reference,mapping_status=CASE WHEN episode_provider_lookup_mappings.mapping_status='unresolved' OR EXCLUDED.mapping_status='unresolved' THEN 'unresolved' ELSE 'resolved' END,metadata=episode_provider_lookup_mappings.metadata||EXCLUDED.metadata,updated_at=now()",
+                    &[&episode_uuid, &provider_id, &lookup.provider_title_id, &lookup.provider_season_number, &lookup.provider_episode_number, &lookup.lookup_reference, &lookup.mapping_status, &metadata],
+                ).await?;
+            }
+        }
+    }
+    Ok(title_id)
+}
+
 async fn requeue_or_close_stale_job(
     transaction: &tokio_postgres::Transaction<'_>,
     job: &CodecVerificationJob,

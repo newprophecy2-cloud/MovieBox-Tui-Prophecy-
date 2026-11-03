@@ -152,6 +152,20 @@ struct OpaqueRef {
     s: usize,
     e: usize,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UnifiedOpaqueRef {
+    p: ProviderKind,
+    v: String,
+    s: usize,
+    e: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    canonical_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    provider_mappings: Vec<ProviderMediaId>,
+    #[serde(default)]
+    unified: bool,
+}
 #[derive(Debug, Serialize, Deserialize)]
 struct OpaqueSource {
     p: ProviderKind,
@@ -213,6 +227,8 @@ struct EligibleSearch {
     items: Vec<CatalogItem>,
     failed: bool,
     provider_status: HashMap<String, String>,
+    #[serde(default)]
+    canonical_ids: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -304,6 +320,8 @@ fn provider_error_means_no_source(error: &ProviderError) -> bool {
 #[derive(Debug, Serialize)]
 struct ApiCatalogItem {
     id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    canonical_id: Option<String>,
     title: String,
     media_type: crate::providers::models::MediaType,
     year: Option<String>,
@@ -313,7 +331,7 @@ struct ApiCatalogItem {
     provider_mappings: Vec<ApiProviderMapping>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct ApiProviderMapping {
     id: String,
     provider: ProviderKind,
@@ -366,6 +384,73 @@ struct ApiDetails {
     seasons: Vec<ApiSeason>,
     audio: Vec<crate::providers::models::AudioTrackOption>,
 }
+
+#[derive(Debug, Serialize)]
+struct UnifiedApiDetails {
+    id: String,
+    canonical_id: String,
+    provider_mappings: Vec<ApiProviderMapping>,
+    partial: bool,
+    provider_status: HashMap<String, String>,
+    title: String,
+    media_type: crate::providers::models::MediaType,
+    year: Option<String>,
+    description: Option<String>,
+    tagline: Option<String>,
+    imdb_rating: Option<String>,
+    director: Option<String>,
+    stars: Option<String>,
+    prints: Option<String>,
+    audios: Option<String>,
+    poster_url: Option<String>,
+    duration: Option<String>,
+    genres: Vec<String>,
+    seasons: Vec<UnifiedApiSeason>,
+    audio: Vec<crate::providers::models::AudioTrackOption>,
+}
+
+#[derive(Debug, Serialize)]
+struct UnifiedApiSeason {
+    canonical_id: String,
+    number: usize,
+    episode_count: usize,
+    provider_mappings: Vec<ApiSeasonProviderMapping>,
+    episodes: Vec<UnifiedApiEpisode>,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiSeasonProviderMapping {
+    provider: ProviderKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_season_id: Option<String>,
+    provider_season_number: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct UnifiedApiEpisode {
+    id: String,
+    canonical_id: String,
+    provider_mappings: Vec<ApiProviderMapping>,
+    #[serde(skip)]
+    provider_lookups: Vec<UnifiedEpisodeProviderLookup>,
+    #[serde(skip)]
+    mapping_status: String,
+    season: usize,
+    number: usize,
+    title: Option<String>,
+    overview: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct UnifiedEpisodeProviderLookup {
+    provider: ProviderKind,
+    provider_title_id: String,
+    provider_season_number: usize,
+    provider_episode_number: usize,
+    lookup_reference: String,
+    provider_title: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct ApiSeason {
     number: usize,
@@ -548,22 +633,75 @@ fn episode_ref(id: &ProviderMediaId, episode: &crate::providers::models::Episode
         e: episode.number,
     })
 }
-fn catalog(item: crate::unified::UnifiedCatalogItem) -> ApiCatalogItem {
+fn fallback_canonical_id(item: &CatalogItem) -> String {
+    let normalized = crate::unified::normalize_anime_title(&item.title);
+    let year = item
+        .year
+        .as_deref()
+        .and_then(|value| value.parse::<i32>().ok())
+        .or(normalized.year_marker)
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    let identity = format!("{:?}|{}|{}", item.media_type, normalized.key, year);
+    let mut hasher = Sha256::new();
+    hasher.update(identity.as_bytes());
+    format!("local-{}", URL_SAFE_NO_PAD.encode(hasher.finalize()))
+}
+
+fn catalog(item: crate::unified::UnifiedCatalogItem, canonical_id: Option<String>) -> ApiCatalogItem {
+    let poster_url = item
+        .primary
+        .poster_url
+        .clone()
+        .filter(|value| crate::net::validate_url_syntax(value, true).is_ok())
+        .or_else(|| {
+            item.provider_items.iter().find_map(|candidate| {
+                candidate.poster_url.clone().filter(|value| {
+                    crate::net::validate_url_syntax(value, true).is_ok()
+                })
+            })
+        });
+    let year = item.primary.year.clone().or_else(|| {
+        item.provider_items
+            .iter()
+            .find_map(|candidate| candidate.year.clone().filter(|value| !value.trim().is_empty()))
+    });
+    let season_count = item.primary.season_count.or_else(|| {
+        item.provider_items
+            .iter()
+            .find_map(|candidate| candidate.season_count)
+    });
+    let fallback_item = CatalogItem {
+        year: year.clone(),
+        ..item.primary.clone()
+    };
+    let canonical_id = canonical_id.unwrap_or_else(|| fallback_canonical_id(&fallback_item));
+    let provider_id_mappings = item.provider_mappings.clone();
+    let provider_mappings = item
+        .provider_mappings
+        .into_iter()
+        .map(|id| ApiProviderMapping {
+            id: provider_ref(&id, 0, 0),
+            provider: id.provider,
+        })
+        .collect::<Vec<_>>();
     ApiCatalogItem {
-        id: provider_ref(&item.primary.id, 0, 0),
+        id: encode(&UnifiedOpaqueRef {
+            p: item.primary.id.provider,
+            v: item.primary.id.value.clone(),
+            s: 0,
+            e: 0,
+            canonical_id: Some(canonical_id.clone()),
+            provider_mappings: provider_id_mappings,
+            unified: true,
+        }),
+        canonical_id: Some(canonical_id),
         title: item.primary.title,
         media_type: item.primary.media_type,
-        year: item.primary.year,
-        poster_url: item.primary.poster_url,
-        season_count: item.primary.season_count,
-        provider_mappings: item
-            .provider_mappings
-            .into_iter()
-            .map(|id| ApiProviderMapping {
-                id: provider_ref(&id, 0, 0),
-                provider: id.provider,
-            })
-            .collect(),
+        year,
+        poster_url,
+        season_count,
+        provider_mappings,
     }
 }
 fn details(d: MediaDetails) -> ApiDetails {
@@ -3500,6 +3638,7 @@ async fn search_json(stream: &mut TcpStream, query: &str, state: ApiState) -> st
     let items = crate::unified::group_catalog_items(eligible.items);
     let failed = eligible.failed;
     let provider_status = eligible.provider_status;
+    let canonical_ids = eligible.canonical_ids;
     let offset = q
         .cursor
         .as_deref()
@@ -3528,7 +3667,12 @@ async fn search_json(stream: &mut TcpStream, query: &str, state: ApiState) -> st
         .into_iter()
         .skip(offset.min(total))
         .take(limit)
-        .map(catalog)
+        .map(|item| {
+            let canonical_id = canonical_ids
+                .get(&provider_mapping_key(&item.primary.id))
+                .cloned();
+            catalog(item, canonical_id)
+        })
         .collect::<Vec<_>>();
     let body = SearchResponse {
         results,
@@ -3548,7 +3692,7 @@ async fn cached_search(state: &ApiState, query: &str) -> EligibleSearch {
         let cache = state.search_cache.lock().await;
         if let Some(entry) = cache.get(&key) {
             if entry.stored_at.elapsed() < SEARCH_CACHE_TTL {
-                return entry.result.clone();
+                return filter_current_search_providers(entry.result.clone());
             }
         }
     }
@@ -3571,7 +3715,7 @@ async fn cached_search(state: &ApiState, query: &str) -> EligibleSearch {
                         result: result.clone(),
                     },
                 );
-                return result;
+                return filter_current_search_providers(result);
             }
         }
     }
@@ -3604,6 +3748,15 @@ async fn cached_search(state: &ApiState, query: &str) -> EligibleSearch {
                 .await;
         }
     }
+    filter_current_search_providers(result)
+}
+
+fn filter_current_search_providers(mut result: EligibleSearch) -> EligibleSearch {
+    let enabled = configured_search_providers();
+    result.items.retain(|item| enabled.contains(&item.id.provider));
+    result
+        .provider_status
+        .retain(|provider, _| enabled.iter().any(|kind| kind.cache_key() == provider));
     result
 }
 
@@ -3622,8 +3775,12 @@ async fn search_sse(stream: &mut TcpStream, query: &str, state: ApiState) -> std
     };
     let eligible = cached_search(&state, &qv).await;
     write_headers(stream, 200, "text/event-stream", None).await?;
+    let canonical_ids = eligible.canonical_ids.clone();
     for item in crate::unified::group_catalog_items(eligible.items) {
-        let payload = serde_json::to_string(&serde_json::json!({"result":catalog(item)})).unwrap();
+        let canonical_id = canonical_ids
+            .get(&provider_mapping_key(&item.primary.id))
+            .cloned();
+        let payload = serde_json::to_string(&serde_json::json!({"result":catalog(item, canonical_id)})).unwrap();
         send_event(stream, "search_result", &payload).await?;
     }
     for (provider, status) in eligible.provider_status {
@@ -3801,6 +3958,84 @@ async fn catalog_item_source_eligibility(
     )
 }
 
+fn provider_mapping_key(id: &ProviderMediaId) -> String {
+    format!("{}:{}", id.provider.cache_key(), id.value)
+}
+
+async fn persist_search_group(
+    state: &ApiState,
+    group: &crate::unified::UnifiedCatalogItem,
+) -> Option<String> {
+    let store = state.catalog.as_ref()?;
+    let primary = &group.primary;
+    let mut records = vec![primary];
+    records.extend(group.provider_items.iter());
+    let provider_titles = records
+        .iter()
+        .map(|item| crate::catalog::UnifiedAnimeProviderTitleInput {
+            provider_key: item.id.provider.cache_key().to_string(),
+            display_name: Some(item.id.provider.label().to_string()),
+            provider_title_id: item.id.value.clone(),
+            provider_title: Some(item.title.clone()),
+            provider_url: None,
+            metadata: serde_json::json!({
+                "year": item.year,
+                "media_type": item.media_type,
+                "season_count": item.season_count,
+            }),
+        })
+        .collect();
+    let year = records
+        .iter()
+        .find_map(|item| item.year.as_deref().and_then(|value| value.parse::<i32>().ok()));
+    let poster_url = records.iter().find_map(|item| {
+        item.poster_url
+            .as_deref()
+            .filter(|value| crate::net::validate_url_syntax(value, true).is_ok())
+            .map(str::to_string)
+    });
+    let input = crate::catalog::UnifiedAnimeInput {
+        canonical_title: primary.title.clone(),
+        synopsis: None,
+        release_year: year,
+        poster_url,
+        catalog_status: None,
+        provider_titles,
+        seasons: Vec::new(),
+    };
+    match store.upsert_unified_anime(input).await {
+        Ok(id) => Some(id),
+        Err(error) => {
+            log::warn!("could not persist unified search mappings: {error}");
+            None
+        }
+    }
+}
+
+fn spawn_source_eligibility_check(
+    tasks: &mut JoinSet<(CatalogItem, SourceEligibility)>,
+    state: ApiState,
+    item: CatalogItem,
+) {
+    tasks.spawn(async move {
+        let semaphore = Arc::clone(&state.search_source_check_slots);
+        let permit = semaphore.acquire_owned().await;
+        if permit.is_err() {
+            return (item, SourceEligibility::CheckFailed);
+        }
+        let fallback = item.clone();
+        match tokio::time::timeout(
+            SEARCH_SOURCE_CHECK_TIMEOUT,
+            catalog_item_source_eligibility(&state, item),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => (fallback, SourceEligibility::CheckFailed),
+        }
+    });
+}
+
 async fn eligible_search(
     state: &ApiState,
     items: Vec<CatalogItem>,
@@ -3808,25 +4043,11 @@ async fn eligible_search(
     mut provider_status: HashMap<String, String>,
 ) -> EligibleSearch {
     let mut tasks = JoinSet::new();
-    for item in items {
-        let state = state.clone();
-        let semaphore = Arc::clone(&state.search_source_check_slots);
-        tasks.spawn(async move {
-            let permit = semaphore.acquire_owned().await;
-            if permit.is_err() {
-                return (item, SourceEligibility::CheckFailed);
-            }
-            let item_fallback = item.clone();
-            match tokio::time::timeout(
-                SEARCH_SOURCE_CHECK_TIMEOUT,
-                catalog_item_source_eligibility(&state, item),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => (item_fallback, SourceEligibility::CheckFailed),
-            }
-        });
+    let mut pending = items.into_iter();
+    for _ in 0..SEARCH_SOURCE_CHECK_CONCURRENCY {
+        if let Some(item) = pending.next() {
+            spawn_source_eligibility_check(&mut tasks, state.clone(), item);
+        }
     }
 
     let mut eligible = Vec::new();
@@ -3851,6 +4072,9 @@ async fn eligible_search(
                 failed = true;
             }
         }
+        if let Some(item) = pending.next() {
+            spawn_source_eligibility_check(&mut tasks, state.clone(), item);
+        }
     }
     for provider in configured_search_providers() {
         let key = provider.cache_key().to_string();
@@ -3867,10 +4091,19 @@ async fn eligible_search(
             .cmp(&provider_priority(b.id.provider))
             .then_with(|| a.title.cmp(&b.title))
     });
+    let mut canonical_ids = HashMap::new();
+    if state.catalog.is_some() {
+        for group in crate::unified::group_catalog_items(eligible.clone()) {
+            if let Some(id) = persist_search_group(state, &group).await {
+                canonical_ids.insert(provider_mapping_key(&group.primary.id), id);
+            }
+        }
+    }
     EligibleSearch {
         items: eligible,
         failed,
         provider_status,
+        canonical_ids,
     }
 }
 
@@ -3997,6 +4230,17 @@ async fn anime_route(
         let (s, b) = err("INVALID_ID", "An anime identifier is required.", None, 400);
         return write_raw_json(stream, s, &b, None).await;
     }
+    if let Ok(unified) = decode::<UnifiedOpaqueRef>(parts[3]) {
+        if unified.unified {
+            let primary = OpaqueRef {
+                p: unified.p,
+                v: unified.v.clone(),
+                s: unified.s,
+                e: unified.e,
+            };
+            return unified_anime_route(stream, path, query, state, unified, primary).await;
+        }
+    }
     let r = parse_ref(parts[3]);
     let Ok(r) = r else {
         let (s, b) = r.unwrap_err();
@@ -4100,6 +4344,705 @@ async fn anime_route(
     }
     let (s, b) = err("INTERNAL_ERROR", "Unsupported anime route.", None, 404);
     write_raw_json(stream, s, &b, None).await
+}
+
+#[derive(Clone)]
+struct UnifiedEpisodeCandidate {
+    anime_id: ProviderMediaId,
+    episode: crate::providers::models::Episode,
+}
+
+fn normalized_episode_title(title: Option<&str>) -> Option<String> {
+    title
+        .map(crate::unified::normalize_anime_title)
+        .map(|title| title.key)
+        .filter(|title| !title.is_empty())
+}
+
+fn episode_special_marker(title: Option<&str>) -> bool {
+    title
+        .map(crate::unified::normalize_anime_title)
+        .is_some_and(|title| {
+            title.key.split_whitespace().any(|token| {
+                matches!(token, "special" | "ova" | "ona" | "movie" | "film" | "recap")
+            })
+        })
+}
+
+fn episode_candidates_can_merge(left: &UnifiedEpisodeCandidate, right: &UnifiedEpisodeCandidate) -> bool {
+    left.episode.season == right.episode.season
+        && left.episode.number == right.episode.number
+        && left.anime_id.provider != right.anime_id.provider
+        && episode_special_marker(left.episode.title.as_deref())
+            == episode_special_marker(right.episode.title.as_deref())
+        // Episode position alone is not enough evidence. Only merge when both
+        // providers supply the same normalized non-empty title; otherwise keep
+        // separate canonical response records.
+        && normalized_episode_title(left.episode.title.as_deref()).is_some()
+        && normalized_episode_title(left.episode.title.as_deref())
+            == normalized_episode_title(right.episode.title.as_deref())
+}
+
+fn canonical_episode_response_id(
+    canonical_anime_id: &str,
+    candidate: &UnifiedEpisodeCandidate,
+) -> String {
+    let identity = normalized_episode_title(candidate.episode.title.as_deref()).unwrap_or_else(|| {
+        format!(
+            "{}:{}",
+            candidate.anime_id.provider.cache_key(),
+            candidate.anime_id.value
+        )
+    });
+    let mut hasher = Sha256::new();
+    hasher.update(canonical_anime_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(candidate.episode.season.to_be_bytes());
+    hasher.update(candidate.episode.number.to_be_bytes());
+    hasher.update([0]);
+    hasher.update(identity.as_bytes());
+    format!(
+        "{}:episode:{}",
+        canonical_anime_id,
+        URL_SAFE_NO_PAD.encode(hasher.finalize())
+    )
+}
+
+async fn persist_unified_details(
+    state: &ApiState,
+    details: &[(ProviderMediaId, MediaDetails)],
+    mappings: &[ProviderMediaId],
+    response: &UnifiedApiDetails,
+) -> Option<String> {
+    let store = state.catalog.as_ref()?;
+    let primary = &details[0].1;
+    let provider_titles = mappings
+        .iter()
+        .map(|mapping| {
+            let provider_details = details
+                .iter()
+                .find(|(candidate, _)| candidate == mapping)
+                .map(|(_, details)| details);
+            crate::catalog::UnifiedAnimeProviderTitleInput {
+                provider_key: mapping.provider.cache_key().to_string(),
+                display_name: Some(mapping.provider.label().to_string()),
+                provider_title_id: mapping.value.clone(),
+                provider_title: provider_details.map(|details| details.title.clone()),
+                provider_url: None,
+                metadata: provider_details.map_or_else(
+                    || serde_json::json!({}),
+                    |details| {
+                        serde_json::json!({
+                            "year": details.year,
+                            "media_type": details.media_type,
+                        })
+                    },
+                ),
+            }
+        })
+        .collect();
+
+    let mut seasons = Vec::new();
+    for unified_season in &response.seasons {
+        let provider_seasons = details
+            .iter()
+            .filter_map(|(mapping, details)| {
+                details
+                    .seasons
+                    .iter()
+                    .find(|season| season.number == unified_season.number)
+                    .map(|season| crate::catalog::UnifiedAnimeProviderSeasonInput {
+                        provider_key: mapping.provider.cache_key().to_string(),
+                        // Provider adapters do not currently expose stable season IDs.
+                        provider_season_id: None,
+                        provider_season_number: Some(season.number as i32),
+                        metadata: serde_json::json!({
+                            "episode_count": season.episodes.len(),
+                        }),
+                    })
+            })
+            .collect();
+
+        let episodes = unified_season
+            .episodes
+            .iter()
+            .filter(|episode| episode.number > 0)
+            .map(|episode| crate::catalog::UnifiedAnimeEpisodeInput {
+                episode_number: episode.number as i32,
+                episode_title: episode.title.clone(),
+                overview: episode.overview.clone(),
+                release_date: None,
+                thumbnail_url: None,
+                // Episode objects currently expose only a season/number lookup, not
+                // an upstream episode ID. Do not persist a fabricated provider ID.
+                provider_episodes: Vec::new(),
+                provider_lookups: episode
+                    .provider_lookups
+                    .iter()
+                    .map(|lookup| crate::catalog::UnifiedAnimeProviderLookupInput {
+                        provider_key: lookup.provider.cache_key().to_string(),
+                        provider_title_id: lookup.provider_title_id.clone(),
+                        provider_season_number: lookup.provider_season_number as i32,
+                        provider_episode_number: lookup.provider_episode_number as i32,
+                        lookup_reference: lookup.lookup_reference.clone(),
+                        mapping_status: episode.mapping_status.clone(),
+                        metadata: serde_json::json!({
+                            "provider_episode_title": lookup.provider_title,
+                        }),
+                    })
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        seasons.push(crate::catalog::UnifiedAnimeSeasonInput {
+            season_number: unified_season.number as i32,
+            canonical_label: None,
+            episode_count_reported: Some(episodes.len() as i32),
+            provider_seasons,
+            episodes,
+        });
+    }
+
+    let input = crate::catalog::UnifiedAnimeInput {
+        canonical_title: primary.title.clone(),
+        synopsis: response.description.clone(),
+        release_year: details
+            .iter()
+            .find_map(|(_, details)| details.year.as_deref().and_then(|year| year.parse().ok())),
+        poster_url: response.poster_url.clone(),
+        catalog_status: None,
+        provider_titles,
+        seasons,
+    };
+    match store.upsert_unified_anime(input).await {
+        Ok(id) => Some(id),
+        Err(error) => {
+            log::warn!("could not persist unified anime details: {error}");
+            None
+        }
+    }
+}
+
+async fn resolve_unified_provider_mappings(
+    state: &ApiState,
+    reference: &UnifiedOpaqueRef,
+) -> Vec<ProviderMediaId> {
+    let mut mappings = vec![ProviderMediaId {
+        provider: reference.p,
+        value: reference.v.clone(),
+    }];
+    mappings.extend(reference.provider_mappings.iter().cloned());
+
+    if let (Some(store), Some(canonical_id)) = (state.catalog.as_ref(), reference.canonical_id.as_deref()) {
+        match store.get_title_detail(canonical_id).await {
+            Ok(Some(detail)) => {
+                for value in detail.provider_mappings {
+                    let Some(object) = value.as_object() else {
+                        continue;
+                    };
+                    let provider = object
+                        .get("provider_key")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(ProviderKind::parse);
+                    let provider_id = object
+                        .get("provider_title_id")
+                        .and_then(serde_json::Value::as_str);
+                    if let (Some(provider), Some(provider_id)) = (provider, provider_id) {
+                        if !provider_id.trim().is_empty() {
+                            mappings.push(ProviderMediaId {
+                                provider,
+                                value: provider_id.to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(error) => log::warn!("could not load persisted unified provider mappings: {error}"),
+        }
+    }
+
+    let eligible = configured_search_providers();
+    mappings.retain(|mapping| eligible.contains(&mapping.provider) && !mapping.value.trim().is_empty());
+    let mut seen = std::collections::HashSet::new();
+    mappings.retain(|mapping| seen.insert((mapping.provider, mapping.value.clone())));
+    mappings.sort_by_key(|mapping| provider_priority(mapping.provider));
+    mappings
+}
+
+async fn fetch_unified_provider_details(
+    state: &ApiState,
+    mappings: &[ProviderMediaId],
+) -> (Vec<(ProviderMediaId, MediaDetails)>, HashMap<String, String>) {
+    let mut tasks = JoinSet::new();
+    let slots = Arc::new(Semaphore::new(SEARCH_PROVIDER_CONCURRENCY));
+    for mapping in mappings.iter().cloned() {
+        let service = state.service.clone();
+        let slots = Arc::clone(&slots);
+        tasks.spawn(async move {
+            let Ok(_permit) = slots.acquire_owned().await else {
+                return (mapping, None, Some("concurrency_limit".to_string()));
+            };
+            let result = tokio::time::timeout(
+                OVERALL_TIMEOUT,
+                service.details_typed(mapping.provider, &mapping.value),
+            )
+            .await;
+            match result {
+                Ok(Ok(details)) if details.id.provider == mapping.provider => {
+                    (mapping, Some(details), None)
+                }
+                Ok(Ok(_)) => (mapping, None, Some("provider_identity_mismatch".to_string())),
+                Ok(Err(error)) => (mapping, None, Some(error.user_message(mapping.provider))),
+                Err(_) => (mapping, None, Some("timeout".to_string())),
+            }
+        });
+    }
+
+    let mut results = Vec::new();
+    let mut status = HashMap::new();
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok((mapping, Some(details), _)) => {
+                status.insert(mapping.provider.cache_key().to_string(), "ok".to_string());
+                results.push((mapping, details));
+            }
+            Ok((mapping, None, Some(error))) => {
+                status.insert(mapping.provider.cache_key().to_string(), error);
+            }
+            Ok((mapping, None, None)) => {
+                status.insert(mapping.provider.cache_key().to_string(), "unavailable".to_string());
+            }
+            Err(error) => {
+                log::warn!("unified details provider task failed: {error}");
+                status.insert("provider_task".to_string(), "task_failed".to_string());
+            }
+        }
+    }
+    results.sort_by_key(|(mapping, _)| provider_priority(mapping.provider));
+    (results, status)
+}
+
+fn unified_api_details(
+    details: &[(ProviderMediaId, MediaDetails)],
+    all_mappings: &[ProviderMediaId],
+    canonical_id: String,
+    provider_status: HashMap<String, String>,
+) -> UnifiedApiDetails {
+    let primary = &details[0].1;
+    let id = encode(&UnifiedOpaqueRef {
+        p: details[0].0.provider,
+        v: details[0].0.value.clone(),
+        s: 0,
+        e: 0,
+        canonical_id: Some(canonical_id.clone()),
+        provider_mappings: all_mappings
+            .iter()
+            .filter(|mapping| **mapping != details[0].0)
+            .cloned()
+            .collect(),
+        unified: true,
+    });
+
+    let mut groups: Vec<Vec<UnifiedEpisodeCandidate>> = Vec::new();
+    let mut candidates = Vec::new();
+    let mut season_numbers = Vec::new();
+    for (anime_id, provider_details) in details {
+        for season in &provider_details.seasons {
+            if !season_numbers.contains(&season.number) {
+                season_numbers.push(season.number);
+            }
+            for episode in &season.episodes {
+                candidates.push(UnifiedEpisodeCandidate {
+                    anime_id: anime_id.clone(),
+                    episode: episode.clone(),
+                });
+            }
+        }
+    }
+    // Process providers in deterministic priority order. The existing gap helper
+    // identifies coordinates absent from the canonical list; a gap is filled only
+    // by this loop when a provider has returned a real episode record for it.
+    candidates.sort_by_key(|candidate| {
+        (
+            provider_priority(candidate.anime_id.provider),
+            candidate.episode.season,
+            candidate.episode.number,
+        )
+    });
+    for candidate in candidates {
+        let expected_through = details
+            .iter()
+            .flat_map(|(_, item)| item.seasons.iter())
+            .filter(|season| season.number == candidate.episode.season)
+            .flat_map(|season| season.episodes.iter())
+            .map(|episode| episode.number)
+            .max()
+            .unwrap_or(candidate.episode.number);
+        let canonical_coordinates = groups
+            .iter()
+            .map(|group| {
+                let episode = &group[0].episode;
+                crate::unified::CanonicalEpisode {
+                    season: episode.season,
+                    episode: episode.number,
+                    title: episode.title.clone(),
+                    overview: episode.overview.clone(),
+                    mappings: Vec::new(),
+                    unresolved_mappings: Vec::new(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let missing = crate::unified::missing_episode_numbers(
+            &canonical_coordinates,
+            candidate.episode.season,
+            expected_through,
+        );
+        if missing.contains(&candidate.episode.number) {
+            // This is a true observed gap fill: only the provider's returned record
+            // is added, and no title or provider ID is synthesized.
+            groups.push(vec![candidate]);
+        } else if let Some(group) = groups.iter_mut().find(|group| {
+            group
+                .iter()
+                .all(|existing| episode_candidates_can_merge(existing, &candidate))
+        }) {
+            group.push(candidate);
+        } else {
+            // Same coordinate with conflicting metadata (or a same-provider
+            // duplicate) remains a separate unresolved response record.
+            groups.push(vec![candidate]);
+        }
+    }
+    groups.sort_by_key(|group| {
+        let candidate = &group[0];
+        (
+            candidate.episode.season,
+            candidate.episode.number,
+            provider_priority(candidate.anime_id.provider),
+        )
+    });
+    let mut coordinate_counts = HashMap::<(usize, usize), usize>::new();
+    for group in &groups {
+        *coordinate_counts
+            .entry((group[0].episode.season, group[0].episode.number))
+            .or_default() += 1;
+    }
+    let unresolved_coordinates = coordinate_counts
+        .into_iter()
+        .filter_map(|(coordinate, count)| (count > 1).then_some(coordinate))
+        .collect::<std::collections::HashSet<_>>();
+    season_numbers.sort_unstable();
+    for group in &groups {
+        if !season_numbers.contains(&group[0].episode.season) {
+            season_numbers.push(group[0].episode.season);
+        }
+    }
+    season_numbers.sort_unstable();
+
+    let mut unified_episodes = Vec::new();
+    for mut group in groups {
+        group.sort_by_key(|candidate| provider_priority(candidate.anime_id.provider));
+        let first = &group[0];
+        let mut mappings = group
+            .iter()
+            .skip(1)
+            .map(|candidate| ApiProviderMapping {
+                id: encode(&OpaqueRef {
+                    p: candidate.anime_id.provider,
+                    v: candidate.anime_id.value.clone(),
+                    s: candidate.episode.season,
+                    e: candidate.episode.number,
+                }),
+                provider: candidate.anime_id.provider,
+            })
+            .collect::<Vec<_>>();
+        mappings.dedup_by_key(|mapping| mapping.provider);
+        let title = group
+            .iter()
+            .find_map(|candidate| candidate.episode.title.clone().filter(|value| !value.trim().is_empty()));
+        let overview = group.iter().find_map(|candidate| {
+            candidate
+                .episode
+                .overview
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+        });
+        unified_episodes.push(UnifiedApiEpisode {
+            id: encode(&OpaqueRef {
+                p: first.anime_id.provider,
+                v: first.anime_id.value.clone(),
+                s: first.episode.season,
+                e: first.episode.number,
+            }),
+            canonical_id: canonical_episode_response_id(&canonical_id, first),
+            provider_mappings: std::mem::take(&mut mappings),
+            provider_lookups: group
+                .iter()
+                .map(|candidate| UnifiedEpisodeProviderLookup {
+                    provider: candidate.anime_id.provider,
+                    provider_title_id: candidate.anime_id.value.clone(),
+                    provider_season_number: candidate.episode.season,
+                    provider_episode_number: candidate.episode.number,
+                    lookup_reference: encode(&OpaqueRef {
+                        p: candidate.anime_id.provider,
+                        v: candidate.anime_id.value.clone(),
+                        s: candidate.episode.season,
+                        e: candidate.episode.number,
+                    }),
+                    provider_title: candidate.episode.title.clone(),
+                })
+                .collect(),
+            mapping_status: if unresolved_coordinates
+                .contains(&(first.episode.season, first.episode.number))
+            {
+                "unresolved".to_string()
+            } else {
+                "resolved".to_string()
+            },
+            season: first.episode.season,
+            number: first.episode.number,
+            title,
+            overview,
+        });
+    }
+
+    let seasons = season_numbers
+        .into_iter()
+        .map(|number| {
+            let season_mappings = details
+                .iter()
+                .filter_map(|(anime_id, provider_details)| {
+                    provider_details
+                        .seasons
+                        .iter()
+                        .find(|season| season.number == number)
+                        .map(|season| ApiSeasonProviderMapping {
+                            provider: anime_id.provider,
+                            // Existing provider adapters expose season numbers but
+                            // not stable season IDs; keep the upstream ID missing.
+                            provider_season_id: None,
+                            provider_season_number: Some(season.number),
+                        })
+                })
+                .collect();
+            UnifiedApiSeason {
+                canonical_id: format!("{canonical_id}:season:{number}"),
+                number,
+                episode_count: unified_episodes
+                    .iter()
+                    .filter(|episode| episode.season == number)
+                    .count(),
+                provider_mappings: season_mappings,
+                episodes: unified_episodes
+                    .iter()
+                    .filter(|episode| episode.season == number)
+                    .cloned()
+                    .collect(),
+            }
+        })
+        .collect();
+
+    let provider_mappings = all_mappings
+        .iter()
+        .filter(|mapping| **mapping != details[0].0)
+        .map(|mapping| ApiProviderMapping {
+            id: provider_ref(mapping, 0, 0),
+            provider: mapping.provider,
+        })
+        .collect();
+    let first_nonempty = |select: fn(&MediaDetails) -> &Option<String>| {
+        details.iter().find_map(|(_, item)| {
+            select(item)
+                .as_ref()
+                .filter(|value| !value.trim().is_empty())
+                .cloned()
+        })
+    };
+    let mut genres = Vec::new();
+    let mut normalized_genres = std::collections::HashSet::new();
+    for (_, item) in details {
+        for genre in &item.genres {
+            let key = genre.trim().to_lowercase();
+            if !key.is_empty() && normalized_genres.insert(key) {
+                genres.push(genre.clone());
+            }
+        }
+    }
+    UnifiedApiDetails {
+        id,
+        canonical_id,
+        provider_mappings,
+        partial: provider_status.values().any(|status| status != "ok"),
+        provider_status,
+        title: if primary.title.trim().is_empty() {
+            first_nonempty(|item| &item.title).unwrap_or_default()
+        } else {
+            primary.title.clone()
+        },
+        media_type: primary.media_type,
+        year: first_nonempty(|item| &item.year),
+        description: first_nonempty(|item| &item.description),
+        tagline: first_nonempty(|item| &item.tagline),
+        imdb_rating: first_nonempty(|item| &item.imdb_rating),
+        director: first_nonempty(|item| &item.director),
+        stars: first_nonempty(|item| &item.stars),
+        prints: first_nonempty(|item| &item.prints),
+        audios: first_nonempty(|item| &item.audios),
+        poster_url: details.iter().find_map(|(_, item)| {
+            item.poster_url
+                .as_ref()
+                .filter(|value| crate::net::validate_url_syntax(value, true).is_ok())
+                .cloned()
+        }),
+        duration: first_nonempty(|item| &item.duration),
+        genres,
+        seasons,
+        // Audio track selection/aggregation is explicitly a later phase.
+        audio: primary.dubs.clone(),
+    }
+}
+
+async fn unified_anime_route(
+    stream: &mut TcpStream,
+    path: &str,
+    query: &str,
+    state: ApiState,
+    unified: UnifiedOpaqueRef,
+    primary_ref: OpaqueRef,
+) -> std::io::Result<()> {
+    let parts: Vec<_> = path.trim_matches('/').split('/').collect();
+    let mappings = resolve_unified_provider_mappings(&state, &unified).await;
+    let (details, provider_status) = fetch_unified_provider_details(&state, &mappings).await;
+    if details.is_empty() {
+        let provider = primary_ref.p;
+        let message = provider_status
+            .get(provider.cache_key())
+            .map(String::as_str)
+            .unwrap_or("No mapped provider returned details.");
+        let (status, body) = if message == "timeout" {
+            err("PROVIDER_TIMEOUT", "Mapped provider details timed out.", Some(provider), 504)
+        } else {
+            err("UPSTREAM_UNAVAILABLE", "No mapped provider returned details.", Some(provider), 502)
+        };
+        log::debug!("unified details unavailable: {message}");
+        return write_raw_json(stream, status, &body, None).await;
+    }
+
+    let primary_details = details
+        .iter()
+        .find(|(mapping, _)| mapping.provider == primary_ref.p && mapping.value == primary_ref.v)
+        .map(|(_, details)| details.clone())
+        .unwrap_or_else(|| details[0].1.clone());
+    if parts.len() == 7 && parts[4] == "episodes" && parts[6] == "full" {
+        return anime_episode_full_route(stream, parts[3], parts[5], primary_ref, primary_details, state).await;
+    }
+    if parts.len() == 7 && parts[4] == "episodes" && parts[6] == "stream" {
+        let audio = query
+            .split('&')
+            .find_map(|pair| {
+                let (key, value) = pair.split_once('=')?;
+                (key == "audio").then(|| percent_decode(value).trim().to_ascii_lowercase())
+            })
+            .unwrap_or_else(|| "hindi".to_string());
+        if crate::unified::normalize_language_code(&audio).is_none() {
+            let (status, body) = err(
+                "UNSUPPORTED_AUDIO_LANGUAGE",
+                "The requested audio language is not recognized.",
+                Some(primary_ref.p),
+                400,
+            );
+            return write_raw_json(stream, status, &body, None).await;
+        }
+        return playback_route(
+            stream,
+            PlaybackIdentity::Episode {
+                anime_id: parts[3].to_string(),
+                episode_id: parts[5].to_string(),
+                anime_ref: primary_ref,
+            },
+            primary_details,
+            state,
+            &audio,
+        )
+        .await;
+    }
+
+    let canonical_id = unified
+        .canonical_id
+        .clone()
+        .unwrap_or_else(|| fallback_canonical_id(&CatalogItem {
+            id: ProviderMediaId {
+                provider: details[0].0.provider,
+                value: details[0].0.value.clone(),
+            },
+            title: details[0].1.title.clone(),
+            media_type: details[0].1.media_type,
+            year: details[0].1.year.clone(),
+            poster_url: details[0].1.poster_url.clone(),
+            season_count: Some(details[0].1.seasons.len()),
+        }));
+    let mut response = unified_api_details(
+        &details,
+        &mappings,
+        canonical_id.clone(),
+        provider_status.clone(),
+    );
+    if let Some(persisted_id) = persist_unified_details(&state, &details, &mappings, &response).await {
+        if persisted_id != canonical_id {
+            response = unified_api_details(&details, &mappings, persisted_id, provider_status);
+        }
+    }
+    if parts.len() == 4 {
+        return write_json(stream, 200, &response, None).await;
+    }
+    if parts[4] == "seasons" {
+        return write_json(stream, 200, &response.seasons, None).await;
+    }
+    if parts[4] == "episodes" {
+        if parts.len() == 5 {
+            let episodes = response
+                .seasons
+                .iter()
+                .flat_map(|season| season.episodes.iter().cloned())
+                .collect::<Vec<_>>();
+            return write_json(stream, 200, &episodes, None).await;
+        }
+        let selected = decode::<OpaqueRef>(parts[5]).ok().and_then(|episode_ref| {
+            if !mappings.iter().any(|mapping| {
+                mapping.provider == episode_ref.p && mapping.value == episode_ref.v
+            }) {
+                return None;
+            }
+            response
+                .seasons
+                .iter()
+                .flat_map(|season| season.episodes.iter())
+                .find(|episode| episode.season == episode_ref.s && episode.number == episode_ref.e)
+                .cloned()
+        }).or_else(|| {
+            let number = parts[5].parse::<usize>().ok()?;
+            response
+                .seasons
+                .iter()
+                .flat_map(|season| season.episodes.iter())
+                .find(|episode| episode.number == number)
+                .cloned()
+        });
+        return match selected {
+            Some(episode) => write_json(stream, 200, &episode, None).await,
+            None => {
+                let (status, body) = err(
+                    "EPISODE_NOT_FOUND",
+                    "The episode was not found.",
+                    Some(primary_ref.p),
+                    404,
+                );
+                write_raw_json(stream, status, &body, None).await
+            }
+        };
+    }
+    let (status, body) = err("INTERNAL_ERROR", "Unsupported anime route.", None, 404);
+    write_raw_json(stream, status, &body, None).await
 }
 
 #[derive(Clone)]
@@ -7371,7 +8314,7 @@ fn openapi() -> serde_json::Value {
             "/docs": {"get": {"responses": {"200": {"description": "API documentation"}}}},
             "/api/v1/diagnostics": {"get": {"responses": {"200": {"description": "Sanitized provider diagnostics"}}}},
             "/api/v1/watch": {"get": {"responses": {"200": {"description": "Episode playback descriptor; verified compatible MP4 sources use direct range passthrough, HLS/DASH remains native, and other verified sources use progressive fragmented-MP4 remux without arbitrary byte-range seeking"}, "400": {"description": "Invalid watch request"}, "415": {"description": "All discovered sources are blocked or have unverified codecs"}}}},
-            "/api/v1/anime/search": {"get": {"description": "Search cards include optional provider_mappings with API-generated provider-specific opaque IDs; the top-level id retains the primary legacy provider ID.", "parameters": [{"name": "q", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 200}}, {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 100}}, {"name": "cursor", "in": "query", "schema": {"type": "string"}}], "responses": {"200": {"description": "Search results"}, "400": {"description": "Invalid query"}}}},
+            "/api/v1/anime/search": {"get": {"description": "Search returns one conservative canonical card per matched Anime, with canonical_id and provider_mappings. The opaque top-level id retains the primary provider reference and mapped provider lookups. PostgreSQL persistence is optional.", "parameters": [{"name": "q", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 200}}, {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 100}}, {"name": "cursor", "in": "query", "schema": {"type": "string"}}], "responses": {"200": {"description": "Unified search results"}, "400": {"description": "Invalid query"}}}},
             "/api/v1/search": {"get": {"description": "PostgreSQL-only catalog search; never performs live provider discovery.", "responses": {"200": {"description": "Catalog search results"}, "400": {"description": "Invalid query"}, "503": {"description": "Catalog database unavailable"}}}},
             "/api/v1/genres": {"get": {"description": "PostgreSQL-backed canonical genre list.", "responses": {"200": {"description": "Genres"}, "503": {"description": "Catalog database unavailable"}}}},
             "/api/v1/catalog/titles/{title_id}": {"get": {"description": "Canonical PostgreSQL catalog title detail; movie titles may include eligible title-owned movie_sources.", "responses": {"200": {"description": "Title detail"}, "404": {"description": "Title not found"}, "503": {"description": "Catalog database unavailable"}}}},
@@ -7411,9 +8354,9 @@ fn openapi() -> serde_json::Value {
             "/api/v1/k-dramas/{id}": {"get": {"responses": {"501": {"description": "Unsupported category"}}}},
             "/api/v1/categories": {"get": {"responses": {"200": {"description": "Supported content categories"}}}},
             "/api/v1/anime/search/stream": {"get": {"responses": {"200": {"description": "SSE search_result, search_provider_error, search_complete events"}}}},
-            "/api/v1/anime/{anime_id}": {"get": {"responses": {"200": {"description": "Anime details"}}}},
-            "/api/v1/anime/{anime_id}/seasons": {"get": {"responses": {"200": {"description": "Seasons"}}}},
-            "/api/v1/anime/{anime_id}/episodes": {"get": {"responses": {"200": {"description": "Episodes"}}}},
+            "/api/v1/anime/{anime_id}": {"get": {"description": "Legacy provider IDs remain accepted. Unified search IDs resolve eligible mapped providers concurrently and return successful details with per-provider status, canonical identity, and partial results.", "responses": {"200": {"description": "Aggregated anime details"}, "502": {"description": "No mapped provider returned details"}, "504": {"description": "Mapped provider details timed out"}}}},
+            "/api/v1/anime/{anime_id}/seasons": {"get": {"description": "Unified season list with canonical season IDs, available episode counts, provider season numbers, and aggregated episodes.", "responses": {"200": {"description": "Unified season list"}}}},
+            "/api/v1/anime/{anime_id}/episodes": {"get": {"description": "Observed episodes aggregated from successful mapped providers; missing numbers are included only when a provider returned an episode record.", "responses": {"200": {"description": "Unified episode list"}}}},
             "/api/v1/anime/{anime_id}/episodes/{episode_id}/full": {"get": {"responses": {"200": {"description": "Anime details, selected episode, and source candidates"}, "400": {"description": "Invalid anime or episode ID"}, "404": {"description": "Episode not found"}}}},
             "/api/v1/anime/{anime_id}/episodes/{episode_id}/stream": {"get": {"responses": {"200": {"description": "Episode playback descriptor; verified compatible MP4 sources use direct range passthrough, native HLS/DASH stays native, and other verified sources use progressive fragmented-MP4 remux"}, "415": {"description": "Sources are blocked or have unverified codecs"}, "429": {"description": "Media-job capacity is busy"}, "502": {"description": "Playback resolution failed"}, "504": {"description": "Playback resolution timed out"}}}},
             "/api/v1/episodes/{episode_id}": {"get": {"responses": {"200": {"description": "Episode details"}, "400": {"description": "Invalid episode ID"}}}},

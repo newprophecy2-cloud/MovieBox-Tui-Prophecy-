@@ -1,10 +1,13 @@
 use crate::providers::models::{CatalogItem, MediaType, ProviderKind, ProviderMediaId};
+use unicode_normalization::UnicodeNormalization;
 
 /// A catalog record with equivalent records from other providers attached.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnifiedCatalogItem {
     pub primary: CatalogItem,
     pub provider_mappings: Vec<ProviderMediaId>,
+    /// Full provider search records retained for metadata merging and persistence.
+    pub provider_items: Vec<CatalogItem>,
 }
 
 /// A normalized title key plus franchise and release-year hints.
@@ -135,14 +138,19 @@ pub fn group_catalog_items(items: Vec<CatalogItem>) -> Vec<UnifiedCatalogItem> {
         .map(|indices| {
             let primary_index = indices[0];
             let primary = items[primary_index].clone();
-            let provider_mappings = indices
+            let provider_items = indices
                 .into_iter()
                 .skip(1)
-                .map(|index| items[index].id.clone())
+                .map(|index| items[index].clone())
+                .collect();
+            let provider_mappings = provider_items
+                .iter()
+                .map(|item| item.id.clone())
                 .collect();
             UnifiedCatalogItem {
                 primary,
                 provider_mappings,
+                provider_items,
             }
         })
         .collect()
@@ -413,7 +421,8 @@ pub fn choose_source_route(
 }
 
 fn title_tokens_and_year(input: &str, remove_bracketed_years: bool) -> (Vec<String>, Option<i32>) {
-    let chars: Vec<char> = input.chars().collect();
+    let normalized: String = input.nfkc().collect();
+    let chars: Vec<char> = normalized.chars().collect();
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut year_marker = None;
@@ -459,7 +468,7 @@ fn title_tokens_and_year(input: &str, remove_bracketed_years: bool) -> (Vec<Stri
 
 fn normalize_nonempty_title(title: &str) -> String {
     title
-        .chars()
+        .nfkc()
         .flat_map(char::to_lowercase)
         .map(|ch| if ch.is_alphanumeric() { ch } else { ' ' })
         .collect::<String>()
