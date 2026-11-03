@@ -604,6 +604,7 @@ impl AppState {
             ProviderKind::BdixCircleFtp => self.bdix_circleftp_enabled,
             ProviderKind::BdixDhakaFlix => self.bdix_dhakaflix_enabled,
             ProviderKind::Addons => self.addons_enabled,
+            ProviderKind::AniZone => true,
         }
     }
 
@@ -615,6 +616,7 @@ impl AppState {
             ProviderKind::BdixCircleFtp => self.bdix_circleftp_enabled = enabled,
             ProviderKind::BdixDhakaFlix => self.bdix_dhakaflix_enabled = enabled,
             ProviderKind::Addons => self.addons_enabled = enabled,
+            ProviderKind::AniZone => {}
         }
     }
 

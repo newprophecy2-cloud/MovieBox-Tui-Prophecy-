@@ -64,8 +64,9 @@ const REMUX_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(20);
 static REMUX_LIMITER: std::sync::LazyLock<Arc<Semaphore>> =
     std::sync::LazyLock::new(|| Arc::new(Semaphore::new(2)));
 static REMUX_DEBUG_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-const PROVIDERS: [ProviderKind; 6] = [
+const PROVIDERS: [ProviderKind; 7] = [
     ProviderKind::MovieBox,
+    ProviderKind::AniZone,
     ProviderKind::FourKHdHub,
     ProviderKind::Dramachi,
     ProviderKind::BdixCircleFtp,
@@ -88,7 +89,7 @@ fn configured_search_providers() -> Vec<ProviderKind> {
     // Keep the configuration fields for the desktop/TUI clients, but do not
     // fan out web requests to providers that are not part of this deployment.
     if crate::config::load().fourkhdhub_enabled {
-        vec![ProviderKind::FourKHdHub]
+        vec![ProviderKind::FourKHdHub, ProviderKind::AniZone]
     } else {
         Vec::new()
     }
@@ -4302,7 +4303,34 @@ async fn playback_route(
             return write_raw_json(stream, status, &body, None).await;
         }
     };
-    let playback = if release.provider == ProviderKind::FourKHdHub {
+    let playback = if release.provider == ProviderKind::AniZone {
+        match tokio::time::timeout(
+            OVERALL_TIMEOUT,
+            state.service.anizone_client.resolve_release(release),
+        )
+        .await
+        {
+            Ok(Ok(playback)) => playback,
+            Ok(Err(error)) => {
+                let (status, body) = err(
+                    "PLAYBACK_RESOLUTION_FAILED",
+                    error.to_string(),
+                    Some(release.provider),
+                    502,
+                );
+                return write_raw_json(stream, status, &body, None).await;
+            }
+            Err(_) => {
+                let (status, body) = err(
+                    "PLAYBACK_RESOLUTION_TIMEOUT",
+                    "AniZone stream resolution timed out.",
+                    Some(release.provider),
+                    504,
+                );
+                return write_raw_json(stream, status, &body, None).await;
+            }
+        }
+    } else if release.provider == ProviderKind::FourKHdHub {
         let Some(client) = state.service.fourk_client.as_ref() else {
             let (status, body) = err(
                 "UPSTREAM_UNAVAILABLE",
@@ -4555,6 +4583,9 @@ fn release_cache_key(r: &OpaqueRef) -> String {
 }
 
 async fn cached_releases(state: &ApiState, r: &OpaqueRef) -> Result<Vec<Release>, ProviderError> {
+    if r.p == ProviderKind::AniZone {
+        return releases_uncached(state, r).await;
+    }
     let key = release_cache_key(r);
     if let Some(entry) = state.release_cache.lock().await.get(&key).cloned()
         && entry.stored_at.elapsed() < RELEASE_CACHE_TTL
@@ -4609,6 +4640,10 @@ async fn releases_uncached(state: &ApiState, r: &OpaqueRef) -> Result<Vec<Releas
     match r.p {
         ProviderKind::MovieBox => {
             crate::providers::ReleaseProvider::episode_streams(&svc.client, &r.v, r.s, r.e).await
+        }
+        ProviderKind::AniZone => {
+            crate::providers::ReleaseProvider::episode_streams(&svc.anizone_client, &r.v, r.s, r.e)
+                .await
         }
         ProviderKind::FourKHdHub => match svc.fourk_client.as_ref() {
             Some(client) => {
@@ -7959,9 +7994,12 @@ mod tests {
     }
 
     #[test]
-    fn configured_search_providers_use_only_fourkhdhub() {
+    fn configured_search_providers_include_anizone_without_removing_fourkhdhub() {
         let providers = configured_search_providers();
-        assert_eq!(providers, vec![ProviderKind::FourKHdHub]);
+        assert_eq!(
+            providers,
+            vec![ProviderKind::FourKHdHub, ProviderKind::AniZone]
+        );
     }
 
     #[test]

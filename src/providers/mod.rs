@@ -1,4 +1,5 @@
 pub mod addons;
+pub mod anizone;
 pub mod bdix;
 pub mod dramachi;
 pub mod fourkhdhub;

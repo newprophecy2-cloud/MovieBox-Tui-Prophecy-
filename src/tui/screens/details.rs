@@ -1428,6 +1428,9 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
                         crate::providers::models::ProviderKind::Dramachi => {
                             "Dramachi CDN".to_string()
                         }
+                        crate::providers::models::ProviderKind::AniZone => {
+                            "AniZone HLS".to_string()
+                        }
                     }
                 };
 
