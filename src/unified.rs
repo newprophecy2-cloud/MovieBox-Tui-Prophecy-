@@ -188,10 +188,8 @@ pub fn group_catalog_items_with_aliases(
                 .skip(1)
                 .map(|index| items[index].clone())
                 .collect();
-            let mut provider_mappings: Vec<ProviderMediaId> = provider_items
-                .iter()
-                .map(|item| item.id.clone())
-                .collect();
+            let mut provider_mappings: Vec<ProviderMediaId> =
+                provider_items.iter().map(|item| item.id.clone()).collect();
             provider_mappings.dedup();
             UnifiedCatalogItem {
                 primary,
@@ -325,7 +323,13 @@ pub fn aggregate_episode_records(records: Vec<ProviderEpisodeRecord>) -> Vec<Can
             });
             continue;
         };
-        if episode_titles_compatible(existing.title.as_deref(), record.title.as_deref()) {
+        let same_provider = existing
+            .mappings
+            .iter()
+            .any(|candidate| candidate.provider == mapping.provider);
+        if !same_provider
+            && episode_titles_compatible(existing.title.as_deref(), record.title.as_deref())
+        {
             if existing.title.is_none() {
                 existing.title = record.title;
             }
@@ -611,7 +615,12 @@ mod tests {
         assert_eq!(normalized.key, "black clover");
         assert_eq!(normalized.year_marker, Some(2017));
         let grouped = group_catalog_items(vec![
-            item(ProviderKind::MovieBox, "a", "Black Clover (2017)", Some("2017")),
+            item(
+                ProviderKind::MovieBox,
+                "a",
+                "Black Clover (2017)",
+                Some("2017"),
+            ),
             item(ProviderKind::Dramachi, "b", "BLACK-CLOVER", Some("2017")),
         ]);
         assert_eq!(grouped.len(), 1);
@@ -673,19 +682,47 @@ mod tests {
             item(ProviderKind::Dramachi, "b", "Example", None),
         ]);
         assert_eq!(grouped.len(), 2);
-        assert!(grouped.iter().all(|group| group.provider_mappings.is_empty()));
+        assert!(
+            grouped
+                .iter()
+                .all(|group| group.provider_mappings.is_empty())
+        );
     }
     #[test]
     fn verified_aliases_merge_different_titles_but_not_conflicting_years() {
         let items = vec![
-            item(ProviderKind::FourKHdHub, "a", "Attack on Titan", Some("2013")),
-            item(ProviderKind::Dramachi, "b", "Shingeki no Kyojin", Some("2013")),
-            item(ProviderKind::Dramachi, "c", "Shingeki no Kyojin", Some("2017")),
+            item(
+                ProviderKind::FourKHdHub,
+                "a",
+                "Attack on Titan",
+                Some("2013"),
+            ),
+            item(
+                ProviderKind::Dramachi,
+                "b",
+                "Shingeki no Kyojin",
+                Some("2013"),
+            ),
+            item(
+                ProviderKind::Dramachi,
+                "c",
+                "Shingeki no Kyojin",
+                Some("2017"),
+            ),
         ];
         let aliases = HashMap::from([
-            ("fourkhdhub:a".to_string(), vec!["Attack on Titan".to_string()]),
-            ("dramachi:b".to_string(), vec!["Attack on Titan".to_string()]),
-            ("dramachi:c".to_string(), vec!["Attack on Titan".to_string()]),
+            (
+                "fourkhdhub:a".to_string(),
+                vec!["Attack on Titan".to_string()],
+            ),
+            (
+                "dramachi:b".to_string(),
+                vec!["Attack on Titan".to_string()],
+            ),
+            (
+                "dramachi:c".to_string(),
+                vec!["Attack on Titan".to_string()],
+            ),
         ]);
         let grouped = group_catalog_items_with_aliases(items, &aliases);
         assert_eq!(grouped.len(), 2);
@@ -789,6 +826,31 @@ mod tests {
         assert_eq!(episodes[89].mappings.len(), 2);
         assert_eq!(episodes[89].unresolved_mappings.len(), 1);
         assert!(missing_episode_numbers(&episodes, 1, 170).is_empty());
+    }
+
+    #[test]
+    fn aggregate_episode_records_keeps_same_provider_duplicates_unresolved() {
+        let episodes = aggregate_episode_records(vec![
+            ProviderEpisodeRecord {
+                provider: ProviderKind::MovieBox,
+                provider_episode_id: "same-provider-a".into(),
+                season: 1,
+                episode: 1,
+                title: Some("Beginning".into()),
+                overview: None,
+            },
+            ProviderEpisodeRecord {
+                provider: ProviderKind::MovieBox,
+                provider_episode_id: "same-provider-b".into(),
+                season: 1,
+                episode: 1,
+                title: Some("Beginning".into()),
+                overview: None,
+            },
+        ]);
+        assert_eq!(episodes.len(), 1);
+        assert_eq!(episodes[0].mappings.len(), 1);
+        assert_eq!(episodes[0].unresolved_mappings.len(), 1);
     }
 
     #[test]

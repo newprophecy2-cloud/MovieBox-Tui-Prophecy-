@@ -15,6 +15,7 @@ const MIGRATION_002: &str = include_str!("../migrations/002_codec_verification.s
 const MIGRATION_003: &str = include_str!("../migrations/003_anime_import_jobs.sql");
 const MIGRATION_004: &str = include_str!("../migrations/004_movie_sources.sql");
 const MIGRATION_005: &str = include_str!("../migrations/005_unified_content_mappings.sql");
+const MIGRATION_006: &str = include_str!("../migrations/006_task3_task4_integrity.sql");
 
 #[derive(Clone)]
 pub struct CatalogStore {
@@ -367,6 +368,7 @@ impl CatalogStore {
         client.batch_execute(MIGRATION_003).await?;
         client.batch_execute(MIGRATION_004).await?;
         client.batch_execute(MIGRATION_005).await?;
+        client.batch_execute(MIGRATION_006).await?;
         Ok(())
     }
 
@@ -1004,11 +1006,18 @@ fn nonempty_text(value: Option<&str>) -> Option<&str> {
 
 fn validate_unified_anime(input: &UnifiedAnimeInput) -> Result<(), CatalogError> {
     if !matches!(input.content_type.as_str(), "anime" | "movie") {
-        return Err(CatalogError::Validation("invalid unified content_type".into()));
+        return Err(CatalogError::Validation(
+            "invalid unified content_type".into(),
+        ));
     }
     validate(&input.canonical_title, &input.content_type)?;
-    if input.release_year.is_some_and(|year| !(1800..=3000).contains(&year)) {
-        return Err(CatalogError::Validation("release_year is out of range".into()));
+    if input
+        .release_year
+        .is_some_and(|year| !(1800..=3000).contains(&year))
+    {
+        return Err(CatalogError::Validation(
+            "release_year is out of range".into(),
+        ));
     }
     if let Some(status) = nonempty_text(input.catalog_status.as_deref()) {
         if !matches!(status, "active" | "pending" | "disabled" | "deleted") {
@@ -1021,7 +1030,9 @@ fn validate_unified_anime(input: &UnifiedAnimeInput) -> Result<(), CatalogError>
             || provider.provider_title_id.trim().is_empty()
             || provider.provider_title_id.chars().count() > 500
         {
-            return Err(CatalogError::Validation("invalid provider title mapping".into()));
+            return Err(CatalogError::Validation(
+                "invalid provider title mapping".into(),
+            ));
         }
     }
     for season in &input.seasons {
@@ -1032,25 +1043,34 @@ fn validate_unified_anime(input: &UnifiedAnimeInput) -> Result<(), CatalogError>
             if provider_season.provider_key.trim().is_empty()
                 || (nonempty_text(provider_season.provider_season_id.as_deref()).is_none()
                     && provider_season.provider_season_number.is_none())
-                || provider_season.provider_season_number.is_some_and(|n| n < 0)
+                || provider_season
+                    .provider_season_number
+                    .is_some_and(|n| n < 0)
             {
-                return Err(CatalogError::Validation("invalid provider season mapping".into()));
+                return Err(CatalogError::Validation(
+                    "invalid provider season mapping".into(),
+                ));
             }
         }
         for episode in &season.episodes {
             if episode.episode_number <= 0 {
-                return Err(CatalogError::Validation("episode_number must be positive".into()));
+                return Err(CatalogError::Validation(
+                    "episode_number must be positive".into(),
+                ));
             }
             if let Some(date) = nonempty_text(episode.release_date.as_deref()) {
                 let bytes = date.as_bytes();
                 if bytes.len() != 10
                     || bytes[4] != b'-'
                     || bytes[7] != b'-'
-                    || !bytes.iter().enumerate().all(|(index, byte)| {
-                        index == 4 || index == 7 || byte.is_ascii_digit()
-                    })
+                    || !bytes
+                        .iter()
+                        .enumerate()
+                        .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit())
                 {
-                    return Err(CatalogError::Validation("release_date must use YYYY-MM-DD".into()));
+                    return Err(CatalogError::Validation(
+                        "release_date must use YYYY-MM-DD".into(),
+                    ));
                 }
             }
             for provider_episode in &episode.provider_episodes {
@@ -1058,9 +1078,13 @@ fn validate_unified_anime(input: &UnifiedAnimeInput) -> Result<(), CatalogError>
                     || provider_episode.provider_key.chars().count() > 200
                     || provider_episode.provider_episode_id.trim().is_empty()
                     || provider_episode.provider_episode_id.chars().count() > 500
-                    || provider_episode.provider_episode_number.is_some_and(|n| n <= 0)
+                    || provider_episode
+                        .provider_episode_number
+                        .is_some_and(|n| n <= 0)
                 {
-                    return Err(CatalogError::Validation("invalid provider episode mapping".into()));
+                    return Err(CatalogError::Validation(
+                        "invalid provider episode mapping".into(),
+                    ));
                 }
             }
             for lookup in &episode.provider_lookups {
@@ -1105,7 +1129,9 @@ async fn upsert_unified_anime_in_tx(
     let lock_scope = format!(
         "{}:{}",
         input.content_type,
-        input.release_year.map_or_else(|| "unknown".to_string(), |year| year.to_string())
+        input
+            .release_year
+            .map_or_else(|| "unknown".to_string(), |year| year.to_string())
     );
     // Serialize find-or-create for the same normalized identity across backend
     // instances; the lock is transaction-scoped and does not alter schema.
@@ -1177,10 +1203,17 @@ async fn upsert_unified_anime_in_tx(
     let title_uuid = parse_uuid(&title_id)?;
 
     for provider in &input.provider_titles {
-        let provider_id = ensure_unified_provider(tx, &provider.provider_key, provider.display_name.as_deref()).await?;
+        let provider_id =
+            ensure_unified_provider(tx, &provider.provider_key, provider.display_name.as_deref())
+                .await?;
         let provider_title = nonempty_text(provider.provider_title.as_deref());
         let provider_url = nonempty_text(provider.provider_url.as_deref());
-        let metadata = if provider.metadata.is_null() || provider.metadata.as_object().is_some_and(|object| object.is_empty()) {
+        let metadata = if provider.metadata.is_null()
+            || provider
+                .metadata
+                .as_object()
+                .is_some_and(|object| object.is_empty())
+        {
             serde_json::json!({})
         } else {
             provider.metadata.clone()
@@ -1207,7 +1240,12 @@ async fn upsert_unified_anime_in_tx(
         for mapping in &season.provider_seasons {
             let provider_id = ensure_unified_provider(tx, &mapping.provider_key, None).await?;
             let provider_season_id = nonempty_text(mapping.provider_season_id.as_deref());
-            let metadata = if mapping.metadata.is_null() || mapping.metadata.as_object().is_some_and(|object| object.is_empty()) {
+            let metadata = if mapping.metadata.is_null()
+                || mapping
+                    .metadata
+                    .as_object()
+                    .is_some_and(|object| object.is_empty())
+            {
                 serde_json::json!({})
             } else {
                 mapping.metadata.clone()
@@ -1229,7 +1267,10 @@ async fn upsert_unified_anime_in_tx(
             ).await?;
             let (episode_id, conflict) = if let Some(existing) = existing {
                 let existing_title: Option<String> = existing.get("episode_title");
-                let conflict = !crate::unified::episode_titles_compatible(existing_title.as_deref(), episode_title);
+                let conflict = !crate::unified::episode_titles_compatible(
+                    existing_title.as_deref(),
+                    episode_title,
+                );
                 let id: String = existing.get("id");
                 if !conflict {
                     tx.execute(
@@ -1270,8 +1311,7 @@ async fn upsert_unified_anime_in_tx(
                 ).await?;
             }
             for lookup in &episode.provider_lookups {
-                let provider_id =
-                    ensure_unified_provider(tx, &lookup.provider_key, None).await?;
+                let provider_id = ensure_unified_provider(tx, &lookup.provider_key, None).await?;
                 let metadata = if lookup.metadata.is_null() {
                     serde_json::json!({})
                 } else {
@@ -1479,7 +1519,12 @@ async fn import_in_tx(c: &Client, i: &ImportTitle) -> Result<ImportSummary, Cata
         } else {
             p.metadata.clone()
         };
-        c.execute("INSERT INTO provider_titles(title_id,provider_id,provider_title_id,provider_title,provider_url,metadata,match_status,last_checked_at) VALUES($1,$2,$3,$4,$5,$6,'verified',now()) ON CONFLICT(provider_id,provider_title_id) DO UPDATE SET title_id=EXCLUDED.title_id,provider_title=EXCLUDED.provider_title,provider_url=EXCLUDED.provider_url,metadata=EXCLUDED.metadata,match_status='verified',updated_at=now()",&[&title_uuid,&pid_uuid,&p.provider_title_id,&p.provider_title,&p.provider_url,&metadata]).await?;
+        let updated = c.execute("INSERT INTO provider_titles(title_id,provider_id,provider_title_id,provider_title,provider_url,metadata,match_status,last_checked_at) VALUES($1,$2,$3,$4,$5,$6,'verified',now()) ON CONFLICT(provider_id,provider_title_id) DO UPDATE SET provider_title=EXCLUDED.provider_title,provider_url=EXCLUDED.provider_url,metadata=EXCLUDED.metadata,match_status='verified',updated_at=now() WHERE provider_titles.title_id=EXCLUDED.title_id",&[&title_uuid,&pid_uuid,&p.provider_title_id,&p.provider_title,&p.provider_url,&metadata]).await?;
+        if updated == 0 {
+            return Err(CatalogError::Validation(
+                "provider title mapping already belongs to a different canonical title".into(),
+            ));
+        }
         if t.content_type == "movie" {
             map_movie_sources(
                 c,
@@ -1622,7 +1667,12 @@ async fn map_episode(
         None => return Ok(()),
     };
     let eid = parse_uuid(eid)?;
-    c.execute("INSERT INTO episode_provider_mappings(episode_id,provider_id,provider_episode_id,provider_episode_number) VALUES($1,$2,$3,$4) ON CONFLICT(provider_id,provider_episode_id) DO UPDATE SET episode_id=EXCLUDED.episode_id,provider_episode_number=EXCLUDED.provider_episode_number",&[&eid,&pid,&pe.provider_episode_id,&pe.provider_episode_number]).await?;
+    let inserted = c.execute("INSERT INTO episode_provider_mappings(episode_id,provider_id,provider_episode_id,provider_episode_number,mapping_status) VALUES($1,$2,$3,$4,'resolved') ON CONFLICT(provider_id,provider_episode_id) DO UPDATE SET provider_episode_number=EXCLUDED.provider_episode_number WHERE episode_provider_mappings.episode_id=EXCLUDED.episode_id",&[&eid,&pid,&pe.provider_episode_id,&pe.provider_episode_number]).await?;
+    if inserted == 0 {
+        return Err(CatalogError::Validation(
+            "provider episode mapping already belongs to a different canonical episode".into(),
+        ));
+    }
     if !pe.sources.is_empty() {
         let current_source_ids = pe
             .sources
