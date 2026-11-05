@@ -2524,6 +2524,10 @@ async fn admin_catalog_import_by_name_route(
                     })?;
                     let episode_metadata = serde_json::to_value(crate::catalog::EpisodeInput {
                         episode_number,
+                        episode_type: None,
+                        episode_coordinate: None,
+                        absolute_episode_number: None,
+                        special_identifier: None,
                         episode_title: episode.title.clone(),
                         overview: episode.overview.clone(),
                         release_date: None,
@@ -2620,6 +2624,10 @@ async fn admin_catalog_import_by_name_route(
             });
             canonical_episodes.push(crate::catalog::EpisodeInput {
                 episode_number: episode.number as i32,
+                episode_type: None,
+                episode_coordinate: None,
+                absolute_episode_number: None,
+                special_identifier: None,
                 episode_title: episode.title.clone(),
                 overview: episode.overview.clone(),
                 release_date: None,
@@ -4435,6 +4443,10 @@ async fn persist_unified_details(
             .filter(|episode| episode.number > 0)
             .map(|episode| crate::catalog::UnifiedAnimeEpisodeInput {
                 episode_number: episode.number as i32,
+                episode_type: None,
+                episode_coordinate: None,
+                absolute_episode_number: None,
+                special_identifier: None,
                 episode_title: episode.title.clone(),
                 overview: episode.overview.clone(),
                 release_date: None,

@@ -18,6 +18,7 @@ const MIGRATION_005: &str = include_str!("../migrations/005_unified_content_mapp
 const MIGRATION_006: &str = include_str!("../migrations/006_task3_task4_integrity.sql");
 const MIGRATION_007: &str = include_str!("../migrations/007_task3_task4_ownership.sql");
 const MIGRATION_008: &str = include_str!("../migrations/008_task3_task4_lifecycle.sql");
+const MIGRATION_009: &str = include_str!("../migrations/009_task3_episode_identity.sql");
 
 #[derive(Clone)]
 pub struct CatalogStore {
@@ -110,6 +111,14 @@ pub struct SeasonInput {
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct EpisodeInput {
     pub episode_number: i32,
+    #[serde(default)]
+    pub episode_type: Option<String>,
+    #[serde(default)]
+    pub episode_coordinate: Option<String>,
+    #[serde(default)]
+    pub absolute_episode_number: Option<i32>,
+    #[serde(default)]
+    pub special_identifier: Option<String>,
     pub episode_title: Option<String>,
     pub overview: Option<String>,
     pub release_date: Option<String>,
@@ -164,6 +173,14 @@ pub struct UnifiedAnimeProviderSeasonInput {
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct UnifiedAnimeEpisodeInput {
     pub episode_number: i32,
+    #[serde(default)]
+    pub episode_type: Option<String>,
+    #[serde(default)]
+    pub episode_coordinate: Option<String>,
+    #[serde(default)]
+    pub absolute_episode_number: Option<i32>,
+    #[serde(default)]
+    pub special_identifier: Option<String>,
     pub episode_title: Option<String>,
     pub overview: Option<String>,
     pub release_date: Option<String>,
@@ -392,6 +409,31 @@ pub fn mapping_status_transition(
     )
 }
 
+fn validate_transition_evidence(reason: &str, evidence: &Value) -> Result<(), CatalogError> {
+    if reason.trim().is_empty() {
+        return Err(CatalogError::Validation(
+            "mapping transition reason must not be empty".into(),
+        ));
+    }
+    if evidence.is_null() {
+        return Err(CatalogError::Validation(
+            "mapping transition evidence must not be null".into(),
+        ));
+    }
+    if let Some(object) = evidence.as_object() {
+        let forbidden = ["password", "secret", "token", "credential", "api_key"];
+        if object.keys().any(|key| {
+            let normalized = key.to_ascii_lowercase();
+            forbidden.iter().any(|word| normalized.contains(word))
+        }) {
+            return Err(CatalogError::Validation(
+                "mapping transition evidence contains sensitive metadata".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReconciliationDecision {
     VerifiedReplacement,
@@ -445,11 +487,21 @@ pub fn reconcile_provider_identity(
 pub struct MappingIntegrityReport {
     pub duplicate_provider_titles: i64,
     pub duplicate_provider_episodes: i64,
+    pub duplicate_lookup_coordinates: i64,
+    pub conflicting_lookup_owners: i64,
     pub orphan_provider_titles: i64,
     pub orphan_provider_episodes: i64,
     pub orphan_lookup_mappings: i64,
+    pub missing_canonical_anime: i64,
+    pub missing_canonical_seasons: i64,
+    pub missing_canonical_episodes: i64,
+    pub cross_anime_season_ownership: i64,
+    pub invalid_mapping_status: i64,
+    pub empty_provider_ids: i64,
+    pub stale_mappings: i64,
     pub unresolved_provider_titles: i64,
     pub unresolved_provider_episodes: i64,
+    pub reconciliation_conflicts: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -508,15 +560,20 @@ impl CatalogStore {
         Ok(Some(store))
     }
     pub async fn migrate(&self) -> Result<(), CatalogError> {
-        let client = self.client.lock().await;
-        client.batch_execute(MIGRATION_001).await?;
-        client.batch_execute(MIGRATION_002).await?;
-        client.batch_execute(MIGRATION_003).await?;
-        client.batch_execute(MIGRATION_004).await?;
-        client.batch_execute(MIGRATION_005).await?;
-        client.batch_execute(MIGRATION_006).await?;
-        client.batch_execute(MIGRATION_007).await?;
-        client.batch_execute(MIGRATION_008).await?;
+        let mut client = self.client.lock().await;
+        let tx = client.transaction().await?;
+        tx.query_one("SELECT pg_advisory_xact_lock($1)", &[&6_731_009_i64])
+            .await?;
+        tx.batch_execute(MIGRATION_001).await?;
+        tx.batch_execute(MIGRATION_002).await?;
+        tx.batch_execute(MIGRATION_003).await?;
+        tx.batch_execute(MIGRATION_004).await?;
+        tx.batch_execute(MIGRATION_005).await?;
+        tx.batch_execute(MIGRATION_006).await?;
+        tx.batch_execute(MIGRATION_007).await?;
+        tx.batch_execute(MIGRATION_008).await?;
+        tx.batch_execute(MIGRATION_009).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -527,21 +584,41 @@ impl CatalogStore {
             "SELECT
                 (SELECT count(*) FROM (SELECT provider_id, provider_title_id FROM provider_titles GROUP BY 1,2 HAVING count(*) > 1) d),
                 (SELECT count(*) FROM (SELECT provider_id, provider_episode_id FROM episode_provider_mappings GROUP BY 1,2 HAVING count(*) > 1) d),
+                (SELECT count(*) FROM (SELECT provider_id, provider_title_id, provider_season_number, provider_episode_number FROM episode_provider_lookup_mappings GROUP BY 1,2,3,4 HAVING count(*) > 1) d),
+                (SELECT count(*) FROM (SELECT provider_id, provider_title_id, provider_season_number, provider_episode_number FROM episode_provider_lookup_mappings WHERE mapping_status='resolved' GROUP BY 1,2,3,4 HAVING count(DISTINCT episode_id) > 1) d),
                 (SELECT count(*) FROM provider_titles pt WHERE NOT EXISTS (SELECT 1 FROM catalog_titles ct WHERE ct.id=pt.title_id)),
                 (SELECT count(*) FROM episode_provider_mappings epm WHERE NOT EXISTS (SELECT 1 FROM episodes e WHERE e.id=epm.episode_id)),
                 (SELECT count(*) FROM episode_provider_lookup_mappings l WHERE NOT EXISTS (SELECT 1 FROM episodes e WHERE e.id=l.episode_id)),
+                (SELECT count(*) FROM provider_titles pt WHERE NOT EXISTS (SELECT 1 FROM catalog_titles ct WHERE ct.id=pt.title_id)),
+                (SELECT count(*) FROM episodes e WHERE e.season_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM seasons s WHERE s.id=e.season_id)),
+                (SELECT count(*) FROM episode_provider_mappings epm WHERE NOT EXISTS (SELECT 1 FROM episodes e WHERE e.id=epm.episode_id)),
+                (SELECT count(*) FROM episodes e JOIN seasons s ON s.id=e.season_id WHERE e.title_id IS DISTINCT FROM s.title_id),
+                (SELECT count(*) FROM provider_titles WHERE match_status NOT IN ('unverified','verified','unresolved','stale','rejected')) + (SELECT count(*) FROM episode_provider_mappings WHERE mapping_status NOT IN ('resolved','unresolved')),
+                (SELECT count(*) FROM provider_titles WHERE length(btrim(provider_title_id))=0) + (SELECT count(*) FROM episode_provider_mappings WHERE length(btrim(provider_episode_id))=0),
+                (SELECT count(*) FROM provider_titles WHERE match_status='stale'),
                 (SELECT count(*) FROM provider_titles WHERE match_status IN ('unresolved','stale','rejected')),
-                (SELECT count(*) FROM episode_provider_mappings WHERE mapping_status='unresolved')",
+                (SELECT count(*) FROM episode_provider_mappings WHERE mapping_status='unresolved'),
+                (SELECT count(*) FROM provider_mapping_transition_history WHERE reason ILIKE '%conflict%' OR reason ILIKE '%ambiguous%')",
             &[],
         ).await?;
         Ok(MappingIntegrityReport {
             duplicate_provider_titles: row.get(0),
             duplicate_provider_episodes: row.get(1),
-            orphan_provider_titles: row.get(2),
-            orphan_provider_episodes: row.get(3),
-            orphan_lookup_mappings: row.get(4),
-            unresolved_provider_titles: row.get(5),
-            unresolved_provider_episodes: row.get(6),
+            duplicate_lookup_coordinates: row.get(2),
+            conflicting_lookup_owners: row.get(3),
+            orphan_provider_titles: row.get(4),
+            orphan_provider_episodes: row.get(5),
+            orphan_lookup_mappings: row.get(6),
+            missing_canonical_anime: row.get(7),
+            missing_canonical_seasons: row.get(8),
+            missing_canonical_episodes: row.get(9),
+            cross_anime_season_ownership: row.get(10),
+            invalid_mapping_status: row.get(11),
+            empty_provider_ids: row.get(12),
+            stale_mappings: row.get(13),
+            unresolved_provider_titles: row.get(14),
+            unresolved_provider_episodes: row.get(15),
+            reconciliation_conflicts: row.get(16),
         })
     }
 
@@ -554,6 +631,7 @@ impl CatalogStore {
         evidence: Value,
     ) -> Result<MappingTransitionResult, CatalogError> {
         let id = parse_uuid(mapping_id)?;
+        validate_transition_evidence(reason, &evidence)?;
         let mut client = self.client.lock().await;
         let tx = client.transaction().await?;
         let row = tx
@@ -1050,11 +1128,11 @@ impl CatalogStore {
         title_id: &str,
         season: i32,
     ) -> Result<Vec<Value>, CatalogError> {
-        let r=self.client.lock().await.query("SELECT e.id::text AS id,e.episode_number,e.episode_title,e.overview,e.release_date::text AS release_date,e.thumbnail_url,s.season_number FROM episodes e JOIN seasons s ON s.id=e.season_id WHERE e.title_id=$1::text::uuid AND s.season_number=$2 ORDER BY e.episode_number",&[&title_id,&season]).await?;
+        let r=self.client.lock().await.query("SELECT e.id::text AS id,e.episode_number,e.episode_type,e.episode_coordinate,e.absolute_episode_number,e.special_identifier,e.episode_title,e.overview,e.release_date::text AS release_date,e.thumbnail_url,s.season_number FROM episodes e JOIN seasons s ON s.id=e.season_id WHERE e.title_id=$1::text::uuid AND s.season_number=$2 ORDER BY e.episode_number",&[&title_id,&season]).await?;
         Ok(r.iter().map(row_json).collect())
     }
     pub async fn get_episode(&self, id: &str) -> Result<Option<Value>, CatalogError> {
-        let r=self.client.lock().await.query_opt("SELECT e.id::text AS id,e.title_id::text AS title_id,e.season_id::text AS season_id,e.episode_number,e.episode_title,e.overview,e.release_date::text AS release_date,e.thumbnail_url,s.season_number FROM episodes e JOIN seasons s ON s.id=e.season_id WHERE e.id::text=$1", &[&id]).await?;
+        let r=self.client.lock().await.query_opt("SELECT e.id::text AS id,e.title_id::text AS title_id,e.season_id::text AS season_id,e.episode_number,e.episode_type,e.episode_coordinate,e.absolute_episode_number,e.special_identifier,e.episode_title,e.overview,e.release_date::text AS release_date,e.thumbnail_url,s.season_number FROM episodes e JOIN seasons s ON s.id=e.season_id WHERE e.id::text=$1", &[&id]).await?;
         Ok(r.as_ref().map(row_json))
     }
     pub async fn list_sources(&self, id: &str) -> Result<Vec<Value>, CatalogError> {
@@ -1305,6 +1383,66 @@ fn nonempty_text(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EpisodeIdentity {
+    episode_type: String,
+    coordinate: String,
+    identity_key: String,
+}
+
+fn episode_identity(
+    episode_number: i32,
+    episode_type: Option<&str>,
+    episode_coordinate: Option<&str>,
+    absolute_episode_number: Option<i32>,
+    special_identifier: Option<&str>,
+) -> Result<EpisodeIdentity, CatalogError> {
+    if episode_number <= 0 {
+        return Err(CatalogError::Validation(
+            "episode_number must be positive".into(),
+        ));
+    }
+    let kind = nonempty_text(episode_type)
+        .unwrap_or("regular")
+        .to_ascii_lowercase();
+    if kind.len() > 64
+        || !kind
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err(CatalogError::Validation("invalid episode_type".into()));
+    }
+    let coordinate = nonempty_text(episode_coordinate)
+        .map(str::to_owned)
+        .or_else(|| absolute_episode_number.map(|n| n.to_string()))
+        .or_else(|| nonempty_text(special_identifier).map(str::to_owned))
+        .unwrap_or_else(|| episode_number.to_string());
+    if coordinate.len() > 128
+        || coordinate.contains(':')
+        || coordinate.chars().any(char::is_whitespace)
+    {
+        return Err(CatalogError::Validation(
+            "invalid episode coordinate".into(),
+        ));
+    }
+    if absolute_episode_number.is_some_and(|n| n <= 0) {
+        return Err(CatalogError::Validation(
+            "absolute_episode_number must be positive".into(),
+        ));
+    }
+    let special = nonempty_text(special_identifier).unwrap_or("");
+    if special.len() > 128 || special.contains(':') || special.chars().any(char::is_whitespace) {
+        return Err(CatalogError::Validation(
+            "invalid special_identifier".into(),
+        ));
+    }
+    Ok(EpisodeIdentity {
+        identity_key: format!("{kind}:{coordinate}"),
+        episode_type: kind,
+        coordinate,
+    })
+}
+
 fn validate_unified_anime(input: &UnifiedAnimeInput) -> Result<(), CatalogError> {
     if !matches!(input.content_type.as_str(), "anime" | "movie") {
         return Err(CatalogError::Validation(
@@ -1354,11 +1492,13 @@ fn validate_unified_anime(input: &UnifiedAnimeInput) -> Result<(), CatalogError>
             }
         }
         for episode in &season.episodes {
-            if episode.episode_number <= 0 {
-                return Err(CatalogError::Validation(
-                    "episode_number must be positive".into(),
-                ));
-            }
+            let _identity = episode_identity(
+                episode.episode_number,
+                episode.episode_type.as_deref(),
+                episode.episode_coordinate.as_deref(),
+                episode.absolute_episode_number,
+                episode.special_identifier.as_deref(),
+            )?;
             if let Some(date) = nonempty_text(episode.release_date.as_deref()) {
                 let bytes = date.as_bytes();
                 if bytes.len() != 10
@@ -1558,13 +1698,20 @@ async fn upsert_unified_anime_in_tx(
         }
 
         for episode in &season.episodes {
+            let identity = episode_identity(
+                episode.episode_number,
+                episode.episode_type.as_deref(),
+                episode.episode_coordinate.as_deref(),
+                episode.absolute_episode_number,
+                episode.special_identifier.as_deref(),
+            )?;
             let episode_title = nonempty_text(episode.episode_title.as_deref());
             let overview = nonempty_text(episode.overview.as_deref());
             let release_date = nonempty_text(episode.release_date.as_deref());
             let thumbnail_url = nonempty_text(episode.thumbnail_url.as_deref());
             let existing = tx.query_opt(
-                "SELECT id::text AS id,episode_title FROM episodes WHERE title_id=$1 AND season_id=$2 AND episode_number=$3 FOR UPDATE",
-                &[&title_uuid, &season_uuid, &episode.episode_number],
+                "SELECT id::text AS id,episode_title FROM episodes WHERE title_id=$1 AND season_id=$2 AND episode_type=$3 AND identity_key=$4 FOR UPDATE",
+                &[&title_uuid, &season_uuid, &identity.episode_type, &identity.identity_key],
             ).await?;
             let (episode_id, conflict) = if let Some(existing) = existing {
                 let existing_title: Option<String> = existing.get("episode_title");
@@ -1582,8 +1729,8 @@ async fn upsert_unified_anime_in_tx(
                 (id, conflict)
             } else {
                 let row = tx.query_one(
-                    "INSERT INTO episodes(title_id,season_id,episode_number,episode_title,overview,release_date,thumbnail_url) VALUES($1,$2,$3,$4,$5,NULLIF($6::text,'')::date,$7) RETURNING id::text",
-                    &[&title_uuid, &season_uuid, &episode.episode_number, &episode_title, &overview, &release_date, &thumbnail_url],
+                    "INSERT INTO episodes(title_id,season_id,episode_number,episode_type,episode_coordinate,absolute_episode_number,special_identifier,identity_key,episode_title,overview,release_date,thumbnail_url) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NULLIF($11::text,'')::date,$12) RETURNING id::text",
+                    &[&title_uuid, &season_uuid, &episode.episode_number, &identity.episode_type, &identity.coordinate, &episode.absolute_episode_number, &episode.special_identifier, &identity.identity_key, &episode_title, &overview, &release_date, &thumbnail_url],
                 ).await?;
                 (row.get::<_, String>(0), false)
             };
@@ -1781,10 +1928,17 @@ async fn import_in_tx(c: &Client, i: &ImportTitle) -> Result<ImportSummary, Cata
         let sid_uuid = parse_uuid(&sid)?;
         s.seasons += 1;
         for e in &season.episodes {
+            let identity = episode_identity(
+                e.episode_number,
+                e.episode_type.as_deref(),
+                e.episode_coordinate.as_deref(),
+                e.absolute_episode_number,
+                e.special_identifier.as_deref(),
+            )?;
             let existing_episode = c
                 .query_opt(
-                    "SELECT episode_title FROM episodes WHERE title_id=$1 AND season_id=$2 AND episode_number=$3",
-                    &[&title_uuid, &sid_uuid, &e.episode_number],
+                    "SELECT episode_title FROM episodes WHERE title_id=$1 AND season_id=$2 AND episode_type=$3 AND identity_key=$4",
+                    &[&title_uuid, &sid_uuid, &identity.episode_type, &identity.identity_key],
                 )
                 .await?;
             if let Some(existing_episode) = existing_episode {
@@ -1799,8 +1953,12 @@ async fn import_in_tx(c: &Client, i: &ImportTitle) -> Result<ImportSummary, Cata
                     )));
                 }
             }
-            let er=c.query_one("INSERT INTO episodes(title_id,season_id,episode_number,episode_title,overview,release_date,thumbnail_url) VALUES($1,$2,$3,$4,$5,$6::text::date,$7) ON CONFLICT(title_id,season_id,episode_number) DO UPDATE SET episode_title=EXCLUDED.episode_title,overview=EXCLUDED.overview,release_date=EXCLUDED.release_date,thumbnail_url=EXCLUDED.thumbnail_url,updated_at=now() RETURNING id::text",&[&title_uuid,&sid_uuid,&e.episode_number,&e.episode_title,&e.overview,&e.release_date,&e.thumbnail_url]).await?;
-            let eid: String = er.get(0);
+            let inserted=c.query_opt("INSERT INTO episodes(title_id,season_id,episode_number,episode_type,episode_coordinate,absolute_episode_number,special_identifier,identity_key,episode_title,overview,release_date,thumbnail_url) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::text::date,$12) ON CONFLICT DO NOTHING RETURNING id::text",&[&title_uuid,&sid_uuid,&e.episode_number,&identity.episode_type,&identity.coordinate,&e.absolute_episode_number,&e.special_identifier,&identity.identity_key,&e.episode_title,&e.overview,&e.release_date,&e.thumbnail_url]).await?;
+            let eid: String = if let Some(row) = inserted {
+                row.get(0)
+            } else {
+                c.query_one("SELECT id::text FROM episodes WHERE title_id=$1 AND season_id=$2 AND episode_type=$3 AND identity_key=$4", &[&title_uuid, &sid_uuid, &identity.episode_type, &identity.identity_key]).await?.get(0)
+            };
             s.episodes += 1;
             for pe in &e.provider_episode_ids {
                 let provider_key = episode_provider_key(pe)?;
@@ -2223,8 +2381,9 @@ fn new_id() -> String {
 mod tests {
     use super::{
         ProviderEpisodeInput, ProviderMappingStatus, ProviderSourceInput, ReconciliationDecision,
-        episode_provider_key, mapping_status_transition, normalize, reconcile_provider_identity,
-        source_codec_is_known_non_hevc, source_identity_fingerprint, source_is_playback_eligible,
+        episode_identity, episode_provider_key, mapping_status_transition, normalize,
+        reconcile_provider_identity, source_codec_is_known_non_hevc, source_identity_fingerprint,
+        source_is_playback_eligible, validate_transition_evidence,
     };
     use serde_json::json;
 
@@ -2425,5 +2584,36 @@ mod tests {
 
         mapping.provider_key = Some("   ".into());
         assert!(episode_provider_key(&mapping).is_err());
+    }
+
+    #[test]
+    fn typed_episode_identity_separates_coordinates_and_types_without_float_matching() {
+        let regular = episode_identity(1, None, None, None, None).unwrap();
+        let decimal = episode_identity(1, Some("regular"), Some("1.5"), None, None).unwrap();
+        let special = episode_identity(1, Some("special"), None, None, Some("special-1")).unwrap();
+        let absolute = episode_identity(1, Some("regular"), None, Some(101), None).unwrap();
+        let movie = episode_identity(1, Some("movie"), Some("feature-a"), None, None).unwrap();
+        assert_eq!(regular.identity_key, "regular:1");
+        assert_eq!(decimal.identity_key, "regular:1.5");
+        assert_ne!(regular.identity_key, special.identity_key);
+        assert_eq!(absolute.coordinate, "101");
+        assert_eq!(movie.identity_key, "movie:feature-a");
+        assert!(episode_identity(1, Some("regular"), Some("1:2"), None, None).is_err());
+    }
+
+    #[test]
+    fn lifecycle_evidence_rejects_empty_or_sensitive_metadata() {
+        assert!(
+            validate_transition_evidence(
+                "verified by detail lookup",
+                &json!({"source": "details"})
+            )
+            .is_ok()
+        );
+        assert!(validate_transition_evidence("", &json!({})).is_err());
+        assert!(
+            validate_transition_evidence("verified", &json!({"api_token": "redacted"})).is_err()
+        );
+        assert!(validate_transition_evidence("verified", &serde_json::Value::Null).is_err());
     }
 }
