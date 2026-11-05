@@ -1,4 +1,5 @@
 use crate::providers::models::{CatalogItem, MediaType, ProviderKind, ProviderMediaId};
+use std::collections::{HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
 /// A catalog record with equivalent records from other providers attached.
@@ -43,6 +44,16 @@ pub fn normalize_anime_title(title: &str) -> NormalizedAnimeTitle {
 /// separate rather than being treated as permission to merge by title alone.
 /// Repeated records from a provider are retained as separate results.
 pub fn group_catalog_items(items: Vec<CatalogItem>) -> Vec<UnifiedCatalogItem> {
+    group_catalog_items_with_aliases(items, &HashMap::new())
+}
+
+/// Use only aliases attached to an exact, verified provider mapping. Search
+/// result titles are never promoted into aliases, and conflicting years or
+/// same-provider records remain separate.
+pub fn group_catalog_items_with_aliases(
+    items: Vec<CatalogItem>,
+    verified_aliases: &HashMap<String, Vec<String>>,
+) -> Vec<UnifiedCatalogItem> {
     #[derive(Debug)]
     struct CandidateGroup {
         indices: Vec<usize>,
@@ -116,6 +127,56 @@ pub fn group_catalog_items(items: Vec<CatalogItem>) -> Vec<UnifiedCatalogItem> {
         groups.extend(candidates.into_iter().map(|group| group.indices));
     }
 
+    let alias_sets: Vec<HashSet<String>> = items
+        .iter()
+        .map(|item| {
+            let key = format!("{}:{}", item.id.provider.cache_key(), item.id.value);
+            verified_aliases
+                .get(&key)
+                .into_iter()
+                .flatten()
+                .map(|alias| normalize_anime_title(alias).key)
+                .filter(|alias| !alias.is_empty())
+                .collect()
+        })
+        .collect();
+    let compatible_years = |left: usize, right: usize| {
+        let (left_year, left_conflict) = years[left];
+        let (right_year, right_conflict) = years[right];
+        !left_conflict
+            && !right_conflict
+            && (left_year.is_none() || right_year.is_none() || left_year == right_year)
+    };
+    let mut changed = true;
+    while changed {
+        changed = false;
+        'outer: for left in 0..groups.len() {
+            for right in (left + 1)..groups.len() {
+                let providers_overlap = groups[left].iter().any(|left_index| {
+                    groups[right].iter().any(|right_index| {
+                        items[*left_index].id.provider == items[*right_index].id.provider
+                    })
+                });
+                let can_merge = groups[left].iter().any(|left_index| {
+                    groups[right].iter().any(|right_index| {
+                        items[*left_index].media_type == items[*right_index].media_type
+                            && items[*left_index].id.provider != items[*right_index].id.provider
+                            && compatible_years(*left_index, *right_index)
+                            && alias_sets[*left_index]
+                                .intersection(&alias_sets[*right_index])
+                                .next()
+                                .is_some()
+                    })
+                }) && !providers_overlap;
+                if can_merge {
+                    let merged = groups.remove(right);
+                    groups[left].extend(merged);
+                    changed = true;
+                    break 'outer;
+                }
+            }
+        }
+    }
     groups.sort_by_key(|indices| indices[0]);
     groups
         .into_iter()
@@ -127,10 +188,11 @@ pub fn group_catalog_items(items: Vec<CatalogItem>) -> Vec<UnifiedCatalogItem> {
                 .skip(1)
                 .map(|index| items[index].clone())
                 .collect();
-            let provider_mappings = provider_items
+            let mut provider_mappings: Vec<ProviderMediaId> = provider_items
                 .iter()
                 .map(|item| item.id.clone())
                 .collect();
+            provider_mappings.dedup();
             UnifiedCatalogItem {
                 primary,
                 provider_mappings,
@@ -612,6 +674,22 @@ mod tests {
         ]);
         assert_eq!(grouped.len(), 2);
         assert!(grouped.iter().all(|group| group.provider_mappings.is_empty()));
+    }
+    #[test]
+    fn verified_aliases_merge_different_titles_but_not_conflicting_years() {
+        let items = vec![
+            item(ProviderKind::FourKHdHub, "a", "Attack on Titan", Some("2013")),
+            item(ProviderKind::Dramachi, "b", "Shingeki no Kyojin", Some("2013")),
+            item(ProviderKind::Dramachi, "c", "Shingeki no Kyojin", Some("2017")),
+        ];
+        let aliases = HashMap::from([
+            ("fourkhdhub:a".to_string(), vec!["Attack on Titan".to_string()]),
+            ("dramachi:b".to_string(), vec!["Attack on Titan".to_string()]),
+            ("dramachi:c".to_string(), vec!["Attack on Titan".to_string()]),
+        ]);
+        let grouped = group_catalog_items_with_aliases(items, &aliases);
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(grouped[0].provider_mappings.len(), 1);
     }
 
     #[test]
