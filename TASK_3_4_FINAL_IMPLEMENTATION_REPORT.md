@@ -75,3 +75,44 @@ TASK 3:
 TASK 4:
 
 - **PARTIALLY COMPLETE** — legacy and unified mapping writes now preserve ownership and reject silent reassignment, with additive integrity checks; PostgreSQL migration/concurrency validation and a complete lifecycle/reconciliation service remain blocked or incomplete.
+
+
+# Second Completion Phase — 2026-11-05
+
+## Additional implementation
+
+The stricter final completion review identified and addressed additional gaps:
+
+- Added `ProviderMappingStatus` with explicit statuses: `unverified`, `verified`, `unresolved`, `stale`, and `rejected`.
+- Added deterministic `mapping_status_transition()` validation so rejected mappings cannot be silently revived and temporary failures do not become rejection.
+- Added conservative `reconcile_provider_identity()` decision logic requiring exact Provider identity, exact returned ID, compatible media type/year, and normalized title evidence.
+- Added read-only `CatalogStore::mapping_integrity_report()` diagnostics for duplicate, orphan, unresolved, and stale mapping counts.
+- Added transactional lookup-coordinate conflict detection. A conflicting Provider/title/season/episode coordinate is recorded as unresolved instead of silently attaching to another canonical Episode.
+- Added migration `007_task3_task4_ownership.sql`.
+- Added lifecycle indexes and a five-state Provider title status check.
+- Added a composite `(title_id, season_id)` ownership key and a `NOT VALID` composite foreign key so new Episode writes cannot attach a Season from another Anime while existing invalid rows remain diagnosable rather than being deleted.
+- Added unit tests covering lifecycle transitions and conservative reconciliation outcomes.
+
+## Second-phase validation
+
+Passed:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo check --all-targets` — passed.
+- `cargo test --lib catalog::tests::mapping_lifecycle_allows_safe_transitions_and_rejects_revival` — passed.
+- `cargo test --lib catalog::tests::reconciliation_requires_strong_identity_evidence` — passed.
+- `cargo test --lib` — 575 passed, 0 failed.
+- `cargo test --tests --quiet` — all non-ignored integration tests passed.
+- `git diff --check` — passed.
+
+PostgreSQL remains blocked because the sandbox has no `psql`, PostgreSQL server, Docker, Podman, or configured disposable `DATABASE_URL`. PostgreSQL-dependent tests were not claimed as passed.
+
+## Updated acceptance status
+
+TASK 3:
+
+- **PARTIALLY COMPLETE** — Rust implementation and unit/integration validation pass, but comprehensive PostgreSQL and route-fixture validation remain unavailable, and the existing Provider models do not yet expose a complete typed identity model for every nonstandard Episode category.
+
+TASK 4:
+
+- **PARTIALLY COMPLETE** — lifecycle transition logic, collision protection, lookup ownership checks, diagnostics, and composite ownership migration are implemented and Rust-tested. PostgreSQL migration, rollback, concurrency, reconciliation persistence, and duplicate/orphan execution tests remain blocked by the environment.

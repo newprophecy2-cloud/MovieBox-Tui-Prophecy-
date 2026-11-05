@@ -16,6 +16,7 @@ const MIGRATION_003: &str = include_str!("../migrations/003_anime_import_jobs.sq
 const MIGRATION_004: &str = include_str!("../migrations/004_movie_sources.sql");
 const MIGRATION_005: &str = include_str!("../migrations/005_unified_content_mappings.sql");
 const MIGRATION_006: &str = include_str!("../migrations/006_task3_task4_integrity.sql");
+const MIGRATION_007: &str = include_str!("../migrations/007_task3_task4_ownership.sql");
 
 #[derive(Clone)]
 pub struct CatalogStore {
@@ -338,6 +339,118 @@ pub enum CatalogError {
     Validation(String),
 }
 
+/// Persisted Provider mapping lifecycle. Transitions are intentionally explicit
+/// so transient refresh failures cannot masquerade as identity rejection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderMappingStatus {
+    Unverified,
+    Verified,
+    Unresolved,
+    Stale,
+    Rejected,
+}
+
+impl ProviderMappingStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unverified => "unverified",
+            Self::Verified => "verified",
+            Self::Unresolved => "unresolved",
+            Self::Stale => "stale",
+            Self::Rejected => "rejected",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "unverified" => Self::Unverified,
+            "verified" => Self::Verified,
+            "unresolved" => Self::Unresolved,
+            "stale" => Self::Stale,
+            "rejected" => Self::Rejected,
+            _ => return None,
+        })
+    }
+}
+
+/// Validate a mapping lifecycle transition. Temporary failures should use
+/// `Unresolved` or retain the current status, never `Rejected`.
+pub fn mapping_status_transition(
+    current: ProviderMappingStatus,
+    next: ProviderMappingStatus,
+) -> bool {
+    use ProviderMappingStatus::*;
+    matches!(
+        (current, next),
+        (Unverified, Unverified | Verified | Unresolved | Rejected)
+            | (Verified, Verified | Stale | Unresolved | Rejected)
+            | (Unresolved, Unresolved | Verified | Stale | Rejected)
+            | (Stale, Stale | Verified | Unresolved | Rejected)
+            | (Rejected, Rejected)
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReconciliationDecision {
+    VerifiedReplacement,
+    Unresolved { reason: String },
+    Rejected { reason: String },
+}
+
+/// Decide whether a changed Provider ID may replace an existing mapping.
+/// Exact Provider identity and strong title/year/media evidence are required;
+/// absence of evidence never counts as proof.
+pub fn reconcile_provider_identity(
+    provider_matches: bool,
+    new_id_matches_response: bool,
+    existing_title: &str,
+    candidate_title: &str,
+    existing_year: Option<i32>,
+    candidate_year: Option<i32>,
+    existing_media_type: &str,
+    candidate_media_type: &str,
+    conflicting_owner: bool,
+) -> ReconciliationDecision {
+    if conflicting_owner {
+        return ReconciliationDecision::Unresolved {
+            reason: "candidate Provider ID already belongs to another canonical record".into(),
+        };
+    }
+    if !provider_matches || !new_id_matches_response {
+        return ReconciliationDecision::Rejected {
+            reason: "Provider identity or exact title ID mismatch".into(),
+        };
+    }
+    if existing_media_type != candidate_media_type
+        || existing_year
+            .zip(candidate_year)
+            .is_some_and(|(left, right)| left != right)
+    {
+        return ReconciliationDecision::Unresolved {
+            reason: "known metadata conflicts".into(),
+        };
+    }
+    let normalize = |value: &str| crate::unified::normalize_anime_title(value).key;
+    if normalize(existing_title) != normalize(candidate_title) {
+        return ReconciliationDecision::Unresolved {
+            reason: "title evidence is ambiguous".into(),
+        };
+    }
+    ReconciliationDecision::VerifiedReplacement
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MappingIntegrityReport {
+    pub duplicate_provider_titles: i64,
+    pub duplicate_provider_episodes: i64,
+    pub orphan_provider_titles: i64,
+    pub orphan_provider_episodes: i64,
+    pub orphan_lookup_mappings: i64,
+    pub unresolved_provider_titles: i64,
+    pub unresolved_provider_episodes: i64,
+}
+
 fn default_anime() -> String {
     "anime".into()
 }
@@ -369,7 +482,33 @@ impl CatalogStore {
         client.batch_execute(MIGRATION_004).await?;
         client.batch_execute(MIGRATION_005).await?;
         client.batch_execute(MIGRATION_006).await?;
+        client.batch_execute(MIGRATION_007).await?;
         Ok(())
+    }
+
+    /// Read-only integrity diagnostics. This never deletes or repairs records.
+    pub async fn mapping_integrity_report(&self) -> Result<MappingIntegrityReport, CatalogError> {
+        let client = self.client.lock().await;
+        let row = client.query_one(
+            "SELECT
+                (SELECT count(*) FROM (SELECT provider_id, provider_title_id FROM provider_titles GROUP BY 1,2 HAVING count(*) > 1) d),
+                (SELECT count(*) FROM (SELECT provider_id, provider_episode_id FROM episode_provider_mappings GROUP BY 1,2 HAVING count(*) > 1) d),
+                (SELECT count(*) FROM provider_titles pt WHERE NOT EXISTS (SELECT 1 FROM catalog_titles ct WHERE ct.id=pt.title_id)),
+                (SELECT count(*) FROM episode_provider_mappings epm WHERE NOT EXISTS (SELECT 1 FROM episodes e WHERE e.id=epm.episode_id)),
+                (SELECT count(*) FROM episode_provider_lookup_mappings l WHERE NOT EXISTS (SELECT 1 FROM episodes e WHERE e.id=l.episode_id)),
+                (SELECT count(*) FROM provider_titles WHERE match_status IN ('unresolved','stale','rejected')),
+                (SELECT count(*) FROM episode_provider_mappings WHERE mapping_status='unresolved')",
+            &[],
+        ).await?;
+        Ok(MappingIntegrityReport {
+            duplicate_provider_titles: row.get(0),
+            duplicate_provider_episodes: row.get(1),
+            orphan_provider_titles: row.get(2),
+            orphan_provider_episodes: row.get(3),
+            orphan_lookup_mappings: row.get(4),
+            unresolved_provider_titles: row.get(5),
+            unresolved_provider_episodes: row.get(6),
+        })
     }
 
     pub async fn create_anime_import_job(
@@ -1317,9 +1456,18 @@ async fn upsert_unified_anime_in_tx(
                 } else {
                     lookup.metadata.clone()
                 };
+                let conflicting_lookup = tx.query_opt(
+                    "SELECT episode_id FROM episode_provider_lookup_mappings WHERE provider_id=$1 AND provider_title_id=$2 AND provider_season_number=$3 AND provider_episode_number=$4 AND episode_id<>$5 FOR UPDATE",
+                    &[&provider_id, &lookup.provider_title_id, &lookup.provider_season_number, &lookup.provider_episode_number, &episode_uuid],
+                ).await?;
+                let effective_status = if conflicting_lookup.is_some() {
+                    "unresolved"
+                } else {
+                    lookup.mapping_status.as_str()
+                };
                 tx.execute(
                     "INSERT INTO episode_provider_lookup_mappings(episode_id,provider_id,provider_title_id,provider_season_number,provider_episode_number,lookup_reference,mapping_status,metadata) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(provider_id,provider_title_id,provider_season_number,provider_episode_number,episode_id) DO UPDATE SET lookup_reference=EXCLUDED.lookup_reference,mapping_status=CASE WHEN episode_provider_lookup_mappings.mapping_status='unresolved' OR EXCLUDED.mapping_status='unresolved' THEN 'unresolved' ELSE 'resolved' END,metadata=episode_provider_lookup_mappings.metadata||EXCLUDED.metadata,updated_at=now()",
-                    &[&episode_uuid, &provider_id, &lookup.provider_title_id, &lookup.provider_season_number, &lookup.provider_episode_number, &lookup.lookup_reference, &lookup.mapping_status, &metadata],
+                    &[&episode_uuid, &provider_id, &lookup.provider_title_id, &lookup.provider_season_number, &lookup.provider_episode_number, &lookup.lookup_reference, &effective_status, &metadata],
                 ).await?;
             }
         }
@@ -1912,7 +2060,8 @@ fn new_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProviderEpisodeInput, ProviderSourceInput, episode_provider_key, normalize,
+        ProviderEpisodeInput, ProviderMappingStatus, ProviderSourceInput, ReconciliationDecision,
+        episode_provider_key, mapping_status_transition, normalize, reconcile_provider_identity,
         source_codec_is_known_non_hevc, source_identity_fingerprint, source_is_playback_eligible,
     };
     use serde_json::json;
@@ -1920,6 +2069,86 @@ mod tests {
     #[test]
     fn normalizes_search_text() {
         assert_eq!(normalize("  One   Piece "), "one piece");
+    }
+
+    #[test]
+    fn mapping_lifecycle_allows_safe_transitions_and_rejects_revival() {
+        assert!(mapping_status_transition(
+            ProviderMappingStatus::Unverified,
+            ProviderMappingStatus::Verified
+        ));
+        assert!(mapping_status_transition(
+            ProviderMappingStatus::Verified,
+            ProviderMappingStatus::Stale
+        ));
+        assert!(mapping_status_transition(
+            ProviderMappingStatus::Stale,
+            ProviderMappingStatus::Verified
+        ));
+        assert!(!mapping_status_transition(
+            ProviderMappingStatus::Rejected,
+            ProviderMappingStatus::Verified
+        ));
+    }
+
+    #[test]
+    fn reconciliation_requires_strong_identity_evidence() {
+        assert_eq!(
+            reconcile_provider_identity(
+                true,
+                true,
+                "Example",
+                "Example",
+                Some(2024),
+                Some(2024),
+                "anime",
+                "anime",
+                false
+            ),
+            ReconciliationDecision::VerifiedReplacement
+        );
+        assert!(matches!(
+            reconcile_provider_identity(
+                true,
+                true,
+                "Example",
+                "Other",
+                Some(2024),
+                Some(2024),
+                "anime",
+                "anime",
+                false
+            ),
+            ReconciliationDecision::Unresolved { .. }
+        ));
+        assert!(matches!(
+            reconcile_provider_identity(
+                true,
+                true,
+                "Example",
+                "Example",
+                Some(2024),
+                Some(2024),
+                "anime",
+                "movie",
+                false
+            ),
+            ReconciliationDecision::Unresolved { .. }
+        ));
+        assert!(matches!(
+            reconcile_provider_identity(
+                true,
+                true,
+                "Example",
+                "Example",
+                Some(2024),
+                Some(2024),
+                "anime",
+                "anime",
+                true
+            ),
+            ReconciliationDecision::Unresolved { .. }
+        ));
     }
 
     #[test]
