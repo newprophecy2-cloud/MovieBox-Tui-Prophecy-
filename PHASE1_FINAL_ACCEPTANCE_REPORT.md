@@ -9,7 +9,7 @@
 | Starting commit for this acceptance run | `180aa2bf9670b3b4a2d998413a53ab3652a45801` |
 | Previous Phase 1 implementation commit | `6be6eb36134fb99710391c11d9d8c27e0135d368` |
 | Acceptance implementation commit | `dc73ce5ad78fb3b7ab1c2c7a49cd0185a2f5ea4a` |
-| Final report commit | Added after this report is committed; recorded in the final Git section below |
+| Final report commit | `4f6a43fab4678933777105dd84b2df7fa7e04915` |
 | Push status | PASSED; acceptance implementation pushed to the target branch |
 | Working tree status before report packaging | CLEAN and synchronized with origin |
 
@@ -229,4 +229,4 @@ The acceptance implementation was pushed in commit:
 dc73ce5ad78fb3b7ab1c2c7a49cd0185a2f5ea4a
 ```
 
-The final report and archive packaging commit will be recorded here once committed. The final branch must remain clean and synchronized with origin.
+The final report commit is `4f6a43fab4678933777105dd84b2df7fa7e04915`. The final archive SHA-256 is recorded in the final delivery message because embedding a ZIP checksum inside the ZIP-contained report would change the checksum itself. The final branch must remain clean and synchronized with origin.
