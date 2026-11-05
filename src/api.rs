@@ -44,8 +44,6 @@ const OVERALL_TIMEOUT: Duration = Duration::from_secs(45);
 const BROWSE_TIMEOUT: Duration = Duration::from_secs(6);
 const CLASSIFICATION_TIMEOUT: Duration = Duration::from_secs(1);
 const PLAYBACK_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(20);
-const SEARCH_SOURCE_CHECK_TIMEOUT: Duration = Duration::from_secs(45);
-const SEARCH_SOURCE_CHECK_CONCURRENCY: usize = 8;
 const SEARCH_PROVIDER_CONCURRENCY: usize = 3;
 const TRACK_PROBE_TIMEOUT: Duration = Duration::from_secs(45);
 const CODEC_VERIFICATION_WORKERS: usize = 2;
@@ -119,7 +117,6 @@ pub struct ApiState {
     playback_inflight: Arc<Mutex<HashMap<String, SharedPlaybackFuture>>>,
     search_cache: Arc<Mutex<HashMap<String, SearchCacheEntry>>>,
     redis_search: Option<redis::aio::MultiplexedConnection>,
-    search_source_check_slots: Arc<Semaphore>,
     remux_cache: crate::remux_cache::RemuxCache,
     native_stream: crate::api_native_stream::NativeStreamProxy,
     connection_slots: Arc<Semaphore>,
@@ -142,7 +139,7 @@ type SharedPlaybackFuture = Shared<BoxFuture<'static, Result<PlaybackSource, Str
 #[derive(Clone)]
 struct SearchCacheEntry {
     stored_at: Instant,
-    result: EligibleSearch,
+    result: SearchResultSet,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -215,15 +212,8 @@ struct SearchResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<String>,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SourceEligibility {
-    Playable,
-    NoSourceConfirmed,
-    CheckFailed,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct EligibleSearch {
+struct SearchResultSet {
     items: Vec<CatalogItem>,
     failed: bool,
     provider_status: HashMap<String, String>,
@@ -309,14 +299,6 @@ fn releases_have_usable_source(releases: &[Release]) -> bool {
     releases.iter().any(release_has_usable_source)
 }
 
-fn provider_error_means_no_source(error: &ProviderError) -> bool {
-    matches!(error, ProviderError::NotFound)
-        || matches!(
-            error,
-            ProviderError::Unavailable(message)
-                if message == "No addon stream sources available"
-        )
-}
 #[derive(Debug, Serialize)]
 struct ApiCatalogItem {
     id: String,
@@ -648,6 +630,18 @@ fn fallback_canonical_id(item: &CatalogItem) -> String {
     format!("local-{}", URL_SAFE_NO_PAD.encode(hasher.finalize()))
 }
 
+fn fallback_singleton_canonical_id(item: &CatalogItem) -> String {
+    let identity = format!(
+        "{}|{}|{}",
+        fallback_canonical_id(item),
+        item.id.provider.cache_key(),
+        item.id.value
+    );
+    let mut hasher = Sha256::new();
+    hasher.update(identity.as_bytes());
+    format!("local-{}", URL_SAFE_NO_PAD.encode(hasher.finalize()))
+}
+
 fn catalog(item: crate::unified::UnifiedCatalogItem, canonical_id: Option<String>) -> ApiCatalogItem {
     let poster_url = item
         .primary
@@ -675,7 +669,13 @@ fn catalog(item: crate::unified::UnifiedCatalogItem, canonical_id: Option<String
         year: year.clone(),
         ..item.primary.clone()
     };
-    let canonical_id = canonical_id.unwrap_or_else(|| fallback_canonical_id(&fallback_item));
+    let canonical_id = canonical_id.unwrap_or_else(|| {
+        if item.provider_mappings.is_empty() {
+            fallback_singleton_canonical_id(&fallback_item)
+        } else {
+            fallback_canonical_id(&fallback_item)
+        }
+    });
     let provider_id_mappings = item.provider_mappings.clone();
     let provider_mappings = item
         .provider_mappings
@@ -921,7 +921,6 @@ pub async fn run() -> std::io::Result<()> {
         playback_inflight: Arc::new(Mutex::new(HashMap::new())),
         search_cache: Arc::new(Mutex::new(HashMap::new())),
         redis_search,
-        search_source_check_slots: Arc::new(Semaphore::new(SEARCH_SOURCE_CHECK_CONCURRENCY)),
         remux_cache,
         native_stream,
         connection_slots: Arc::new(Semaphore::new(MAX_API_CONNECTIONS)),
@@ -3686,7 +3685,7 @@ async fn search_json(stream: &mut TcpStream, query: &str, state: ApiState) -> st
     write_json(stream, 200, &body, None).await
 }
 
-async fn cached_search(state: &ApiState, query: &str) -> EligibleSearch {
+async fn cached_search(state: &ApiState, query: &str) -> SearchResultSet {
     let key = query.trim().to_ascii_lowercase();
     {
         let cache = state.search_cache.lock().await;
@@ -3699,14 +3698,14 @@ async fn cached_search(state: &ApiState, query: &str) -> EligibleSearch {
 
     if let Some(connection) = state.redis_search.as_ref() {
         let mut connection = connection.clone();
-        let redis_key = format!("moviebox:search:v2:{key}");
+        let redis_key = format!("moviebox:search:v3:{key}");
         let cached: Option<Vec<u8>> = redis::cmd("GET")
             .arg(redis_key)
             .query_async(&mut connection)
             .await
             .unwrap_or_default();
         if let Some(payload) = cached {
-            if let Ok(result) = serde_json::from_slice::<EligibleSearch>(&payload) {
+            if let Ok(result) = serde_json::from_slice::<SearchResultSet>(&payload) {
                 let mut memory = state.search_cache.lock().await;
                 memory.insert(
                     key.clone(),
@@ -3721,7 +3720,7 @@ async fn cached_search(state: &ApiState, query: &str) -> EligibleSearch {
     }
 
     let (items, failed, provider_status) = search_all(&state.service, query).await;
-    let result = eligible_search(state, items, failed, provider_status).await;
+    let result = persist_search_results(state, items, failed, provider_status).await;
     let mut cache = state.search_cache.lock().await;
     if cache.len() >= SEARCH_CACHE_MAX_ENTRIES {
         cache.retain(|_, entry| entry.stored_at.elapsed() < SEARCH_CACHE_TTL);
@@ -3739,7 +3738,7 @@ async fn cached_search(state: &ApiState, query: &str) -> EligibleSearch {
     if let Some(connection) = state.redis_search.as_ref() {
         if let Ok(payload) = serde_json::to_vec(&result) {
             let mut connection = connection.clone();
-            let redis_key = format!("moviebox:search:v2:{key}");
+            let redis_key = format!("moviebox:search:v3:{key}");
             let _: Result<(), _> = redis::cmd("SETEX")
                 .arg(redis_key)
                 .arg(SEARCH_CACHE_TTL.as_secs())
@@ -3751,7 +3750,7 @@ async fn cached_search(state: &ApiState, query: &str) -> EligibleSearch {
     filter_current_search_providers(result)
 }
 
-fn filter_current_search_providers(mut result: EligibleSearch) -> EligibleSearch {
+fn filter_current_search_providers(mut result: SearchResultSet) -> SearchResultSet {
     let enabled = configured_search_providers();
     result.items.retain(|item| enabled.contains(&item.id.provider));
     result
@@ -3788,8 +3787,6 @@ async fn search_sse(stream: &mut TcpStream, query: &str, state: ApiState) -> std
             continue;
         }
         let (code, event) = match status.as_str() {
-            "no_source_confirmed" => ("NO_SOURCE_CONFIRMED", "search_provider_status"),
-            "source_check_failed" => ("SOURCE_CHECK_FAILED", "search_provider_error"),
             "timeout" => ("PROVIDER_TIMEOUT", "search_provider_error"),
             _ => ("UPSTREAM_UNAVAILABLE", "search_provider_error"),
         };
@@ -3898,66 +3895,6 @@ async fn search_all(
     (items, failed, provider_status)
 }
 
-async fn catalog_item_source_eligibility(
-    state: &ApiState,
-    item: CatalogItem,
-) -> (CatalogItem, SourceEligibility) {
-    let details = match tokio::time::timeout(
-        SEARCH_SOURCE_CHECK_TIMEOUT,
-        state
-            .service
-            .details_typed(item.id.provider, &item.id.value),
-    )
-    .await
-    {
-        Ok(Ok(details)) => details,
-        Ok(Err(_)) | Err(_) => return (item, SourceEligibility::CheckFailed),
-    };
-
-    let episode_refs = details
-        .seasons
-        .iter()
-        .flat_map(|season| season.episodes.iter())
-        .map(|episode| OpaqueRef {
-            p: details.id.provider,
-            v: details.id.value.clone(),
-            s: episode.season,
-            e: episode.number,
-        })
-        .collect::<Vec<_>>();
-    let refs = if episode_refs.is_empty() {
-        vec![OpaqueRef {
-            p: details.id.provider,
-            v: details.id.value.clone(),
-            s: 0,
-            e: 0,
-        }]
-    } else {
-        episode_refs
-    };
-
-    let mut check_failed = false;
-    for episode_ref in refs {
-        match tokio::time::timeout(SOURCE_TIMEOUT, cached_releases(state, &episode_ref)).await {
-            Ok(Ok(releases)) if releases_have_usable_source(&releases) => {
-                return (item, SourceEligibility::Playable);
-            }
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) if provider_error_means_no_source(&error) => {}
-            Ok(Err(_)) | Err(_) => check_failed = true,
-        }
-    }
-
-    (
-        item,
-        if check_failed {
-            SourceEligibility::CheckFailed
-        } else {
-            SourceEligibility::NoSourceConfirmed
-        },
-    )
-}
-
 fn provider_mapping_key(id: &ProviderMediaId) -> String {
     format!("{}:{}", id.provider.cache_key(), id.value)
 }
@@ -3976,10 +3913,11 @@ async fn persist_search_group(
             provider_key: item.id.provider.cache_key().to_string(),
             display_name: Some(item.id.provider.label().to_string()),
             provider_title_id: item.id.value.clone(),
-                provider_title: Some(item.title.clone()),
-                provider_url: None,
-                last_successful_resolution: true,
-                metadata: serde_json::json!({
+            provider_title: Some(item.title.clone()),
+            provider_url: None,
+            // Search success confirms discovery only, not detail/playback resolution.
+            last_successful_resolution: false,
+            metadata: serde_json::json!({
                 "year": item.year,
                 "media_type": item.media_type,
                 "season_count": item.season_count,
@@ -3988,7 +3926,12 @@ async fn persist_search_group(
         .collect();
     let year = records
         .iter()
-        .find_map(|item| item.year.as_deref().and_then(|value| value.parse::<i32>().ok()));
+        .find_map(|item| {
+            item.year
+                .as_deref()
+                .and_then(|value| value.parse::<i32>().ok())
+                .or_else(|| crate::unified::normalize_anime_title(&item.title).year_marker)
+        });
     let poster_url = records.iter().find_map(|item| {
         item.poster_url
             .as_deref()
@@ -3997,6 +3940,11 @@ async fn persist_search_group(
     });
     let input = crate::catalog::UnifiedAnimeInput {
         canonical_title: primary.title.clone(),
+        content_type: match primary.media_type {
+            MediaType::Movie => "movie",
+            MediaType::Series => "anime",
+        }
+        .to_string(),
         synopsis: None,
         release_year: year,
         poster_url,
@@ -4013,95 +3961,27 @@ async fn persist_search_group(
     }
 }
 
-fn spawn_source_eligibility_check(
-    tasks: &mut JoinSet<(CatalogItem, SourceEligibility)>,
-    state: ApiState,
-    item: CatalogItem,
-) {
-    tasks.spawn(async move {
-        let semaphore = Arc::clone(&state.search_source_check_slots);
-        let permit = semaphore.acquire_owned().await;
-        if permit.is_err() {
-            return (item, SourceEligibility::CheckFailed);
-        }
-        let fallback = item.clone();
-        match tokio::time::timeout(
-            SEARCH_SOURCE_CHECK_TIMEOUT,
-            catalog_item_source_eligibility(&state, item),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => (fallback, SourceEligibility::CheckFailed),
-        }
-    });
-}
-
-async fn eligible_search(
+async fn persist_search_results(
     state: &ApiState,
-    items: Vec<CatalogItem>,
-    mut failed: bool,
-    mut provider_status: HashMap<String, String>,
-) -> EligibleSearch {
-    let mut tasks = JoinSet::new();
-    let mut pending = items.into_iter();
-    for _ in 0..SEARCH_SOURCE_CHECK_CONCURRENCY {
-        if let Some(item) = pending.next() {
-            spawn_source_eligibility_check(&mut tasks, state.clone(), item);
-        }
-    }
-
-    let mut eligible = Vec::new();
-    let mut provider_playable = std::collections::HashSet::new();
-    let mut provider_failed = std::collections::HashSet::new();
-    let mut provider_no_source = std::collections::HashSet::new();
-    while let Some(result) = tasks.join_next().await {
-        let Ok((item, status)) = result else {
-            failed = true;
-            continue;
-        };
-        match status {
-            SourceEligibility::Playable => {
-                provider_playable.insert(item.id.provider);
-                eligible.push(item);
-            }
-            SourceEligibility::NoSourceConfirmed => {
-                provider_no_source.insert(item.id.provider);
-            }
-            SourceEligibility::CheckFailed => {
-                provider_failed.insert(item.id.provider);
-                failed = true;
-            }
-        }
-        if let Some(item) = pending.next() {
-            spawn_source_eligibility_check(&mut tasks, state.clone(), item);
-        }
-    }
-    for provider in configured_search_providers() {
-        let key = provider.cache_key().to_string();
-        if provider_failed.contains(&provider) {
-            provider_status.insert(key, "source_check_failed".to_string());
-        } else if provider_playable.contains(&provider) {
-            provider_status.insert(key, "ok".to_string());
-        } else if provider_no_source.contains(&provider) {
-            provider_status.insert(key, "no_source_confirmed".to_string());
-        }
-    }
-    eligible.sort_by(|a, b| {
+    mut items: Vec<CatalogItem>,
+    failed: bool,
+    provider_status: HashMap<String, String>,
+) -> SearchResultSet {
+    items.sort_by(|a, b| {
         provider_priority(a.id.provider)
             .cmp(&provider_priority(b.id.provider))
             .then_with(|| a.title.cmp(&b.title))
     });
     let mut canonical_ids = HashMap::new();
     if state.catalog.is_some() {
-        for group in crate::unified::group_catalog_items(eligible.clone()) {
+        for group in crate::unified::group_catalog_items(items.clone()) {
             if let Some(id) = persist_search_group(state, &group).await {
                 canonical_ids.insert(provider_mapping_key(&group.primary.id), id);
             }
         }
     }
-    EligibleSearch {
-        items: eligible,
+    SearchResultSet {
+        items,
         failed,
         provider_status,
         canonical_ids,
@@ -4506,6 +4386,11 @@ async fn persist_unified_details(
 
     let input = crate::catalog::UnifiedAnimeInput {
         canonical_title: primary.title.clone(),
+        content_type: match primary.media_type {
+            MediaType::Movie => "movie",
+            MediaType::Series => "anime",
+        }
+        .to_string(),
         synopsis: response.description.clone(),
         release_year: details
             .iter()
@@ -9004,13 +8889,38 @@ mod tests {
         ]);
         assert_eq!(unified.len(), 1);
 
-        let response = catalog(unified.into_iter().next().unwrap());
+        let response = catalog(unified.into_iter().next().unwrap(), None);
         let primary: OpaqueRef = decode(&response.id).unwrap();
         assert_eq!(primary.p, ProviderKind::FourKHdHub);
         assert_eq!(response.provider_mappings.len(), 1);
         let secondary: OpaqueRef = decode(&response.provider_mappings[0].id).unwrap();
         assert_eq!(secondary.p, ProviderKind::Dramachi);
         assert_eq!(secondary.v, "black-clover-2017");
+    }
+
+    #[test]
+    fn unmerged_search_cards_receive_distinct_local_canonical_ids() {
+        let make_item = |id: &str| CatalogItem {
+            id: ProviderMediaId {
+                provider: ProviderKind::Dramachi,
+                value: id.to_string(),
+            },
+            title: "Example".to_string(),
+            media_type: MediaType::Series,
+            year: Some("2017".to_string()),
+            poster_url: None,
+            season_count: Some(1),
+        };
+        let groups = crate::unified::group_catalog_items(vec![
+            make_item("example-a"),
+            make_item("example-b"),
+        ]);
+        assert_eq!(groups.len(), 2);
+        let cards = groups
+            .into_iter()
+            .map(|group| catalog(group, None))
+            .collect::<Vec<_>>();
+        assert_ne!(cards[0].canonical_id, cards[1].canonical_id);
     }
 
     #[test]
@@ -9725,29 +9635,6 @@ mod tests {
             .filter_map(|stream| tag_value(stream.tags.as_ref(), "language"))
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(languages, ["eng", "hin", "kor"].into_iter().collect());
-    }
-
-    #[test]
-    fn search_source_failures_are_not_treated_as_confirmed_absence() {
-        assert!(provider_error_means_no_source(&ProviderError::NotFound));
-        assert!(provider_error_means_no_source(&ProviderError::Unavailable(
-            "No addon stream sources available".into(),
-        )));
-        assert!(!provider_error_means_no_source(&ProviderError::Network(
-            "connection reset".into(),
-        )));
-        assert!(!provider_error_means_no_source(
-            &ProviderError::RateLimited(None)
-        ));
-        assert!(!provider_error_means_no_source(&ProviderError::Parsing(
-            "invalid response".into(),
-        )));
-    }
-
-    #[test]
-    fn search_source_eligibility_has_a_bounded_per_item_budget() {
-        assert_eq!(SEARCH_SOURCE_CHECK_TIMEOUT, Duration::from_secs(45));
-        assert!(SEARCH_SOURCE_CHECK_TIMEOUT >= SOURCE_TIMEOUT);
     }
 
     #[test]
