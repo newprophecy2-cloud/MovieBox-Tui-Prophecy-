@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -662,6 +663,30 @@ impl CatalogStore {
             &[&provider_key, &provider_title_id],
         ).await?;
         Ok(r.as_ref().map(title_from_row))
+    }
+    pub async fn verified_provider_aliases(
+        &self,
+        mappings: &[(String, String)],
+    ) -> Result<HashMap<String, Vec<String>>, CatalogError> {
+        let client = self.client.lock().await;
+        let mut aliases = HashMap::new();
+        for (provider_key, provider_title_id) in mappings {
+            let rows = client
+                .query(
+                    "SELECT DISTINCT ata.title FROM title_alternative_titles ata JOIN provider_titles pt ON pt.title_id=ata.title_id JOIN provider_registry pr ON pr.id=pt.provider_id WHERE pr.provider_key=$1 AND pt.provider_title_id=$2 AND pt.match_status='verified' ORDER BY ata.title",
+                    &[provider_key, provider_title_id],
+                )
+                .await?;
+            let values = rows
+                .iter()
+                .filter_map(|row| row.try_get::<_, String>("title").ok())
+                .filter(|title| !title.trim().is_empty())
+                .collect::<Vec<_>>();
+            if !values.is_empty() {
+                aliases.insert(format!("{provider_key}:{provider_title_id}"), values);
+            }
+        }
+        Ok(aliases)
     }
     pub async fn get_title_detail(&self, id: &str) -> Result<Option<CatalogDetail>, CatalogError> {
         let c = self.client.lock().await;

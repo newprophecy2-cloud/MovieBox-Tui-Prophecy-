@@ -45,6 +45,7 @@ const BROWSE_TIMEOUT: Duration = Duration::from_secs(6);
 const CLASSIFICATION_TIMEOUT: Duration = Duration::from_secs(1);
 const PLAYBACK_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(20);
 const SEARCH_PROVIDER_CONCURRENCY: usize = 3;
+const SEARCH_MAX_PAGES: usize = 3;
 const TRACK_PROBE_TIMEOUT: Duration = Duration::from_secs(45);
 const CODEC_VERIFICATION_WORKERS: usize = 2;
 const CODEC_VERIFICATION_LEASE_SECONDS: i32 = 120;
@@ -219,6 +220,8 @@ struct SearchResultSet {
     provider_status: HashMap<String, String>,
     #[serde(default)]
     canonical_ids: HashMap<String, String>,
+    #[serde(default)]
+    verified_aliases: HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3634,7 +3637,10 @@ async fn search_json(stream: &mut TcpStream, query: &str, state: ApiState) -> st
         return write_raw_json(stream, s, &b, None).await;
     }
     let eligible = cached_search(&state, &qv).await;
-    let items = crate::unified::group_catalog_items(eligible.items);
+    let items = crate::unified::group_catalog_items_with_aliases(
+        eligible.items,
+        &eligible.verified_aliases,
+    );
     let failed = eligible.failed;
     let provider_status = eligible.provider_status;
     let canonical_ids = eligible.canonical_ids;
@@ -3720,7 +3726,27 @@ async fn cached_search(state: &ApiState, query: &str) -> SearchResultSet {
     }
 
     let (items, failed, provider_status) = search_all(&state.service, query).await;
-    let result = persist_search_results(state, items, failed, provider_status).await;
+    let mappings = items
+        .iter()
+        .map(|item| {
+            (
+                item.id.provider.cache_key().to_string(),
+                item.id.value.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let verified_aliases = match state.catalog.as_ref() {
+        Some(store) => store.verified_provider_aliases(&mappings).await.unwrap_or_default(),
+        None => HashMap::new(),
+    };
+    let result = persist_search_results(
+        state,
+        items,
+        failed,
+        provider_status,
+        verified_aliases,
+    )
+    .await;
     let mut cache = state.search_cache.lock().await;
     if cache.len() >= SEARCH_CACHE_MAX_ENTRIES {
         cache.retain(|_, entry| entry.stored_at.elapsed() < SEARCH_CACHE_TTL);
@@ -3775,7 +3801,10 @@ async fn search_sse(stream: &mut TcpStream, query: &str, state: ApiState) -> std
     let eligible = cached_search(&state, &qv).await;
     write_headers(stream, 200, "text/event-stream", None).await?;
     let canonical_ids = eligible.canonical_ids.clone();
-    for item in crate::unified::group_catalog_items(eligible.items) {
+    for item in crate::unified::group_catalog_items_with_aliases(
+        eligible.items,
+        &eligible.verified_aliases,
+    ) {
         let canonical_id = canonical_ids
             .get(&provider_mapping_key(&item.primary.id))
             .cloned();
@@ -3796,7 +3825,7 @@ async fn search_sse(stream: &mut TcpStream, query: &str, state: ApiState) -> std
             "message": if code == "NO_SOURCE_CONFIRMED" {
                 "No usable source was confirmed for the provider search results."
             } else {
-                "The provider search or source eligibility check did not complete."
+                "The provider search did not complete successfully."
             }
         })
         .to_string();
@@ -3835,7 +3864,29 @@ async fn search_all(
             }
             (
                 p,
-                tokio::time::timeout(OVERALL_TIMEOUT, svc.search_typed(p, &q, 1)).await,
+                tokio::time::timeout(OVERALL_TIMEOUT, async move {
+                    let pages = if svc.capabilities(p).supports_pagination {
+                        1..=SEARCH_MAX_PAGES
+                    } else {
+                        1..=1
+                    };
+                    let mut all = Vec::new();
+                    let mut seen = std::collections::HashSet::new();
+                    for page in pages {
+                        let page_items = svc.search_typed(p, &q, page).await?;
+                        let before = all.len();
+                        for item in page_items {
+                            if seen.insert(item.id.clone()) {
+                                all.push(item);
+                            }
+                        }
+                        if all.len() == before || (all.is_empty() && page > 1) {
+                            break;
+                        }
+                    }
+                    Ok::<Vec<CatalogItem>, ProviderError>(all)
+                })
+                .await,
             )
         });
     }
@@ -3966,6 +4017,7 @@ async fn persist_search_results(
     mut items: Vec<CatalogItem>,
     failed: bool,
     provider_status: HashMap<String, String>,
+    verified_aliases: HashMap<String, Vec<String>>,
 ) -> SearchResultSet {
     items.sort_by(|a, b| {
         provider_priority(a.id.provider)
@@ -3974,7 +4026,10 @@ async fn persist_search_results(
     });
     let mut canonical_ids = HashMap::new();
     if state.catalog.is_some() {
-        for group in crate::unified::group_catalog_items(items.clone()) {
+        for group in crate::unified::group_catalog_items_with_aliases(
+            items.clone(),
+            &verified_aliases,
+        ) {
             if let Some(id) = persist_search_group(state, &group).await {
                 canonical_ids.insert(provider_mapping_key(&group.primary.id), id);
             }
@@ -3985,6 +4040,7 @@ async fn persist_search_results(
         failed,
         provider_status,
         canonical_ids,
+        verified_aliases,
     }
 }
 
@@ -4479,7 +4535,10 @@ async fn fetch_unified_provider_details(
                     (mapping, Some(details), None)
                 }
                 Ok(Ok(_)) => (mapping, None, Some("provider_identity_mismatch".to_string())),
-                Ok(Err(error)) => (mapping, None, Some(error.user_message(mapping.provider))),
+                Ok(Err(error)) => {
+                    let provider = mapping.provider;
+                    (mapping, None, Some(error.user_message(provider)))
+                }
                 Err(_) => (mapping, None, Some("timeout".to_string())),
             }
         });
@@ -4762,7 +4821,10 @@ fn unified_api_details(
         partial: provider_status.values().any(|status| status != "ok"),
         provider_status,
         title: if primary.title.trim().is_empty() {
-            first_nonempty(|item| &item.title).unwrap_or_default()
+            details
+                .iter()
+                .find_map(|(_, item)| (!item.title.trim().is_empty()).then(|| item.title.clone()))
+                .unwrap_or_default()
         } else {
             primary.title.clone()
         },
