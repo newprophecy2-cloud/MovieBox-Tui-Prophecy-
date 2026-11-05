@@ -17,6 +17,7 @@ const MIGRATION_004: &str = include_str!("../migrations/004_movie_sources.sql");
 const MIGRATION_005: &str = include_str!("../migrations/005_unified_content_mappings.sql");
 const MIGRATION_006: &str = include_str!("../migrations/006_task3_task4_integrity.sql");
 const MIGRATION_007: &str = include_str!("../migrations/007_task3_task4_ownership.sql");
+const MIGRATION_008: &str = include_str!("../migrations/008_task3_task4_lifecycle.sql");
 
 #[derive(Clone)]
 pub struct CatalogStore {
@@ -451,6 +452,38 @@ pub struct MappingIntegrityReport {
     pub unresolved_provider_episodes: i64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct MappingTransitionResult {
+    pub mapping_type: String,
+    pub mapping_id: String,
+    pub previous_status: String,
+    pub new_status: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProviderTitleReconciliation {
+    pub canonical_title_id: String,
+    pub provider_key: String,
+    pub old_provider_title_id: String,
+    pub new_provider_title_id: String,
+    pub old_title: String,
+    pub new_title: String,
+    pub old_year: Option<i32>,
+    pub new_year: Option<i32>,
+    pub content_type: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProviderEpisodeReconciliation {
+    pub canonical_episode_id: String,
+    pub provider_key: String,
+    pub provider_title_id: String,
+    pub old_provider_episode_id: String,
+    pub new_provider_episode_id: String,
+    pub season_number: i32,
+    pub episode_number: i32,
+}
+
 fn default_anime() -> String {
     "anime".into()
 }
@@ -483,6 +516,7 @@ impl CatalogStore {
         client.batch_execute(MIGRATION_005).await?;
         client.batch_execute(MIGRATION_006).await?;
         client.batch_execute(MIGRATION_007).await?;
+        client.batch_execute(MIGRATION_008).await?;
         Ok(())
     }
 
@@ -509,6 +543,134 @@ impl CatalogStore {
             unresolved_provider_titles: row.get(5),
             unresolved_provider_episodes: row.get(6),
         })
+    }
+
+    /// Apply a validated title mapping status transition and append an audit row.
+    pub async fn transition_provider_title_status(
+        &self,
+        mapping_id: &str,
+        next: ProviderMappingStatus,
+        reason: &str,
+        evidence: Value,
+    ) -> Result<MappingTransitionResult, CatalogError> {
+        let id = parse_uuid(mapping_id)?;
+        let mut client = self.client.lock().await;
+        let tx = client.transaction().await?;
+        let row = tx
+            .query_one(
+                "SELECT match_status FROM provider_titles WHERE id=$1 FOR UPDATE",
+                &[&id],
+            )
+            .await?;
+        let previous: String = row.get(0);
+        let current = ProviderMappingStatus::parse(&previous).ok_or_else(|| {
+            CatalogError::Validation("unknown Provider title mapping status".into())
+        })?;
+        if !mapping_status_transition(current, next) {
+            return Err(CatalogError::Validation(format!(
+                "invalid mapping transition {previous} -> {}",
+                next.as_str()
+            )));
+        }
+        tx.execute("UPDATE provider_titles SET match_status=$2, last_checked_at=now(), updated_at=now() WHERE id=$1", &[&id, &next.as_str()]).await?;
+        tx.execute("INSERT INTO provider_mapping_transition_history(mapping_type,mapping_id,previous_status,new_status,reason,evidence) VALUES('title',$1,$2,$3,$4,$5)", &[&id, &previous, &next.as_str(), &reason, &evidence]).await?;
+        tx.commit().await?;
+        Ok(MappingTransitionResult {
+            mapping_type: "title".into(),
+            mapping_id: mapping_id.into(),
+            previous_status: previous,
+            new_status: next.as_str().into(),
+        })
+    }
+
+    /// Reconcile a changed Provider title ID without deleting the old mapping.
+    pub async fn reconcile_provider_title_mapping(
+        &self,
+        input: ProviderTitleReconciliation,
+    ) -> Result<ReconciliationDecision, CatalogError> {
+        let title_id = parse_uuid(&input.canonical_title_id)?;
+        let mut client = self.client.lock().await;
+        let tx = client.transaction().await?;
+        let provider_id: Uuid = tx
+            .query_one(
+                "SELECT id FROM provider_registry WHERE provider_key=$1",
+                &[&input.provider_key],
+            )
+            .await?
+            .get(0);
+        let old = tx.query_opt("SELECT id, title_id, match_status FROM provider_titles WHERE provider_id=$1 AND provider_title_id=$2 FOR UPDATE", &[&provider_id, &input.old_provider_title_id]).await?;
+        let Some(old) = old else {
+            return Ok(ReconciliationDecision::Unresolved {
+                reason: "old Provider title mapping was not found".into(),
+            });
+        };
+        let owner: Uuid = old.get("title_id");
+        if owner != title_id {
+            return Ok(ReconciliationDecision::Unresolved {
+                reason: "old mapping belongs to another canonical title".into(),
+            });
+        }
+        let conflict = tx.query_opt("SELECT title_id FROM provider_titles WHERE provider_id=$1 AND provider_title_id=$2 FOR UPDATE", &[&provider_id, &input.new_provider_title_id]).await?.is_some_and(|row| row.get::<_, Uuid>(0) != title_id);
+        let decision = reconcile_provider_identity(
+            true,
+            !input.new_provider_title_id.trim().is_empty(),
+            &input.old_title,
+            &input.new_title,
+            input.old_year,
+            input.new_year,
+            &input.content_type,
+            &input.content_type,
+            conflict,
+        );
+        if !matches!(decision, ReconciliationDecision::VerifiedReplacement) {
+            return Ok(decision);
+        }
+        tx.execute("INSERT INTO provider_titles(title_id,provider_id,provider_title_id,provider_title,match_status,last_checked_at) VALUES($1,$2,$3,$4,'verified',now()) ON CONFLICT(provider_id,provider_title_id) DO NOTHING", &[&title_id, &provider_id, &input.new_provider_title_id, &input.new_title]).await?;
+        let old_id: Uuid = old.get("id");
+        tx.execute("UPDATE provider_titles SET match_status='stale', updated_at=now() WHERE id=$1 AND match_status='verified'", &[&old_id]).await?;
+        tx.execute("INSERT INTO provider_mapping_transition_history(mapping_type,mapping_id,previous_status,new_status,reason,evidence) VALUES('title',$1,$2,'stale','Provider ID reconciled',jsonb_build_object('new_provider_title_id',$3)) ON CONFLICT DO NOTHING", &[&old_id, &old.get::<_, String>("match_status"), &input.new_provider_title_id]).await?;
+        tx.commit().await?;
+        Ok(decision)
+    }
+
+    /// Reconcile an Episode ID change while retaining the old mapping history.
+    pub async fn reconcile_provider_episode_mapping(
+        &self,
+        input: ProviderEpisodeReconciliation,
+    ) -> Result<ReconciliationDecision, CatalogError> {
+        let episode_id = parse_uuid(&input.canonical_episode_id)?;
+        let mut client = self.client.lock().await;
+        let tx = client.transaction().await?;
+        let provider_id: Uuid = tx
+            .query_one(
+                "SELECT id FROM provider_registry WHERE provider_key=$1",
+                &[&input.provider_key],
+            )
+            .await?
+            .get(0);
+        let owner = tx.query_opt("SELECT episode_id FROM episode_provider_mappings WHERE provider_id=$1 AND provider_episode_id=$2 FOR UPDATE", &[&provider_id, &input.new_provider_episode_id]).await?;
+        if let Some(row) = owner {
+            if row.get::<_, Uuid>(0) != episode_id {
+                return Ok(ReconciliationDecision::Unresolved {
+                    reason: "new Provider Episode ID already has another owner".into(),
+                });
+            }
+        }
+        let old = tx.query_opt("SELECT id, episode_id, mapping_status FROM episode_provider_mappings WHERE provider_id=$1 AND provider_episode_id=$2 FOR UPDATE", &[&provider_id, &input.old_provider_episode_id]).await?;
+        let Some(old) = old else {
+            return Ok(ReconciliationDecision::Unresolved {
+                reason: "old Provider Episode mapping was not found".into(),
+            });
+        };
+        if old.get::<_, Uuid>("episode_id") != episode_id {
+            return Ok(ReconciliationDecision::Unresolved {
+                reason: "old Provider Episode mapping belongs to another canonical Episode".into(),
+            });
+        }
+        tx.execute("INSERT INTO episode_provider_mappings(episode_id,provider_id,provider_episode_id,provider_episode_number,mapping_status) VALUES($1,$2,$3,$4,'resolved') ON CONFLICT(provider_id,provider_episode_id) DO NOTHING", &[&episode_id, &provider_id, &input.new_provider_episode_id, &input.episode_number]).await?;
+        tx.execute("UPDATE episode_provider_mappings SET mapping_status='unresolved', metadata=metadata||jsonb_build_object('reconciled_to',$3), updated_at=now() WHERE id=$1 AND mapping_status='resolved'", &[&old.get::<_, Uuid>("id"), &input.provider_title_id, &input.new_provider_episode_id]).await?;
+        tx.commit().await?;
+        Ok(ReconciliationDecision::VerifiedReplacement)
     }
 
     pub async fn create_anime_import_job(
