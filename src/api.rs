@@ -9,6 +9,7 @@ use futures::{
 };
 use std::{
     collections::HashMap,
+    future::Future,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -3865,26 +3866,12 @@ async fn search_all(
             (
                 p,
                 tokio::time::timeout(OVERALL_TIMEOUT, async move {
-                    let pages = if svc.capabilities(p).supports_pagination {
-                        1..=SEARCH_MAX_PAGES
-                    } else {
-                        1..=1
-                    };
-                    let mut all = Vec::new();
-                    let mut seen = std::collections::HashSet::new();
-                    for page in pages {
-                        let page_items = svc.search_typed(p, &q, page).await?;
-                        let before = all.len();
-                        for item in page_items {
-                            if seen.insert(item.id.clone()) {
-                                all.push(item);
-                            }
-                        }
-                        if all.len() == before || (all.is_empty() && page > 1) {
-                            break;
-                        }
-                    }
-                    Ok::<Vec<CatalogItem>, ProviderError>(all)
+                    search_provider_pages(svc.capabilities(p).supports_pagination, |page| {
+                        let svc = Arc::clone(&svc);
+                        let q = q.clone();
+                        async move { svc.search_typed(p, &q, page).await }
+                    })
+                    .await
                 })
                 .await,
             )
@@ -3944,6 +3931,36 @@ async fn search_all(
             .then_with(|| provider_priority(a.id.provider).cmp(&provider_priority(b.id.provider)))
     });
     (items, failed, provider_status)
+}
+
+async fn search_provider_pages<F, Fut>(
+    supports_pagination: bool,
+    mut fetch: F,
+) -> Result<Vec<CatalogItem>, ProviderError>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: Future<Output = Result<Vec<CatalogItem>, ProviderError>>,
+{
+    let pages = if supports_pagination {
+        1..=SEARCH_MAX_PAGES
+    } else {
+        1..=1
+    };
+    let mut all = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for page in pages {
+        let page_items = fetch(page).await?;
+        let before = all.len();
+        for item in page_items {
+            if seen.insert(item.id.clone()) {
+                all.push(item);
+            }
+        }
+        if all.len() == before || (all.is_empty() && page > 1) {
+            break;
+        }
+    }
+    Ok(all)
 }
 
 fn provider_mapping_key(id: &ProviderMediaId) -> String {
@@ -9929,5 +9946,180 @@ mod tests {
             &HashMap::new(),
             Classification::Anime
         ));
+    }
+
+    fn mock_search_item(provider: ProviderKind, value: &str) -> CatalogItem {
+        CatalogItem {
+            id: ProviderMediaId {
+                provider,
+                value: value.into(),
+            },
+            title: value.into(),
+            media_type: MediaType::Series,
+            year: Some("2024".into()),
+            poster_url: None,
+            season_count: Some(1),
+        }
+    }
+
+    #[tokio::test]
+    async fn deterministic_provider_timeout_does_not_cancel_successful_provider() {
+        let timeout = tokio::time::timeout(Duration::from_millis(10), search_provider_pages(true, |_page| async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok::<Vec<CatalogItem>, ProviderError>(Vec::new())
+        }));
+        let success = search_provider_pages(false, |_page| async {
+            Ok::<Vec<CatalogItem>, ProviderError>(vec![mock_search_item(
+                ProviderKind::Dramachi,
+                "success",
+            )])
+        });
+        let (timed_out, successful) = tokio::join!(timeout, success);
+        assert!(timed_out.is_err());
+        assert_eq!(successful.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn deterministic_provider_outage_isolated_from_success() {
+        let failed = search_provider_pages(false, |_page| async {
+            Err::<Vec<CatalogItem>, _>(ProviderError::Unavailable("fixture outage".into()))
+        });
+        let successful = search_provider_pages(false, |_page| async {
+            Ok::<Vec<CatalogItem>, ProviderError>(vec![mock_search_item(
+                ProviderKind::FourKHdHub,
+                "available",
+            )])
+        });
+        let (failed, successful) = tokio::join!(failed, successful);
+        assert!(matches!(failed, Err(ProviderError::Unavailable(_))));
+        assert_eq!(successful.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn deterministic_empty_response_is_safe_and_pagination_stops() {
+        let mut pages = Vec::new();
+        let result = search_provider_pages(true, |page| {
+            pages.push(page);
+            async { Ok::<Vec<CatalogItem>, ProviderError>(Vec::new()) }
+        })
+        .await
+        .unwrap();
+        assert!(result.is_empty());
+        assert_eq!(pages, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn deterministic_pagination_deduplicates_but_preserves_provider_identity() {
+        let mut requested_pages = Vec::new();
+        let result = search_provider_pages(true, |page| {
+            requested_pages.push(page);
+            async move {
+                Ok::<Vec<CatalogItem>, ProviderError>(match page {
+                    1 => vec![
+                        mock_search_item(ProviderKind::Dramachi, "same"),
+                        mock_search_item(ProviderKind::FourKHdHub, "same"),
+                    ],
+                    2 => vec![mock_search_item(ProviderKind::Dramachi, "same")],
+                    _ => Vec::new(),
+                })
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(requested_pages, vec![1, 2]);
+        assert_eq!(result.len(), 2);
+        assert!(result.iter().any(|item| item.id.provider == ProviderKind::Dramachi));
+        assert!(result.iter().any(|item| item.id.provider == ProviderKind::FourKHdHub));
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ApkSearchResponseContract {
+        results: Vec<ApkSearchItemContract>,
+        next_cursor: Option<String>,
+        partial: Option<bool>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ApkSearchItemContract {
+        id: String,
+        title: String,
+        media_type: Option<String>,
+        year: Option<String>,
+        poster_url: Option<String>,
+        season_count: Option<usize>,
+    }
+
+    #[test]
+    fn apk_search_contract_accepts_success_empty_partial_and_source_independent_results() {
+        let successful_item = ApiCatalogItem {
+            id: "backend-opaque-id".into(),
+            canonical_id: Some("canonical-123".into()),
+            title: "Fixture Anime".into(),
+            media_type: MediaType::Series,
+            year: Some("2024".into()),
+            poster_url: None,
+            season_count: Some(1),
+            provider_mappings: vec![ApiProviderMapping {
+                id: "provider-opaque-id".into(),
+                provider: ProviderKind::Dramachi,
+            }],
+        };
+        let cases = [
+            SearchResponse {
+                results: vec![successful_item],
+                next_cursor: Some("cursor-2".into()),
+                partial: false,
+                provider_status: HashMap::new(),
+                language_intent: None,
+                verified_language_matches: None,
+                message: None,
+            },
+            SearchResponse {
+                results: Vec::new(),
+                next_cursor: None,
+                partial: false,
+                provider_status: HashMap::new(),
+                language_intent: None,
+                verified_language_matches: None,
+                message: None,
+            },
+            SearchResponse {
+                results: vec![ApiCatalogItem {
+                    id: "partial-opaque-id".into(),
+                    canonical_id: None,
+                    title: "No Playable Source Fixture".into(),
+                    media_type: MediaType::Series,
+                    year: None,
+                    poster_url: None,
+                    season_count: None,
+                    provider_mappings: Vec::new(),
+                }],
+                next_cursor: None,
+                partial: true,
+                provider_status: HashMap::from([("fourkhdhub".into(), "timeout".into())]),
+                language_intent: None,
+                verified_language_matches: None,
+                message: Some("Partial provider results".into()),
+            },
+        ];
+        let parsed = cases
+            .iter()
+            .map(|response| {
+                serde_json::from_value::<ApkSearchResponseContract>(
+                    serde_json::to_value(response).unwrap(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(parsed[0].results[0].id, "backend-opaque-id");
+        assert_eq!(parsed[0].results[0].title, "Fixture Anime");
+        assert_eq!(parsed[0].results[0].media_type.as_deref(), Some("series"));
+        assert_eq!(parsed[0].results[0].year.as_deref(), Some("2024"));
+        assert_eq!(parsed[0].results[0].season_count, Some(1));
+        assert_eq!(parsed[0].next_cursor.as_deref(), Some("cursor-2"));
+        assert!(parsed[1].results.is_empty());
+        assert!(parsed[2].partial == Some(true));
+        assert_eq!(parsed[2].results[0].id, "partial-opaque-id");
+        assert!(parsed[2].results[0].poster_url.is_none());
     }
 }
