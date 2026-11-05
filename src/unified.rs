@@ -38,8 +38,10 @@ pub fn normalize_anime_title(title: &str) -> NormalizedAnimeTitle {
     }
 }
 
-/// Group records only when the title key and media type match and their years are
-/// compatible. Repeated records from a provider are retained as separate results.
+/// Group records only when the title key and media type match and both records
+/// have the same known year. Unknown or contradictory year evidence is kept
+/// separate rather than being treated as permission to merge by title alone.
+/// Repeated records from a provider are retained as separate results.
 pub fn group_catalog_items(items: Vec<CatalogItem>) -> Vec<UnifiedCatalogItem> {
     #[derive(Debug)]
     struct CandidateGroup {
@@ -82,30 +84,12 @@ pub fn group_catalog_items(items: Vec<CatalogItem>) -> Vec<UnifiedCatalogItem> {
 
     let mut groups: Vec<Vec<usize>> = Vec::new();
     for (_, _, indices) in buckets {
-        let known_years: Vec<i32> = indices
-            .iter()
-            .filter_map(|&index| {
-                let (year, conflicting_metadata) = years[index];
-                (!conflicting_metadata).then_some(year).flatten()
-            })
-            .fold(Vec::new(), |mut acc, year| {
-                if !acc.contains(&year) {
-                    acc.push(year);
-                }
-                acc
-            });
-        let uncertain_years = known_years.len() > 1;
-        let sole_year = if known_years.len() == 1 {
-            known_years.first().copied()
-        } else {
-            None
-        };
         let mut candidates: Vec<CandidateGroup> = Vec::new();
 
         for index in indices {
             let (item_year, contradictory_markers) = years[index];
-            let isolated = contradictory_markers || (item_year.is_none() && uncertain_years);
-            let target_year = item_year.or(sole_year);
+            let isolated = contradictory_markers || item_year.is_none();
+            let target_year = item_year;
             let provider = items[index].id.provider;
 
             let existing = if isolated {
@@ -138,7 +122,7 @@ pub fn group_catalog_items(items: Vec<CatalogItem>) -> Vec<UnifiedCatalogItem> {
         .map(|indices| {
             let primary_index = indices[0];
             let primary = items[primary_index].clone();
-            let provider_items = indices
+            let provider_items: Vec<CatalogItem> = indices
                 .into_iter()
                 .skip(1)
                 .map(|index| items[index].clone())
@@ -565,7 +549,7 @@ mod tests {
         assert_eq!(normalized.key, "black clover");
         assert_eq!(normalized.year_marker, Some(2017));
         let grouped = group_catalog_items(vec![
-            item(ProviderKind::MovieBox, "a", "Black Clover (2017)", None),
+            item(ProviderKind::MovieBox, "a", "Black Clover (2017)", Some("2017")),
             item(ProviderKind::Dramachi, "b", "BLACK-CLOVER", Some("2017")),
         ]);
         assert_eq!(grouped.len(), 1);
@@ -618,6 +602,16 @@ mod tests {
                 .iter()
                 .all(|group| group.provider_mappings.is_empty())
         );
+    }
+
+    #[test]
+    fn matching_titles_with_unknown_years_remain_separate() {
+        let grouped = group_catalog_items(vec![
+            item(ProviderKind::FourKHdHub, "a", "Example", None),
+            item(ProviderKind::Dramachi, "b", "Example", None),
+        ]);
+        assert_eq!(grouped.len(), 2);
+        assert!(grouped.iter().all(|group| group.provider_mappings.is_empty()));
     }
 
     #[test]

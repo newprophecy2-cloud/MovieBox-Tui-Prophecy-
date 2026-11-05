@@ -116,6 +116,8 @@ pub struct EpisodeInput {
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct UnifiedAnimeInput {
     pub canonical_title: String,
+    #[serde(default = "default_anime")]
+    pub content_type: String,
     pub synopsis: Option<String>,
     pub release_year: Option<i32>,
     pub poster_url: Option<String>,
@@ -963,7 +965,10 @@ fn nonempty_text(value: Option<&str>) -> Option<&str> {
 }
 
 fn validate_unified_anime(input: &UnifiedAnimeInput) -> Result<(), CatalogError> {
-    validate(&input.canonical_title, "anime")?;
+    if !matches!(input.content_type.as_str(), "anime" | "movie") {
+        return Err(CatalogError::Validation("invalid unified content_type".into()));
+    }
+    validate(&input.canonical_title, &input.content_type)?;
     if input.release_year.is_some_and(|year| !(1800..=3000).contains(&year)) {
         return Err(CatalogError::Validation("release_year is out of range".into()));
     }
@@ -1058,6 +1063,20 @@ async fn upsert_unified_anime_in_tx(
     tx: &tokio_postgres::Transaction<'_>,
     input: &UnifiedAnimeInput,
 ) -> Result<String, CatalogError> {
+    let normalized = crate::unified::normalize_anime_title(&input.canonical_title).key;
+    let lock_scope = format!(
+        "{}:{}",
+        input.content_type,
+        input.release_year.map_or_else(|| "unknown".to_string(), |year| year.to_string())
+    );
+    // Serialize find-or-create for the same normalized identity across backend
+    // instances; the lock is transaction-scoped and does not alter schema.
+    tx.query_one(
+        "SELECT pg_advisory_xact_lock(hashtext($1),hashtext($2))",
+        &[&normalized, &lock_scope],
+    )
+    .await?;
+
     // A provider identity is stronger evidence than title text. Check every
     // supplied identity before using the conservative normalized-title match.
     let mut matched_id: Option<String> = None;
@@ -1086,16 +1105,19 @@ async fn upsert_unified_anime_in_tx(
         }
     }
     if matched_id.is_none() {
-        let normalized = normalize(&input.canonical_title);
+        let provider_keys = input
+            .provider_titles
+            .iter()
+            .map(|provider| provider.provider_key.clone())
+            .collect::<Vec<_>>();
         let row = tx.query_opt(
-            "SELECT id::text AS id FROM catalog_titles WHERE normalized_title=$1 AND content_type='anime' AND catalog_status<>'deleted' AND (release_year IS NULL OR $2::int IS NULL OR release_year=$2) ORDER BY (release_year IS NULL),updated_at DESC LIMIT 1 FOR UPDATE",
-            &[&normalized, &input.release_year],
+            "SELECT ct.id::text AS id FROM catalog_titles ct WHERE ct.normalized_title=$1 AND ct.content_type=$2 AND ct.catalog_status<>'deleted' AND $3::int IS NOT NULL AND ct.release_year=$3 AND NOT EXISTS (SELECT 1 FROM provider_titles pt JOIN provider_registry pr ON pr.id=pt.provider_id WHERE pt.title_id=ct.id AND pr.provider_key=ANY($4::text[])) ORDER BY ct.updated_at DESC LIMIT 1 FOR UPDATE",
+            &[&normalized, &input.content_type, &input.release_year, &provider_keys],
         ).await?;
         matched_id = row.map(|row| row.get("id"));
     }
 
     let title_id = if let Some(id) = matched_id {
-        let normalized = normalize(&input.canonical_title);
         let synopsis = nonempty_text(input.synopsis.as_deref());
         let poster_url = nonempty_text(input.poster_url.as_deref());
         let status = nonempty_text(input.catalog_status.as_deref());
@@ -1105,13 +1127,12 @@ async fn upsert_unified_anime_in_tx(
         ).await?;
         row.get::<_, String>(0)
     } else {
-        let normalized = normalize(&input.canonical_title);
         let synopsis = nonempty_text(input.synopsis.as_deref());
         let poster_url = nonempty_text(input.poster_url.as_deref());
         let status = nonempty_text(input.catalog_status.as_deref()).unwrap_or("active");
         let row = tx.query_one(
-            "INSERT INTO catalog_titles(canonical_title,normalized_title,content_type,synopsis,release_year,poster_url,catalog_status,metadata_source,metadata_updated_at) VALUES($1,$2,'anime',$3,$4,$5,$6,'unified_import',now()) RETURNING id::text",
-            &[&input.canonical_title, &normalized, &synopsis, &input.release_year, &poster_url, &status],
+            "INSERT INTO catalog_titles(canonical_title,normalized_title,content_type,synopsis,release_year,poster_url,catalog_status,metadata_source,metadata_updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,'unified_import',now()) RETURNING id::text",
+            &[&input.canonical_title, &normalized, &input.content_type, &synopsis, &input.release_year, &poster_url, &status],
         ).await?;
         row.get::<_, String>(0)
     };
@@ -1126,10 +1147,15 @@ async fn upsert_unified_anime_in_tx(
         } else {
             provider.metadata.clone()
         };
-        tx.execute(
-            "INSERT INTO provider_titles(title_id,provider_id,provider_title_id,provider_title,provider_url,metadata,match_status,last_checked_at) VALUES($1,$2,$3,$4,$5,$6,'unverified',CASE WHEN $7 THEN now() ELSE NULL END) ON CONFLICT(provider_id,provider_title_id) DO UPDATE SET title_id=EXCLUDED.title_id,provider_title=COALESCE(NULLIF(EXCLUDED.provider_title,''),provider_titles.provider_title),provider_url=COALESCE(NULLIF(EXCLUDED.provider_url,''),provider_titles.provider_url),metadata=CASE WHEN EXCLUDED.metadata='{}'::jsonb THEN provider_titles.metadata ELSE EXCLUDED.metadata END,last_checked_at=CASE WHEN $7 THEN now() ELSE provider_titles.last_checked_at END,updated_at=now()",
+        let updated = tx.execute(
+            "INSERT INTO provider_titles(title_id,provider_id,provider_title_id,provider_title,provider_url,metadata,match_status,last_checked_at) VALUES($1,$2,$3,$4,$5,$6,'unverified',CASE WHEN $7 THEN now() ELSE NULL END) ON CONFLICT(provider_id,provider_title_id) DO UPDATE SET provider_title=COALESCE(NULLIF(EXCLUDED.provider_title,''),provider_titles.provider_title),provider_url=COALESCE(NULLIF(EXCLUDED.provider_url,''),provider_titles.provider_url),metadata=CASE WHEN EXCLUDED.metadata='{}'::jsonb THEN provider_titles.metadata ELSE EXCLUDED.metadata END,last_checked_at=CASE WHEN $7 THEN now() ELSE provider_titles.last_checked_at END,updated_at=now() WHERE provider_titles.title_id=EXCLUDED.title_id",
             &[&title_uuid, &provider_id, &provider.provider_title_id, &provider_title, &provider_url, &metadata, &provider.last_successful_resolution],
         ).await?;
+        if updated == 0 {
+            return Err(CatalogError::Validation(
+                "provider title mapping already belongs to a different canonical title".into(),
+            ));
+        }
     }
 
     for season in &input.seasons {
@@ -1283,7 +1309,7 @@ fn empty_job(id: String, kind: String) -> CatalogJob {
     }
 }
 async fn upsert_title(c: &Client, i: &TitleUpsert) -> Result<(CatalogTitle, bool), CatalogError> {
-    let n = normalize(&i.canonical_title);
+    let n = normalize_catalog_title(&i.canonical_title, &i.content_type);
     let st = i.catalog_status.clone().unwrap_or_else(|| "active".into());
     let r=c.query_one("INSERT INTO catalog_titles(mal_id,canonical_title,normalized_title,content_type,synopsis,release_year,poster_url,catalog_status,metadata_source,metadata_updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,'import',now()) ON CONFLICT(mal_id) WHERE mal_id IS NOT NULL DO UPDATE SET canonical_title=EXCLUDED.canonical_title,normalized_title=EXCLUDED.normalized_title,content_type=EXCLUDED.content_type,synopsis=EXCLUDED.synopsis,release_year=EXCLUDED.release_year,poster_url=EXCLUDED.poster_url,catalog_status=EXCLUDED.catalog_status,metadata_updated_at=now(),updated_at=now() RETURNING id::text,mal_id,canonical_title,normalized_title,content_type,synopsis,release_year,poster_url,catalog_status,(xmax=0) AS inserted",&[&i.mal_id,&i.canonical_title,&n,&i.content_type,&i.synopsis,&i.release_year,&i.poster_url,&st]).await?;
     Ok((title_from_row(&r), r.get("inserted")))
@@ -1302,10 +1328,15 @@ async fn import_in_tx(c: &Client, i: &ImportTitle) -> Result<ImportSummary, Cata
         None
     };
     let existing_compatible_title = if existing_provider_title.is_none() && i.mal_id.is_none() {
-        let normalized = normalize(&i.canonical_title);
+        let normalized = normalize_catalog_title(&i.canonical_title, &i.content_type);
+        let provider_keys = i
+            .providers
+            .iter()
+            .map(|provider| provider.provider_key.clone())
+            .collect::<Vec<_>>();
         c.query_opt(
-            "SELECT id::text AS id FROM catalog_titles WHERE normalized_title=$1 AND content_type=$2 AND catalog_status <> 'deleted' AND ($3::int IS NULL OR release_year IS NULL OR release_year=$3) ORDER BY (release_year IS NULL), updated_at DESC LIMIT 1",
-            &[&normalized, &i.content_type, &i.release_year],
+            "SELECT ct.id::text AS id FROM catalog_titles ct WHERE ct.normalized_title=$1 AND ct.content_type=$2 AND ct.catalog_status <> 'deleted' AND (($2='anime' AND $3::int IS NOT NULL AND ct.release_year=$3) OR ($2<>'anime' AND ($3::int IS NULL OR ct.release_year IS NULL OR ct.release_year=$3))) AND NOT EXISTS (SELECT 1 FROM provider_titles pt JOIN provider_registry pr ON pr.id=pt.provider_id WHERE pt.title_id=ct.id AND pr.provider_key=ANY($4::text[])) ORDER BY (ct.release_year IS NULL), ct.updated_at DESC LIMIT 1",
+            &[&normalized, &i.content_type, &i.release_year, &provider_keys],
         )
         .await?
     } else {
@@ -1314,7 +1345,7 @@ async fn import_in_tx(c: &Client, i: &ImportTitle) -> Result<ImportSummary, Cata
     let existing_title = existing_provider_title.or(existing_compatible_title);
     let (t, ins) = if let Some(existing) = existing_title {
         let id: String = existing.get("id");
-        let normalized = normalize(&i.canonical_title);
+        let normalized = normalize_catalog_title(&i.canonical_title, &i.content_type);
         let status = i.catalog_status.clone().unwrap_or_else(|| "active".into());
         let updated = c.query_one(
             "UPDATE catalog_titles SET canonical_title=$2,normalized_title=$3,content_type=$4,synopsis=$5,release_year=$6,poster_url=$7,catalog_status=$8,metadata_source='import',metadata_updated_at=now(),updated_at=now() WHERE id=$1::text::uuid RETURNING id::text,mal_id,canonical_title,normalized_title,content_type,synopsis,release_year,poster_url,catalog_status",
@@ -1766,6 +1797,14 @@ fn source_is_playback_eligible(source: &Value) -> bool {
         .and_then(Value::as_str)
         .is_some_and(source_codec_is_known_non_hevc)
 }
+fn normalize_catalog_title(value: &str, content_type: &str) -> String {
+    if matches!(content_type, "anime" | "movie") {
+        crate::unified::normalize_anime_title(value).key
+    } else {
+        normalize(value)
+    }
+}
+
 fn normalize(v: &str) -> String {
     v.trim()
         .to_lowercase()
