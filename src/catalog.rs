@@ -668,22 +668,35 @@ impl CatalogStore {
         &self,
         mappings: &[(String, String)],
     ) -> Result<HashMap<String, Vec<String>>, CatalogError> {
+        if mappings.is_empty() {
+            return Ok(HashMap::new());
+        }
         let client = self.client.lock().await;
         let mut aliases = HashMap::new();
+        let mut provider_keys = Vec::new();
+        let mut provider_title_ids = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         for (provider_key, provider_title_id) in mappings {
-            let rows = client
-                .query(
-                    "SELECT DISTINCT ata.title FROM title_alternative_titles ata JOIN provider_titles pt ON pt.title_id=ata.title_id JOIN provider_registry pr ON pr.id=pt.provider_id WHERE pr.provider_key=$1 AND pt.provider_title_id=$2 AND pt.match_status='verified' ORDER BY ata.title",
-                    &[provider_key, provider_title_id],
-                )
-                .await?;
-            let values = rows
-                .iter()
-                .filter_map(|row| row.try_get::<_, String>("title").ok())
-                .filter(|title| !title.trim().is_empty())
-                .collect::<Vec<_>>();
-            if !values.is_empty() {
-                aliases.insert(format!("{provider_key}:{provider_title_id}"), values);
+            if seen.insert((provider_key.clone(), provider_title_id.clone())) {
+                provider_keys.push(provider_key.clone());
+                provider_title_ids.push(provider_title_id.clone());
+            }
+        }
+        let rows = client
+            .query(
+                "SELECT DISTINCT pr.provider_key, pt.provider_title_id, ata.title FROM title_alternative_titles ata JOIN provider_titles pt ON pt.title_id=ata.title_id JOIN provider_registry pr ON pr.id=pt.provider_id JOIN UNNEST($1::text[], $2::text[]) AS requested(provider_key, provider_title_id) ON requested.provider_key=pr.provider_key AND requested.provider_title_id=pt.provider_title_id WHERE pt.match_status='verified' ORDER BY pr.provider_key, pt.provider_title_id, ata.title",
+                &[&provider_keys, &provider_title_ids],
+            )
+            .await?;
+        for row in rows {
+            let provider_key: String = row.get("provider_key");
+            let provider_title_id: String = row.get("provider_title_id");
+            let title: String = row.get("title");
+            if !title.trim().is_empty() {
+                aliases
+                    .entry(format!("{provider_key}:{provider_title_id}"))
+                    .or_insert_with(Vec::new)
+                    .push(title);
             }
         }
         Ok(aliases)
