@@ -646,7 +646,10 @@ fn fallback_singleton_canonical_id(item: &CatalogItem) -> String {
     format!("local-{}", URL_SAFE_NO_PAD.encode(hasher.finalize()))
 }
 
-fn catalog(item: crate::unified::UnifiedCatalogItem, canonical_id: Option<String>) -> ApiCatalogItem {
+fn catalog(
+    item: crate::unified::UnifiedCatalogItem,
+    canonical_id: Option<String>,
+) -> ApiCatalogItem {
     let poster_url = item
         .primary
         .poster_url
@@ -654,15 +657,19 @@ fn catalog(item: crate::unified::UnifiedCatalogItem, canonical_id: Option<String
         .filter(|value| crate::net::validate_url_syntax(value, true).is_ok())
         .or_else(|| {
             item.provider_items.iter().find_map(|candidate| {
-                candidate.poster_url.clone().filter(|value| {
-                    crate::net::validate_url_syntax(value, true).is_ok()
-                })
+                candidate
+                    .poster_url
+                    .clone()
+                    .filter(|value| crate::net::validate_url_syntax(value, true).is_ok())
             })
         });
     let year = item.primary.year.clone().or_else(|| {
-        item.provider_items
-            .iter()
-            .find_map(|candidate| candidate.year.clone().filter(|value| !value.trim().is_empty()))
+        item.provider_items.iter().find_map(|candidate| {
+            candidate
+                .year
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+        })
     });
     let season_count = item.primary.season_count.or_else(|| {
         item.provider_items
@@ -3737,17 +3744,14 @@ async fn cached_search(state: &ApiState, query: &str) -> SearchResultSet {
         })
         .collect::<Vec<_>>();
     let verified_aliases = match state.catalog.as_ref() {
-        Some(store) => store.verified_provider_aliases(&mappings).await.unwrap_or_default(),
+        Some(store) => store
+            .verified_provider_aliases(&mappings)
+            .await
+            .unwrap_or_default(),
         None => HashMap::new(),
     };
-    let result = persist_search_results(
-        state,
-        items,
-        failed,
-        provider_status,
-        verified_aliases,
-    )
-    .await;
+    let result =
+        persist_search_results(state, items, failed, provider_status, verified_aliases).await;
     let mut cache = state.search_cache.lock().await;
     if cache.len() >= SEARCH_CACHE_MAX_ENTRIES {
         cache.retain(|_, entry| entry.stored_at.elapsed() < SEARCH_CACHE_TTL);
@@ -3779,7 +3783,9 @@ async fn cached_search(state: &ApiState, query: &str) -> SearchResultSet {
 
 fn filter_current_search_providers(mut result: SearchResultSet) -> SearchResultSet {
     let enabled = configured_search_providers();
-    result.items.retain(|item| enabled.contains(&item.id.provider));
+    result
+        .items
+        .retain(|item| enabled.contains(&item.id.provider));
     result
         .provider_status
         .retain(|provider, _| enabled.iter().any(|kind| kind.cache_key() == provider));
@@ -3802,14 +3808,15 @@ async fn search_sse(stream: &mut TcpStream, query: &str, state: ApiState) -> std
     let eligible = cached_search(&state, &qv).await;
     write_headers(stream, 200, "text/event-stream", None).await?;
     let canonical_ids = eligible.canonical_ids.clone();
-    for item in crate::unified::group_catalog_items_with_aliases(
-        eligible.items,
-        &eligible.verified_aliases,
-    ) {
+    for item in
+        crate::unified::group_catalog_items_with_aliases(eligible.items, &eligible.verified_aliases)
+    {
         let canonical_id = canonical_ids
             .get(&provider_mapping_key(&item.primary.id))
             .cloned();
-        let payload = serde_json::to_string(&serde_json::json!({"result":catalog(item, canonical_id)})).unwrap();
+        let payload =
+            serde_json::to_string(&serde_json::json!({"result":catalog(item, canonical_id)}))
+                .unwrap();
         send_event(stream, "search_result", &payload).await?;
     }
     for (provider, status) in eligible.provider_status {
@@ -3992,14 +3999,12 @@ async fn persist_search_group(
             }),
         })
         .collect();
-    let year = records
-        .iter()
-        .find_map(|item| {
-            item.year
-                .as_deref()
-                .and_then(|value| value.parse::<i32>().ok())
-                .or_else(|| crate::unified::normalize_anime_title(&item.title).year_marker)
-        });
+    let year = records.iter().find_map(|item| {
+        item.year
+            .as_deref()
+            .and_then(|value| value.parse::<i32>().ok())
+            .or_else(|| crate::unified::normalize_anime_title(&item.title).year_marker)
+    });
     let poster_url = records.iter().find_map(|item| {
         item.poster_url
             .as_deref()
@@ -4043,10 +4048,9 @@ async fn persist_search_results(
     });
     let mut canonical_ids = HashMap::new();
     if state.catalog.is_some() {
-        for group in crate::unified::group_catalog_items_with_aliases(
-            items.clone(),
-            &verified_aliases,
-        ) {
+        for group in
+            crate::unified::group_catalog_items_with_aliases(items.clone(), &verified_aliases)
+        {
             if let Some(id) = persist_search_group(state, &group).await {
                 canonical_ids.insert(provider_mapping_key(&group.primary.id), id);
             }
@@ -4318,12 +4322,18 @@ fn episode_special_marker(title: Option<&str>) -> bool {
         .map(crate::unified::normalize_anime_title)
         .is_some_and(|title| {
             title.key.split_whitespace().any(|token| {
-                matches!(token, "special" | "ova" | "ona" | "movie" | "film" | "recap")
+                matches!(
+                    token,
+                    "special" | "ova" | "ona" | "movie" | "film" | "recap"
+                )
             })
         })
 }
 
-fn episode_candidates_can_merge(left: &UnifiedEpisodeCandidate, right: &UnifiedEpisodeCandidate) -> bool {
+fn episode_candidates_can_merge(
+    left: &UnifiedEpisodeCandidate,
+    right: &UnifiedEpisodeCandidate,
+) -> bool {
     left.episode.season == right.episode.season
         && left.episode.number == right.episode.number
         && left.anime_id.provider != right.anime_id.provider
@@ -4341,13 +4351,14 @@ fn canonical_episode_response_id(
     canonical_anime_id: &str,
     candidate: &UnifiedEpisodeCandidate,
 ) -> String {
-    let identity = normalized_episode_title(candidate.episode.title.as_deref()).unwrap_or_else(|| {
-        format!(
-            "{}:{}",
-            candidate.anime_id.provider.cache_key(),
-            candidate.anime_id.value
-        )
-    });
+    let identity =
+        normalized_episode_title(candidate.episode.title.as_deref()).unwrap_or_else(|| {
+            format!(
+                "{}:{}",
+                candidate.anime_id.provider.cache_key(),
+                candidate.anime_id.value
+            )
+        });
     let mut hasher = Sha256::new();
     hasher.update(canonical_anime_id.as_bytes());
     hasher.update([0]);
@@ -4492,7 +4503,9 @@ async fn resolve_unified_provider_mappings(
     }];
     mappings.extend(reference.provider_mappings.iter().cloned());
 
-    if let (Some(store), Some(canonical_id)) = (state.catalog.as_ref(), reference.canonical_id.as_deref()) {
+    if let (Some(store), Some(canonical_id)) =
+        (state.catalog.as_ref(), reference.canonical_id.as_deref())
+    {
         match store.get_title_detail(canonical_id).await {
             Ok(Some(detail)) => {
                 for value in detail.provider_mappings {
@@ -4522,7 +4535,8 @@ async fn resolve_unified_provider_mappings(
     }
 
     let eligible = configured_search_providers();
-    mappings.retain(|mapping| eligible.contains(&mapping.provider) && !mapping.value.trim().is_empty());
+    mappings
+        .retain(|mapping| eligible.contains(&mapping.provider) && !mapping.value.trim().is_empty());
     let mut seen = std::collections::HashSet::new();
     mappings.retain(|mapping| seen.insert((mapping.provider, mapping.value.clone())));
     mappings.sort_by_key(|mapping| provider_priority(mapping.provider));
@@ -4532,7 +4546,10 @@ async fn resolve_unified_provider_mappings(
 async fn fetch_unified_provider_details(
     state: &ApiState,
     mappings: &[ProviderMediaId],
-) -> (Vec<(ProviderMediaId, MediaDetails)>, HashMap<String, String>) {
+) -> (
+    Vec<(ProviderMediaId, MediaDetails)>,
+    HashMap<String, String>,
+) {
     let mut tasks = JoinSet::new();
     let slots = Arc::new(Semaphore::new(SEARCH_PROVIDER_CONCURRENCY));
     for mapping in mappings.iter().cloned() {
@@ -4548,10 +4565,17 @@ async fn fetch_unified_provider_details(
             )
             .await;
             match result {
-                Ok(Ok(details)) if details.id.provider == mapping.provider => {
+                Ok(Ok(details))
+                    if details.id.provider == mapping.provider
+                        && details.id.value == mapping.value =>
+                {
                     (mapping, Some(details), None)
                 }
-                Ok(Ok(_)) => (mapping, None, Some("provider_identity_mismatch".to_string())),
+                Ok(Ok(_)) => (
+                    mapping,
+                    None,
+                    Some("provider_identity_mismatch".to_string()),
+                ),
                 Ok(Err(error)) => {
                     let provider = mapping.provider;
                     (mapping, None, Some(error.user_message(provider)))
@@ -4573,7 +4597,10 @@ async fn fetch_unified_provider_details(
                 status.insert(mapping.provider.cache_key().to_string(), error);
             }
             Ok((mapping, None, None)) => {
-                status.insert(mapping.provider.cache_key().to_string(), "unavailable".to_string());
+                status.insert(
+                    mapping.provider.cache_key().to_string(),
+                    "unavailable".to_string(),
+                );
             }
             Err(error) => {
                 log::warn!("unified details provider task failed: {error}");
@@ -4720,9 +4747,13 @@ fn unified_api_details(
             })
             .collect::<Vec<_>>();
         mappings.dedup_by_key(|mapping| mapping.provider);
-        let title = group
-            .iter()
-            .find_map(|candidate| candidate.episode.title.clone().filter(|value| !value.trim().is_empty()));
+        let title = group.iter().find_map(|candidate| {
+            candidate
+                .episode
+                .title
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+        });
         let overview = group.iter().find_map(|candidate| {
             candidate
                 .episode
@@ -4886,9 +4917,19 @@ async fn unified_anime_route(
             .map(String::as_str)
             .unwrap_or("No mapped provider returned details.");
         let (status, body) = if message == "timeout" {
-            err("PROVIDER_TIMEOUT", "Mapped provider details timed out.", Some(provider), 504)
+            err(
+                "PROVIDER_TIMEOUT",
+                "Mapped provider details timed out.",
+                Some(provider),
+                504,
+            )
         } else {
-            err("UPSTREAM_UNAVAILABLE", "No mapped provider returned details.", Some(provider), 502)
+            err(
+                "UPSTREAM_UNAVAILABLE",
+                "No mapped provider returned details.",
+                Some(provider),
+                502,
+            )
         };
         log::debug!("unified details unavailable: {message}");
         return write_raw_json(stream, status, &body, None).await;
@@ -4900,7 +4941,54 @@ async fn unified_anime_route(
         .map(|(_, details)| details.clone())
         .unwrap_or_else(|| details[0].1.clone());
     if parts.len() == 7 && parts[4] == "episodes" && parts[6] == "full" {
-        return anime_episode_full_route(stream, parts[3], parts[5], primary_ref, primary_details, state).await;
+        let episode_ref = match decode::<OpaqueRef>(parts[5]) {
+            Ok(reference) => reference,
+            Err(_) => {
+                let (status, body) = err(
+                    "INVALID_ID",
+                    "The episode identifier is invalid.",
+                    None,
+                    400,
+                );
+                return write_raw_json(stream, status, &body, None).await;
+            }
+        };
+        if !mappings
+            .iter()
+            .any(|mapping| mapping.provider == episode_ref.p && mapping.value == episode_ref.v)
+        {
+            let (status, body) = err(
+                "INVALID_ID",
+                "The episode provider mapping is not part of this anime.",
+                Some(primary_ref.p),
+                400,
+            );
+            return write_raw_json(stream, status, &body, None).await;
+        }
+        let episode_details = details
+            .iter()
+            .find(|(mapping, _)| {
+                mapping.provider == episode_ref.p && mapping.value == episode_ref.v
+            })
+            .map(|(_, details)| details.clone());
+        let Some(episode_details) = episode_details else {
+            let (status, body) = err(
+                "UPSTREAM_UNAVAILABLE",
+                "The mapped episode provider details are unavailable.",
+                Some(episode_ref.p),
+                502,
+            );
+            return write_raw_json(stream, status, &body, None).await;
+        };
+        return anime_episode_full_route(
+            stream,
+            parts[3],
+            parts[5],
+            primary_ref,
+            episode_details,
+            state,
+        )
+        .await;
     }
     if parts.len() == 7 && parts[4] == "episodes" && parts[6] == "stream" {
         let audio = query
@@ -4924,19 +5012,32 @@ async fn unified_anime_route(
             PlaybackIdentity::Episode {
                 anime_id: parts[3].to_string(),
                 episode_id: parts[5].to_string(),
-                anime_ref: primary_ref,
+                anime_ref: primary_ref.clone(),
             },
-            primary_details,
+            details
+                .iter()
+                .find(|(mapping, _)| {
+                    mapping.provider
+                        == decode::<OpaqueRef>(parts[5])
+                            .ok()
+                            .map(|reference| reference.p)
+                            .unwrap_or(primary_ref.p)
+                        && mapping.value
+                            == decode::<OpaqueRef>(parts[5])
+                                .ok()
+                                .map(|reference| reference.v)
+                                .unwrap_or_else(|| primary_ref.v.clone())
+                })
+                .map(|(_, details)| details.clone())
+                .unwrap_or_else(|| primary_details.clone()),
             state,
             &audio,
         )
         .await;
     }
 
-    let canonical_id = unified
-        .canonical_id
-        .clone()
-        .unwrap_or_else(|| fallback_canonical_id(&CatalogItem {
+    let canonical_id = unified.canonical_id.clone().unwrap_or_else(|| {
+        fallback_canonical_id(&CatalogItem {
             id: ProviderMediaId {
                 provider: details[0].0.provider,
                 value: details[0].0.value.clone(),
@@ -4946,14 +5047,17 @@ async fn unified_anime_route(
             year: details[0].1.year.clone(),
             poster_url: details[0].1.poster_url.clone(),
             season_count: Some(details[0].1.seasons.len()),
-        }));
+        })
+    });
     let mut response = unified_api_details(
         &details,
         &mappings,
         canonical_id.clone(),
         provider_status.clone(),
     );
-    if let Some(persisted_id) = persist_unified_details(&state, &details, &mappings, &response).await {
+    if let Some(persisted_id) =
+        persist_unified_details(&state, &details, &mappings, &response).await
+    {
         if persisted_id != canonical_id {
             response = unified_api_details(&details, &mappings, persisted_id, provider_status);
         }
@@ -4973,27 +5077,32 @@ async fn unified_anime_route(
                 .collect::<Vec<_>>();
             return write_json(stream, 200, &episodes, None).await;
         }
-        let selected = decode::<OpaqueRef>(parts[5]).ok().and_then(|episode_ref| {
-            if !mappings.iter().any(|mapping| {
-                mapping.provider == episode_ref.p && mapping.value == episode_ref.v
-            }) {
-                return None;
-            }
-            response
-                .seasons
-                .iter()
-                .flat_map(|season| season.episodes.iter())
-                .find(|episode| episode.season == episode_ref.s && episode.number == episode_ref.e)
-                .cloned()
-        }).or_else(|| {
-            let number = parts[5].parse::<usize>().ok()?;
-            response
-                .seasons
-                .iter()
-                .flat_map(|season| season.episodes.iter())
-                .find(|episode| episode.number == number)
-                .cloned()
-        });
+        let selected = decode::<OpaqueRef>(parts[5])
+            .ok()
+            .and_then(|episode_ref| {
+                if !mappings.iter().any(|mapping| {
+                    mapping.provider == episode_ref.p && mapping.value == episode_ref.v
+                }) {
+                    return None;
+                }
+                response
+                    .seasons
+                    .iter()
+                    .flat_map(|season| season.episodes.iter())
+                    .find(|episode| {
+                        episode.season == episode_ref.s && episode.number == episode_ref.e
+                    })
+                    .cloned()
+            })
+            .or_else(|| {
+                let number = parts[5].parse::<usize>().ok()?;
+                response
+                    .seasons
+                    .iter()
+                    .flat_map(|season| season.episodes.iter())
+                    .find(|episode| episode.number == number)
+                    .cloned()
+            });
         return match selected {
             Some(episode) => write_json(stream, 200, &episode, None).await,
             None => {
@@ -5151,9 +5260,7 @@ async fn playback_route(
                     return write_raw_json(stream, status, &body, None).await;
                 }
             };
-            if episode_ref.p != anime_ref.p
-                || episode_ref.v != anime_ref.v
-                || media_details.id.value != anime_ref.v
+            if episode_ref.p != media_details.id.provider || episode_ref.v != media_details.id.value
             {
                 let (status, body) = err(
                     "INVALID_ID",
@@ -5163,7 +5270,17 @@ async fn playback_route(
                 );
                 return write_raw_json(stream, status, &body, None).await;
             }
-            if media_details.id.provider != anime_ref.p || encode(anime_ref) != *anime_id {
+            let unified_anime_id_matches =
+                decode::<UnifiedOpaqueRef>(anime_id)
+                    .ok()
+                    .is_some_and(|reference| {
+                        reference.unified
+                            && reference.p == anime_ref.p
+                            && reference.v == anime_ref.v
+                    });
+            if (media_details.id.provider != anime_ref.p || encode(anime_ref) != *anime_id)
+                && !unified_anime_id_matches
+            {
                 let (status, body) = err(
                     "INVALID_ID",
                     "The anime identifier does not match the requested item.",
@@ -5454,18 +5571,24 @@ async fn anime_episode_full_route(
             return write_raw_json(stream, status, &body, None).await;
         }
     };
-    if episode_ref.p != anime_ref.p || episode_ref.v != anime_ref.v {
+    if details_result.id.provider != episode_ref.p || details_result.id.value != episode_ref.v {
         let (status, body) = err(
             "INVALID_ID",
-            "The episode does not belong to the requested anime.",
-            None,
+            "The episode provider mapping does not match the resolved details.",
+            Some(episode_ref.p),
             400,
         );
         return write_raw_json(stream, status, &body, None).await;
     }
 
     let anime = details(details_result);
-    if anime.id != anime_id {
+    let unified_anime_id_matches =
+        decode::<UnifiedOpaqueRef>(anime_id)
+            .ok()
+            .is_some_and(|reference| {
+                reference.unified && reference.p == anime_ref.p && reference.v == anime_ref.v
+            });
+    if anime.id != anime_id && !unified_anime_id_matches {
         let (status, body) = err(
             "INVALID_ID",
             "The anime identifier does not match the requested item.",
@@ -9964,10 +10087,13 @@ mod tests {
 
     #[tokio::test]
     async fn deterministic_provider_timeout_does_not_cancel_successful_provider() {
-        let timeout = tokio::time::timeout(Duration::from_millis(10), search_provider_pages(true, |_page| async {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            Ok::<Vec<CatalogItem>, ProviderError>(Vec::new())
-        }));
+        let timeout = tokio::time::timeout(
+            Duration::from_millis(10),
+            search_provider_pages(true, |_page| async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Ok::<Vec<CatalogItem>, ProviderError>(Vec::new())
+            }),
+        );
         let success = search_provider_pages(false, |_page| async {
             Ok::<Vec<CatalogItem>, ProviderError>(vec![mock_search_item(
                 ProviderKind::Dramachi,
@@ -10028,8 +10154,16 @@ mod tests {
         .unwrap();
         assert_eq!(requested_pages, vec![1, 2]);
         assert_eq!(result.len(), 2);
-        assert!(result.iter().any(|item| item.id.provider == ProviderKind::Dramachi));
-        assert!(result.iter().any(|item| item.id.provider == ProviderKind::FourKHdHub));
+        assert!(
+            result
+                .iter()
+                .any(|item| item.id.provider == ProviderKind::Dramachi)
+        );
+        assert!(
+            result
+                .iter()
+                .any(|item| item.id.provider == ProviderKind::FourKHdHub)
+        );
     }
 
     #[derive(Debug, Deserialize)]
