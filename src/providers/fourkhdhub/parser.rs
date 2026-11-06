@@ -45,6 +45,7 @@ static SEL_OG_IMAGE: LazyLock<Selector> =
     LazyLock::new(|| Selector::parse("meta[property=\"og:image\"]").unwrap());
 static SEL_OG_TITLE: LazyLock<Selector> =
     LazyLock::new(|| Selector::parse("meta[property=\"og:title\"]").unwrap());
+static SEL_DOCUMENT_TITLE: LazyLock<Selector> = LazyLock::new(|| Selector::parse("title").unwrap());
 static SEL_META_DESC: LazyLock<Selector> =
     LazyLock::new(|| Selector::parse("meta[name=\"description\"]").unwrap());
 
@@ -116,12 +117,24 @@ pub fn parse_details(id: &str, html: &str) -> Result<MediaDetails, FourKHdHubErr
         .select(&SEL_IMDB)
         .find_map(|node| text_of(Some(node)));
     let poster_url = meta_content(&document, &SEL_OG_IMAGE);
-    let year = find_metadata(&document, "Release:")
-        .and_then(|value| first_four_digit_year(&value))
+    // `Last Air` is an end date, not the series release year. Prefer the
+    // provider's document title, which carries the canonical year in pages
+    // such as `Hunter x Hunter (2011) - 4K-HDHub`, before falling back to the
+    // metadata block and finally the end date for older provider templates.
+    let document_title = document
+        .select(&SEL_DOCUMENT_TITLE)
+        .next()
+        .and_then(|node| text_of(Some(node)));
+    let year = document_title
+        .as_deref()
+        .and_then(first_four_digit_year)
+        .or_else(|| {
+            find_metadata(&document, "Release:").and_then(|value| first_four_digit_year(&value))
+        })
+        .or_else(|| first_four_digit_year(&raw_title))
         .or_else(|| {
             find_metadata(&document, "Last Air:").and_then(|value| first_four_digit_year(&value))
-        })
-        .or_else(|| first_four_digit_year(&raw_title));
+        });
     let genres = document
         .select(&SEL_BADGE_A)
         .filter_map(|node| text_of(Some(node)))
@@ -640,6 +653,16 @@ mod tests {
         .unwrap();
         assert_eq!(details.seasons.len(), 1);
         assert_eq!(details.seasons[0].episodes[0].number, 1);
+    }
+
+    #[test]
+    fn document_title_year_beats_last_air_date() {
+        let details = parse_details(
+            "/hunter-x-hunter-series-666/",
+            "<html><head><title>Hunter x Hunter (2011) - 4K-HDHub</title></head><body><h1>Hunter x Hunter</h1><div class='metadata-item'><span class='metadata-label'>Last Air:</span><span class='metadata-value'>2014-09-23</span></div><div id='episodes'><div class='episode-download-item'><div class='episode-file-title'>Hunter.x.Hunter.S01E01</div></div></div></body></html>",
+        )
+        .unwrap();
+        assert_eq!(details.year.as_deref(), Some("2011"));
     }
 
     #[test]
