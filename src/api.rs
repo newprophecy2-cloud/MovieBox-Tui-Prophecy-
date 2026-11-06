@@ -40,8 +40,14 @@ use crate::{
 const MAX_QUERY: usize = 200;
 const DEFAULT_LIMIT: usize = 20;
 const MAX_LIMIT: usize = 100;
+#[cfg(not(test))]
 const SOURCE_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(test)]
+const SOURCE_TIMEOUT: Duration = Duration::from_millis(25);
+#[cfg(not(test))]
 const OVERALL_TIMEOUT: Duration = Duration::from_secs(45);
+#[cfg(test)]
+const OVERALL_TIMEOUT: Duration = Duration::from_millis(25);
 const BROWSE_TIMEOUT: Duration = Duration::from_secs(6);
 const CLASSIFICATION_TIMEOUT: Duration = Duration::from_secs(1);
 const PLAYBACK_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(20);
@@ -122,7 +128,16 @@ pub struct ApiState {
     remux_cache: crate::remux_cache::RemuxCache,
     native_stream: crate::api_native_stream::NativeStreamProxy,
     connection_slots: Arc<Semaphore>,
+    #[cfg(test)]
+    test_release_overrides: TestReleaseOverrides,
+    #[cfg(test)]
+    test_release_delays: Arc<Mutex<HashMap<String, Duration>>>,
+    #[cfg(test)]
+    test_fallback_refs: Arc<Mutex<HashMap<String, Vec<OpaqueRef>>>>,
 }
+
+#[cfg(test)]
+type TestReleaseOverrides = Arc<Mutex<HashMap<String, Result<Vec<Release>, ProviderError>>>>;
 
 #[derive(Clone)]
 struct ReleaseCacheEntry {
@@ -935,6 +950,12 @@ pub async fn run() -> std::io::Result<()> {
         remux_cache,
         native_stream,
         connection_slots: Arc::new(Semaphore::new(MAX_API_CONNECTIONS)),
+        #[cfg(test)]
+        test_release_overrides: Arc::new(Mutex::new(HashMap::new())),
+        #[cfg(test)]
+        test_release_delays: Arc::new(Mutex::new(HashMap::new())),
+        #[cfg(test)]
+        test_fallback_refs: Arc::new(Mutex::new(HashMap::new())),
     };
     start_codec_verification_workers(state.clone());
     start_anime_import_workers(state.clone());
@@ -5779,6 +5800,15 @@ fn aggregate_episode_sources(
 
 async fn cached_releases(state: &ApiState, r: &OpaqueRef) -> Result<Vec<Release>, ProviderError> {
     let key = release_cache_key(r);
+    #[cfg(test)]
+    {
+        if let Some(delay) = state.test_release_delays.lock().await.get(&key).copied() {
+            tokio::time::sleep(delay).await;
+        }
+        if let Some(result) = state.test_release_overrides.lock().await.get(&key).cloned() {
+            return result;
+        }
+    }
     if let Some(entry) = state.release_cache.lock().await.get(&key).cloned()
         && entry.stored_at.elapsed() < RELEASE_CACHE_TTL
     {
@@ -6531,6 +6561,21 @@ async fn resolve_valid_direct_source(
 }
 
 async fn verified_fallback_episode_refs(state: &ApiState, source: &OpaqueSource) -> Vec<OpaqueRef> {
+    #[cfg(test)]
+    if let Some(refs) = state
+        .test_fallback_refs
+        .lock()
+        .await
+        .get(&release_cache_key(&OpaqueRef {
+            p: source.p,
+            v: source.v.clone(),
+            s: source.s,
+            e: source.e,
+        }))
+        .cloned()
+    {
+        return refs;
+    }
     let Some(catalog) = state.catalog.as_ref() else {
         return Vec::new();
     };
@@ -9046,6 +9091,576 @@ mod tests {
             }],
             resource_id: None,
         }
+    }
+
+    async fn test_state() -> (ApiState, tempfile::TempDir) {
+        let root = tempfile::tempdir().unwrap();
+        let remux_cache = crate::remux_cache::RemuxCache::open(crate::config::MediaSettings {
+            cache_dir: root.path().join("remux"),
+            cache_ttl: Duration::from_secs(60),
+            cache_max_bytes: 1_048_576,
+            max_concurrent_jobs: 1,
+            job_timeout: Duration::from_secs(60),
+        })
+        .await
+        .unwrap();
+        let native_stream = crate::api_native_stream::NativeStreamProxy::new(1_048_576).unwrap();
+        (
+            ApiState {
+                service: Arc::new(MovieBoxService::new()),
+                catalog: None,
+                release_cache: Arc::new(Mutex::new(HashMap::new())),
+                release_inflight: Arc::new(Mutex::new(HashMap::new())),
+                playback_cache: Arc::new(Mutex::new(HashMap::new())),
+                playback_inflight: Arc::new(Mutex::new(HashMap::new())),
+                search_cache: Arc::new(Mutex::new(HashMap::new())),
+                redis_search: None,
+                remux_cache,
+                native_stream,
+                connection_slots: Arc::new(Semaphore::new(MAX_API_CONNECTIONS)),
+                test_release_overrides: Arc::new(Mutex::new(HashMap::new())),
+                test_release_delays: Arc::new(Mutex::new(HashMap::new())),
+                test_fallback_refs: Arc::new(Mutex::new(HashMap::new())),
+            },
+            root,
+        )
+    }
+
+    async fn cache_releases(state: &ApiState, reference: &OpaqueRef, releases: Vec<Release>) {
+        state.release_cache.lock().await.insert(
+            release_cache_key(reference),
+            ReleaseCacheEntry {
+                stored_at: Instant::now(),
+                releases,
+            },
+        );
+    }
+
+    async fn override_releases(
+        state: &ApiState,
+        reference: &OpaqueRef,
+        result: Result<Vec<Release>, ProviderError>,
+    ) {
+        state
+            .test_release_overrides
+            .lock()
+            .await
+            .insert(release_cache_key(reference), result);
+    }
+
+    async fn set_fallback_refs(state: &ApiState, source: &OpaqueSource, refs: Vec<OpaqueRef>) {
+        state.test_fallback_refs.lock().await.insert(
+            release_cache_key(&OpaqueRef {
+                p: source.p,
+                v: source.v.clone(),
+                s: source.s,
+                e: source.e,
+            }),
+            refs,
+        );
+    }
+
+    fn test_anime_details(reference: &OpaqueRef) -> (MediaDetails, String, String) {
+        let id = ProviderMediaId {
+            provider: reference.p,
+            value: reference.v.clone(),
+        };
+        let episode = crate::providers::models::Episode {
+            season: reference.s,
+            number: reference.e,
+            title: Some("Test episode".into()),
+            overview: Some("Test overview".into()),
+        };
+        let details_result = MediaDetails {
+            id: id.clone(),
+            title: "Test anime".into(),
+            media_type: MediaType::Series,
+            year: Some("2026".into()),
+            description: Some("Test description".into()),
+            tagline: None,
+            imdb_rating: None,
+            director: None,
+            stars: None,
+            prints: None,
+            audios: None,
+            poster_url: Some("https://cdn.example/poster.jpg".into()),
+            duration: None,
+            genres: vec!["Anime".into()],
+            seasons: vec![Season {
+                number: reference.s,
+                episodes: vec![episode.clone()],
+            }],
+            dubs: vec![],
+        };
+        (
+            details_result.clone(),
+            details(details_result).id,
+            episode_ref(&id, &episode),
+        )
+    }
+
+    async fn read_http_json(stream: &mut TcpStream) -> (u16, serde_json::Value) {
+        let mut response = Vec::new();
+        let (_header_end, body) = loop {
+            let mut chunk = [0u8; 4096];
+            let count = stream.read(&mut chunk).await.unwrap();
+            assert!(count > 0, "route closed before returning an HTTP response");
+            response.extend_from_slice(&chunk[..count]);
+            let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let body_start = header_end + 4;
+            if let Ok(body) = serde_json::from_slice(&response[body_start..]) {
+                break (body_start, body);
+            }
+        };
+        let status = String::from_utf8_lossy(&response)
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse::<u16>()
+            .unwrap();
+        (status, body)
+    }
+
+    async fn invoke_full_route(
+        state: ApiState,
+        anime_id: &str,
+        episode_id: &str,
+        anime_ref: OpaqueRef,
+        details_result: MediaDetails,
+        alternate_refs: Vec<OpaqueRef>,
+    ) -> (u16, serde_json::Value) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(address).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        anime_episode_full_route(
+            &mut server,
+            anime_id,
+            episode_id,
+            anime_ref,
+            details_result,
+            alternate_refs,
+            state,
+        )
+        .await
+        .unwrap();
+        read_http_json(&mut client).await
+    }
+
+    async fn invoke_direct_route(state: ApiState, source_id: &str) -> (u16, serde_json::Value) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(address).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        let body = serde_json::to_vec(&serde_json::json!({"source_id": source_id})).unwrap();
+        direct_play_route(&mut server, state, &body).await.unwrap();
+        read_http_json(&mut client).await
+    }
+
+    #[tokio::test]
+    async fn anime_episode_full_route_http_aggregates_sources_and_preserves_contract() {
+        let primary = OpaqueRef {
+            p: ProviderKind::FourKHdHub,
+            v: "primary-title".into(),
+            s: 1,
+            e: 2,
+        };
+        let alternate = OpaqueRef {
+            p: ProviderKind::Dramachi,
+            v: "alternate-title".into(),
+            s: 1,
+            e: 2,
+        };
+        let (state, _root) = test_state().await;
+        cache_releases(
+            &state,
+            &primary,
+            vec![verified_release(
+                primary.p,
+                "primary.mkv",
+                "https://cdn.example/primary.mkv",
+            )],
+        )
+        .await;
+        cache_releases(
+            &state,
+            &alternate,
+            vec![verified_release(
+                alternate.p,
+                "alternate.mkv",
+                "https://cdn.example/alternate.mkv",
+            )],
+        )
+        .await;
+        let (details_result, anime_id, episode_id) = test_anime_details(&primary);
+        let (status, body) = invoke_full_route(
+            state,
+            &anime_id,
+            &episode_id,
+            primary.clone(),
+            details_result,
+            vec![alternate],
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["anime"]["title"], "Test anime");
+        assert_eq!(body["selected_episode"]["number"], 2);
+        assert_eq!(body["sources_status"], "ok");
+        assert_eq!(body["sources_partial"], false);
+        assert_eq!(body["sources"].as_array().unwrap().len(), 2);
+        let providers = body["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|source| {
+                decode::<OpaqueSource>(source["id"].as_str().unwrap())
+                    .unwrap()
+                    .p
+            })
+            .collect::<Vec<_>>();
+        assert!(providers.contains(&ProviderKind::FourKHdHub));
+        assert!(providers.contains(&ProviderKind::Dramachi));
+    }
+
+    #[tokio::test]
+    async fn anime_episode_full_route_http_reports_partial_failure_and_timeout() {
+        let primary = OpaqueRef {
+            p: ProviderKind::FourKHdHub,
+            v: "primary-title".into(),
+            s: 1,
+            e: 2,
+        };
+        let failed = OpaqueRef {
+            p: ProviderKind::Dramachi,
+            v: "failed-title".into(),
+            s: 1,
+            e: 2,
+        };
+        let timed_out = OpaqueRef {
+            p: ProviderKind::Addons,
+            v: "timeout-title".into(),
+            s: 1,
+            e: 2,
+        };
+        let (state, _root) = test_state().await;
+        cache_releases(
+            &state,
+            &primary,
+            vec![verified_release(
+                primary.p,
+                "primary.mkv",
+                "https://cdn.example/primary.mkv",
+            )],
+        )
+        .await;
+        override_releases(
+            &state,
+            &failed,
+            Err(ProviderError::Network("provider down".into())),
+        )
+        .await;
+        state.test_release_delays.lock().await.insert(
+            release_cache_key(&timed_out),
+            SOURCE_TIMEOUT + Duration::from_millis(30),
+        );
+        let (details_result, anime_id, episode_id) = test_anime_details(&primary);
+        let (status, body) = invoke_full_route(
+            state,
+            &anime_id,
+            &episode_id,
+            primary,
+            details_result,
+            vec![failed, timed_out],
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["sources_status"], "partial");
+        assert_eq!(body["sources_partial"], true);
+        assert_eq!(
+            body["source_error"]["error"]["code"],
+            "UPSTREAM_UNAVAILABLE"
+        );
+    }
+
+    #[tokio::test]
+    async fn anime_episode_full_route_http_rejects_wrong_anime_episode_and_provider_ids() {
+        let primary = OpaqueRef {
+            p: ProviderKind::FourKHdHub,
+            v: "primary-title".into(),
+            s: 1,
+            e: 2,
+        };
+        let (details_result, anime_id, episode_id) = test_anime_details(&primary);
+        let (state, _root) = test_state().await;
+        let (status, body) = invoke_full_route(
+            state,
+            &encode(&OpaqueRef {
+                p: ProviderKind::FourKHdHub,
+                v: "wrong-anime".into(),
+                s: 0,
+                e: 0,
+            }),
+            &episode_id,
+            primary.clone(),
+            details_result.clone(),
+            vec![],
+        )
+        .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["error"]["code"], "INVALID_ID");
+
+        let (state, _root) = test_state().await;
+        let wrong_provider_episode = encode(&OpaqueRef {
+            p: ProviderKind::Dramachi,
+            v: primary.v.clone(),
+            s: 1,
+            e: 2,
+        });
+        let (status, body) = invoke_full_route(
+            state,
+            &anime_id,
+            &wrong_provider_episode,
+            primary.clone(),
+            details_result.clone(),
+            vec![],
+        )
+        .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["error"]["code"], "INVALID_ID");
+
+        let (state, _root) = test_state().await;
+        let wrong_episode = encode(&OpaqueRef {
+            p: primary.p,
+            v: primary.v.clone(),
+            s: 1,
+            e: 3,
+        });
+        let (status, body) = invoke_full_route(
+            state,
+            &anime_id,
+            &wrong_episode,
+            primary.clone(),
+            details_result,
+            vec![],
+        )
+        .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["error"]["code"], "EPISODE_NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn direct_play_route_http_falls_back_after_original_fetch_failure_and_timeout() {
+        for timeout in [false, true] {
+            let primary = OpaqueRef {
+                p: ProviderKind::FourKHdHub,
+                v: "primary-title".into(),
+                s: 1,
+                e: 2,
+            };
+            let alternate = OpaqueRef {
+                p: ProviderKind::Dramachi,
+                v: "alternate-title".into(),
+                s: 1,
+                e: 2,
+            };
+            let original = verified_release(
+                primary.p,
+                "original.mkv",
+                "https://cdn.example/original.mkv",
+            );
+            let fallback = verified_release(
+                alternate.p,
+                "fallback.mkv",
+                "https://cdn.example/fallback.mkv",
+            );
+            let source_id = source_ref(&original, &primary, 0);
+            let fallback_source_id = api_sources(std::slice::from_ref(&fallback), &alternate)[0]
+                .id
+                .clone();
+            let (state, _root) = test_state().await;
+            if timeout {
+                state.test_release_delays.lock().await.insert(
+                    release_cache_key(&primary),
+                    SOURCE_TIMEOUT + Duration::from_millis(30),
+                );
+            } else {
+                override_releases(
+                    &state,
+                    &primary,
+                    Err(ProviderError::Unavailable("original failed".into())),
+                )
+                .await;
+            }
+            cache_releases(&state, &alternate, vec![fallback]).await;
+            let source = decode::<OpaqueSource>(&source_id).unwrap();
+            set_fallback_refs(&state, &source, vec![alternate]).await;
+            let (status, body) = invoke_direct_route(state, &source_id).await;
+            assert_eq!(status, 200);
+            assert_eq!(body["data"]["source_id"], fallback_source_id);
+            assert_eq!(body["data"]["provider"], "dramachi");
+            assert_eq!(
+                body["data"]["message"],
+                "Fallback provider playback URL resolved."
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_play_route_http_skips_failed_alternates_and_returns_later_source() {
+        let primary = OpaqueRef {
+            p: ProviderKind::FourKHdHub,
+            v: "primary-title".into(),
+            s: 1,
+            e: 2,
+        };
+        let first = OpaqueRef {
+            p: ProviderKind::Dramachi,
+            v: "first-title".into(),
+            s: 1,
+            e: 2,
+        };
+        let second = OpaqueRef {
+            p: ProviderKind::Addons,
+            v: "second-title".into(),
+            s: 1,
+            e: 2,
+        };
+        let later = OpaqueRef {
+            p: ProviderKind::BdixCircleFtp,
+            v: "later-title".into(),
+            s: 1,
+            e: 2,
+        };
+        let original = verified_release(
+            primary.p,
+            "original.mkv",
+            "https://cdn.example/original.mkv",
+        );
+        let success = verified_release(later.p, "later.mkv", "https://cdn.example/later.mkv");
+        let source_id = source_ref(&original, &primary, 0);
+        let expected_id = api_sources(std::slice::from_ref(&success), &later)[0]
+            .id
+            .clone();
+        let (state, _root) = test_state().await;
+        override_releases(
+            &state,
+            &primary,
+            Err(ProviderError::Unavailable("original failed".into())),
+        )
+        .await;
+        override_releases(
+            &state,
+            &first,
+            Err(ProviderError::Network("first failed".into())),
+        )
+        .await;
+        override_releases(
+            &state,
+            &second,
+            Err(ProviderError::Unavailable("second failed".into())),
+        )
+        .await;
+        cache_releases(&state, &later, vec![success]).await;
+        let source = decode::<OpaqueSource>(&source_id).unwrap();
+        set_fallback_refs(&state, &source, vec![first, second, later]).await;
+        let (status, body) = invoke_direct_route(state, &source_id).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"]["source_id"], expected_id);
+        assert_eq!(body["data"]["provider"], "bdix_circleftp");
+    }
+
+    #[tokio::test]
+    async fn direct_play_route_http_rejects_identity_unsafe_incompatible_and_all_failed_sources() {
+        let primary = OpaqueRef {
+            p: ProviderKind::FourKHdHub,
+            v: "primary-title".into(),
+            s: 1,
+            e: 2,
+        };
+        let original = verified_release(
+            primary.p,
+            "original.mkv",
+            "https://cdn.example/original.mkv",
+        );
+        let source_id = source_ref(&original, &primary, 0);
+
+        let (state, _root) = test_state().await;
+        override_releases(
+            &state,
+            &primary,
+            Ok(vec![Release {
+                episode: Some(3),
+                ..original.clone()
+            }]),
+        )
+        .await;
+        let (status, body) = invoke_direct_route(state, &source_id).await;
+        assert_eq!(status, 404);
+        assert_eq!(body["error"]["code"], "SOURCE_NOT_FOUND");
+
+        for candidate in [
+            verified_release(
+                ProviderKind::Dramachi,
+                "unsafe.mkv",
+                "http://127.0.0.1/unsafe.mkv",
+            ),
+            Release {
+                codec: Some("HEVC".into()),
+                ..verified_release(
+                    ProviderKind::Dramachi,
+                    "incompatible.mkv",
+                    "https://cdn.example/incompatible.mkv",
+                )
+            },
+        ] {
+            let alternate = OpaqueRef {
+                p: candidate.provider,
+                v: candidate.filename.clone(),
+                s: 1,
+                e: 2,
+            };
+            let (state, _root) = test_state().await;
+            override_releases(
+                &state,
+                &primary,
+                Err(ProviderError::Unavailable("original failed".into())),
+            )
+            .await;
+            cache_releases(&state, &alternate, vec![candidate]).await;
+            let source = decode::<OpaqueSource>(&source_id).unwrap();
+            set_fallback_refs(&state, &source, vec![alternate]).await;
+            let (status, body) = invoke_direct_route(state, &source_id).await;
+            assert_eq!(status, 503);
+            assert_eq!(body["error"]["code"], "UPSTREAM_UNAVAILABLE");
+        }
+
+        let (state, _root) = test_state().await;
+        override_releases(
+            &state,
+            &primary,
+            Err(ProviderError::Unavailable("original failed".into())),
+        )
+        .await;
+        let source = decode::<OpaqueSource>(&source_id).unwrap();
+        let failed_alternate = OpaqueRef {
+            p: ProviderKind::Dramachi,
+            v: "failed-title".into(),
+            s: 1,
+            e: 2,
+        };
+        override_releases(
+            &state,
+            &failed_alternate,
+            Err(ProviderError::Network("alternate failed".into())),
+        )
+        .await;
+        set_fallback_refs(&state, &source, vec![failed_alternate]).await;
+        let (status, body) = invoke_direct_route(state, &source_id).await;
+        assert_eq!(status, 503);
+        assert_eq!(body["error"]["code"], "UPSTREAM_UNAVAILABLE");
     }
 
     #[test]
