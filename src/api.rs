@@ -282,16 +282,18 @@ fn release_has_usable_source(release: &Release) -> bool {
 }
 
 fn release_has_verification_candidate(release: &Release) -> bool {
-    release.provider == ProviderKind::FourKHdHub
-        && release.mirrors.iter().any(|mirror| {
-            !mirror.resolver_url.trim().is_empty()
-                && crate::net::validate_url_syntax(&mirror.resolver_url, false).is_ok()
-        })
+    matches!(
+        release.provider,
+        ProviderKind::FourKHdHub | ProviderKind::Dramachi
+    ) && release.mirrors.iter().any(|mirror| {
+        !mirror.resolver_url.trim().is_empty()
+            && crate::net::validate_url_syntax(&mirror.resolver_url, false).is_ok()
+            && (release.provider == ProviderKind::FourKHdHub || mirror.direct_file)
+    })
 }
 
 fn release_requires_codec_probe(release: &Release) -> bool {
-    release.provider == ProviderKind::FourKHdHub
-        && source_codec_eligibility(release.codec.as_deref()) == SourceCodecEligibility::Unverified
+    source_codec_eligibility(release.codec.as_deref()) == SourceCodecEligibility::Unverified
         && release_has_verification_candidate(release)
 }
 
@@ -304,6 +306,7 @@ fn codec_ineligibility_error(releases: &[Release]) -> Option<(&'static str, &'st
         || releases.iter().any(|release| {
             source_codec_eligibility(release.codec.as_deref()) == SourceCodecEligibility::Verified
                 || (release.provider == ProviderKind::AniZone && release_has_usable_source(release))
+                || release_requires_codec_probe(release)
         })
     {
         return None;
@@ -6621,10 +6624,14 @@ async fn resolve_valid_direct_source(
         .await
         .map_err(|_| "resolved URL rejected".to_string())?;
     let mut verified_release = release.clone();
-    if release.provider == ProviderKind::FourKHdHub {
+    if matches!(
+        release.provider,
+        ProviderKind::FourKHdHub | ProviderKind::Dramachi
+    ) && source_codec_eligibility(release.codec.as_deref()) == SourceCodecEligibility::Unverified
+    {
         match crate::codec_verification::verify_playback_source(&playback)
             .await
-            .map_err(|_| "FourKHDHub media codec could not be verified".to_string())?
+            .map_err(|_| "Provider media codec could not be verified".to_string())?
         {
             crate::codec_verification::CodecProbeResult::Allowed(codec) => {
                 verified_release.codec = Some(codec);
@@ -10751,6 +10758,47 @@ mod tests {
         release.codec = Some("H.264/AVC".into());
         assert!(release_has_usable_source(&release));
         assert!(releases_have_usable_source(&[release]));
+    }
+
+    #[test]
+    fn dramachi_direct_mp4_without_codec_is_exposed_as_a_probe_candidate() {
+        let episode = OpaqueRef {
+            p: ProviderKind::Dramachi,
+            v: "42999".into(),
+            s: 1,
+            e: 13,
+        };
+        let release = Release {
+            provider: ProviderKind::Dramachi,
+            filename: "Haibane_Renmei_S01E13_KimoiTV.com.mp4".into(),
+            quality: Some("360p".into()),
+            codec: None,
+            language: Some("Japanese".into()),
+            size_bytes: Some(64_660_000),
+            season: Some(1),
+            episode: Some(13),
+            mirrors: vec![crate::providers::models::SourceMirror {
+                label: "Dramachi direct file".into(),
+                resolver_url: "https://media.example/cdn/episode.mp4".into(),
+                headers: vec![],
+                direct_file: true,
+            }],
+            resource_id: Some("145126".into()),
+        };
+
+        assert!(!release_has_usable_source(&release));
+        assert!(release_requires_codec_probe(&release));
+        assert_eq!(
+            codec_ineligibility_error(std::slice::from_ref(&release)),
+            None
+        );
+        let sources = api_sources(std::slice::from_ref(&release), &episode);
+        assert_eq!(sources.len(), 1);
+        assert_eq!(
+            decode::<OpaqueSource>(&sources[0].id).unwrap().p,
+            ProviderKind::Dramachi
+        );
+        assert_eq!(sources[0].codec, None);
     }
 
     #[test]

@@ -99,7 +99,10 @@ pub(crate) struct DirectPlaybackEvidence {
 pub async fn verify_playback_source(
     source: &PlaybackSource,
 ) -> Result<CodecProbeResult, CodecProbeError> {
-    if source.provider != ProviderKind::FourKHdHub {
+    if !matches!(
+        source.provider,
+        ProviderKind::FourKHdHub | ProviderKind::Dramachi
+    ) {
         return Err(CodecProbeError::UnsupportedProvider);
     }
 
