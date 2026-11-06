@@ -7,6 +7,9 @@ use reqwest::Url;
 const DEFAULT_BASE_URL: &str = "https://4khdhub.one/";
 const BROWSER_UA: &str = crate::net::DEFAULT_BROWSER_USER_AGENT;
 const MIRROR_RESOLUTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
+const MAX_PREFLIGHT_CANDIDATES: usize = 16;
+const PREFLIGHT_RANGE_BYTES: u64 = 8192;
+const PREFLIGHT_TEXT_BODY_LIMIT: usize = 64 * 1024;
 
 #[derive(thiserror::Error, Debug)]
 pub enum FourKHdHubError {
@@ -157,6 +160,7 @@ impl FourKHdHubClient {
             let mirror_headers = mirror.headers.clone();
             let mirror_host = safe_host(&mirror_url);
             resolve_tasks.push(async move {
+                let stage_started = std::time::Instant::now();
                 let fetch = async {
                     if mirror_url.contains("hubcloud.") {
                         hubcloud::resolve(&client, &mirror_url, intent).await
@@ -177,11 +181,19 @@ impl FourKHdHubClient {
                         FourKHdHubError::NoPlayableMirror("mirror resolver timed out".into())
                     })
                     .and_then(|res| res);
-                if let Err(error) = &result {
-                    let (class, status) = safe_error_class(error);
-                    log::warn!(
-                        "4KHDHub resolver stage failed: host={mirror_host} class={class} status={status:?}"
-                    );
+                match &result {
+                    Ok(candidates) => log::info!(
+                        "4khdhub_candidate stage=resolver host={mirror_host} elapsed_ms={} outcome=ok candidate_count={}",
+                        stage_started.elapsed().as_millis(),
+                        candidates.len()
+                    ),
+                    Err(error) => {
+                        let (class, status) = safe_error_class(error);
+                        log::warn!(
+                            "4khdhub_candidate stage=resolver host={mirror_host} elapsed_ms={} outcome=failed category={class} http_status={status:?}",
+                            stage_started.elapsed().as_millis()
+                        );
+                    }
                 }
                 result
             });
@@ -198,7 +210,14 @@ impl FourKHdHubClient {
                     if let Ok(mut cand_list) = resolve_res {
                         cand_list.sort_by_key(|(url, label, _)| hubcloud::score(url, label, intent));
                         for (url, label, headers) in cand_list {
-                            if spawned_preflights >= 6 || !seen.insert(url.clone()) {
+                            if spawned_preflights >= MAX_PREFLIGHT_CANDIDATES {
+                                log::info!(
+                                    "4khdhub_candidate stage=preflight host={} outcome=skipped category=candidate-budget",
+                                    safe_host(&url)
+                                );
+                                continue;
+                            }
+                            if !seen.insert(url.clone()) {
                                 continue;
                             }
                             spawned_preflights += 1;
@@ -219,12 +238,20 @@ impl FourKHdHubClient {
                                 merged.push(("User-Agent".to_string(), BROWSER_UA.to_string()));
                             }
                             preflight_tasks.push(async move {
+                                let stage_started = std::time::Instant::now();
                                 let result = this.preflight_with_seekable(&url, &merged).await;
-                                if let Err(error) = &result {
-                                    let (class, status) = safe_error_class(error);
-                                    log::warn!(
-                                        "4KHDHub preflight stage failed: host={candidate_host} class={class} status={status:?}"
-                                    );
+                                match &result {
+                                    Ok((_, seekable)) => log::info!(
+                                        "4khdhub_candidate stage=preflight host={candidate_host} elapsed_ms={} outcome=ok range_supported={seekable}",
+                                        stage_started.elapsed().as_millis()
+                                    ),
+                                    Err(error) => {
+                                        let (class, status) = safe_error_class(error);
+                                        log::warn!(
+                                            "4khdhub_candidate stage=preflight host={candidate_host} elapsed_ms={} outcome=failed category={class} http_status={status:?}",
+                                            stage_started.elapsed().as_millis()
+                                        );
+                                    }
                                 }
                                 let (playable_url, is_seekable) = result?;
                                 let resolved_score =
@@ -312,15 +339,15 @@ impl FourKHdHubClient {
     ) -> Result<(String, bool), FourKHdHubError> {
         let probe = async {
             let validated_url = self.validate_public_playback_url(url).await?;
-            let mut request = self
-                .client
-                .get(&validated_url)
-                .header(reqwest::header::RANGE, "bytes=0-8191");
+            let mut request = self.client.get(&validated_url).header(
+                reqwest::header::RANGE,
+                format!("bytes=0-{}", PREFLIGHT_RANGE_BYTES - 1),
+            );
             for (name, value) in headers {
                 request = request.header(name, value);
             }
             let response = request.send().await?.error_for_status()?;
-            let mut is_seekable = response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+            let mut is_seekable = validated_preflight_range(&response)?;
             let mut final_url = response.url().clone();
             self.validate_public_playback_url(final_url.as_str())
                 .await?;
@@ -334,7 +361,7 @@ impl FourKHdHubClient {
                 || content_type.contains("application/zip")
                 || content_type.contains("text/plain")
             {
-                let body_bytes = response.bytes().await.unwrap_or_default();
+                let body_bytes = read_bounded_body(response, PREFLIGHT_TEXT_BODY_LIMIT).await?;
                 let body_lower = String::from_utf8_lossy(&body_bytes).to_ascii_lowercase();
                 if body_lower.contains("failed to extract link")
                     || body_lower.contains("token expired")
@@ -362,15 +389,15 @@ impl FourKHdHubClient {
                         ))
                     })?;
                 let wrapped = self.validate_public_playback_url(&wrapped).await?;
-                let mut wrapped_request = self
-                    .client
-                    .get(&wrapped)
-                    .header(reqwest::header::RANGE, "bytes=0-8191");
+                let mut wrapped_request = self.client.get(&wrapped).header(
+                    reqwest::header::RANGE,
+                    format!("bytes=0-{}", PREFLIGHT_RANGE_BYTES - 1),
+                );
                 for (name, value) in headers {
                     wrapped_request = wrapped_request.header(name, value);
                 }
                 let wrapped_response = wrapped_request.send().await?.error_for_status()?;
-                is_seekable = wrapped_response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+                is_seekable = validated_preflight_range(&wrapped_response)?;
                 final_url = wrapped_response.url().clone();
                 self.validate_public_playback_url(final_url.as_str())
                     .await?;
@@ -384,7 +411,8 @@ impl FourKHdHubClient {
                     || wrapped_type.contains("application/zip")
                     || wrapped_type.contains("text/plain")
                 {
-                    let wrapped_bytes = wrapped_response.bytes().await.unwrap_or_default();
+                    let wrapped_bytes =
+                        read_bounded_body(wrapped_response, PREFLIGHT_TEXT_BODY_LIMIT).await?;
                     let wrapped_lower =
                         String::from_utf8_lossy(&wrapped_bytes).to_ascii_lowercase();
                     if wrapped_lower.contains("failed to extract link")
@@ -455,6 +483,81 @@ fn safe_host(raw: &str) -> String {
         .unwrap_or_else(|| "invalid-host".into())
 }
 
+fn validated_preflight_range(response: &reqwest::Response) -> Result<bool, FourKHdHubError> {
+    if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+        return Ok(false);
+    }
+    let content_range = response
+        .headers()
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| FourKHdHubError::NoPlayableMirror("invalid upstream byte range".into()))?;
+    if !valid_initial_content_range(
+        content_range,
+        response.content_length(),
+        PREFLIGHT_RANGE_BYTES,
+    ) {
+        return Err(FourKHdHubError::NoPlayableMirror(
+            "invalid upstream byte range".into(),
+        ));
+    }
+    Ok(true)
+}
+
+fn valid_initial_content_range(value: &str, content_length: Option<u64>, requested: u64) -> bool {
+    let mut parts = value.split_whitespace();
+    if !parts
+        .next()
+        .is_some_and(|unit| unit.eq_ignore_ascii_case("bytes"))
+    {
+        return false;
+    }
+    let Some((interval, total)) = parts.next().and_then(|part| part.split_once('/')) else {
+        return false;
+    };
+    if parts.next().is_some() {
+        return false;
+    }
+    let (Some((start, end)), Ok(total)) = (interval.split_once('-'), total.parse::<u64>()) else {
+        return false;
+    };
+    let (Ok(start), Ok(end)) = (start.parse::<u64>(), end.parse::<u64>()) else {
+        return false;
+    };
+    if total == 0 || start != 0 || end >= total {
+        return false;
+    }
+    let Some(expected_end) = requested.min(total).checked_sub(1) else {
+        return false;
+    };
+    if end != expected_end {
+        return false;
+    }
+    let Some(expected_length) = end.checked_add(1) else {
+        return false;
+    };
+    content_length.is_none_or(|actual| actual == expected_length)
+}
+
+async fn read_bounded_body(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, FourKHdHubError> {
+    let mut body = Vec::with_capacity(limit.min(8192));
+    while let Some(chunk) = response.chunk().await? {
+        let remaining = limit.saturating_sub(body.len());
+        if chunk.len() > remaining {
+            body.extend_from_slice(&chunk[..remaining]);
+            break;
+        }
+        body.extend_from_slice(&chunk);
+        if body.len() == limit {
+            break;
+        }
+    }
+    Ok(body)
+}
+
 fn safe_error_class(error: &FourKHdHubError) -> (&'static str, Option<u16>) {
     match error {
         FourKHdHubError::Network(error) => {
@@ -465,6 +568,8 @@ fn safe_error_class(error: &FourKHdHubError) -> (&'static str, Option<u16>) {
                 "connect-failure"
             } else if error.is_timeout() {
                 "network-timeout"
+            } else if status == Some(502) {
+                "upstream-http-502"
             } else if status.is_some() {
                 "upstream-http-error"
             } else {
@@ -480,6 +585,8 @@ fn safe_error_class(error: &FourKHdHubError) -> (&'static str, Option<u16>) {
                 "mirror-timeout"
             } else if reason.contains("expired") || reason.contains("quota") {
                 "expired-or-quota"
+            } else if reason.contains("byte range") {
+                "invalid-byte-range"
             } else if reason.contains("content type") {
                 "unexpected-content-type"
             } else {
@@ -522,6 +629,40 @@ mod tests {
         let client = FourKHdHubClient::new().expect("client creation");
         assert!(client.provider_url("movie/inception-2010").is_ok());
         assert!(client.provider_url("https://evil.com/movie").is_err());
+    }
+
+    #[test]
+    fn preflight_range_requires_exact_offsets_and_consistent_length() {
+        assert!(valid_initial_content_range(
+            "bytes 0-8191/9000",
+            Some(8192),
+            8192
+        ));
+        assert!(valid_initial_content_range(
+            "bytes 0-99/100",
+            Some(100),
+            8192
+        ));
+        assert!(!valid_initial_content_range(
+            "bytes 1-8192/9000",
+            Some(8192),
+            8192
+        ));
+        assert!(!valid_initial_content_range(
+            "bytes 0-8190/9000",
+            Some(8191),
+            8192
+        ));
+        assert!(!valid_initial_content_range(
+            "bytes 0-8191/9000",
+            Some(10),
+            8192
+        ));
+        assert!(!valid_initial_content_range(
+            "bytes 0-8191/*",
+            Some(8192),
+            8192
+        ));
     }
 
     #[tokio::test]

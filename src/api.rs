@@ -6619,16 +6619,29 @@ async fn resolve_valid_direct_source(
     release: &Release,
     content_type: Option<&str>,
 ) -> Result<(PlaybackSource, String, reqwest::Url), String> {
+    let resolution_started = Instant::now();
     let playback = resolve_direct_provider_source(release, state).await?;
+    log::info!(
+        "direct_play_timing provider={} stage=provider_url_resolution elapsed_ms={} outcome=ok",
+        release.provider,
+        resolution_started.elapsed().as_millis()
+    );
+    let validation_started = Instant::now();
     let validated_url = crate::net::validate_public_url(&playback.url, false)
         .await
         .map_err(|_| "resolved URL rejected".to_string())?;
+    log::info!(
+        "direct_play_timing provider={} stage=resolved_url_validation elapsed_ms={} outcome=ok",
+        release.provider,
+        validation_started.elapsed().as_millis()
+    );
     let mut verified_release = release.clone();
     if matches!(
         release.provider,
         ProviderKind::FourKHdHub | ProviderKind::Dramachi
     ) && source_codec_eligibility(release.codec.as_deref()) == SourceCodecEligibility::Unverified
     {
+        let verification_started = Instant::now();
         match crate::codec_verification::verify_playback_source(&playback)
             .await
             .map_err(|_| "Provider media codec could not be verified".to_string())?
@@ -6644,6 +6657,11 @@ async fn resolve_valid_direct_source(
                 return Err("FourKHDHub media codec is not supported by playback policy".into());
             }
         }
+        log::info!(
+            "direct_play_timing provider={} stage=codec_compatibility_verification elapsed_ms={} outcome=verified",
+            release.provider,
+            verification_started.elapsed().as_millis()
+        );
     }
     let url_type = direct_url_type(&validated_url, &verified_release, content_type)
         .ok_or_else(|| "direct playback compatibility unknown".to_string())?;
@@ -6786,10 +6804,22 @@ async fn direct_play_route(
     let started = Instant::now();
     let mut selected_source_id = source_id.to_string();
     let mut selected_provider = source.p;
+    let source_lookup_started = Instant::now();
     let original_fetch =
         tokio::time::timeout(SOURCE_TIMEOUT, cached_releases(&state, &reference)).await;
+    log::info!(
+        "direct_play_timing provider={} stage=source_lookup elapsed_ms={} outcome={}",
+        source.p,
+        source_lookup_started.elapsed().as_millis(),
+        if matches!(&original_fetch, Ok(Ok(_))) {
+            "ok"
+        } else {
+            "failed"
+        }
+    );
     let mut original_error = None;
     let mut original_resolution_error = None;
+    let provider_resolution_started = Instant::now();
     let original_resolution = match original_fetch {
         Ok(Ok(releases)) => {
             let release = match source.f.as_deref() {
@@ -6832,6 +6862,16 @@ async fn direct_play_route(
             None
         }
     };
+    log::info!(
+        "direct_play_timing provider={} stage=provider_resolution_and_verification elapsed_ms={} outcome={}",
+        source.p,
+        provider_resolution_started.elapsed().as_millis(),
+        if original_resolution.is_some() {
+            "ok"
+        } else {
+            "failed"
+        }
+    );
     let (playback, url_type, validated_url) = if let Some(resolved) = original_resolution {
         resolved
     } else if original_resolution_error.as_deref().is_none_or(|error| {
@@ -6840,9 +6880,19 @@ async fn direct_play_route(
             "resolved URL rejected" | "direct playback compatibility unknown"
         )
     }) {
-        let Some((resolved, fallback_source_id, fallback_provider)) =
-            try_direct_fallback(&state, &source).await
-        else {
+        let fallback_started = Instant::now();
+        let fallback = try_direct_fallback(&state, &source).await;
+        log::info!(
+            "direct_play_timing provider={} stage=fallback elapsed_ms={} outcome={}",
+            source.p,
+            fallback_started.elapsed().as_millis(),
+            if fallback.is_some() {
+                "ok"
+            } else {
+                "unavailable"
+            }
+        );
+        let Some((resolved, fallback_source_id, fallback_provider)) = fallback else {
             if let Some(error) = original_error {
                 let (status, response) = provider_error(error, source.p);
                 return write_raw_json(stream, status, &response, None).await;
@@ -6889,6 +6939,7 @@ async fn direct_play_route(
         return write_raw_json(stream, status, &response, None).await;
     };
     let headers = direct_safe_headers(&playback.headers);
+    let response_started = Instant::now();
     let response = serde_json::json!({
         "success": true,
         "data": {
@@ -6909,7 +6960,14 @@ async fn direct_play_route(
             "resolution_latency_ms": started.elapsed().as_millis()
         }
     });
-    write_json(stream, 200, &response, None).await
+    let result = write_json(stream, 200, &response, None).await;
+    log::info!(
+        "direct_play_timing provider={} stage=response_assembly_and_write elapsed_ms={} total_elapsed_ms={}",
+        selected_provider,
+        response_started.elapsed().as_millis(),
+        started.elapsed().as_millis()
+    );
+    result
 }
 
 async fn native_stream_route(

@@ -734,17 +734,30 @@ impl NativeStreamProxy {
         for (name, value) in response.headers() {
             if matches!(
                 name.as_str(),
-                "content-length"
-                    | "content-range"
-                    | "accept-ranges"
-                    | "etag"
-                    | "last-modified"
-                    | "cache-control"
-                    | "content-disposition"
+                "content-length" | "accept-ranges" | "etag" | "last-modified" | "cache-control"
             ) && let Ok(value) = value.to_str()
             {
                 header.push_str(name.as_str());
                 header.push_str(": ");
+                header.push_str(value);
+                header.push_str("\r\n");
+            }
+            if name == reqwest::header::CONTENT_RANGE
+                && matches!(
+                    status,
+                    reqwest::StatusCode::PARTIAL_CONTENT
+                        | reqwest::StatusCode::RANGE_NOT_SATISFIABLE
+                )
+                && let Ok(value) = value.to_str()
+            {
+                header.push_str("Content-Range: ");
+                header.push_str(value);
+                header.push_str("\r\n");
+            }
+            if name == reqwest::header::CONTENT_DISPOSITION
+                && let Ok(value) = value.to_str()
+            {
+                header.push_str("Content-Disposition: ");
                 header.push_str(value);
                 header.push_str("\r\n");
             }
@@ -1765,7 +1778,7 @@ mod tests {
         assert!(relayed_text.ends_with("\r\n\r\ncde"));
 
         let response = mock_http_response(
-            b"HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: 5\r\nAccept-Ranges: none\r\nConnection: close\r\n\r\nabcde",
+            b"HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: 5\r\nContent-Range: bytes 2-4/5\r\nAccept-Ranges: none\r\nConnection: close\r\n\r\nabcde",
         )
         .await;
         let relayed = relay_direct_to_bytes(response, Some("bytes=2-4")).await;

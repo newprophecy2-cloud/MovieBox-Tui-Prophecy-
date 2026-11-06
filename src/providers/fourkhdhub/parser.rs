@@ -227,18 +227,20 @@ pub fn parse_releases(
             .select(link_selector)
             .filter_map(|link| {
                 let href = link.value().attr("href")?;
-                if !href.starts_with("https://") || href.contains("logout") {
+                let validated = crate::net::validate_url_syntax(href, false).ok()?;
+                let host = validated.host_str()?.to_ascii_lowercase();
+                if validated.path().to_ascii_lowercase().contains("logout") {
                     return None;
                 }
                 let label = text_of(Some(link)).unwrap_or_else(|| "Source".into());
                 Some(SourceMirror {
                     label,
-                    resolver_url: href.to_string(),
+                    resolver_url: validated.to_string(),
                     headers: Vec::new(),
-                    direct_file: !href.contains("hubcloud.")
-                        && !href.contains("hubdrive.")
-                        && !href.contains("greenmotors.")
-                        && !href.contains("greenmountmotors."),
+                    direct_file: !host.contains("hubcloud.")
+                        && !host.contains("hubdrive.")
+                        && !host.contains("greenmotors.")
+                        && !host.contains("greenmountmotors."),
                 })
             })
             .collect::<Vec<_>>();
@@ -586,7 +588,7 @@ fn normalize_filename(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{matches_search_query, parse_details, strip_trailing_year};
+    use super::{matches_search_query, parse_details, parse_releases, strip_trailing_year};
     use crate::providers::fourkhdhub::FourKHdHubError;
     use crate::providers::models::MediaType;
 
@@ -690,6 +692,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(details.year.as_deref(), Some("2011"));
+    }
+
+    #[test]
+    fn release_mirror_filter_normalizes_https_and_rejects_invalid_targets() {
+        let releases = parse_releases(
+            r#"<div class="download-item"><div class="file-title">Example.1080p.mp4</div>
+                <a href="HTTPS://Example.com/video.mp4">valid</a>
+                <a href="https://example.com/LOGOUT">logout</a>
+                <a href="http://example.com/video.mp4">http</a>
+                <a href="https://localhost/video.mp4">localhost</a>
+            </div>"#,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(releases.len(), 1);
+        assert_eq!(releases[0].mirrors.len(), 1);
+        assert_eq!(
+            releases[0].mirrors[0].resolver_url,
+            "https://example.com/video.mp4"
+        );
     }
 
     #[test]

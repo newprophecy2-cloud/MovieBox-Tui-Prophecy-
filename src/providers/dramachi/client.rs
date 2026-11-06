@@ -101,6 +101,50 @@ impl DramachiClient {
         }
     }
 
+    async fn send_logged(
+        &self,
+        url: &str,
+        stage: &'static str,
+    ) -> Result<reqwest::Response, DramachiError> {
+        let request_started = std::time::Instant::now();
+        let response = match self.client.get(url).send().await {
+            Ok(response) => response,
+            Err(error) => {
+                let category = if error.is_connect() && error.is_timeout() {
+                    "connect-timeout"
+                } else if error.is_connect() {
+                    "connect-failure"
+                } else if error.is_timeout() {
+                    "request-timeout"
+                } else {
+                    "network-error"
+                };
+                log::warn!(
+                    "dramachi_request stage={stage} elapsed_ms={} outcome=failed category={category}",
+                    request_started.elapsed().as_millis()
+                );
+                return Err(error.into());
+            }
+        };
+        let status = response.status();
+        let category = if status.is_success() {
+            "none"
+        } else if status.as_u16() == 502 {
+            "upstream-http-502"
+        } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            "upstream-rate-limited"
+        } else {
+            "upstream-http-error"
+        };
+        log::info!(
+            "dramachi_request stage={stage} elapsed_ms={} http_status={} outcome={} category={category}",
+            request_started.elapsed().as_millis(),
+            status.as_u16(),
+            if status.is_success() { "ok" } else { "failed" }
+        );
+        Ok(response.error_for_status()?)
+    }
+
     async fn fetch_title_details(
         &self,
         title_id: &str,
@@ -117,7 +161,7 @@ impl DramachiClient {
             self.base_url,
             encode_param(title_id)
         );
-        let resp = self.client.get(&url).send().await?.error_for_status()?;
+        let resp = self.send_logged(&url, "title_v2").await?;
         let data: DramachiTitleDetailsResponse = resp
             .json()
             .await
@@ -381,7 +425,7 @@ impl DramachiClient {
             encode_param(title_id)
         );
 
-        let resp = self.client.get(&url).send().await?.error_for_status()?;
+        let resp = self.send_logged(&url, "eplist").await?;
         let data: DramachiEpisodeListResponse = resp
             .json()
             .await
@@ -410,7 +454,7 @@ impl DramachiClient {
             encode_param(disk)
         );
 
-        let resp = self.client.get(&url).send().await?;
+        let resp = self.send_logged(&url, "get_file").await?;
         let data: DramachiFileInfoResponse = resp.json().await.map_err(|e| {
             DramachiError::Parsing(format!("failed to parse getFile response: {e}"))
         })?;

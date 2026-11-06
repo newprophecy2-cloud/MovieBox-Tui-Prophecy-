@@ -5,6 +5,8 @@ use scraper::{Html, Selector};
 use std::net::IpAddr;
 use std::sync::LazyLock;
 
+const MAX_RESOLVER_URLS: usize = 16;
+
 static SEL_DOWNLOAD: LazyLock<Selector> = LazyLock::new(|| {
     Selector::parse("a#download, a.btn-primary, a.btn-success, a.btn[href*='/download/'], a[href*='/download/'], a[href*='gamerxyt.com'], a[href*='hubcloud.php']").unwrap()
 });
@@ -32,26 +34,53 @@ pub async fn resolve(
 
     let mut candidates = Vec::new();
     let mut last_error = None;
-    for resolver_url in resolver_urls.into_iter().take(8) {
-        let resolver_html = match client
-            .get(&resolver_url)
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status)
-        {
-            Ok(response) => match response.text().await {
-                Ok(html) => html,
-                Err(error) => {
-                    last_error = Some(FourKHdHubError::Network(error));
-                    continue;
-                }
-            },
+    for resolver_url in resolver_urls.into_iter().take(MAX_RESOLVER_URLS) {
+        let resolver_started = std::time::Instant::now();
+        let resolver_host = safe_host(&resolver_url);
+        let response = match client.get(&resolver_url).send().await {
+            Ok(response) => response,
             Err(error) => {
+                let category = network_error_category(&error);
+                let status = error.status().map(|status| status.as_u16());
+                log::warn!(
+                    "4khdhub_candidate stage=resolver_url host={resolver_host} elapsed_ms={} outcome=failed category={category} http_status={status:?}",
+                    resolver_started.elapsed().as_millis()
+                );
+                last_error = Some(FourKHdHubError::Network(error));
+                continue;
+            }
+        };
+        let status = response.status().as_u16();
+        let response = match response.error_for_status() {
+            Ok(response) => response,
+            Err(error) => {
+                let category = network_error_category(&error);
+                log::warn!(
+                    "4khdhub_candidate stage=resolver_url host={resolver_host} elapsed_ms={} outcome=failed category={category} http_status={:?}",
+                    resolver_started.elapsed().as_millis(),
+                    error
+                        .status()
+                        .map(|status| status.as_u16())
+                        .or(Some(status))
+                );
+                last_error = Some(FourKHdHubError::Network(error));
+                continue;
+            }
+        };
+        let resolver_html = match response.text().await {
+            Ok(html) => html,
+            Err(error) => {
+                let category = network_error_category(&error);
+                log::warn!(
+                    "4khdhub_candidate stage=resolver_url host={resolver_host} elapsed_ms={} outcome=failed category={category} http_status={status}",
+                    resolver_started.elapsed().as_millis()
+                );
                 last_error = Some(FourKHdHubError::Network(error));
                 continue;
             }
         };
         let resolver = Html::parse_document(&resolver_html);
+        let candidate_count_before = candidates.len();
         candidates.extend(
             extract_script_pixeldrain_urls(&resolver_html)
                 .into_iter()
@@ -80,6 +109,11 @@ pub async fn resolve(
                 (score(&url, &label, intent), url, clean_label(&label))
             })
         }));
+        log::info!(
+            "4khdhub_candidate stage=resolver_url host={resolver_host} elapsed_ms={} outcome=ok http_status={status} candidate_count={}",
+            resolver_started.elapsed().as_millis(),
+            candidates.len().saturating_sub(candidate_count_before)
+        );
     }
     if candidates.is_empty()
         && let Some(error) = last_error
@@ -98,6 +132,29 @@ pub async fn resolve(
         ))
     } else {
         Ok(resolved)
+    }
+}
+
+fn safe_host(raw: &str) -> String {
+    Url::parse(raw)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .unwrap_or_else(|| "invalid-host".into())
+}
+
+fn network_error_category(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() && error.is_connect() {
+        "connect-timeout"
+    } else if error.is_connect() {
+        "connect-failure"
+    } else if error.is_timeout() {
+        "network-timeout"
+    } else if error.status() == Some(reqwest::StatusCode::BAD_GATEWAY) {
+        "upstream-http-502"
+    } else if error.status().is_some() {
+        "upstream-http-error"
+    } else {
+        "network-error"
     }
 }
 

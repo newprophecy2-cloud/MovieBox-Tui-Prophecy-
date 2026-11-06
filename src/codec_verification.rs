@@ -101,6 +101,7 @@ pub(crate) struct DirectPlaybackEvidence {
 pub async fn verify_playback_source(
     source: &PlaybackSource,
 ) -> Result<CodecProbeResult, CodecProbeError> {
+    let verification_started = std::time::Instant::now();
     if !matches!(
         source.provider,
         ProviderKind::FourKHdHub | ProviderKind::Dramachi
@@ -108,41 +109,162 @@ pub async fn verify_playback_source(
         return Err(CodecProbeError::UnsupportedProvider);
     }
 
+    let validation_started = std::time::Instant::now();
     let url = validate_media_url(&source.url).await?;
+    log::info!(
+        "direct_play_verification provider={} stage=source_validation elapsed_ms={}",
+        source.provider,
+        validation_started.elapsed().as_millis()
+    );
     let sample_limit = if source.provider == ProviderKind::Dramachi {
         DRAMACHI_FAST_SAMPLE_LIMIT
     } else {
         SAMPLE_LIMIT
     };
-    let sample = tokio::time::timeout(
+    let download_started = std::time::Instant::now();
+    let sample = match tokio::time::timeout(
         DOWNLOAD_TIMEOUT,
         download_sample(&url, &source.headers, sample_limit),
     )
     .await
-    .map_err(|_| CodecProbeError::DownloadTimeout)??;
-    if sample.is_empty() {
+    {
+        Ok(Ok(sample)) => sample,
+        Ok(Err(error)) => {
+            log::warn!(
+                "direct_play_verification provider={} stage=range_download attempt=1 elapsed_ms={} outcome=failed category={}",
+                source.provider,
+                download_started.elapsed().as_millis(),
+                error.code()
+            );
+            return Err(error);
+        }
+        Err(_) => {
+            log::warn!(
+                "direct_play_verification provider={} stage=range_download attempt=1 elapsed_ms={} outcome=failed category=MEDIA_PROBE_TIMEOUT",
+                source.provider,
+                download_started.elapsed().as_millis()
+            );
+            return Err(CodecProbeError::DownloadTimeout);
+        }
+    };
+    log::info!(
+        "direct_play_verification provider={} stage=range_download attempt=1 elapsed_ms={} requested_bytes={} downloaded_bytes={} http_status={} range_supported={}",
+        source.provider,
+        download_started.elapsed().as_millis(),
+        sample_limit,
+        sample.bytes.len(),
+        sample.http_status,
+        sample.range_supported
+    );
+    if sample.bytes.is_empty() {
         return Err(CodecProbeError::EmptyMedia);
     }
 
     let ffprobe = ffprobe_executable().ok_or(CodecProbeError::ProbeUnavailable)?;
-    match probe_sample_with_executable(&ffprobe, &sample, PROBE_TIMEOUT).await {
+    let probe_started = std::time::Instant::now();
+    let first_probe = probe_sample_with_executable(&ffprobe, &sample.bytes, PROBE_TIMEOUT).await;
+    log::info!(
+        "direct_play_verification provider={} stage=ffprobe attempt=1 elapsed_ms={} sample_bytes={} result={}",
+        source.provider,
+        probe_started.elapsed().as_millis(),
+        sample.bytes.len(),
+        probe_result_category(&first_probe)
+    );
+    let result = match first_probe {
         Ok(result) => Ok(result),
-        Err(_) if source.provider == ProviderKind::Dramachi => {
+        Err(error)
+            if source.provider == ProviderKind::Dramachi && should_retry_dramachi_probe(error) =>
+        {
             // Front-loaded MP4 metadata can be inspected from a small range. If
             // moov/codec configuration is later in the file, retry once with a
             // still-bounded sample rather than downloading the generic 32 MiB.
-            let sample = tokio::time::timeout(
+            // Timeouts, missing ffprobe, and output-limit failures are not cured
+            // by transferring and probing more media, so those fail immediately.
+            log::info!(
+                "direct_play_verification provider={} stage=probe_retry reason={}",
+                source.provider,
+                error.code()
+            );
+            let download_started = std::time::Instant::now();
+            let sample = match tokio::time::timeout(
                 DOWNLOAD_TIMEOUT,
                 download_sample(&url, &source.headers, DRAMACHI_FALLBACK_SAMPLE_LIMIT),
             )
             .await
-            .map_err(|_| CodecProbeError::DownloadTimeout)??;
-            if sample.is_empty() {
+            {
+                Ok(Ok(sample)) => sample,
+                Ok(Err(error)) => {
+                    log::warn!(
+                        "direct_play_verification provider={} stage=range_download attempt=2 elapsed_ms={} outcome=failed category={}",
+                        source.provider,
+                        download_started.elapsed().as_millis(),
+                        error.code()
+                    );
+                    return Err(error);
+                }
+                Err(_) => {
+                    log::warn!(
+                        "direct_play_verification provider={} stage=range_download attempt=2 elapsed_ms={} outcome=failed category=MEDIA_PROBE_TIMEOUT",
+                        source.provider,
+                        download_started.elapsed().as_millis()
+                    );
+                    return Err(CodecProbeError::DownloadTimeout);
+                }
+            };
+            log::info!(
+                "direct_play_verification provider={} stage=range_download attempt=2 elapsed_ms={} requested_bytes={} downloaded_bytes={} http_status={} range_supported={}",
+                source.provider,
+                download_started.elapsed().as_millis(),
+                DRAMACHI_FALLBACK_SAMPLE_LIMIT,
+                sample.bytes.len(),
+                sample.http_status,
+                sample.range_supported
+            );
+            if sample.bytes.is_empty() {
                 return Err(CodecProbeError::EmptyMedia);
             }
-            probe_sample_with_executable(&ffprobe, &sample, PROBE_TIMEOUT).await
+            let probe_started = std::time::Instant::now();
+            let result = probe_sample_with_executable(&ffprobe, &sample.bytes, PROBE_TIMEOUT).await;
+            log::info!(
+                "direct_play_verification provider={} stage=ffprobe attempt=2 elapsed_ms={} sample_bytes={} result={}",
+                source.provider,
+                probe_started.elapsed().as_millis(),
+                sample.bytes.len(),
+                probe_result_category(&result)
+            );
+            result
         }
         Err(error) => Err(error),
+    };
+    log::info!(
+        "direct_play_verification provider={} stage=complete elapsed_ms={} result={}",
+        source.provider,
+        verification_started.elapsed().as_millis(),
+        probe_result_category(&result)
+    );
+    result
+}
+
+struct DownloadedSample {
+    bytes: Vec<u8>,
+    http_status: u16,
+    range_supported: bool,
+}
+
+fn should_retry_dramachi_probe(error: CodecProbeError) -> bool {
+    matches!(
+        error,
+        CodecProbeError::ProbeFailed | CodecProbeError::MalformedProbeOutput
+    )
+}
+
+fn probe_result_category(result: &Result<CodecProbeResult, CodecProbeError>) -> &'static str {
+    match result {
+        Ok(CodecProbeResult::Allowed(_)) => "h264-allowed",
+        Ok(CodecProbeResult::BlockedHevc(_)) => "hevc-blocked",
+        Ok(CodecProbeResult::Unsupported(_)) => "unsupported-codec",
+        Ok(CodecProbeResult::NoVideoStream) => "no-video-stream",
+        Err(error) => error.code(),
     }
 }
 
@@ -297,7 +419,7 @@ async fn download_sample(
     url: &reqwest::Url,
     trusted_headers: &[(String, String)],
     sample_limit: usize,
-) -> Result<Vec<u8>, CodecProbeError> {
+) -> Result<DownloadedSample, CodecProbeError> {
     let client = guarded_media_client()?;
     let mut request = client.get(url.clone()).header(
         reqwest::header::RANGE,
@@ -336,18 +458,24 @@ async fn download_sample(
         .send()
         .await
         .map_err(|_| CodecProbeError::MediaUnavailable)?;
+    let http_status = response.status().as_u16();
     if !response.status().is_success() {
         return Err(CodecProbeError::MediaUnavailable);
     }
     crate::net::validate_public_url(response.url().as_str(), false)
         .await
         .map_err(|_| CodecProbeError::UnsafeRedirect)?;
-    if let Some(content_range) = response
+    let content_range = response
         .headers()
         .get(reqwest::header::CONTENT_RANGE)
         .and_then(|value| value.to_str().ok())
-        && !content_range.to_ascii_lowercase().starts_with("bytes 0-")
-    {
+        .map(str::to_string);
+    let range_supported = response.status() == reqwest::StatusCode::PARTIAL_CONTENT
+        && content_range.as_deref().is_some_and(|content_range| {
+            validated_initial_range(content_range, response.content_length(), sample_limit)
+                .is_some()
+        });
+    if response.status() == reqwest::StatusCode::PARTIAL_CONTENT && !range_supported {
         return Err(CodecProbeError::MediaUnavailable);
     }
 
@@ -365,7 +493,11 @@ async fn download_sample(
             break;
         }
     }
-    Ok(sample)
+    Ok(DownloadedSample {
+        bytes: sample,
+        http_status,
+        range_supported,
+    })
 }
 
 fn ffprobe_executable() -> Option<std::path::PathBuf> {
@@ -582,6 +714,21 @@ mod tests {
         assert_eq!(DRAMACHI_FAST_SAMPLE_LIMIT, 1024 * 1024);
         assert_eq!(DRAMACHI_FALLBACK_SAMPLE_LIMIT, 4 * 1024 * 1024);
         assert!(DRAMACHI_FALLBACK_SAMPLE_LIMIT < SAMPLE_LIMIT);
+    }
+
+    #[test]
+    fn dramachi_retries_only_when_more_sample_bytes_can_help() {
+        assert!(should_retry_dramachi_probe(CodecProbeError::ProbeFailed));
+        assert!(should_retry_dramachi_probe(
+            CodecProbeError::MalformedProbeOutput
+        ));
+        assert!(!should_retry_dramachi_probe(CodecProbeError::ProbeTimeout));
+        assert!(!should_retry_dramachi_probe(
+            CodecProbeError::ProbeUnavailable
+        ));
+        assert!(!should_retry_dramachi_probe(
+            CodecProbeError::ProbeOutputLimit
+        ));
     }
 
     async fn probe_fixture(bytes: &[u8]) -> Result<CodecProbeResult, CodecProbeError> {
