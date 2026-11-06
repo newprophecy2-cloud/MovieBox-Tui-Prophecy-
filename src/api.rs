@@ -4013,14 +4013,13 @@ where
     let mut seen = std::collections::HashSet::new();
     for page in pages {
         let page_items = fetch(page).await?;
-        let before = all.len();
+        if page_items.is_empty() {
+            break;
+        }
         for item in page_items {
             if seen.insert(item.id.clone()) {
                 all.push(item);
             }
-        }
-        if all.len() == before || (all.is_empty() && page > 1) {
-            break;
         }
     }
     Ok(all)
@@ -4373,6 +4372,30 @@ fn normalized_episode_title(title: Option<&str>) -> Option<String> {
         .filter(|title| !title.is_empty())
 }
 
+fn is_generic_episode_title(title: Option<&str>) -> bool {
+    let Some(title) = title else {
+        return true;
+    };
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.chars().all(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    let stripped = lower
+        .trim_start_matches("episode")
+        .trim_start_matches("ep.")
+        .trim_start_matches("ep")
+        .trim_start_matches('e')
+        .trim_start_matches("chapter")
+        .trim_start_matches("ch.")
+        .trim_start_matches("ch")
+        .trim();
+    stripped.is_empty() || stripped.chars().all(|c| c.is_ascii_digit())
+}
+
 fn episode_special_marker(title: Option<&str>) -> bool {
     title
         .map(crate::unified::normalize_anime_title)
@@ -4453,12 +4476,16 @@ fn matching_episode(
 
     // Different season layouts are accepted only when a meaningful episode title
     // uniquely identifies the record. Number-only matching is deliberately unsafe.
+    if is_generic_episode_title(source.title.as_deref()) {
+        return None;
+    }
     let source_title = normalized_episode_title(source.title.as_deref())?;
     if episode_special_marker(source.title.as_deref()) {
         return None;
     }
     let mut titled = episodes.filter(|episode| {
         !episode_special_marker(episode.title.as_deref())
+            && !is_generic_episode_title(episode.title.as_deref())
             && normalized_episode_title(episode.title.as_deref()).as_deref()
                 == Some(source_title.as_str())
     });
@@ -4488,25 +4515,34 @@ async fn discover_episode_mappings(
         let query = selected_anime.title.clone();
         let source_identity = selected_anime.clone();
         tasks.spawn(async move {
+            let supports_pagination = service.capabilities(provider).supports_pagination;
             let search = tokio::time::timeout(
                 DYNAMIC_DISCOVERY_TIMEOUT,
-                service.search_typed(provider, &query, 1),
+                search_provider_pages(supports_pagination, |page| {
+                    let service = Arc::clone(&service);
+                    let query = query.clone();
+                    async move { service.search_typed(provider, &query, page).await }
+                }),
             )
             .await;
             let Ok(Ok(items)) = search else {
                 return Vec::new();
             };
-            let query_key = crate::unified::normalize_anime_title(&query).key;
-            let mut results = Vec::new();
-            for item in items
+            let source_title = crate::unified::normalize_anime_title(&source_identity.title);
+            let candidates = items
                 .into_iter()
                 .filter(|item| {
+                    let candidate_title = crate::unified::normalize_anime_title(&item.title);
                     item.media_type == MediaType::Series
-                        && crate::unified::normalize_anime_title(&item.title).key == query_key
+                        && candidate_title.key == source_title.key
+                        && candidate_title.franchise_discriminator
+                            == source_title.franchise_discriminator
                         && years_compatible(source_identity.year.as_deref(), item.year.as_deref())
                 })
                 .take(DYNAMIC_DISCOVERY_MAX_RESULTS)
-            {
+                .collect::<Vec<_>>();
+            let mut results = Vec::new();
+            for item in candidates {
                 let fetched = tokio::time::timeout(
                     DYNAMIC_DISCOVERY_TIMEOUT,
                     service.details_typed(provider, &item.id.value),
@@ -4514,6 +4550,7 @@ async fn discover_episode_mappings(
                 .await;
                 if let Ok(Ok(details)) = fetched
                     && details.id.provider == provider
+                    && details.id.value == item.id.value
                     && same_anime_identity(&source_identity, &details)
                 {
                     results.push((item.id, details));
@@ -4874,12 +4911,53 @@ async fn fetch_unified_provider_details(
 async fn discover_unmapped_provider_details(
     state: &ApiState,
     known_details: &[(ProviderMediaId, MediaDetails)],
+    canonical_id: Option<&str>,
 ) -> (
     Vec<(ProviderMediaId, MediaDetails)>,
     HashMap<String, String>,
 ) {
     let mut status = HashMap::new();
-    let Some((_, primary)) = known_details.first() else {
+    let trusted_identity = match known_details.first().map(|(_, details)| details.clone()) {
+        Some(identity) => Some(identity),
+        None => {
+            if let (Some(store), Some(cid)) = (state.catalog.as_ref(), canonical_id) {
+                match store.get_title_detail(cid).await {
+                    Ok(Some(detail)) => {
+                        let media_type = if detail.title.content_type == "movie" {
+                            MediaType::Movie
+                        } else {
+                            MediaType::Series
+                        };
+                        Some(MediaDetails {
+                            id: ProviderMediaId {
+                                provider: ProviderKind::FourKHdHub,
+                                value: String::new(),
+                            },
+                            title: detail.title.canonical_title,
+                            media_type,
+                            year: detail.title.release_year.map(|y| y.to_string()),
+                            description: detail.title.synopsis,
+                            tagline: None,
+                            imdb_rating: None,
+                            director: None,
+                            stars: None,
+                            prints: None,
+                            audios: None,
+                            poster_url: detail.title.poster_url,
+                            duration: None,
+                            genres: Vec::new(),
+                            seasons: Vec::new(),
+                            dubs: Vec::new(),
+                        })
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
+    };
+    let Some(primary_identity) = trusted_identity else {
         return (Vec::new(), status);
     };
     let targets = configured_search_providers()
@@ -4889,8 +4967,7 @@ async fn discover_unmapped_provider_details(
                 .iter()
                 .any(|(mapping, _)| mapping.provider == *provider)
         });
-    let query = primary.title.clone();
-    let primary_identity = primary.clone();
+    let query = primary_identity.title.clone();
     let slots = Arc::new(Semaphore::new(SEARCH_PROVIDER_CONCURRENCY));
     let mut tasks = JoinSet::new();
 
@@ -4903,9 +4980,14 @@ async fn discover_unmapped_provider_details(
             let Ok(_permit) = slots.acquire_owned().await else {
                 return (provider, None, "concurrency_limit".to_string());
             };
+            let supports_pagination = service.capabilities(provider).supports_pagination;
             let search = tokio::time::timeout(
                 DYNAMIC_DISCOVERY_TIMEOUT,
-                service.search_typed(provider, &query, 1),
+                search_provider_pages(supports_pagination, |page| {
+                    let service = Arc::clone(&service);
+                    let query = query.clone();
+                    async move { service.search_typed(provider, &query, page).await }
+                }),
             )
             .await;
             let items = match search {
@@ -4915,6 +4997,9 @@ async fn discover_unmapped_provider_details(
                 }
                 Err(_) => return (provider, None, "timeout".to_string()),
             };
+            if items.is_empty() {
+                return (provider, None, "empty".to_string());
+            }
             let primary_title = crate::unified::normalize_anime_title(&primary_identity.title);
             let candidates = items
                 .into_iter()
@@ -4929,7 +5014,7 @@ async fn discover_unmapped_provider_details(
                 .take(DYNAMIC_DISCOVERY_MAX_RESULTS)
                 .collect::<Vec<_>>();
             if candidates.is_empty() {
-                return (provider, None, "empty".to_string());
+                return (provider, None, "no_verified_match".to_string());
             }
 
             let mut verified = Vec::new();
@@ -5271,7 +5356,8 @@ async fn unified_anime_route(
     let mut mappings = resolve_unified_provider_mappings(&state, &unified).await;
     let (mut details, mut provider_status) =
         fetch_unified_provider_details(&state, &mappings).await;
-    let (discovered, discovery_status) = discover_unmapped_provider_details(&state, &details).await;
+    let (discovered, discovery_status) =
+        discover_unmapped_provider_details(&state, &details, unified.canonical_id.as_deref()).await;
     for (mapping, provider_details) in discovered {
         // Replace a stale same-provider mapping with the newly verified ID.
         mappings.retain(|existing| existing.provider != mapping.provider);
@@ -12102,7 +12188,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(requested_pages, vec![1, 2]);
+        assert_eq!(requested_pages, vec![1, 2, 3]);
         assert_eq!(result.len(), 2);
         assert!(
             result
@@ -12205,5 +12291,372 @@ mod tests {
         assert!(parsed[2].partial == Some(true));
         assert_eq!(parsed[2].results[0].id, "partial-opaque-id");
         assert!(parsed[2].results[0].poster_url.is_none());
+    }
+
+    // --- Master Fix 8: Comprehensive Multi-Provider Discovery, Mapping & Fallback Tests ---
+
+    #[tokio::test]
+    async fn pagination_does_not_stop_on_duplicate_only_page_when_page_three_has_new_valid_anime() {
+        let mut requested_pages = Vec::new();
+        let result = search_provider_pages(true, |page| {
+            requested_pages.push(page);
+            async move {
+                Ok::<Vec<CatalogItem>, ProviderError>(match page {
+                    1 => (0..10)
+                        .map(|i| mock_search_item(ProviderKind::Dramachi, &format!("anime-{i}")))
+                        .collect(),
+                    2 => (0..10)
+                        .map(|i| mock_search_item(ProviderKind::Dramachi, &format!("anime-{i}")))
+                        .collect(),
+                    3 => vec![mock_search_item(
+                        ProviderKind::Dramachi,
+                        "anime-page-3-valid",
+                    )],
+                    _ => Vec::new(),
+                })
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(requested_pages, vec![1, 2, 3]);
+        assert_eq!(result.len(), 11);
+        assert!(
+            result
+                .iter()
+                .any(|item| item.id.value == "anime-page-3-valid")
+        );
+    }
+
+    #[tokio::test]
+    async fn pagination_finds_valid_candidate_on_page_one_two_and_three() {
+        for target_page in 1..=3 {
+            let mut requested_pages = Vec::new();
+            let result = search_provider_pages(true, |page| {
+                requested_pages.push(page);
+                async move {
+                    Ok::<Vec<CatalogItem>, ProviderError>(if page == target_page {
+                        vec![mock_search_item(ProviderKind::AniZone, "target-candidate")]
+                    } else if page < target_page {
+                        vec![mock_search_item(
+                            ProviderKind::AniZone,
+                            &format!("filler-{page}"),
+                        )]
+                    } else {
+                        Vec::new()
+                    })
+                }
+            })
+            .await
+            .unwrap();
+            assert!(
+                result
+                    .iter()
+                    .any(|item| item.id.value == "target-candidate")
+            );
+            assert!(requested_pages.contains(&target_page));
+        }
+    }
+
+    #[tokio::test]
+    async fn pagination_unsupported_provider_queries_only_page_one() {
+        let mut requested_pages = Vec::new();
+        let result = search_provider_pages(false, |page| {
+            requested_pages.push(page);
+            async move {
+                Ok::<Vec<CatalogItem>, ProviderError>(vec![mock_search_item(
+                    ProviderKind::FourKHdHub,
+                    "item-page-1",
+                )])
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(requested_pages, vec![1]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id.value, "item-page-1");
+    }
+
+    #[tokio::test]
+    async fn pagination_deduplicates_identical_ids_across_pages() {
+        let result = search_provider_pages(true, |page| async move {
+            Ok::<Vec<CatalogItem>, ProviderError>(match page {
+                1 => vec![mock_search_item(ProviderKind::Dramachi, "dup-id")],
+                2 => vec![mock_search_item(ProviderKind::Dramachi, "dup-id")],
+                3 => vec![mock_search_item(ProviderKind::Dramachi, "dup-id")],
+                _ => Vec::new(),
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id.value, "dup-id");
+    }
+
+    #[tokio::test]
+    async fn pagination_page_timeout_and_failure_isolation() {
+        let timeout = tokio::time::timeout(
+            Duration::from_millis(15),
+            search_provider_pages(true, |_page| async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Ok::<Vec<CatalogItem>, ProviderError>(Vec::new())
+            }),
+        )
+        .await;
+        assert!(timeout.is_err());
+
+        // Independent provider call succeeds despite another failing
+        let success = search_provider_pages(true, |page| async move {
+            if page == 1 {
+                Ok(vec![mock_search_item(
+                    ProviderKind::AniZone,
+                    "isolated-success",
+                )])
+            } else {
+                Ok(Vec::new())
+            }
+        })
+        .await;
+        assert!(success.is_ok());
+        assert_eq!(success.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn identity_validation_matching_title_and_media_type_accepted() {
+        let base = synthetic_anime(ProviderKind::FourKHdHub, 1, 1, "Episode 1");
+        let candidate = synthetic_anime(ProviderKind::AniZone, 1, 1, "Episode 1");
+        assert!(same_anime_identity(&base, &candidate));
+    }
+
+    #[test]
+    fn identity_validation_wrong_media_type_rejected() {
+        let mut base = synthetic_anime(ProviderKind::FourKHdHub, 1, 1, "Episode 1");
+        let mut candidate = synthetic_anime(ProviderKind::AniZone, 1, 1, "Episode 1");
+        candidate.media_type = MediaType::Movie;
+        assert!(!same_anime_identity(&base, &candidate));
+        base.media_type = MediaType::Movie;
+        candidate.media_type = MediaType::Series;
+        assert!(!same_anime_identity(&base, &candidate));
+    }
+
+    #[test]
+    fn identity_validation_wrong_franchise_rejected() {
+        let mut base = synthetic_anime(ProviderKind::FourKHdHub, 1, 1, "Episode 1");
+        base.title = "Naruto (2002)".into();
+        let mut candidate = synthetic_anime(ProviderKind::AniZone, 1, 1, "Episode 1");
+        candidate.title = "Naruto Shippuden".into();
+        assert!(!same_anime_identity(&base, &candidate));
+    }
+
+    #[test]
+    fn identity_validation_incompatible_year_rejected() {
+        let mut base = synthetic_anime(ProviderKind::FourKHdHub, 1, 1, "Episode 1");
+        base.year = Some("2017".into());
+        let mut candidate = synthetic_anime(ProviderKind::AniZone, 1, 1, "Episode 1");
+        candidate.year = Some("2023".into());
+        assert!(!same_anime_identity(&base, &candidate));
+    }
+
+    #[test]
+    fn identity_validation_ambiguous_candidate_rejected_by_mapping() {
+        let candidate1 = (
+            ProviderMediaId {
+                provider: ProviderKind::Dramachi,
+                value: "dramachi-1".into(),
+            },
+            synthetic_anime(ProviderKind::Dramachi, 1, 1, "Episode 1"),
+        );
+        let candidate2 = (
+            ProviderMediaId {
+                provider: ProviderKind::Dramachi,
+                value: "dramachi-2".into(),
+            },
+            synthetic_anime(ProviderKind::Dramachi, 1, 1, "Episode 1"),
+        );
+        let mut by_provider: HashMap<ProviderKind, Vec<(ProviderMediaId, MediaDetails)>> =
+            HashMap::new();
+        by_provider
+            .entry(ProviderKind::Dramachi)
+            .or_default()
+            .push(candidate1);
+        by_provider
+            .entry(ProviderKind::Dramachi)
+            .or_default()
+            .push(candidate2);
+        let verified = by_provider
+            .into_values()
+            .filter(|candidates| candidates.len() == 1)
+            .flatten()
+            .collect::<Vec<_>>();
+        assert!(verified.is_empty(), "Ambiguous candidates must be rejected");
+    }
+
+    #[tokio::test]
+    async fn identity_recovery_when_no_trusted_identity_exists_rejects_unsafe_discovery() {
+        let (state, _root) = test_state().await;
+        let (discovered, status) = discover_unmapped_provider_details(&state, &[], None).await;
+        assert!(discovered.is_empty());
+        assert!(status.is_empty());
+    }
+
+    #[test]
+    fn episode_mapping_matching_season_and_episode() {
+        let source = crate::providers::models::Episode {
+            season: 1,
+            number: 10,
+            title: Some("Destiny".into()),
+            overview: None,
+        };
+        let candidate = synthetic_anime(ProviderKind::Dramachi, 1, 10, "Destiny");
+        let matched = matching_episode(&source, &candidate);
+        assert!(matched.is_some());
+        let ep = matched.unwrap();
+        assert_eq!(ep.season, 1);
+        assert_eq!(ep.number, 10);
+    }
+
+    #[test]
+    fn episode_mapping_same_episode_from_multiple_providers() {
+        let source = crate::providers::models::Episode {
+            season: 1,
+            number: 10,
+            title: Some("Destiny".into()),
+            overview: None,
+        };
+        let candidate1 = synthetic_anime(ProviderKind::Dramachi, 1, 10, "Destiny");
+        let candidate2 = synthetic_anime(ProviderKind::AniZone, 1, 10, "Destiny");
+        assert_eq!(matching_episode(&source, &candidate1).unwrap().number, 10);
+        assert_eq!(matching_episode(&source, &candidate2).unwrap().number, 10);
+    }
+
+    #[test]
+    fn episode_mapping_wrong_episode_rejected() {
+        let source = crate::providers::models::Episode {
+            season: 1,
+            number: 10,
+            title: Some("Destiny".into()),
+            overview: None,
+        };
+        let candidate = synthetic_anime(ProviderKind::Dramachi, 1, 11, "A Different Day");
+        assert!(matching_episode(&source, &candidate).is_none());
+    }
+
+    #[test]
+    fn episode_mapping_special_episode_handled_safely() {
+        let special = crate::providers::models::Episode {
+            season: 1,
+            number: 10,
+            title: Some("Black Clover OVA 1".into()),
+            overview: None,
+        };
+        let regular = synthetic_anime(ProviderKind::Dramachi, 1, 10, "Destiny");
+        assert!(matching_episode(&special, &regular).is_none());
+    }
+
+    #[test]
+    fn episode_mapping_generic_title_does_not_cause_false_merging_across_seasons() {
+        let source = crate::providers::models::Episode {
+            season: 2,
+            number: 1,
+            title: Some("Episode 1".into()),
+            overview: None,
+        };
+        let candidate = synthetic_anime(ProviderKind::AniZone, 1, 1, "Episode 1");
+        assert!(matching_episode(&source, &candidate).is_none());
+    }
+
+    #[test]
+    fn episode_mapping_conflicting_meaningful_titles_handled_conservatively() {
+        let source = crate::providers::models::Episode {
+            season: 1,
+            number: 10,
+            title: Some("The Light That Pierces Darkness".into()),
+            overview: None,
+        };
+        let candidate = synthetic_anime(
+            ProviderKind::Dramachi,
+            1,
+            10,
+            "A Completely Different Episode Title",
+        );
+        assert!(matching_episode(&source, &candidate).is_none());
+    }
+
+    #[tokio::test]
+    async fn playback_fallback_primary_fails_and_alternate_succeeds_with_timeout_isolation() {
+        let primary = OpaqueRef {
+            p: ProviderKind::FourKHdHub,
+            v: "primary-title".into(),
+            s: 1,
+            e: 5,
+        };
+        let timed_out_alt = OpaqueRef {
+            p: ProviderKind::Dramachi,
+            v: "dramachi-title".into(),
+            s: 1,
+            e: 5,
+        };
+        let successful_alt = OpaqueRef {
+            p: ProviderKind::BdixCircleFtp,
+            v: "bdix-title".into(),
+            s: 1,
+            e: 5,
+        };
+
+        let original = Release {
+            episode: Some(5),
+            ..verified_release(primary.p, "orig.mkv", "https://cdn.example/orig.mkv")
+        };
+        let success_rel = Release {
+            episode: Some(5),
+            ..verified_release(successful_alt.p, "succ.mkv", "https://cdn.example/succ.mkv")
+        };
+        let source_id = source_ref(&original, &primary, 0);
+        let expected_source_id = api_sources(std::slice::from_ref(&success_rel), &successful_alt)
+            [0]
+        .id
+        .clone();
+
+        let (state, _root) = test_state().await;
+        override_releases(
+            &state,
+            &primary,
+            Err(ProviderError::Unavailable("primary unavailable".into())),
+        )
+        .await;
+        state.test_release_delays.lock().await.insert(
+            release_cache_key(&timed_out_alt),
+            SOURCE_TIMEOUT + Duration::from_millis(50),
+        );
+        cache_releases(&state, &successful_alt, vec![success_rel]).await;
+
+        let source = decode::<OpaqueSource>(&source_id).unwrap();
+        set_fallback_refs(&state, &source, vec![timed_out_alt, successful_alt]).await;
+
+        let (status, body) = invoke_direct_route(state, &source_id).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"]["source_id"], expected_source_id);
+        assert_eq!(body["data"]["provider"], "bdix_circleftp");
+    }
+
+    #[tokio::test]
+    async fn playback_fallback_rejects_wrong_anime_identity() {
+        let primary = OpaqueRef {
+            p: ProviderKind::FourKHdHub,
+            v: "primary-anime".into(),
+            s: 1,
+            e: 2,
+        };
+        let original = verified_release(primary.p, "orig.mkv", "https://cdn.example/orig.mkv");
+        let source_id = source_ref(&original, &primary, 0);
+
+        let (state, _root) = test_state().await;
+        cache_releases(&state, &primary, Vec::new()).await;
+
+        let source = decode::<OpaqueSource>(&source_id).unwrap();
+        set_fallback_refs(&state, &source, Vec::new()).await;
+
+        let (status, body) = invoke_direct_route(state, &source_id).await;
+        assert_eq!(status, 404);
+        assert_eq!(body["error"]["code"], "SOURCE_NOT_FOUND");
     }
 }
