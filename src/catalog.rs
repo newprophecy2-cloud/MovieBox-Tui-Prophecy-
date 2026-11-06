@@ -1135,6 +1135,40 @@ impl CatalogStore {
         let r=self.client.lock().await.query_opt("SELECT e.id::text AS id,e.title_id::text AS title_id,e.season_id::text AS season_id,e.episode_number,e.episode_type,e.episode_coordinate,e.absolute_episode_number,e.special_identifier,e.episode_title,e.overview,e.release_date::text AS release_date,e.thumbnail_url,s.season_number FROM episodes e JOIN seasons s ON s.id=e.season_id WHERE e.id::text=$1", &[&id]).await?;
         Ok(r.as_ref().map(row_json))
     }
+    /// Return only resolved provider title/episode coordinates that belong to
+    /// the same canonical episode as the supplied provider lookup coordinate.
+    /// Unresolved and conflicting mappings are intentionally excluded.
+    pub async fn verified_episode_provider_mappings(
+        &self,
+        provider_key: &str,
+        provider_title_id: &str,
+        season: usize,
+        episode: usize,
+    ) -> Result<Vec<(String, String, usize, usize)>, CatalogError> {
+        let rows = self.client.lock().await.query(
+            "SELECT DISTINCT target_pr.provider_key, target_lookup.provider_title_id, target_lookup.provider_season_number, target_lookup.provider_episode_number
+             FROM episode_provider_lookup_mappings source_lookup
+             JOIN provider_registry source_pr ON source_pr.id=source_lookup.provider_id
+             JOIN episode_provider_lookup_mappings target_lookup ON target_lookup.episode_id=source_lookup.episode_id AND target_lookup.mapping_status='resolved'
+             JOIN provider_registry target_pr ON target_pr.id=target_lookup.provider_id
+             WHERE source_pr.provider_key=$1 AND source_lookup.provider_title_id=$2
+               AND source_lookup.provider_season_number=$3 AND source_lookup.provider_episode_number=$4
+               AND source_lookup.mapping_status='resolved'
+             ORDER BY target_pr.provider_key, target_lookup.provider_title_id",
+            &[&provider_key, &provider_title_id, &(season as i32), &(episode as i32)],
+        ).await?;
+        Ok(rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get::<_, String>(0),
+                    row.get::<_, String>(1),
+                    row.get::<_, i32>(2).max(0) as usize,
+                    row.get::<_, i32>(3).max(0) as usize,
+                )
+            })
+            .collect())
+    }
     pub async fn list_sources(&self, id: &str) -> Result<Vec<Value>, CatalogError> {
         let r=self.client.lock().await.query("SELECT ps.id::text AS id,ps.episode_id::text AS episode_id,ps.provider_source_id,pr.provider_key,ps.source_reference,ps.quality_label,ps.video_codec,ps.audio_codec,ps.container_format,ps.resolution_width,ps.resolution_height,ps.source_status,ps.codec_verification_status,ps.expires_at::text AS expires_at FROM provider_sources ps JOIN provider_registry pr ON pr.id=ps.provider_id WHERE ps.episode_id=$1::text::uuid AND ps.source_status NOT IN('blocked','invalid') AND (ps.expires_at IS NULL OR ps.expires_at>now()) ORDER BY ps.resolution_height DESC NULLS LAST", &[&id]).await?;
         Ok(r.iter()
