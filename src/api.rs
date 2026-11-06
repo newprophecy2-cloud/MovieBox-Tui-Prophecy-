@@ -5687,18 +5687,70 @@ async fn anime_episode_full_route(
     .buffer_unordered(3)
     .collect::<Vec<_>>()
     .await;
+    let results = release_results
+        .into_iter()
+        .map(|(reference, provider, result)| {
+            let result = match result {
+                Ok(Ok(releases)) => Ok(releases),
+                Ok(Err(error)) => Err(EpisodeReleaseFailure::Provider(error)),
+                Err(_) => Err(EpisodeReleaseFailure::Timeout),
+            };
+            (reference, provider, result)
+        });
+    let (sources, sources_status, sources_partial, source_error) =
+        aggregate_episode_sources(results);
+
+    write_json(
+        stream,
+        200,
+        &AnimeEpisodeFullResponse {
+            anime,
+            selected_episode,
+            sources,
+            sources_status,
+            sources_partial,
+            source_error,
+        },
+        None,
+    )
+    .await
+}
+
+fn release_cache_key(r: &OpaqueRef) -> String {
+    format!("{}:{}:{}:{}", r.p.cache_key(), r.v, r.s, r.e)
+}
+
+enum EpisodeReleaseFailure {
+    Provider(ProviderError),
+    Timeout,
+}
+
+type EpisodeReleaseResult = (
+    OpaqueRef,
+    ProviderKind,
+    Result<Vec<Release>, EpisodeReleaseFailure>,
+);
+
+fn aggregate_episode_sources(
+    release_results: impl IntoIterator<Item = EpisodeReleaseResult>,
+) -> (
+    Vec<ApiSource>,
+    &'static str,
+    bool,
+    Option<serde_json::Value>,
+) {
     let mut sources = Vec::new();
     let mut errors = Vec::new();
     for (reference, provider, result) in release_results {
         match result {
-            Ok(Ok(releases)) => sources.extend(api_sources(&releases, &reference)),
-            Ok(Err(error)) => {
+            Ok(releases) => sources.extend(api_sources(&releases, &reference)),
+            Err(EpisodeReleaseFailure::Provider(error)) => {
                 let (_, body) = provider_error(error, provider);
                 if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) {
                     errors.push(value);
                 }
             }
-            Err(_) => {
+            Err(EpisodeReleaseFailure::Timeout) => {
                 let (_, body) = err(
                     "REQUEST_DEADLINE_EXCEEDED",
                     "The source request deadline was exceeded.",
@@ -5722,25 +5774,7 @@ async fn anime_episode_full_route(
     } else {
         "ok"
     };
-
-    write_json(
-        stream,
-        200,
-        &AnimeEpisodeFullResponse {
-            anime,
-            selected_episode,
-            sources,
-            sources_status,
-            sources_partial,
-            source_error,
-        },
-        None,
-    )
-    .await
-}
-
-fn release_cache_key(r: &OpaqueRef) -> String {
-    format!("{}:{}:{}:{}", r.p.cache_key(), r.v, r.s, r.e)
+    (sources, sources_status, sources_partial, source_error)
 }
 
 async fn cached_releases(state: &ApiState, r: &OpaqueRef) -> Result<Vec<Release>, ProviderError> {
@@ -6525,6 +6559,64 @@ async fn verified_fallback_episode_refs(state: &ApiState, source: &OpaqueSource)
         .collect()
 }
 
+fn release_matches_episode(release: &Release, source: &OpaqueSource) -> bool {
+    release.provider == source.p
+        && release.season.is_none_or(|season| season == source.s)
+        && release.episode.is_none_or(|episode| episode == source.e)
+}
+
+async fn try_direct_fallback(
+    state: &ApiState,
+    source: &OpaqueSource,
+) -> Option<((PlaybackSource, String, reqwest::Url), String, ProviderKind)> {
+    let refs = verified_fallback_episode_refs(state, source).await;
+    for fallback_ref in refs {
+        let Ok(alternate_releases) =
+            tokio::time::timeout(SOURCE_TIMEOUT, cached_releases(state, &fallback_ref))
+                .await
+                .unwrap_or(Err(ProviderError::Unavailable("fallback timeout".into())))
+        else {
+            continue;
+        };
+        let mut candidates = alternate_releases
+            .into_iter()
+            .filter(|candidate| {
+                candidate.provider == fallback_ref.p
+                    && candidate
+                        .season
+                        .is_none_or(|season| season == fallback_ref.s)
+                    && candidate
+                        .episode
+                        .is_none_or(|episode| episode == fallback_ref.e)
+                    && release_has_usable_source(candidate)
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|candidate| {
+            (
+                provider_priority(candidate.provider),
+                std::cmp::Reverse(candidate.resolution_u64()),
+            )
+        });
+        for candidate in candidates.into_iter().take(3) {
+            if let Ok(resolved) =
+                resolve_valid_direct_source(state, &candidate, source.content_type.as_deref()).await
+            {
+                let candidate_source_id = api_sources_for_content(
+                    std::slice::from_ref(&candidate),
+                    &fallback_ref,
+                    source.content_type.as_deref(),
+                )
+                .first()
+                .map(|source| source.id.clone());
+                if let Some(candidate_source_id) = candidate_source_id {
+                    return Some((resolved, candidate_source_id, candidate.provider));
+                }
+            }
+        }
+    }
+    None
+}
+
 async fn direct_play_route(
     stream: &mut TcpStream,
     state: ApiState,
@@ -6556,139 +6648,110 @@ async fn direct_play_route(
         s: source.s,
         e: source.e,
     };
-    let releases =
-        match tokio::time::timeout(SOURCE_TIMEOUT, cached_releases(&state, &reference)).await {
-            Ok(Ok(releases)) => releases,
-            Ok(Err(error)) => {
-                let (status, response) = provider_error(error, source.p);
-                return write_raw_json(stream, status, &response, None).await;
-            }
-            Err(_) => {
-                let (status, response) = err(
-                    "DIRECT_PLAY_RESOLUTION_TIMEOUT",
-                    "Direct provider URL resolution timed out.",
-                    Some(source.p),
-                    504,
-                );
-                return write_raw_json(stream, status, &response, None).await;
-            }
-        };
-    let release = match source.f.as_deref() {
-        Some(fingerprint) => releases
-            .iter()
-            .find(|release| release_fingerprint(release) == fingerprint),
-        None => releases.get(source.i),
-    };
-    let Some(release) = release else {
-        let (status, response) = err(
-            "SOURCE_NOT_FOUND",
-            "The source was not found.",
-            Some(source.p),
-            404,
-        );
-        return write_raw_json(stream, status, &response, None).await;
-    };
     let started = Instant::now();
     let mut selected_source_id = source_id.to_string();
     let mut selected_provider = source.p;
-    let (playback, url_type, validated_url) = match resolve_valid_direct_source(
-        &state,
-        release,
-        source.content_type.as_deref(),
-    )
-    .await
-    {
-        Ok(resolved) => resolved,
-        Err(original_error) => {
-            let retryable = !matches!(
-                original_error.as_str(),
-                "resolved URL rejected" | "direct playback compatibility unknown"
-            );
-            let mut fallback = None;
-            if retryable {
-                let refs = verified_fallback_episode_refs(&state, &source).await;
-                'providers: for fallback_ref in refs {
-                    let Ok(alternate_releases) = tokio::time::timeout(
-                        SOURCE_TIMEOUT,
-                        cached_releases(&state, &fallback_ref),
-                    )
-                    .await
-                    .unwrap_or(Err(ProviderError::Unavailable("fallback timeout".into()))) else {
-                        continue;
-                    };
-                    let mut candidates = alternate_releases
-                        .into_iter()
-                        .filter(|candidate| release_has_usable_source(candidate))
-                        .collect::<Vec<_>>();
-                    candidates.sort_by_key(|candidate| {
-                        (
-                            candidate.quality != release.quality,
-                            provider_priority(candidate.provider),
-                            std::cmp::Reverse(candidate.resolution_u64()),
-                        )
-                    });
-                    for candidate in candidates.into_iter().take(3) {
-                        if let Ok(resolved) = resolve_valid_direct_source(
-                            &state,
-                            &candidate,
-                            source.content_type.as_deref(),
-                        )
-                        .await
-                        {
-                            let candidate_source_id = api_sources_for_content(
-                                std::slice::from_ref(&candidate),
-                                &fallback_ref,
-                                source.content_type.as_deref(),
-                            )
-                            .first()
-                            .map(|source| source.id.clone());
-                            if let Some(candidate_source_id) = candidate_source_id {
-                                selected_source_id = candidate_source_id;
-                                selected_provider = candidate.provider;
-                                fallback = Some(resolved);
-                                break 'providers;
-                            }
-                        }
-                    }
-                }
-            }
-            let Some(resolved) = fallback else {
-                let (code, message, status) = if original_error.contains("timed out") {
-                    (
-                        "DIRECT_PLAY_RESOLUTION_TIMEOUT",
-                        "Direct provider URL resolution timed out.",
-                        504,
-                    )
-                } else if original_error == "provider unavailable" {
-                    (
-                        "DIRECT_PLAY_RESOLUTION_FAILED",
-                        "The provider is unavailable.",
-                        503,
-                    )
-                } else if original_error == "no direct provider URL" {
-                    (
-                        "DIRECT_PLAY_RESOLUTION_FAILED",
-                        "The provider did not return a direct media URL.",
-                        502,
-                    )
-                } else if original_error == "resolved URL rejected" {
-                    (
-                        "DIRECT_URL_REJECTED",
-                        "The resolved provider URL is not an allowed public HTTPS destination.",
-                        403,
-                    )
-                } else {
-                    (
-                        "DIRECT_PLAY_RESOLUTION_FAILED",
-                        "The provider could not resolve a direct media URL.",
-                        502,
-                    )
-                };
-                let (status, response) = err(code, message, Some(source.p), status);
+    let original_fetch =
+        tokio::time::timeout(SOURCE_TIMEOUT, cached_releases(&state, &reference)).await;
+    let mut original_error = None;
+    let mut original_resolution_error = None;
+    let original_resolution = match original_fetch {
+        Ok(Ok(releases)) => {
+            let release = match source.f.as_deref() {
+                Some(fingerprint) => releases.iter().find(|release| {
+                    release_matches_episode(release, &source)
+                        && release_fingerprint(release) == fingerprint
+                }),
+                None => releases
+                    .iter()
+                    .enumerate()
+                    .find(|(index, release)| {
+                        *index == source.i && release_matches_episode(release, &source)
+                    })
+                    .map(|(_, release)| release),
+            };
+            let Some(release) = release else {
+                let (status, response) = err(
+                    "SOURCE_NOT_FOUND",
+                    "The source was not found.",
+                    Some(source.p),
+                    404,
+                );
                 return write_raw_json(stream, status, &response, None).await;
             };
-            resolved
+            match resolve_valid_direct_source(&state, release, source.content_type.as_deref()).await
+            {
+                Ok(resolved) => Some(resolved),
+                Err(error) => {
+                    original_resolution_error = Some(error);
+                    None
+                }
+            }
         }
+        Ok(Err(error)) => {
+            original_error = Some(error);
+            None
+        }
+        Err(_) => {
+            original_resolution_error = Some("resolution timed out".to_string());
+            None
+        }
+    };
+    let (playback, url_type, validated_url) = if let Some(resolved) = original_resolution {
+        resolved
+    } else if original_resolution_error.as_deref().is_none_or(|error| {
+        !matches!(
+            error,
+            "resolved URL rejected" | "direct playback compatibility unknown"
+        )
+    }) {
+        let Some((resolved, fallback_source_id, fallback_provider)) =
+            try_direct_fallback(&state, &source).await
+        else {
+            if let Some(error) = original_error {
+                let (status, response) = provider_error(error, source.p);
+                return write_raw_json(stream, status, &response, None).await;
+            }
+            let error = original_resolution_error.unwrap_or_else(|| "resolution failed".into());
+            let (code, message, status) = if error.contains("timed out") {
+                (
+                    "DIRECT_PLAY_RESOLUTION_TIMEOUT",
+                    "Direct provider URL resolution timed out.",
+                    504,
+                )
+            } else if error == "provider unavailable" {
+                (
+                    "DIRECT_PLAY_RESOLUTION_FAILED",
+                    "The provider is unavailable.",
+                    503,
+                )
+            } else if error == "no direct provider URL" {
+                (
+                    "DIRECT_PLAY_RESOLUTION_FAILED",
+                    "The provider did not return a direct media URL.",
+                    502,
+                )
+            } else {
+                (
+                    "DIRECT_PLAY_RESOLUTION_FAILED",
+                    "The provider could not resolve a direct media URL.",
+                    502,
+                )
+            };
+            let (status, response) = err(code, message, Some(source.p), status);
+            return write_raw_json(stream, status, &response, None).await;
+        };
+        selected_source_id = fallback_source_id;
+        selected_provider = fallback_provider;
+        resolved
+    } else {
+        let (status, response) = err(
+            "DIRECT_URL_REJECTED",
+            "The resolved provider URL is not an allowed public HTTPS destination.",
+            Some(source.p),
+            403,
+        );
+        return write_raw_json(stream, status, &response, None).await;
     };
     let headers = direct_safe_headers(&playback.headers);
     let response = serde_json::json!({
@@ -8963,6 +9026,152 @@ mod tests {
         assert_eq!(decoded.v, episode.v);
         assert_eq!((decoded.s, decoded.e, decoded.i), (1, 5, 0));
         assert!(decoded.f.is_some());
+    }
+
+    fn verified_release(provider: ProviderKind, filename: &str, url: &str) -> Release {
+        Release {
+            provider,
+            filename: filename.into(),
+            quality: Some("1080p".into()),
+            codec: Some("H.264".into()),
+            language: Some("Japanese".into()),
+            size_bytes: Some(100),
+            season: Some(1),
+            episode: Some(2),
+            mirrors: vec![crate::providers::models::SourceMirror {
+                label: "Direct".into(),
+                resolver_url: url.into(),
+                headers: vec![],
+                direct_file: true,
+            }],
+            resource_id: None,
+        }
+    }
+
+    #[test]
+    fn anime_episode_full_route_aggregates_verified_provider_sources() {
+        let primary = OpaqueRef {
+            p: ProviderKind::FourKHdHub,
+            v: "primary-title".into(),
+            s: 1,
+            e: 2,
+        };
+        let alternate = OpaqueRef {
+            p: ProviderKind::Dramachi,
+            v: "alternate-title".into(),
+            s: 1,
+            e: 2,
+        };
+        let (sources, status, partial, error) = aggregate_episode_sources([
+            (
+                primary.clone(),
+                primary.p,
+                Ok(vec![verified_release(
+                    primary.p,
+                    "primary.mkv",
+                    "https://cdn.example/primary.mkv",
+                )]),
+            ),
+            (
+                alternate.clone(),
+                alternate.p,
+                Ok(vec![verified_release(
+                    alternate.p,
+                    "alternate.mkv",
+                    "https://cdn.example/alternate.mkv",
+                )]),
+            ),
+        ]);
+        assert_eq!(status, "ok");
+        assert!(!partial);
+        assert!(error.is_none());
+        assert_eq!(sources.len(), 2);
+        let providers = sources
+            .iter()
+            .map(|source| decode::<OpaqueSource>(&source.id).unwrap().p)
+            .collect::<Vec<_>>();
+        assert!(providers.contains(&ProviderKind::FourKHdHub));
+        assert!(providers.contains(&ProviderKind::Dramachi));
+    }
+
+    #[test]
+    fn anime_episode_full_route_reports_partial_provider_failures() {
+        let primary = OpaqueRef {
+            p: ProviderKind::FourKHdHub,
+            v: "primary-title".into(),
+            s: 1,
+            e: 2,
+        };
+        let failed = OpaqueRef {
+            p: ProviderKind::Dramachi,
+            v: "alternate-title".into(),
+            s: 1,
+            e: 2,
+        };
+        let (sources, status, partial, error) = aggregate_episode_sources([
+            (
+                primary.clone(),
+                primary.p,
+                Ok(vec![verified_release(
+                    primary.p,
+                    "primary.mkv",
+                    "https://cdn.example/primary.mkv",
+                )]),
+            ),
+            (
+                failed,
+                ProviderKind::Dramachi,
+                Err(EpisodeReleaseFailure::Provider(ProviderError::Network(
+                    "provider down".into(),
+                ))),
+            ),
+        ]);
+        assert_eq!(sources.len(), 1);
+        assert_eq!(status, "partial");
+        assert!(partial);
+        assert!(error.is_some());
+    }
+
+    #[test]
+    fn direct_play_route_rejects_wrong_episode_identity() {
+        let source = OpaqueSource {
+            p: ProviderKind::Dramachi,
+            v: "title".into(),
+            s: 1,
+            e: 2,
+            content_type: None,
+            f: None,
+            i: 0,
+        };
+        let wrong_episode = verified_release(
+            ProviderKind::Dramachi,
+            "wrong-episode.mkv",
+            "https://cdn.example/wrong-episode.mkv",
+        );
+        let wrong_episode = Release {
+            episode: Some(3),
+            ..wrong_episode
+        };
+        assert!(!release_matches_episode(&wrong_episode, &source));
+    }
+
+    #[test]
+    fn direct_play_route_rejects_wrong_provider_identity() {
+        let source = OpaqueSource {
+            p: ProviderKind::Dramachi,
+            v: "title".into(),
+            s: 1,
+            e: 2,
+            content_type: None,
+            f: None,
+            i: 0,
+        };
+        let wrong_provider = verified_release(
+            ProviderKind::FourKHdHub,
+            "wrong-provider.mkv",
+            "https://cdn.example/wrong-provider.mkv",
+        );
+        assert!(!release_matches_episode(&wrong_provider, &source));
     }
     #[test]
     fn source_fingerprint_survives_release_reordering() {
