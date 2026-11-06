@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use crate::models::BrowseMetrics;
 use crate::providers::Provider;
+use crate::providers::anizone::AniZoneClient;
 use crate::providers::bdix::circleftp::CircleFtpClient;
 use crate::providers::bdix::dhakaflix::client::DhakaFlixClient;
 use crate::providers::fourkhdhub::FourKHdHubClient;
@@ -12,6 +13,7 @@ use crate::providers::moviebox::client::MovieBoxClient;
 #[derive(Clone)]
 pub struct MovieBoxService {
     pub client: MovieBoxClient,
+    pub anizone_client: AniZoneClient,
     pub fourk_client: Option<FourKHdHubClient>,
     pub circleftp_client: CircleFtpClient,
     pub dhakaflix_client: DhakaFlixClient,
@@ -35,6 +37,7 @@ impl MovieBoxService {
 
         Self {
             client: MovieBoxClient::new(),
+            anizone_client: AniZoneClient::new(),
             fourk_client: FourKHdHubClient::new().ok(),
             circleftp_client: CircleFtpClient::new(),
             dhakaflix_client: DhakaFlixClient::new(),
@@ -47,6 +50,7 @@ impl MovieBoxService {
     pub fn capabilities(&self, provider: ProviderKind) -> crate::providers::ProviderCapabilities {
         match provider {
             ProviderKind::MovieBox => Provider::capabilities(&self.client),
+            ProviderKind::AniZone => Provider::capabilities(&self.anizone_client),
             ProviderKind::FourKHdHub => self
                 .fourk_client
                 .as_ref()
@@ -76,6 +80,7 @@ impl MovieBoxService {
     ) -> Result<Vec<CatalogItem>, ProviderError> {
         match provider {
             ProviderKind::MovieBox => Provider::search(&self.client, query, page).await,
+            ProviderKind::AniZone => Provider::search(&self.anizone_client, query, page).await,
             ProviderKind::FourKHdHub => {
                 let fourk = self.fourk_client.as_ref().ok_or_else(|| {
                     ProviderError::Unavailable("4KHDHub is unavailable".to_string())
@@ -168,6 +173,7 @@ impl MovieBoxService {
     ) -> Result<MediaDetails, ProviderError> {
         match provider {
             ProviderKind::MovieBox => Provider::details(&self.client, subject_id).await,
+            ProviderKind::AniZone => Provider::details(&self.anizone_client, subject_id).await,
             ProviderKind::FourKHdHub => {
                 let fourk = self.fourk_client.as_ref().ok_or_else(|| {
                     ProviderError::Unavailable("4KHDHub is unavailable".to_string())

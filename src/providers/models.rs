@@ -16,15 +16,18 @@ pub enum ProviderKind {
     Addons,
     #[serde(rename = "dramachi")]
     Dramachi,
+    #[serde(rename = "anizone")]
+    AniZone,
 }
 
 impl ProviderKind {
-    pub const ENABLED: [Self; 5] = [
+    pub const ENABLED: [Self; 6] = [
         Self::MovieBox,
         Self::FourKHdHub,
         Self::Dramachi,
         Self::BdixCircleFtp,
         Self::BdixDhakaFlix,
+        Self::AniZone,
     ];
 
     pub const fn cache_key(self) -> &'static str {
@@ -35,6 +38,7 @@ impl ProviderKind {
             Self::BdixDhakaFlix => "bdix_dhakaflix",
             Self::Addons => "addons",
             Self::Dramachi => "dramachi",
+            Self::AniZone => "anizone",
         }
     }
 
@@ -46,6 +50,7 @@ impl ProviderKind {
             Self::BdixDhakaFlix => "DhakaFlix (BDIX)",
             Self::Addons => "Addons",
             Self::Dramachi => "Dramachi",
+            Self::AniZone => "AniZone",
         }
     }
 
@@ -57,6 +62,7 @@ impl ProviderKind {
             "bdix_dhakaflix" | "dhakaflix (bdix)" => Some(Self::BdixDhakaFlix),
             "addons" | "addon" => Some(Self::Addons),
             "dramachi" => Some(Self::Dramachi),
+            "anizone" => Some(Self::AniZone),
             _ => None,
         }
     }
@@ -286,6 +292,7 @@ impl Release {
                 ProviderKind::BdixDhakaFlix => "DhakaFlix",
                 ProviderKind::Addons => "Addon",
                 ProviderKind::Dramachi => "Dramachi",
+                ProviderKind::AniZone => "AniZone",
                 ProviderKind::MovieBox => "Direct",
             })
     }

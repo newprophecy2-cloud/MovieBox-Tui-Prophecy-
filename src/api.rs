@@ -71,8 +71,9 @@ const REMUX_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(20);
 static REMUX_LIMITER: std::sync::LazyLock<Arc<Semaphore>> =
     std::sync::LazyLock::new(|| Arc::new(Semaphore::new(2)));
 static REMUX_DEBUG_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-const PROVIDERS: [ProviderKind; 6] = [
+const PROVIDERS: [ProviderKind; 7] = [
     ProviderKind::MovieBox,
+    ProviderKind::AniZone,
     ProviderKind::FourKHdHub,
     ProviderKind::Dramachi,
     ProviderKind::BdixCircleFtp,
@@ -104,6 +105,9 @@ fn configured_search_providers() -> Vec<ProviderKind> {
     }
     if config.dramachi_enabled {
         providers.push(ProviderKind::Dramachi);
+    }
+    if config.anizone_enabled {
+        providers.push(ProviderKind::AniZone);
     }
     providers
 }
@@ -262,11 +266,19 @@ fn source_codec_eligibility(codec: Option<&str>) -> SourceCodecEligibility {
 }
 
 fn release_has_usable_source(release: &Release) -> bool {
+    let has_valid_url = release.mirrors.iter().any(|mirror| {
+        !mirror.resolver_url.trim().is_empty()
+            && crate::net::validate_url_syntax(&mirror.resolver_url, true).is_ok()
+    });
+    if release.provider == ProviderKind::AniZone {
+        return has_valid_url
+            && release.mirrors.iter().any(|mirror| {
+                mirror.resolver_url.to_ascii_lowercase().contains(".m3u8")
+                    || mirror.resolver_url.to_ascii_lowercase().contains("m3u8")
+            });
+    }
     source_codec_eligibility(release.codec.as_deref()) == SourceCodecEligibility::Verified
-        && release.mirrors.iter().any(|mirror| {
-            !mirror.resolver_url.trim().is_empty()
-                && crate::net::validate_url_syntax(&mirror.resolver_url, true).is_ok()
-        })
+        && has_valid_url
 }
 
 fn release_has_verification_candidate(release: &Release) -> bool {
@@ -285,6 +297,7 @@ fn codec_ineligibility_error(releases: &[Release]) -> Option<(&'static str, &'st
     if releases.is_empty()
         || releases.iter().any(|release| {
             source_codec_eligibility(release.codec.as_deref()) == SourceCodecEligibility::Verified
+                || (release.provider == ProviderKind::AniZone && release_has_usable_source(release))
         })
     {
         return None;
@@ -2798,6 +2811,7 @@ async fn diagnostics_route(stream: &mut TcpStream, state: ApiState) -> std::io::
         .await
         .unwrap_or_default();
     let built_in = serde_json::json!({
+        "anizone": { "configured": config.anizone_enabled, "initialized": true, "upstream": "not_checked" },
         "fourkhdhub": { "configured": config.fourkhdhub_enabled, "initialized": state.service.fourk_client.is_some(), "upstream": "not_checked" },
         "dramachi": { "configured": config.dramachi_enabled, "initialized": true, "upstream": "not_checked" },
         "bdix_circleftp": { "configured": config.bdix_circleftp_enabled, "initialized": true, "upstream": "not_checked" },
@@ -2806,6 +2820,7 @@ async fn diagnostics_route(stream: &mut TcpStream, state: ApiState) -> std::io::
     let built_in_streaming = config.streaming_enabled
         && ((config.fourkhdhub_enabled && state.service.fourk_client.is_some())
             || config.dramachi_enabled
+            || config.anizone_enabled
             || config.bdix_circleftp_enabled
             || config.bdix_dhakaflix_enabled);
 
@@ -5264,6 +5279,14 @@ async fn resolve_playback_candidate(
     state: &ApiState,
     release: &Release,
 ) -> Result<crate::providers::models::PlaybackSource, String> {
+    if release.provider == ProviderKind::AniZone {
+        return state
+            .service
+            .anizone_client
+            .resolve_release(release)
+            .await
+            .map_err(|error| error.to_string());
+    }
     if release.provider == ProviderKind::FourKHdHub {
         let client = state
             .service
@@ -5863,6 +5886,10 @@ async fn releases_uncached(state: &ApiState, r: &OpaqueRef) -> Result<Vec<Releas
         ProviderKind::MovieBox => {
             crate::providers::ReleaseProvider::episode_streams(&svc.client, &r.v, r.s, r.e).await
         }
+        ProviderKind::AniZone => {
+            crate::providers::ReleaseProvider::episode_streams(&svc.anizone_client, &r.v, r.s, r.e)
+                .await
+        }
         ProviderKind::FourKHdHub => match svc.fourk_client.as_ref() {
             Some(client) => {
                 crate::providers::ReleaseProvider::episode_streams(client, &r.v, r.s, r.e).await
@@ -5934,6 +5961,7 @@ fn api_sources_for_content(
         .enumerate()
         .filter(|(_, release)| {
             source_codec_eligibility(release.codec.as_deref()) == SourceCodecEligibility::Verified
+                || (release.provider == ProviderKind::AniZone && release_has_usable_source(release))
         })
         .map(|(i, r)| ApiSource {
             id: source_ref_for_content(r, episode, i, content_type),
@@ -6511,6 +6539,18 @@ async fn resolve_direct_provider_source(
     source: &Release,
     state: &ApiState,
 ) -> Result<PlaybackSource, String> {
+    if source.provider == ProviderKind::AniZone {
+        return match tokio::time::timeout(
+            PLAYBACK_RESOLUTION_TIMEOUT,
+            state.service.anizone_client.resolve_release(source),
+        )
+        .await
+        {
+            Ok(Ok(playback)) => Ok(playback),
+            Ok(Err(error)) => Err(error.to_string()),
+            Err(_) => Err("resolution timed out".to_string()),
+        };
+    }
     if source.provider == ProviderKind::FourKHdHub {
         let Some(client) = state.service.fourk_client.as_ref() else {
             return Err("provider unavailable".to_string());
@@ -6995,7 +7035,18 @@ async fn cached_playback_source(
             let state = state.clone();
             let release = release.clone();
             let task = tokio::spawn(async move {
-                if release.provider == ProviderKind::FourKHdHub {
+                if release.provider == ProviderKind::AniZone {
+                    match tokio::time::timeout(
+                        PLAYBACK_RESOLUTION_TIMEOUT,
+                        state.service.anizone_client.resolve_release(&release),
+                    )
+                    .await
+                    {
+                        Ok(Ok(playback)) => Ok(playback),
+                        Ok(Err(error)) => Err(error.to_string()),
+                        Err(_) => Err("AniZone playback resolution timed out.".to_string()),
+                    }
+                } else if release.provider == ProviderKind::FourKHdHub {
                     let Some(client) = state.service.fourk_client.as_ref() else {
                         return Err("4KHDHub is unavailable.".to_string());
                     };
@@ -10068,6 +10119,7 @@ mod tests {
         let providers = configured_search_providers();
         assert!(providers.contains(&ProviderKind::FourKHdHub));
         assert!(providers.contains(&ProviderKind::Dramachi));
+        assert!(providers.contains(&ProviderKind::AniZone));
         assert!(!providers.contains(&ProviderKind::BdixCircleFtp));
         assert!(!providers.contains(&ProviderKind::BdixDhakaFlix));
         assert!(!providers.contains(&ProviderKind::Addons));
