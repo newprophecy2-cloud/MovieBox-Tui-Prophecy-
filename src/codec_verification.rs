@@ -10,6 +10,8 @@ use tokio::{
 use crate::providers::models::{PlaybackSource, ProviderKind};
 
 const SAMPLE_LIMIT: usize = 32 * 1024 * 1024;
+const DRAMACHI_FAST_SAMPLE_LIMIT: usize = 1024 * 1024;
+const DRAMACHI_FALLBACK_SAMPLE_LIMIT: usize = 4 * 1024 * 1024;
 const DIRECT_SAMPLE_LIMIT: usize = 4 * 1024 * 1024;
 const PROBE_STDOUT_LIMIT: usize = 64 * 1024;
 const PROBE_STDERR_LIMIT: usize = 64 * 1024;
@@ -107,15 +109,41 @@ pub async fn verify_playback_source(
     }
 
     let url = validate_media_url(&source.url).await?;
-    let sample = tokio::time::timeout(DOWNLOAD_TIMEOUT, download_sample(&url, &source.headers))
-        .await
-        .map_err(|_| CodecProbeError::DownloadTimeout)??;
+    let sample_limit = if source.provider == ProviderKind::Dramachi {
+        DRAMACHI_FAST_SAMPLE_LIMIT
+    } else {
+        SAMPLE_LIMIT
+    };
+    let sample = tokio::time::timeout(
+        DOWNLOAD_TIMEOUT,
+        download_sample(&url, &source.headers, sample_limit),
+    )
+    .await
+    .map_err(|_| CodecProbeError::DownloadTimeout)??;
     if sample.is_empty() {
         return Err(CodecProbeError::EmptyMedia);
     }
 
     let ffprobe = ffprobe_executable().ok_or(CodecProbeError::ProbeUnavailable)?;
-    probe_sample_with_executable(&ffprobe, &sample, PROBE_TIMEOUT).await
+    match probe_sample_with_executable(&ffprobe, &sample, PROBE_TIMEOUT).await {
+        Ok(result) => Ok(result),
+        Err(_) if source.provider == ProviderKind::Dramachi => {
+            // Front-loaded MP4 metadata can be inspected from a small range. If
+            // moov/codec configuration is later in the file, retry once with a
+            // still-bounded sample rather than downloading the generic 32 MiB.
+            let sample = tokio::time::timeout(
+                DOWNLOAD_TIMEOUT,
+                download_sample(&url, &source.headers, DRAMACHI_FALLBACK_SAMPLE_LIMIT),
+            )
+            .await
+            .map_err(|_| CodecProbeError::DownloadTimeout)??;
+            if sample.is_empty() {
+                return Err(CodecProbeError::EmptyMedia);
+            }
+            probe_sample_with_executable(&ffprobe, &sample, PROBE_TIMEOUT).await
+        }
+        Err(error) => Err(error),
+    }
 }
 
 pub(crate) async fn inspect_direct_playback_source(
@@ -268,11 +296,12 @@ fn guarded_media_client() -> Result<reqwest::Client, CodecProbeError> {
 async fn download_sample(
     url: &reqwest::Url,
     trusted_headers: &[(String, String)],
+    sample_limit: usize,
 ) -> Result<Vec<u8>, CodecProbeError> {
     let client = guarded_media_client()?;
     let mut request = client.get(url.clone()).header(
         reqwest::header::RANGE,
-        format!("bytes=0-{}", SAMPLE_LIMIT - 1),
+        format!("bytes=0-{}", sample_limit - 1),
     );
     let mut referer_seen = false;
     for (name, value) in trusted_headers.iter().take(16) {
@@ -323,16 +352,16 @@ async fn download_sample(
     }
 
     let mut stream = response.bytes_stream();
-    let mut sample = Vec::with_capacity(SAMPLE_LIMIT.min(1024 * 1024));
+    let mut sample = Vec::with_capacity(sample_limit.min(1024 * 1024));
     while let Some(next) = stream.next().await {
         let chunk = next.map_err(|_| CodecProbeError::MediaUnavailable)?;
-        let remaining = SAMPLE_LIMIT.saturating_sub(sample.len());
+        let remaining = sample_limit.saturating_sub(sample.len());
         if chunk.len() > remaining {
             sample.extend_from_slice(&chunk[..remaining]);
             break;
         }
         sample.extend_from_slice(&chunk);
-        if sample.len() == SAMPLE_LIMIT {
+        if sample.len() == sample_limit {
             break;
         }
     }
@@ -547,6 +576,13 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+
+    #[test]
+    fn dramachi_probe_uses_small_fast_range_and_bounded_fallback() {
+        assert_eq!(DRAMACHI_FAST_SAMPLE_LIMIT, 1024 * 1024);
+        assert_eq!(DRAMACHI_FALLBACK_SAMPLE_LIMIT, 4 * 1024 * 1024);
+        assert!(DRAMACHI_FALLBACK_SAMPLE_LIMIT < SAMPLE_LIMIT);
+    }
 
     async fn probe_fixture(bytes: &[u8]) -> Result<CodecProbeResult, CodecProbeError> {
         let executable = ffprobe_executable().expect("ffprobe installed for this test run");

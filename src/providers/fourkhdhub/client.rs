@@ -6,7 +6,7 @@ use reqwest::Url;
 
 const DEFAULT_BASE_URL: &str = "https://4khdhub.one/";
 const BROWSER_UA: &str = crate::net::DEFAULT_BROWSER_USER_AGENT;
-const MIRROR_RESOLUTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(14);
+const MIRROR_RESOLUTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
 
 #[derive(thiserror::Error, Debug)]
 pub enum FourKHdHubError {
@@ -408,10 +408,10 @@ impl FourKHdHubClient {
             Ok((final_url.to_string(), is_seekable))
         };
 
-        tokio::time::timeout(std::time::Duration::from_millis(3500), probe)
+        tokio::time::timeout(std::time::Duration::from_secs(6), probe)
             .await
             .map_err(|_| {
-                FourKHdHubError::NoPlayableMirror("mirror preflight probe timed out (3.5s)".into())
+                FourKHdHubError::NoPlayableMirror("mirror preflight probe timed out (6s)".into())
             })?
     }
 

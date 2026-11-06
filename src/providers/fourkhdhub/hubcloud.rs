@@ -23,57 +23,69 @@ pub async fn resolve(
         .error_for_status()?
         .text()
         .await?;
-    let resolver_url = {
-        let document = Html::parse_document(&drive_html);
-        document
-            .select(&SEL_DOWNLOAD)
-            .filter_map(|node| node.value().attr("href"))
-            .find(|href| href.starts_with("https://"))
-            .map(str::to_string)
-            .ok_or_else(|| FourKHdHubError::Parse("HubCloud resolver link missing".into()))?
-    };
+    let resolver_urls = extract_resolver_urls(&drive_html);
+    if resolver_urls.is_empty() {
+        return Err(FourKHdHubError::Parse(
+            "HubCloud resolver link missing".into(),
+        ));
+    }
 
-    let resolver_html = client
-        .get(&resolver_url)
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
-    let resolver = Html::parse_document(&resolver_html);
-
-    let mut candidates = extract_script_pixeldrain_urls(&resolver_html)
-        .into_iter()
-        .map(|url| {
-            (
-                score(&url, "PixelDrain", intent),
-                url,
-                "PixelDrain".to_string(),
-            )
-        })
-        .collect::<Vec<_>>();
-    candidates.extend(
-        resolver
-            .select(&SEL_LINKS)
-            .filter_map(|node| {
-                let href = node.value().attr("href")?;
-                let label = node.text().collect::<String>();
-                if let Some(unwrapped) = unwrap_watch_online_url(href)
-                    && let Ok(valid) = validate_playback_url(&unwrapped)
-                {
-                    return Some((
-                        score(&valid, "Watch Online", intent),
-                        valid,
-                        "Watch Online".to_string(),
-                    ));
+    let mut candidates = Vec::new();
+    let mut last_error = None;
+    for resolver_url in resolver_urls.into_iter().take(8) {
+        let resolver_html = match client
+            .get(&resolver_url)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+        {
+            Ok(response) => match response.text().await {
+                Ok(html) => html,
+                Err(error) => {
+                    last_error = Some(FourKHdHubError::Network(error));
+                    continue;
                 }
-                validate_playback_url(href).ok().map(|url| {
-                    let url = pixeldrain_api_url(&url).unwrap_or(url);
-                    (score(&url, &label, intent), url, clean_label(&label))
-                })
+            },
+            Err(error) => {
+                last_error = Some(FourKHdHubError::Network(error));
+                continue;
+            }
+        };
+        let resolver = Html::parse_document(&resolver_html);
+        candidates.extend(
+            extract_script_pixeldrain_urls(&resolver_html)
+                .into_iter()
+                .map(|url| {
+                    (
+                        score(&url, "PixelDrain", intent),
+                        url,
+                        "PixelDrain".to_string(),
+                    )
+                }),
+        );
+        candidates.extend(resolver.select(&SEL_LINKS).filter_map(|node| {
+            let href = node.value().attr("href")?;
+            let label = node.text().collect::<String>();
+            if let Some(unwrapped) = unwrap_watch_online_url(href)
+                && let Ok(valid) = validate_playback_url(&unwrapped)
+            {
+                return Some((
+                    score(&valid, "Watch Online", intent),
+                    valid,
+                    "Watch Online".to_string(),
+                ));
+            }
+            validate_playback_url(href).ok().map(|url| {
+                let url = pixeldrain_api_url(&url).unwrap_or(url);
+                (score(&url, &label, intent), url, clean_label(&label))
             })
-            .collect::<Vec<_>>(),
-    );
+        }));
+    }
+    if candidates.is_empty()
+        && let Some(error) = last_error
+    {
+        return Err(error.into());
+    }
     candidates.sort_by_key(|candidate| candidate.0);
     let mut resolved = candidates
         .into_iter()
@@ -87,6 +99,25 @@ pub async fn resolve(
     } else {
         Ok(resolved)
     }
+}
+
+fn extract_resolver_urls(drive_html: &str) -> Vec<String> {
+    let document = Html::parse_document(drive_html);
+    document
+        .select(&SEL_DOWNLOAD)
+        .filter_map(|node| node.value().attr("href"))
+        .filter_map(|href| {
+            let url = Url::parse(href).ok()?;
+            let host = url.host_str()?.to_ascii_lowercase();
+            (url.scheme() == "https"
+                && ((host.starts_with("hubcloud.") || host.contains(".hubcloud."))
+                    || host == "gamerxyt.com"
+                    || host.ends_with(".gamerxyt.com")))
+            .then(|| url.to_string())
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 pub async fn resolve_hubdrive(
@@ -480,6 +511,18 @@ fn clean_label(label: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extracts_all_trusted_resolver_links() {
+        let html = r#"<a class="btn-primary" href="https://hubcloud.ist/download/one">one</a>
+            <a class="btn-success" href="https://gamerxyt.com/download/two">two</a>
+            <a class="btn-primary" href="https://evil-example.com/download/no">bad</a>
+            <a class="btn-primary" href="http://hubcloud.ist/download/insecure">bad</a>"#;
+        let urls = extract_resolver_urls(html);
+        assert_eq!(urls.len(), 2);
+        assert!(urls.iter().any(|url| url.ends_with("/download/one")));
+        assert!(urls.iter().any(|url| url.ends_with("/download/two")));
+    }
 
     #[test]
     fn validates_and_encodes_unencoded_playback_paths() {
