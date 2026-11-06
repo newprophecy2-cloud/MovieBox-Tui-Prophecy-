@@ -492,6 +492,8 @@ struct AnimeEpisodeFullResponse {
     sources_status: &'static str,
     sources_partial: bool,
     source_error: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    provider_status: HashMap<String, String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -4389,12 +4391,6 @@ fn episode_candidates_can_merge(
         && left.anime_id.provider != right.anime_id.provider
         && episode_special_marker(left.episode.title.as_deref())
             == episode_special_marker(right.episode.title.as_deref())
-        // Episode position alone is not enough evidence. Only merge when both
-        // providers supply the same normalized non-empty title; otherwise keep
-        // separate canonical response records.
-        && normalized_episode_title(left.episode.title.as_deref()).is_some()
-        && normalized_episode_title(left.episode.title.as_deref())
-            == normalized_episode_title(right.episode.title.as_deref())
 }
 
 fn canonical_episode_response_id(
@@ -5053,10 +5049,9 @@ async fn unified_anime_route(
                     .find(|episode| {
                         episode.season == episode_ref.s && episode.number == episode_ref.e
                     })?;
-                if !crate::unified::episode_titles_compatible(
-                    selected_title,
-                    episode.title.as_deref(),
-                ) {
+                if episode_special_marker(selected_title)
+                    != episode_special_marker(episode.title.as_deref())
+                {
                     return None;
                 }
                 Some(OpaqueRef {
@@ -5747,7 +5742,7 @@ async fn anime_episode_full_route(
             };
             (reference, provider, result)
         });
-    let (sources, sources_status, sources_partial, source_error) =
+    let (sources, sources_status, sources_partial, source_error, provider_status) =
         aggregate_episode_sources(results);
 
     write_json(
@@ -5760,6 +5755,7 @@ async fn anime_episode_full_route(
             sources_status,
             sources_partial,
             source_error,
+            provider_status,
         },
         None,
     )
@@ -5788,19 +5784,35 @@ fn aggregate_episode_sources(
     &'static str,
     bool,
     Option<serde_json::Value>,
+    HashMap<String, String>,
 ) {
     let mut sources = Vec::new();
     let mut errors = Vec::new();
+    let mut provider_status = HashMap::new();
     for (reference, provider, result) in release_results {
+        let provider_key = provider.cache_key().to_string();
         match result {
-            Ok(releases) => sources.extend(api_sources(&releases, &reference)),
+            Ok(releases) => {
+                let provider_sources = api_sources(&releases, &reference);
+                provider_status.insert(
+                    provider_key,
+                    if provider_sources.is_empty() {
+                        "episode_list_ok_no_sources".to_string()
+                    } else {
+                        "sources_ok".to_string()
+                    },
+                );
+                sources.extend(provider_sources);
+            }
             Err(EpisodeReleaseFailure::Provider(error)) => {
+                provider_status.insert(provider_key, "source_error".to_string());
                 let (_, body) = provider_error(error, provider);
                 if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) {
                     errors.push(value);
                 }
             }
             Err(EpisodeReleaseFailure::Timeout) => {
+                provider_status.insert(provider_key, "source_timeout".to_string());
                 let (_, body) = err(
                     "REQUEST_DEADLINE_EXCEEDED",
                     "The source request deadline was exceeded.",
@@ -5824,7 +5836,13 @@ fn aggregate_episode_sources(
     } else {
         "ok"
     };
-    (sources, sources_status, sources_partial, source_error)
+    (
+        sources,
+        sources_status,
+        sources_partial,
+        source_error,
+        provider_status,
+    )
 }
 
 async fn cached_releases(state: &ApiState, r: &OpaqueRef) -> Result<Vec<Release>, ProviderError> {
@@ -9753,7 +9771,7 @@ mod tests {
             s: 1,
             e: 2,
         };
-        let (sources, status, partial, error) = aggregate_episode_sources([
+        let (sources, status, partial, error, provider_status) = aggregate_episode_sources([
             (
                 primary.clone(),
                 primary.p,
@@ -9776,6 +9794,14 @@ mod tests {
         assert_eq!(status, "ok");
         assert!(!partial);
         assert!(error.is_none());
+        assert_eq!(
+            provider_status.get("fourkhdhub").map(String::as_str),
+            Some("sources_ok")
+        );
+        assert_eq!(
+            provider_status.get("dramachi").map(String::as_str),
+            Some("sources_ok")
+        );
         assert_eq!(sources.len(), 2);
         let providers = sources
             .iter()
@@ -9799,7 +9825,7 @@ mod tests {
             s: 1,
             e: 2,
         };
-        let (sources, status, partial, error) = aggregate_episode_sources([
+        let (sources, status, partial, error, provider_status) = aggregate_episode_sources([
             (
                 primary.clone(),
                 primary.p,
@@ -9821,6 +9847,10 @@ mod tests {
         assert_eq!(status, "partial");
         assert!(partial);
         assert!(error.is_some());
+        assert_eq!(
+            provider_status.get("dramachi").map(String::as_str),
+            Some("source_error")
+        );
     }
 
     #[test]
@@ -10180,6 +10210,44 @@ mod tests {
         let secondary: OpaqueRef = decode(&response.provider_mappings[0].id).unwrap();
         assert_eq!(secondary.p, ProviderKind::Dramachi);
         assert_eq!(secondary.v, "black-clover-2017");
+    }
+
+    #[test]
+    fn unified_episode_coordinates_merge_when_provider_titles_differ() {
+        let primary_ref = OpaqueRef {
+            p: ProviderKind::AniZone,
+            v: "haibane-anizone".into(),
+            s: 1,
+            e: 1,
+        };
+        let alternate_ref = OpaqueRef {
+            p: ProviderKind::Dramachi,
+            v: "42999".into(),
+            s: 1,
+            e: 1,
+        };
+        let (mut primary, _, _) = test_anime_details(&primary_ref);
+        let (mut alternate, _, _) = test_anime_details(&alternate_ref);
+        primary.seasons[0].episodes[0].title = Some("Cocoon / Dream of Falling".into());
+        alternate.seasons[0].episodes[0].title = Some("Haibane Renmei S01E01".into());
+
+        let details = vec![
+            (primary.id.clone(), primary),
+            (alternate.id.clone(), alternate),
+        ];
+        let mappings = details.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
+        let response =
+            unified_api_details(&details, &mappings, "local-haibane".into(), HashMap::new());
+        let episode = &response.seasons[0].episodes[0];
+
+        assert_eq!(response.seasons[0].episode_count, 1);
+        assert_eq!(episode.provider_lookups.len(), 2);
+        assert_eq!(episode.provider_mappings.len(), 1);
+        assert_eq!(
+            episode.provider_mappings[0].provider,
+            ProviderKind::Dramachi
+        );
+        assert_eq!(episode.mapping_status, "resolved");
     }
 
     #[test]

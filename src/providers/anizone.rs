@@ -179,7 +179,9 @@ impl AniZoneClient {
                     },
                     year: item.year.map(|year| year.to_string()),
                     poster_url: item.cover,
-                    season_count: item.episode_count,
+                    // Search exposes an episode count, not an authoritative
+                    // season count. Details is the source of season metadata.
+                    season_count: None,
                 })
             })
             .collect()
@@ -514,6 +516,7 @@ struct SearchItem {
     kind: String,
     year: Option<i64>,
     cover: Option<String>,
+    #[allow(dead_code)]
     episode_count: Option<usize>,
 }
 #[derive(Debug)]
