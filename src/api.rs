@@ -4871,6 +4871,107 @@ async fn fetch_unified_provider_details(
     (results, status)
 }
 
+async fn discover_unmapped_provider_details(
+    state: &ApiState,
+    known_details: &[(ProviderMediaId, MediaDetails)],
+) -> (
+    Vec<(ProviderMediaId, MediaDetails)>,
+    HashMap<String, String>,
+) {
+    let mut status = HashMap::new();
+    let Some((_, primary)) = known_details.first() else {
+        return (Vec::new(), status);
+    };
+    let targets = configured_search_providers()
+        .into_iter()
+        .filter(|provider| {
+            !known_details
+                .iter()
+                .any(|(mapping, _)| mapping.provider == *provider)
+        });
+    let query = primary.title.clone();
+    let primary_identity = primary.clone();
+    let slots = Arc::new(Semaphore::new(SEARCH_PROVIDER_CONCURRENCY));
+    let mut tasks = JoinSet::new();
+
+    for provider in targets {
+        let service = Arc::clone(&state.service);
+        let query = query.clone();
+        let primary_identity = primary_identity.clone();
+        let slots = Arc::clone(&slots);
+        tasks.spawn(async move {
+            let Ok(_permit) = slots.acquire_owned().await else {
+                return (provider, None, "concurrency_limit".to_string());
+            };
+            let search = tokio::time::timeout(
+                DYNAMIC_DISCOVERY_TIMEOUT,
+                service.search_typed(provider, &query, 1),
+            )
+            .await;
+            let items = match search {
+                Ok(Ok(items)) => items,
+                Ok(Err(error)) => {
+                    return (provider, None, error.user_message(provider));
+                }
+                Err(_) => return (provider, None, "timeout".to_string()),
+            };
+            let primary_title = crate::unified::normalize_anime_title(&primary_identity.title);
+            let candidates = items
+                .into_iter()
+                .filter(|item| {
+                    let candidate_title = crate::unified::normalize_anime_title(&item.title);
+                    item.media_type == primary_identity.media_type
+                        && candidate_title.key == primary_title.key
+                        && candidate_title.franchise_discriminator
+                            == primary_title.franchise_discriminator
+                        && years_compatible(primary_identity.year.as_deref(), item.year.as_deref())
+                })
+                .take(DYNAMIC_DISCOVERY_MAX_RESULTS)
+                .collect::<Vec<_>>();
+            if candidates.is_empty() {
+                return (provider, None, "empty".to_string());
+            }
+
+            let mut verified = Vec::new();
+            for item in candidates {
+                let details = tokio::time::timeout(
+                    DYNAMIC_DISCOVERY_TIMEOUT,
+                    service.details_typed(provider, &item.id.value),
+                )
+                .await;
+                if let Ok(Ok(details)) = details
+                    && details.id.provider == provider
+                    && details.id.value == item.id.value
+                    && same_anime_identity(&primary_identity, &details)
+                {
+                    verified.push((item.id, details));
+                }
+            }
+            match verified.len() {
+                1 => (provider, verified.pop(), "ok".to_string()),
+                0 => (provider, None, "no_verified_match".to_string()),
+                _ => (provider, None, "ambiguous_match".to_string()),
+            }
+        });
+    }
+
+    let mut discovered = Vec::new();
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok((provider, Some((mapping, details)), provider_status)) => {
+                status.insert(provider.cache_key().to_string(), provider_status);
+                discovered.push((mapping, details));
+            }
+            Ok((provider, None, provider_status)) => {
+                status.insert(provider.cache_key().to_string(), provider_status);
+            }
+            Err(error) => log::warn!("unified provider discovery task failed: {error}"),
+        }
+    }
+    discovered.sort_by_key(|(mapping, _)| provider_priority(mapping.provider));
+    (discovered, status)
+}
+
 fn unified_api_details(
     details: &[(ProviderMediaId, MediaDetails)],
     all_mappings: &[ProviderMediaId],
@@ -5167,8 +5268,20 @@ async fn unified_anime_route(
     primary_ref: OpaqueRef,
 ) -> std::io::Result<()> {
     let parts: Vec<_> = path.trim_matches('/').split('/').collect();
-    let mappings = resolve_unified_provider_mappings(&state, &unified).await;
-    let (details, provider_status) = fetch_unified_provider_details(&state, &mappings).await;
+    let mut mappings = resolve_unified_provider_mappings(&state, &unified).await;
+    let (mut details, mut provider_status) =
+        fetch_unified_provider_details(&state, &mappings).await;
+    let (discovered, discovery_status) = discover_unmapped_provider_details(&state, &details).await;
+    for (mapping, provider_details) in discovered {
+        // Replace a stale same-provider mapping with the newly verified ID.
+        mappings.retain(|existing| existing.provider != mapping.provider);
+        details.retain(|(existing, _)| existing.provider != mapping.provider);
+        mappings.push(mapping.clone());
+        details.push((mapping, provider_details));
+    }
+    provider_status.extend(discovery_status);
+    mappings.sort_by_key(|mapping| provider_priority(mapping.provider));
+    details.sort_by_key(|(mapping, _)| provider_priority(mapping.provider));
     if details.is_empty() {
         let provider = primary_ref.p;
         let message = provider_status

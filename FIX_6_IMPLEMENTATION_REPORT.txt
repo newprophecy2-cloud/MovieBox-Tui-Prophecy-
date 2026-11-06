@@ -1,0 +1,141 @@
+Prophecy Verse Backend — Fix 6 Implementation Report
+=====================================================
+
+Repository: newprophecy2-cloud/MovieBox-Tui-Prophecy-
+Branch: feature/complete-anime-multiprovider-search-playback
+Starting commit: 770a61e948e32b667ac55a676d2ed5785c86532a
+
+Status
+------
+Implemented the Details API integration for bounded, validated multi-provider anime discovery.
+The change was committed and pushed after this report was written.
+
+1. Exact root cause
+-------------------
+The unified Anime Details route resolved only provider IDs already present in the incoming unified
+reference or in persisted catalog mappings. It then fetched details only for those mappings.
+
+The existing search-based discover_episode_mappings() function was reachable only from the full
+selected-episode route. It was not part of the normal Anime Details or flat Episodes request flow.
+Consequently, when only 4KHDHub had a persisted mapping, the Details API fetched only 4KHDHub and
+returned its 51 episodes. Dramachi and AniZone were not searched or loaded during Details discovery,
+even though they were enabled providers.
+
+2. Exact files changed
+----------------------
+- src/api.rs
+  - Added bounded all-provider discovery for enabled providers without successful Details mappings.
+  - Integrated verified discovery into unified_anime_route().
+  - Reused the existing unified_api_details() aggregation and persistence workflow.
+- FIX_6_IMPLEMENTATION_REPORT.txt
+  - This report.
+
+No APK, frontend, Firebase, playback fallback, or provider adapter files were modified.
+
+3. Discovery behavior implemented
+----------------------------------
+For each enabled provider without a successful Details mapping, the Details route now:
+
+- Searches using the primary anime title.
+- Applies a bounded search timeout and result limit.
+- Validates media type, normalized title, franchise discriminator, and compatible year.
+- Fetches provider Details for candidate IDs.
+- Validates the returned provider identity and full anime identity.
+- Accepts only one verified candidate per provider; ambiguous candidates remain unsuccessful.
+- Aggregates all successfully verified provider Details through the existing Fix 3 workflow.
+- Replaces a stale same-provider mapping when a newly verified provider ID is found.
+- Persists the verified mappings and episode lookups through the existing catalog architecture.
+
+Provider failures do not stop discovery for other providers. Status values such as timeout, empty,
+no_verified_match, ambiguous_match, and provider errors are retained in provider_status. Any enabled
+provider that cannot be successfully checked keeps the response partial flag true.
+
+4. Provider mapping coverage
+----------------------------
+Before:
+- Details fetched only for provider IDs carried by the unified reference or already persisted.
+- In the reported Black Clover production case, only 4KHDHub was loaded by Details.
+- Observed live count: 4KHDHub 51 episodes; Dramachi 175; AniZone 170 when queried separately.
+
+After implementation:
+- Details discovery searches every currently enabled anime provider missing a successful mapping.
+- Verified provider IDs are included in the unified mapping set and persisted.
+- A live production run is required to record the actual post-change provider mapping counts.
+
+5. Unified episode counts
+-------------------------
+The existing Fix 3 aggregation remains responsible for episode grouping and deduplication.
+Episodes are not invented, and provider records are not merged solely because episode numbers match.
+Provider season/episode coordinates, provider title IDs, provider lookups, episode titles, and
+alternative provider references remain preserved.
+
+Automated tests do not provide a live Black Clover before/after count. The expected live target is
+that all currently verified unique records are returned; if all 175 Dramachi records are verified
+and equivalent records are correctly deduplicated, Season 1 should contain 175 episodes.
+
+6. Black Clover episode availability
+-------------------------------------
+Requested live checks: episodes 1, 52, 89, 100, 155, and 170.
+
+Result in this sandbox: NOT LIVE-VERIFIED. No production-like API instance and no live unified
+Details request were available in the sandbox, so no availability claim is made for these episode
+numbers.
+
+7. Provider status and partial-discovery accuracy
+-------------------------------------------------
+Implemented behavior:
+
+- Successful provider Details/discovery is reported as ok.
+- Provider search/detail timeouts are reported as timeout.
+- Empty search results are reported as empty.
+- Candidates that fail identity validation are reported as no_verified_match.
+- Ambiguous verified candidates are reported as ambiguous_match.
+- Any non-ok enabled provider status makes the unified response partial.
+- A response is not reported as complete when only one provider was successfully checked and other
+enabled providers failed or returned incomplete coverage.
+
+8. Database persistence and reuse
+---------------------------------
+Verified discovered provider mappings are passed through the existing persist_unified_details()
+path. On later Details requests, persisted verified provider mappings are loaded and reused, avoiding
+unnecessary repeated provider searches when all verified mappings are already available.
+
+Database persistence was not exercised against a live PostgreSQL instance in this sandbox. The
+existing persistence code path was preserved and the full automated test suite passed.
+
+9. API and APK compatibility
+----------------------------
+The existing route shapes and response compatibility were preserved:
+
+- GET /api/v1/anime/search
+- GET /api/v1/anime/{anime_id}
+- GET /api/v1/anime/{anime_id}/episodes
+- GET /api/v1/anime/{anime_id}/episodes/{episode_id}/full
+- POST /api/v1/play/direct
+
+The flat /episodes array, total episode count, per-season episode_count, existing response fields,
+and opaque provider references remain intact. No APK code was changed.
+
+10. Validation results
+----------------------
+Passed:
+
+- cargo fmt --all -- --check
+- git diff --check
+- cargo test --all-targets --locked
+- cargo build --release --locked
+
+The full test suite completed with exit code 0. The locked release build completed with exit code 0.
+
+Live and device validation not completed:
+
+- Live Black Clover unified Details/Episodes API result
+- Live provider counts and episode availability for 1, 52, 89, 100, 155, and 170
+- PostgreSQL persistence against a production-like database
+- Search -> Details -> Episodes -> Full Episode route sequence against a running deployment
+- Actual Android playback
+
+11. Git delivery
+----------------
+No deployment was performed. The implementation and this report were committed to the requested
+feature branch and pushed to its GitHub remote after validation.
