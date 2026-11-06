@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 const BASE_URL: &str = "https://anizone.to";
-const DEFAULT_UA: &str = crate::net::DEFAULT_BROWSER_USER_AGENT;
+const DEFAULT_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 const MAX_HTML_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PAGES: usize = 64;
 const PAGE_TIMEOUT: Duration = Duration::from_secs(15);

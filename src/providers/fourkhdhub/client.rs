@@ -99,7 +99,10 @@ impl FourKHdHubClient {
         let mut url = self.base_url.clone();
         url.query_pairs_mut().append_pair("s", query);
         let html = self.fetch_text(url).await?;
-        parser::parse_search(&self.base_url, &html)
+        Ok(parser::parse_search(&self.base_url, &html)?
+            .into_iter()
+            .filter(|item| parser::matches_search_query(&item.title, query))
+            .collect())
     }
 
     async fn fetch_cached_page(&self, id: &str) -> Result<String, FourKHdHubError> {

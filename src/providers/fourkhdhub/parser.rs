@@ -92,6 +92,23 @@ pub fn parse_search(base: &Url, html: &str) -> Result<Vec<CatalogItem>, FourKHdH
     Ok(items)
 }
 
+pub fn matches_search_query(title: &str, query: &str) -> bool {
+    let normalize = |value: &str| {
+        value
+            .split(|character: char| !character.is_alphanumeric())
+            .filter(|token| token.len() > 1)
+            .map(str::to_lowercase)
+            .collect::<Vec<_>>()
+    };
+    let query_tokens = normalize(query);
+    let title_tokens = normalize(title);
+    query_tokens.iter().all(|query_token| {
+        title_tokens
+            .iter()
+            .any(|title_token| title_token.starts_with(query_token))
+    })
+}
+
 pub fn parse_details(id: &str, html: &str) -> Result<MediaDetails, FourKHdHubError> {
     let document = Html::parse_document(html);
     let raw_title = document
@@ -439,8 +456,6 @@ fn detect_codec(value: &str) -> Option<String> {
         Some("HEVC".into())
     } else if lower.contains("h.264") || lower.contains("h264") || lower.contains("x264") {
         Some("H.264".into())
-    } else if lower.contains("remux") {
-        Some("REMUX".into())
     } else {
         None
     }
@@ -571,7 +586,7 @@ fn normalize_filename(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_details, strip_trailing_year};
+    use super::{matches_search_query, parse_details, strip_trailing_year};
     use crate::providers::fourkhdhub::FourKHdHubError;
     use crate::providers::models::MediaType;
 
@@ -579,6 +594,18 @@ mod tests {
     fn strips_parenthesized_year() {
         assert_eq!(strip_trailing_year("Movie Name (2024)"), "Movie Name");
         assert_eq!(strip_trailing_year("  X (1999)  "), "X");
+    }
+
+    #[test]
+    fn fuzzy_search_results_must_match_each_significant_query_token() {
+        assert!(matches_search_query("Black Clover (2017)", "Black Clover"));
+        assert!(matches_search_query(
+            "Hunter x Hunter (2011)",
+            "Hunter x Hunter"
+        ));
+        assert!(!matches_search_query("Naruto (2002)", "Naruto Shippuden"));
+        assert!(matches_search_query("Naruto Shippuden", "Naruto Ship"));
+        assert!(matches_search_query("Naruto", ""));
     }
 
     #[test]
@@ -687,5 +714,14 @@ mod tests {
         assert_eq!(detect_quality("Film.720p.HD.x264").as_deref(), Some("720p"));
         assert_eq!(detect_quality("Old.Show.480p.SD").as_deref(), Some("480p"));
         assert_eq!(detect_quality("Unknown.Release.Title"), None);
+    }
+
+    #[test]
+    fn remux_is_not_misreported_as_a_video_codec() {
+        use super::detect_codec;
+
+        assert_eq!(detect_codec("Movie.2160p.BluRay.REMUX"), None);
+        assert_eq!(detect_codec("Movie.REMUX.x265"), Some("H.265".into()));
+        assert_eq!(detect_codec("Movie.REMUX.x264"), Some("H.264".into()));
     }
 }

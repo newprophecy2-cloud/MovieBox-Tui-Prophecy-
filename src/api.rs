@@ -289,6 +289,12 @@ fn release_has_verification_candidate(release: &Release) -> bool {
         })
 }
 
+fn release_requires_codec_probe(release: &Release) -> bool {
+    release.provider == ProviderKind::FourKHdHub
+        && source_codec_eligibility(release.codec.as_deref()) == SourceCodecEligibility::Unverified
+        && release_has_verification_candidate(release)
+}
+
 fn is_blocked_h265_codec(codec: Option<&str>) -> bool {
     source_codec_eligibility(codec) == SourceCodecEligibility::BlockedH265
 }
@@ -5962,6 +5968,7 @@ fn api_sources_for_content(
         .filter(|(_, release)| {
             source_codec_eligibility(release.codec.as_deref()) == SourceCodecEligibility::Verified
                 || (release.provider == ProviderKind::AniZone && release_has_usable_source(release))
+                || release_requires_codec_probe(release)
         })
         .map(|(i, r)| ApiSource {
             id: source_ref_for_content(r, episode, i, content_type),
@@ -6595,7 +6602,25 @@ async fn resolve_valid_direct_source(
     let validated_url = crate::net::validate_public_url(&playback.url, false)
         .await
         .map_err(|_| "resolved URL rejected".to_string())?;
-    let url_type = direct_url_type(&validated_url, release, content_type)
+    let mut verified_release = release.clone();
+    if release.provider == ProviderKind::FourKHdHub {
+        match crate::codec_verification::verify_playback_source(&playback)
+            .await
+            .map_err(|_| "FourKHDHub media codec could not be verified".to_string())?
+        {
+            crate::codec_verification::CodecProbeResult::Allowed(codec) => {
+                verified_release.codec = Some(codec);
+            }
+            crate::codec_verification::CodecProbeResult::BlockedHevc(_) => {
+                return Err("FourKHDHub source blocked by H.265/HEVC playback policy".into());
+            }
+            crate::codec_verification::CodecProbeResult::Unsupported(_)
+            | crate::codec_verification::CodecProbeResult::NoVideoStream => {
+                return Err("FourKHDHub media codec is not supported by playback policy".into());
+            }
+        }
+    }
+    let url_type = direct_url_type(&validated_url, &verified_release, content_type)
         .ok_or_else(|| "direct playback compatibility unknown".to_string())?;
     Ok((playback, url_type.to_string(), validated_url))
 }
@@ -10334,13 +10359,31 @@ mod tests {
         };
         assert!(release_has_verification_candidate(&release));
         assert!(!release_has_usable_source(&release));
+        let episode = OpaqueRef {
+            p: ProviderKind::FourKHdHub,
+            v: "series".into(),
+            s: 1,
+            e: 1,
+        };
+        assert_eq!(
+            api_sources(std::slice::from_ref(&release), &episode).len(),
+            1
+        );
 
         release.codec = Some("HEVC".into());
         assert!(release_has_verification_candidate(&release));
         assert!(!release_has_usable_source(&release));
+        assert!(api_sources(std::slice::from_ref(&release), &episode).is_empty());
+        assert!(!release_requires_codec_probe(&release));
+
+        release.codec = None;
+        assert!(release_requires_codec_probe(&release));
+        release.codec = Some("REMUX".into());
+        assert!(release_requires_codec_probe(&release));
 
         release.provider = ProviderKind::Dramachi;
         assert!(!release_has_verification_candidate(&release));
+        assert!(!release_requires_codec_probe(&release));
     }
 
     #[test]
