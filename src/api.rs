@@ -1244,7 +1244,9 @@ async fn handle(mut stream: TcpStream, state: ApiState) -> std::io::Result<()> {
     if !allowed_method {
         return write_json(&mut stream, 405, &serde_json::json!({"error":{"code":"METHOD_NOT_ALLOWED","message":"Only GET is supported."}}), None).await;
     }
-    route(
+    let started = Instant::now();
+    let metric_route = normalized_metric_route(target);
+    let result = route(
         &mut stream,
         target,
         state,
@@ -1253,7 +1255,76 @@ async fn handle(mut stream: TcpStream, state: ApiState) -> std::io::Result<()> {
         method,
         method == "HEAD",
     )
-    .await
+    .await;
+    crate::observability::record_request(
+        &metric_route,
+        0,
+        started.elapsed().as_millis() as u64,
+        result
+            .as_ref()
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::TimedOut),
+    );
+    result
+}
+
+fn normalized_metric_route(target: &str) -> String {
+    let path = target.split_once('?').map_or(target, |(path, _)| path);
+    let known = [
+        "/",
+        "/health",
+        "/ready",
+        "/openapi.json",
+        "/docs",
+        "/api/v1",
+        "/api/v1/search",
+        "/api/v1/diagnostics",
+        "/api/v1/metrics",
+        "/api/v1/home",
+        "/api/v1/genres",
+        "/api/v1/trending",
+        "/api/v1/popular",
+        "/api/v1/latest",
+        "/api/v1/movies",
+        "/api/v1/k-dramas",
+        "/api/v1/anime/search",
+        "/api/v1/anime/search/stream",
+        "/api/v1/watch",
+    ];
+    if known.contains(&path) {
+        return path.to_string();
+    }
+    if path.starts_with("/api/v1/admin/catalog/jobs/") {
+        return "/api/v1/admin/catalog/jobs/{job_id}".into();
+    }
+    if path.starts_with("/api/v1/catalog/titles/") {
+        if path.ends_with("/seasons") {
+            return "/api/v1/catalog/titles/{title_id}/seasons".into();
+        }
+        if path.contains("/seasons/") && path.ends_with("/episodes") {
+            return "/api/v1/catalog/titles/{title_id}/seasons/{season}/episodes".into();
+        }
+        return "/api/v1/catalog/titles/{title_id}".into();
+    }
+    if path.starts_with("/api/v1/catalog/episodes/") {
+        return if path.ends_with("/sources") {
+            "/api/v1/catalog/episodes/{episode_id}/sources".into()
+        } else {
+            "/api/v1/catalog/episodes/{episode_id}".into()
+        };
+    }
+    if path.starts_with("/api/v1/catalog/sources/") {
+        return "/api/v1/catalog/sources/{source_id}".into();
+    }
+    if path.starts_with("/api/v1/anime/") {
+        return "/api/v1/anime/{anime_id}".into();
+    }
+    if path.starts_with("/api/v1/episodes/") {
+        return "/api/v1/episodes/{episode_id}".into();
+    }
+    if path.starts_with("/api/v1/sources/") {
+        return "/api/v1/sources/{source_id}".into();
+    }
+    "/__unknown__".into()
 }
 
 async fn route(
@@ -1327,6 +1398,9 @@ async fn route(
         _ if path.starts_with("/api/v1/catalog/sources/") => catalog_source_route(stream, path, state).await,
         _ if path.starts_with("/api/v1/catalog/titles/") => catalog_title_detail_route(stream, path, state).await,
         "/api/v1/diagnostics" => diagnostics_route(stream, state).await,
+        "/api/v1/metrics" | "/metrics" => {
+            write_json(stream, 200, &crate::observability::snapshot(), None).await
+        }
         "/api/stream-proxy" => {
             stream_proxy_route(stream, query, state, request_headers, head_only).await
         }
@@ -1490,7 +1564,13 @@ async fn catalog_search_route(
         }
         Ok(items) => write_json(stream, 200, &serde_json::json!({"success":true,"data":{"items":items,"pending_import":false},"meta":{"request_id":request_id()}}), None).await,
         Err(crate::catalog::CatalogError::Validation(message)) => write_json(stream, 400, &serde_json::json!({"success":false,"error":{"code":"VALIDATION_FAILED","message":message,"retryable":false},"meta":{"request_id":request_id()}}), None).await,
-        Err(_) => write_json(stream, 503, &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","message":"The catalog database is unavailable.","retryable":true},"meta":{"request_id":request_id()}}), None).await,
+        Err(error) => {
+            log::error!(
+                "catalog operation failed operation=search category={} error={error:?}",
+                error.category()
+            );
+            write_json(stream, 503, &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","message":"The catalog database is unavailable.","retryable":true},"meta":{"request_id":request_id()}}), None).await
+        },
     }
 }
 
@@ -1510,9 +1590,18 @@ async fn catalog_home_route(
         ("movies", Some("movie")),
         ("k_dramas", Some("k_drama")),
     ] {
-        match catalog.list_titles(content_type, limit, query_number(query, "offset", 0)).await {
+        match catalog
+            .list_titles(content_type, limit, query_number(query, "offset", 0))
+            .await
+        {
             Ok(items) => sections.push(serde_json::json!({"key":key,"items":items})),
-            Err(_) => return write_json(stream, 503, &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","message":"The catalog database is unavailable.","retryable":true}}), None).await,
+            Err(error) => {
+                log::error!(
+                    "catalog operation failed operation=home_list_titles category={} error={error:?}",
+                    error.category()
+                );
+                return write_json(stream, 503, &serde_json::json!({"success":false,"error":{"code":"DATABASE_UNAVAILABLE","message":"The catalog database is unavailable.","retryable":true}}), None).await;
+            }
         }
     }
     write_json(stream, 200, &serde_json::json!({"success":true,"data":{"sections":sections,"source":"postgresql_catalog"},"meta":{"request_id":request_id()}}), None).await
@@ -3896,22 +3985,19 @@ async fn cached_search(state: &ApiState, query: &str) -> SearchResultSet {
         let cache = state.search_cache.lock().await;
         if let Some(entry) = cache.get(&key) {
             if entry.stored_at.elapsed() < SEARCH_CACHE_TTL && !entry.result.failed {
+                crate::observability::record_cache("search_memory", "hit");
                 return filter_current_search_providers(entry.result.clone());
             }
         }
     }
+    crate::observability::record_cache("search_memory", "miss");
 
     if let Some(result) = read_redis_search_cache(state.redis_search.as_deref(), &key).await {
-        let mut memory = state.search_cache.lock().await;
-        memory.insert(
-            key.clone(),
-            SearchCacheEntry {
-                stored_at: Instant::now(),
-                result: result.clone(),
-            },
-        );
+        crate::observability::record_cache("search_redis", "redis_hit");
+        insert_search_cache(state, &key, result.clone()).await;
         return filter_current_search_providers(result);
     }
+    crate::observability::record_cache("search_redis", "redis_miss");
 
     let (items, failed, provider_status, execution_metadata) =
         search_all_for_providers_with_metadata(&state.service, query, providers).await;
@@ -3937,20 +4023,7 @@ async fn cached_search(state: &ApiState, query: &str) -> SearchResultSet {
     // Failed/partial searches are never persisted as cache entries. In particular,
     // a transient provider outage must not replace a complete result.
     if is_complete_search_cacheable(&result) {
-        let mut cache = state.search_cache.lock().await;
-        if cache.len() >= SEARCH_CACHE_MAX_ENTRIES {
-            cache.retain(|_, entry| entry.stored_at.elapsed() < SEARCH_CACHE_TTL);
-            if cache.len() >= SEARCH_CACHE_MAX_ENTRIES {
-                cache.clear();
-            }
-        }
-        cache.insert(
-            key.clone(),
-            SearchCacheEntry {
-                stored_at: Instant::now(),
-                result: result.clone(),
-            },
-        );
+        insert_search_cache(state, &key, result.clone()).await;
         write_redis_search_cache(
             state.redis_search.as_deref(),
             &key,
@@ -3960,6 +4033,29 @@ async fn cached_search(state: &ApiState, query: &str) -> SearchResultSet {
         .await;
     }
     filter_current_search_providers(result)
+}
+
+async fn insert_search_cache(state: &ApiState, key: &str, result: SearchResultSet) {
+    let mut cache = state.search_cache.lock().await;
+    if cache.len() >= SEARCH_CACHE_MAX_ENTRIES {
+        let before = cache.len();
+        cache.retain(|_, entry| entry.stored_at.elapsed() < SEARCH_CACHE_TTL);
+        for _ in 0..before.saturating_sub(cache.len()) {
+            crate::observability::record_cache("search_memory", "expiration");
+        }
+        if cache.len() >= SEARCH_CACHE_MAX_ENTRIES {
+            cache.clear();
+            crate::observability::record_cache("search_memory", "eviction");
+        }
+    }
+    cache.insert(
+        key.to_string(),
+        SearchCacheEntry {
+            stored_at: Instant::now(),
+            result,
+        },
+    );
+    crate::observability::record_cache("search_memory", "insert");
 }
 
 fn filter_current_search_providers(mut result: SearchResultSet) -> SearchResultSet {
@@ -4530,6 +4626,7 @@ async fn search_all_for_providers_with_metadata(
     while let Some(joined) = tasks.join_next().await {
         match joined {
             Ok((p, r, metadata)) => {
+                let duration_ms = metadata.duration_ms;
                 execution_metadata_by_provider.insert(p.cache_key().to_string(), metadata);
                 match r {
                     Ok(Ok(result)) => {
@@ -4538,22 +4635,46 @@ async fn search_all_for_providers_with_metadata(
                             partial_error,
                         } = result;
                         if let Some(error) = partial_error {
+                            crate::observability::record_provider(
+                                p.cache_key(),
+                                "failure",
+                                duration_ms,
+                            );
                             provider_status.insert(
                                 p.cache_key().to_string(),
                                 partial_provider_status(p, &error),
                             );
                             failed = true;
                         } else {
+                            crate::observability::record_provider(
+                                p.cache_key(),
+                                "success",
+                                duration_ms,
+                            );
                             provider_status.insert(p.cache_key().to_string(), "ok".to_string());
                         }
                         items.extend(result_items);
                     }
                     Ok(Err(e)) => {
+                        crate::observability::record_provider(
+                            p.cache_key(),
+                            if matches!(&e, ProviderError::Unavailable(_)) {
+                                "unavailable"
+                            } else {
+                                "failure"
+                            },
+                            duration_ms,
+                        );
                         provider_status
                             .insert(p.cache_key().to_string(), safe_provider_search_error(p, &e));
                         failed = true;
                     }
                     Err(_) => {
+                        crate::observability::record_provider(
+                            p.cache_key(),
+                            "timeout",
+                            duration_ms,
+                        );
                         provider_status.insert(p.cache_key().to_string(), "timeout".to_string());
                         failed = true;
                     }
@@ -7014,8 +7135,10 @@ async fn cached_releases(state: &ApiState, r: &OpaqueRef) -> Result<Vec<Release>
     if let Some(entry) = state.release_cache.lock().await.get(&key).cloned()
         && entry.stored_at.elapsed() < RELEASE_CACHE_TTL
     {
+        crate::observability::record_cache("release", "hit");
         return Ok(entry.releases);
     }
+    crate::observability::record_cache("release", "miss");
 
     // Keep one provider fetch in flight per episode. The task is spawned before
     // callers await it, so a request timeout cannot leave a permanently pending
@@ -7043,20 +7166,24 @@ async fn cached_releases(state: &ApiState, r: &OpaqueRef) -> Result<Vec<Release>
     };
 
     let fetched = shared.await;
-    state.release_inflight.lock().await.remove(&key);
-    let fetched = fetched?;
-    let mut cache = state.release_cache.lock().await;
-    if cache.len() >= 2048 {
-        cache.retain(|_, entry| entry.stored_at.elapsed() < RELEASE_CACHE_TTL);
+    if let Ok(releases) = &fetched {
+        let mut cache = state.release_cache.lock().await;
+        if cache.len() >= 2048 {
+            cache.retain(|_, entry| entry.stored_at.elapsed() < RELEASE_CACHE_TTL);
+        }
+        cache.insert(
+            key.clone(),
+            ReleaseCacheEntry {
+                stored_at: Instant::now(),
+                releases: releases.clone(),
+            },
+        );
+        crate::observability::record_cache("release", "insert");
     }
-    cache.insert(
-        key,
-        ReleaseCacheEntry {
-            stored_at: Instant::now(),
-            releases: fetched.clone(),
-        },
-    );
-    Ok(fetched)
+    // Keep the in-flight future visible until the successful cache entry is
+    // published. A completion-boundary caller sees either representation.
+    state.release_inflight.lock().await.remove(&key);
+    fetched
 }
 
 async fn releases_uncached(state: &ApiState, r: &OpaqueRef) -> Result<Vec<Release>, ProviderError> {
@@ -8484,8 +8611,10 @@ async fn cached_playback_source(
     if let Some(entry) = state.playback_cache.lock().await.get(source_id).cloned()
         && entry.stored_at.elapsed() < PLAYBACK_CACHE_TTL
     {
+        crate::observability::record_cache("playback", "hit");
         return Ok(entry.playback);
     }
+    crate::observability::record_cache("playback", "miss");
 
     let key = source_id.to_string();
     let shared = {
@@ -8556,20 +8685,22 @@ async fn cached_playback_source(
     };
 
     let resolved = shared.await;
-    state.playback_inflight.lock().await.remove(&key);
     if let Ok(playback) = &resolved {
         let mut cache = state.playback_cache.lock().await;
         if cache.len() >= 2048 {
             cache.retain(|_, entry| entry.stored_at.elapsed() < PLAYBACK_CACHE_TTL);
         }
         cache.insert(
-            key,
+            key.clone(),
             PlaybackCacheEntry {
                 stored_at: Instant::now(),
                 playback: playback.clone(),
             },
         );
+        crate::observability::record_cache("playback", "insert");
     }
+    // Make the completed value visible before the shared future is removed.
+    state.playback_inflight.lock().await.remove(&key);
     resolved
 }
 
@@ -10131,6 +10262,7 @@ async fn write_headers(
     content_type: &str,
     extra: Option<&str>,
 ) -> std::io::Result<()> {
+    crate::observability::record_response(status);
     let reason = match status {
         204 => "No Content",
         200 => "OK",
@@ -13214,6 +13346,20 @@ mod tests {
             provider_status: HashMap::from([("dramachi".into(), "timeout".into())]),
             ..complete_search_cache_fixture()
         }
+    }
+
+    #[tokio::test]
+    async fn search_cache_insertion_helper_enforces_capacity() {
+        let (state, _root) = test_state().await;
+        for index in 0..(SEARCH_CACHE_MAX_ENTRIES + 1) {
+            insert_search_cache(
+                &state,
+                &format!("capacity-{index}"),
+                complete_search_cache_fixture(),
+            )
+            .await;
+        }
+        assert!(state.search_cache.lock().await.len() <= SEARCH_CACHE_MAX_ENTRIES);
     }
 
     #[tokio::test]

@@ -357,6 +357,17 @@ pub enum CatalogError {
     Validation(String),
 }
 
+impl CatalogError {
+    pub fn category(&self) -> &'static str {
+        match self {
+            Self::Validation(_) => "validation",
+            Self::Database(error) if error.is_closed() => "connection",
+            Self::Database(error) if error.as_db_error().is_some() => "query",
+            Self::Database(_) => "operational",
+        }
+    }
+}
+
 /// Persisted Provider mapping lifecycle. Transitions are intentionally explicit
 /// so transient refresh failures cannot masquerade as identity rejection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

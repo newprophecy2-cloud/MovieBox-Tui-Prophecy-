@@ -14,6 +14,7 @@ pub mod language;
 pub mod logging;
 pub mod models;
 pub mod net;
+pub mod observability;
 pub(crate) mod playback_planner;
 pub mod player;
 pub(crate) mod progressive_remux;
