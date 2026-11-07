@@ -744,6 +744,13 @@ fn release_fingerprint(r: &Release) -> String {
         hasher.update(mirror.resolver_url.as_bytes());
         hasher.update([u8::from(mirror.direct_file)]);
         hasher.update([0]);
+        for (name, value) in &mirror.headers {
+            hasher.update(name.to_ascii_lowercase().as_bytes());
+            hasher.update([0]);
+            hasher.update(value.as_bytes());
+            hasher.update([0]);
+        }
+        hasher.update([0xff]);
     }
     URL_SAFE_NO_PAD.encode(hasher.finalize())
 }
@@ -7056,12 +7063,48 @@ fn api_sources_for_content(
     episode: &OpaqueRef,
     content_type: Option<&str>,
 ) -> Vec<ApiSource> {
+    let mut seen = std::collections::HashSet::new();
     rs.iter()
         .enumerate()
         .filter(|(_, release)| {
-            source_codec_eligibility(release.codec.as_deref()) == SourceCodecEligibility::Verified
-                || (release.provider == ProviderKind::AniZone && release_has_usable_source(release))
-                || release_requires_codec_probe(release)
+            // Provider adapters may return a parseable release list containing
+            // records for neighboring episodes. Unknown coordinates remain
+            // usable for providers that do not expose them, but an explicit
+            // mismatch must never become a source for this episode.
+            release.provider == episode.p
+                && release.season.is_none_or(|season| season == episode.s)
+                && release.episode.is_none_or(|number| number == episode.e)
+                && (source_codec_eligibility(release.codec.as_deref())
+                    == SourceCodecEligibility::Verified
+                    || (release.provider == ProviderKind::AniZone
+                        && release_has_usable_source(release))
+                    || release_requires_codec_probe(release))
+        })
+        .filter(|(_, release)| {
+            // The public source ID includes an ordinal for compatibility, so
+            // deduplicate before assigning it. Keep quality/language/codec and
+            // headers in the identity because they are meaningful alternatives.
+            let mut identity = String::new();
+            identity.push_str(release.provider.cache_key());
+            identity.push('\0');
+            identity.push_str(release.quality.as_deref().unwrap_or_default());
+            identity.push('\0');
+            identity.push_str(release.codec.as_deref().unwrap_or_default());
+            identity.push('\0');
+            identity.push_str(release.language.as_deref().unwrap_or_default());
+            identity.push('\0');
+            for mirror in &release.mirrors {
+                identity.push_str(&mirror.resolver_url);
+                identity.push('\0');
+                for (name, value) in &mirror.headers {
+                    identity.push_str(&name.to_ascii_lowercase());
+                    identity.push('=');
+                    identity.push_str(value);
+                    identity.push('\0');
+                }
+                identity.push('\u{ff}');
+            }
+            seen.insert(identity)
         })
         .map(|(i, r)| ApiSource {
             id: source_ref_for_content(r, episode, i, content_type),
@@ -11878,6 +11921,58 @@ mod tests {
         assert_eq!(status, 503);
         assert!(body.contains("UPSTREAM_UNAVAILABLE"));
         assert!(body.contains("retryable\":true"));
+    }
+
+    #[test]
+    fn api_sources_rejects_explicitly_wrong_episode_and_deduplicates_same_url() {
+        let episode = OpaqueRef {
+            p: ProviderKind::Dramachi,
+            v: "title".into(),
+            s: 1,
+            e: 2,
+        };
+        let first = verified_release(
+            ProviderKind::Dramachi,
+            "episode-2-a.mkv",
+            "https://cdn.example/episode-2.mkv",
+        );
+        let duplicate = Release {
+            filename: "episode-2-b.mkv".into(),
+            ..first.clone()
+        };
+        let wrong_episode = Release {
+            episode: Some(3),
+            ..first.clone()
+        };
+        let sources = api_sources(&[first, duplicate, wrong_episode], &episode);
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].quality.as_deref(), Some("1080p"));
+    }
+
+    #[test]
+    fn source_identity_preserves_same_url_when_required_headers_differ() {
+        let episode = OpaqueRef {
+            p: ProviderKind::Dramachi,
+            v: "title".into(),
+            s: 1,
+            e: 2,
+        };
+        let first = verified_release(
+            ProviderKind::Dramachi,
+            "episode-2.mkv",
+            "https://cdn.example/episode-2.mkv",
+        );
+        let second = Release {
+            mirrors: vec![crate::providers::models::SourceMirror {
+                label: "Direct".into(),
+                resolver_url: "https://cdn.example/episode-2.mkv".into(),
+                headers: vec![("Referer".into(), "https://one.example/".into())],
+                direct_file: true,
+            }],
+            ..first.clone()
+        };
+        assert_ne!(release_fingerprint(&first), release_fingerprint(&second));
+        assert_eq!(api_sources(&[first, second], &episode).len(), 2);
     }
 
     #[test]
