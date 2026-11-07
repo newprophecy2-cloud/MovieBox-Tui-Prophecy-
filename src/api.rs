@@ -11359,6 +11359,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn real_http_disconnect_during_direct_upstream_acquisition_cancels_upstream_and_releases_slot()
+     {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let upstream_task = tokio::spawn(async move {
+            let (mut socket, _) = upstream.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                if socket.read_exact(&mut byte).await.is_err() {
+                    return;
+                }
+                request.push(byte[0]);
+            }
+            let _ = started_tx.send(());
+            let mut probe = [0u8; 1];
+            let _ = socket.read(&mut probe).await;
+        });
+
+        let (mut state, _root) = test_state().await;
+        state.native_stream.test_set_slot_capacity(1);
+        let direct_path = state
+            .native_stream
+            .direct_playback_url(
+                "source-1",
+                &format!("http://{upstream_address}/video.mp4"),
+                &[],
+            )
+            .unwrap();
+        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_address = backend.local_addr().unwrap();
+        let client = TcpStream::connect(backend_address).await.unwrap();
+        let (server, _) = backend.accept().await.unwrap();
+        let handler = tokio::spawn(handle(server, state.clone()));
+        let mut client = client;
+        client
+            .write_all(
+                format!(
+                    "GET {direct_path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        started_rx.await.unwrap();
+        drop(client);
+
+        tokio::time::timeout(Duration::from_secs(3), handler)
+            .await
+            .expect("route handler did not stop after client disconnect")
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), upstream_task)
+            .await
+            .expect("upstream request remained open after client disconnect")
+            .unwrap();
+        assert!(state.native_stream.test_try_acquire_slot());
+    }
+
+    #[tokio::test]
+    async fn real_http_disconnect_during_direct_body_relay_cancels_upstream_and_releases_slot() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let (headers_tx, headers_rx) = tokio::sync::oneshot::channel();
+        let upstream_task = tokio::spawn(async move {
+            let (mut socket, _) = upstream.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                if socket.read_exact(&mut byte).await.is_err() {
+                    return;
+                }
+                request.push(byte[0]);
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: 4\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            socket.flush().await.unwrap();
+            let _ = headers_tx.send(());
+            let mut probe = [0u8; 1];
+            let _ = socket.read(&mut probe).await;
+        });
+
+        let (mut state, _root) = test_state().await;
+        state.native_stream.test_set_slot_capacity(1);
+        let direct_path = state
+            .native_stream
+            .direct_playback_url(
+                "source-1",
+                &format!("http://{upstream_address}/video.mp4"),
+                &[],
+            )
+            .unwrap();
+        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_address = backend.local_addr().unwrap();
+        let mut client = TcpStream::connect(backend_address).await.unwrap();
+        let (server, _) = backend.accept().await.unwrap();
+        let handler = tokio::spawn(handle(server, state.clone()));
+        client
+            .write_all(
+                format!(
+                    "GET {direct_path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        headers_rx.await.unwrap();
+        let mut response = Vec::new();
+        while !response.ends_with(b"\r\n\r\n") {
+            let mut byte = [0u8; 1];
+            client.read_exact(&mut byte).await.unwrap();
+            response.push(byte[0]);
+        }
+        assert!(response.starts_with(b"HTTP/1.1 200"));
+        drop(client);
+
+        tokio::time::timeout(Duration::from_secs(3), handler)
+            .await
+            .expect("route handler did not stop after body-relay disconnect")
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), upstream_task)
+            .await
+            .expect("upstream body remained open after client disconnect")
+            .unwrap();
+        assert!(state.native_stream.test_try_acquire_slot());
+    }
+
+    #[tokio::test]
     async fn direct_play_route_falls_back_to_another_source_from_same_provider() {
         let primary = OpaqueRef {
             p: ProviderKind::Dramachi,

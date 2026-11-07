@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     io,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -23,6 +23,13 @@ const MAX_MANIFEST_BYTES: usize = 10 * 1024 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+// This is an operation bound, not a playback-duration policy. It is deliberately
+// long enough for normal long-form playback while bounding abandoned work.
+const DIRECT_STREAM_OPERATION_DEADLINE: Duration = Duration::from_secs(24 * 60 * 60);
+const THROUGHPUT_WINDOW: Duration = Duration::from_secs(30);
+const THROUGHPUT_BUCKET: Duration = Duration::from_secs(1);
+const MIN_STREAM_THROUGHPUT_BYTES_PER_SEC: u64 = 1024;
 
 #[derive(Clone)]
 pub(crate) struct NativeStreamProxy {
@@ -104,6 +111,39 @@ struct UpstreamRequestOptions<'a> {
     require_range: bool,
 }
 
+#[derive(Default)]
+struct ThroughputTracker {
+    buckets: VecDeque<(Instant, u64)>,
+}
+
+impl ThroughputTracker {
+    fn record(&mut self, now: Instant, bytes: u64) -> bool {
+        if let Some((bucket_started, bucket_bytes)) = self.buckets.back_mut()
+            && now.saturating_duration_since(*bucket_started) < THROUGHPUT_BUCKET
+        {
+            *bucket_bytes = bucket_bytes.saturating_add(bytes);
+        } else {
+            self.buckets.push_back((now, bytes));
+        }
+        while self
+            .buckets
+            .front()
+            .is_some_and(|(started, _)| now.saturating_duration_since(*started) > THROUGHPUT_WINDOW)
+        {
+            self.buckets.pop_front();
+        }
+        let Some((oldest, _)) = self.buckets.front() else {
+            return false;
+        };
+        let elapsed = now.saturating_duration_since(*oldest);
+        if elapsed < THROUGHPUT_WINDOW {
+            return false;
+        }
+        let bytes = self.buckets.iter().map(|(_, bytes)| *bytes).sum::<u64>();
+        bytes < MIN_STREAM_THROUGHPUT_BYTES_PER_SEC.saturating_mul(elapsed.as_secs())
+    }
+}
+
 #[derive(Clone, Debug)]
 struct TemplateVariable {
     name: String,
@@ -123,6 +163,16 @@ impl NativeStreamProxy {
             slots: Arc::new(Semaphore::new(16)),
             max_segment_bytes,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_slot_capacity(&mut self, capacity: usize) {
+        self.slots = Arc::new(Semaphore::new(capacity));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_try_acquire_slot(&self) -> bool {
+        self.slots.clone().try_acquire_owned().is_ok()
     }
 
     pub(crate) fn playback_url(
@@ -298,6 +348,7 @@ impl NativeStreamProxy {
                     head_only,
                     require_range: true,
                 },
+                Instant::now() + RESPONSE_HEADER_TIMEOUT,
             )
             .await
         {
@@ -415,6 +466,7 @@ impl NativeStreamProxy {
             Ok(permit) => permit,
             Err(_) => return write_error(stream, 503, "Direct media capacity is busy.").await,
         };
+        let deadline = Instant::now() + DIRECT_STREAM_OPERATION_DEADLINE;
         let range = match request_headers.get("range") {
             Some(value) if valid_single_byte_range(value) => Some(value.as_str()),
             Some(_) => {
@@ -423,24 +475,32 @@ impl NativeStreamProxy {
             }
             None => None,
         };
-        let response = match self
-            .send_upstream(
-                &claims.target_url,
-                &claims.root_url,
-                &claims.upstream_headers,
-                request_headers,
-                UpstreamRequestOptions {
-                    range,
-                    head_only,
-                    require_range: false,
-                },
-            )
-            .await
-        {
+        let upstream = self.send_upstream(
+            &claims.target_url,
+            &claims.root_url,
+            &claims.upstream_headers,
+            request_headers,
+            UpstreamRequestOptions {
+                range,
+                head_only,
+                require_range: false,
+            },
+            deadline,
+        );
+        let response = match tokio::select! {
+            response = upstream => response,
+            disconnect = wait_for_peer_disconnect(stream) => {
+                match disconnect {
+                    Ok(()) => log::debug!("direct_stream_cancelled reason=downstream_disconnect phase=upstream"),
+                    Err(error) => log::debug!("direct_stream_cancelled reason=downstream_probe_error phase=upstream error={error}"),
+                }
+                return Ok(());
+            }
+        } {
             Ok(response) => response,
             Err((status, message)) => return write_error(stream, status, message).await,
         };
-        self.relay_direct_response(stream, response, head_only, range)
+        self.relay_direct_response(stream, response, head_only, range, deadline)
             .await
     }
 
@@ -451,6 +511,7 @@ impl NativeStreamProxy {
         provider_headers: &[(String, String)],
         request_headers: &HashMap<String, String>,
         options: UpstreamRequestOptions<'_>,
+        deadline: Instant,
     ) -> Result<reqwest::Response, (u16, &'static str)> {
         let range = options.range;
         let head_only = options.head_only;
@@ -472,12 +533,8 @@ impl NativeStreamProxy {
                 }
                 if same_origin {
                     request = request.header(name.as_str(), value.as_str());
-                } else if name.eq_ignore_ascii_case("user-agent") {
-                    request = request.header(name.as_str(), value.as_str());
-                } else if name.eq_ignore_ascii_case("referer")
-                    && let Some(referer) = sanitized_referer_origin(value)
-                {
-                    request = request.header(name.as_str(), referer);
+                } else if let Some(value) = cross_origin_header_value(name, value) {
+                    request = request.header(name.as_str(), value);
                 }
             }
             if !provider_headers
@@ -490,9 +547,10 @@ impl NativeStreamProxy {
             if let Some(range) = range {
                 request = request.header(reqwest::header::RANGE, range);
             }
-            let response = tokio::time::timeout(STREAM_IDLE_TIMEOUT, request.send())
+            let header_deadline = (Instant::now() + RESPONSE_HEADER_TIMEOUT).min(deadline);
+            let response = tokio::time::timeout_at(header_deadline.into(), request.send())
                 .await
-                .map_err(|_| (504, "The upstream media request timed out."))?
+                .map_err(|_| (504, "The upstream media response timed out."))?
                 .map_err(|_| (502, "The upstream media request failed."))?;
             if !response.status().is_redirection() {
                 if let Some(range) = range {
@@ -614,14 +672,41 @@ impl NativeStreamProxy {
         if head_only {
             return Ok(());
         }
+        let expected_body_bytes = expected_range_bytes.or(content_length);
         let mut total = 0u64;
         let mut body = response.bytes_stream();
         loop {
             let next = tokio::time::timeout(STREAM_IDLE_TIMEOUT, body.next()).await;
             let chunk = match next {
-                Err(_) => return Ok(()),
-                Ok(None) => break,
-                Ok(Some(Err(_))) => return Ok(()),
+                Err(_) => {
+                    log::warn!(
+                        "native_stream_failure reason=idle_timeout status={} received_bytes={} expected_bytes={:?}",
+                        status.as_u16(),
+                        total,
+                        expected_body_bytes
+                    );
+                    return Ok(());
+                }
+                Ok(None) => {
+                    if expected_body_bytes.is_some_and(|expected| expected != total) {
+                        log::warn!(
+                            "native_stream_failure reason=incomplete_body status={} received_bytes={} expected_bytes={:?}",
+                            status.as_u16(),
+                            total,
+                            expected_body_bytes
+                        );
+                    }
+                    break;
+                }
+                Ok(Some(Err(_))) => {
+                    log::warn!(
+                        "native_stream_failure reason=upstream_body_read status={} received_bytes={} expected_bytes={:?}",
+                        status.as_u16(),
+                        total,
+                        expected_body_bytes
+                    );
+                    return Ok(());
+                }
                 Ok(Some(Ok(chunk))) => chunk,
             };
             total = total.saturating_add(chunk.len() as u64);
@@ -653,12 +738,18 @@ impl NativeStreamProxy {
         response: reqwest::Response,
         head_only: bool,
         request_range: Option<&str>,
+        deadline: Instant,
     ) -> io::Result<()> {
         let status = response.status();
         if !(status.is_success() || status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE) {
+            let error_status = if status.is_client_error() {
+                status.as_u16()
+            } else {
+                502
+            };
             return write_error(
                 stream,
-                502,
+                error_status,
                 "The upstream media server rejected the request.",
             )
             .await;
@@ -775,16 +866,75 @@ impl NativeStreamProxy {
         if head_only {
             return Ok(());
         }
+        let expected_body_bytes = expected_range_bytes.or(content_length);
         let mut total = 0u64;
+        let mut throughput = ThroughputTracker::default();
         let mut body = response.bytes_stream();
         loop {
-            let next = tokio::time::timeout(STREAM_IDLE_TIMEOUT, body.next()).await;
+            let next = tokio::select! {
+                next = tokio::time::timeout_at(
+                    deadline.into(),
+                    tokio::time::timeout(STREAM_IDLE_TIMEOUT, body.next()),
+                ) => next,
+                disconnect = wait_for_peer_disconnect(stream) => {
+                    match disconnect {
+                        Ok(()) => log::debug!("direct_stream_cancelled reason=downstream_disconnect phase=body"),
+                        Err(error) => log::debug!("direct_stream_cancelled reason=downstream_probe_error phase=body error={error}"),
+                    }
+                    return Ok(());
+                }
+            };
             let chunk = match next {
-                Err(_) | Ok(None) => return Ok(()),
-                Ok(Some(Err(_))) => return Ok(()),
-                Ok(Some(Ok(chunk))) => chunk,
+                Err(_) => {
+                    log::warn!(
+                        "direct_stream_failure reason=overall_deadline status={} received_bytes={} expected_bytes={:?}",
+                        status.as_u16(),
+                        total,
+                        expected_body_bytes
+                    );
+                    return Ok(());
+                }
+                Ok(Err(_)) => {
+                    log::warn!(
+                        "direct_stream_failure reason=idle_timeout status={} received_bytes={} expected_bytes={:?}",
+                        status.as_u16(),
+                        total,
+                        expected_body_bytes
+                    );
+                    return Ok(());
+                }
+                Ok(Ok(None)) => {
+                    if expected_body_bytes.is_some_and(|expected| expected != total) {
+                        log::warn!(
+                            "direct_stream_failure reason=incomplete_body status={} received_bytes={} expected_bytes={:?}",
+                            status.as_u16(),
+                            total,
+                            expected_body_bytes
+                        );
+                    }
+                    return Ok(());
+                }
+                Ok(Ok(Some(Err(_)))) => {
+                    log::warn!(
+                        "direct_stream_failure reason=upstream_body_read status={} received_bytes={} expected_bytes={:?}",
+                        status.as_u16(),
+                        total,
+                        expected_body_bytes
+                    );
+                    return Ok(());
+                }
+                Ok(Ok(Some(Ok(chunk)))) => chunk,
             };
             total = total.saturating_add(chunk.len() as u64);
+            if throughput.record(Instant::now(), chunk.len() as u64) {
+                log::warn!(
+                    "direct_stream_failure reason=sustained_low_throughput status={} received_bytes={} expected_bytes={:?}",
+                    status.as_u16(),
+                    total,
+                    expected_body_bytes
+                );
+                return Ok(());
+            }
             if !status.is_success() && total > MAX_ERROR_BODY_BYTES as u64 {
                 return Ok(());
             }
@@ -800,6 +950,19 @@ impl NativeStreamProxy {
             }
             stream.write_all(&chunk).await?;
             stream.flush().await?;
+        }
+    }
+}
+
+async fn wait_for_peer_disconnect(stream: &TcpStream) -> io::Result<()> {
+    loop {
+        stream.readable().await?;
+        let mut probe = [0u8; 1];
+        match stream.try_read(&mut probe) {
+            Ok(0) => return Ok(()),
+            Ok(_) => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(error) => return Err(error),
         }
     }
 }
@@ -857,6 +1020,21 @@ fn sanitized_referer_origin(value: &str) -> Option<String> {
         return None;
     }
     Some(format!("{}/", referer.origin().ascii_serialization()))
+}
+
+fn cross_origin_header_value(name: &str, value: &str) -> Option<String> {
+    if name.eq_ignore_ascii_case("user-agent")
+        || matches!(
+            name.to_ascii_lowercase().as_str(),
+            "accept" | "accept-language"
+        )
+    {
+        return Some(value.to_string());
+    }
+    if name.eq_ignore_ascii_case("referer") || name.eq_ignore_ascii_case("origin") {
+        return sanitized_referer_origin(value);
+    }
+    None
 }
 
 fn resolve_claim_target(
@@ -1716,6 +1894,285 @@ mod tests {
         upstream_task.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn direct_relay_streams_unknown_length_variable_speed_body_progressively() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut socket, _) = upstream.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nConnection: close\r\n\r\nab",
+                )
+                .await
+                .unwrap();
+            socket.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            socket.write_all(b"cd").await.unwrap();
+            socket.flush().await.unwrap();
+        });
+        let response = reqwest::Client::new()
+            .get(format!("http://{upstream_address}/video.mp4"))
+            .send()
+            .await
+            .unwrap();
+        let downstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = downstream.local_addr().unwrap();
+        let proxy = proxy();
+        let relay_task = tokio::spawn(async move {
+            let (mut socket, _) = downstream.accept().await.unwrap();
+            proxy
+                .relay_direct_response(
+                    &mut socket,
+                    response,
+                    false,
+                    None,
+                    Instant::now() + DIRECT_STREAM_OPERATION_DEADLINE,
+                )
+                .await
+                .unwrap();
+        });
+        let mut client = TcpStream::connect(address).await.unwrap();
+        let mut headers = Vec::new();
+        while !headers.ends_with(b"\r\n\r\n") {
+            let mut byte = [0u8; 1];
+            client.read_exact(&mut byte).await.unwrap();
+            headers.push(byte[0]);
+        }
+        let started = Instant::now();
+        let mut body = Vec::new();
+        client.read_to_end(&mut body).await.unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        assert_eq!(body, b"abcd");
+        relay_task.await.unwrap();
+        upstream_task.await.unwrap();
+    }
+
+    async fn read_raw_request(socket: &mut TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut byte = [0u8; 1];
+        while !request.ends_with(b"\r\n\r\n") {
+            socket.read_exact(&mut byte).await.unwrap();
+            request.push(byte[0]);
+        }
+        String::from_utf8(request).unwrap().to_ascii_lowercase()
+    }
+
+    #[tokio::test]
+    async fn direct_redirects_preserve_same_origin_headers_and_strip_cross_origin_credentials() {
+        let same_origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let same_address = same_origin.local_addr().unwrap();
+        let same_task = tokio::spawn(async move {
+            let (mut first, _) = same_origin.accept().await.unwrap();
+            let first_request = read_raw_request(&mut first).await;
+            first
+                .write_all(b"HTTP/1.1 302 Found\r\nLocation: /final\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let (mut second, _) = same_origin.accept().await.unwrap();
+            let second_request = read_raw_request(&mut second).await;
+            second
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            (first_request, second_request)
+        });
+        let headers = vec![
+            ("Cookie".into(), "session=secret".into()),
+            ("Authorization".into(), "Bearer secret".into()),
+            ("X-Api-Key".into(), "secret".into()),
+            (
+                "Referer".into(),
+                "https://provider.example/path?secret=1".into(),
+            ),
+            ("Accept".into(), "video/*".into()),
+            ("User-Agent".into(), "player".into()),
+        ];
+        let proxy = proxy();
+        let root = Url::parse(&format!("http://{same_address}/video.mp4")).unwrap();
+        let response = proxy
+            .send_upstream(
+                &root,
+                &root,
+                &headers,
+                &HashMap::new(),
+                UpstreamRequestOptions {
+                    range: Some("bytes=0-3"),
+                    head_only: false,
+                    require_range: false,
+                },
+                Instant::now() + DIRECT_STREAM_OPERATION_DEADLINE,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let (first_request, second_request) = same_task.await.unwrap();
+        assert!(first_request.contains("cookie: session=secret"));
+        assert!(second_request.contains("authorization: bearer secret"));
+        assert!(second_request.contains("x-api-key: secret"));
+        assert!(second_request.contains("range: bytes=0-3"));
+
+        let cross_origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cross_address = cross_origin.local_addr().unwrap();
+        let cross_task = tokio::spawn(async move {
+            let (mut socket, _) = cross_origin.accept().await.unwrap();
+            let request = read_raw_request(&mut socket).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            request
+        });
+        let redirect = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redirect_address = redirect.local_addr().unwrap();
+        let target = format!("http://{cross_address}/final");
+        let redirect_task = tokio::spawn(async move {
+            let (mut socket, _) = redirect.accept().await.unwrap();
+            let request = read_raw_request(&mut socket).await;
+            let location =
+                format!("HTTP/1.1 302 Found\r\nLocation: {target}\r\nConnection: close\r\n\r\n");
+            socket.write_all(location.as_bytes()).await.unwrap();
+            request
+        });
+        let root = Url::parse(&format!("http://{redirect_address}/video.mp4")).unwrap();
+        let response = proxy
+            .send_upstream(
+                &root,
+                &root,
+                &headers,
+                &HashMap::new(),
+                UpstreamRequestOptions {
+                    range: Some("bytes=0-3"),
+                    head_only: false,
+                    require_range: false,
+                },
+                Instant::now() + DIRECT_STREAM_OPERATION_DEADLINE,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let redirect_request = redirect_task.await.unwrap();
+        let cross_request = cross_task.await.unwrap();
+        assert!(redirect_request.contains("cookie: session=secret"));
+        assert!(!cross_request.contains("cookie:"));
+        assert!(!cross_request.contains("authorization:"));
+        assert!(!cross_request.contains("x-api-key:"));
+        assert!(cross_request.contains("user-agent: player"));
+        assert!(cross_request.contains("accept: video/*"));
+        assert!(cross_request.contains("referer: https://provider.example/"));
+        assert!(cross_request.contains("range: bytes=0-3"));
+    }
+
+    #[tokio::test]
+    async fn direct_redirect_chain_respects_original_operation_deadline_and_redirect_bounds() {
+        let delayed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let delayed_address = delayed.local_addr().unwrap();
+        let delayed_task = tokio::spawn(async move {
+            let (mut socket, _) = delayed.accept().await.unwrap();
+            let _ = read_raw_request(&mut socket).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await;
+        });
+        let first = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first_address = first.local_addr().unwrap();
+        let delayed_target = format!("http://{delayed_address}/final");
+        let first_task = tokio::spawn(async move {
+            let (mut socket, _) = first.accept().await.unwrap();
+            let _ = read_raw_request(&mut socket).await;
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {delayed_target}\r\nConnection: close\r\n\r\n"
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let proxy = proxy();
+        let root = Url::parse(&format!("http://{first_address}/start")).unwrap();
+        let result = proxy
+            .send_upstream(
+                &root,
+                &root,
+                &[],
+                &HashMap::new(),
+                UpstreamRequestOptions {
+                    range: None,
+                    head_only: false,
+                    require_range: false,
+                },
+                Instant::now() + Duration::from_millis(50),
+            )
+            .await;
+        assert_eq!(result.unwrap_err().0, 504);
+        first_task.await.unwrap();
+        delayed_task.await.unwrap();
+
+        let loop_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let loop_address = loop_listener.local_addr().unwrap();
+        let loop_task = tokio::spawn(async move {
+            for _ in 0..=MAX_REDIRECTS {
+                let (mut socket, _) = loop_listener.accept().await.unwrap();
+                let _ = read_raw_request(&mut socket).await;
+                socket
+                    .write_all(
+                        b"HTTP/1.1 302 Found\r\nLocation: /loop\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let root = Url::parse(&format!("http://{loop_address}/loop")).unwrap();
+        let result = proxy
+            .send_upstream(
+                &root,
+                &root,
+                &[],
+                &HashMap::new(),
+                UpstreamRequestOptions {
+                    range: None,
+                    head_only: false,
+                    require_range: false,
+                },
+                Instant::now() + DIRECT_STREAM_OPERATION_DEADLINE,
+            )
+            .await;
+        assert_eq!(result.unwrap_err().0, 502);
+        loop_task.await.unwrap();
+
+        let missing = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let missing_address = missing.local_addr().unwrap();
+        let missing_task = tokio::spawn(async move {
+            let (mut socket, _) = missing.accept().await.unwrap();
+            let _ = read_raw_request(&mut socket).await;
+            socket
+                .write_all(b"HTTP/1.1 302 Found\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let root = Url::parse(&format!("http://{missing_address}/missing")).unwrap();
+        let result = proxy
+            .send_upstream(
+                &root,
+                &root,
+                &[],
+                &HashMap::new(),
+                UpstreamRequestOptions {
+                    range: None,
+                    head_only: false,
+                    require_range: false,
+                },
+                Instant::now() + DIRECT_STREAM_OPERATION_DEADLINE,
+            )
+            .await;
+        assert_eq!(result.unwrap_err().0, 502);
+        missing_task.await.unwrap();
+    }
+
     async fn mock_http_response(response_bytes: &'static [u8]) -> reqwest::Response {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1750,7 +2207,13 @@ mod tests {
         let task = tokio::spawn(async move {
             let (mut socket, _) = downstream.accept().await.unwrap();
             proxy
-                .relay_direct_response(&mut socket, response, false, range.as_deref())
+                .relay_direct_response(
+                    &mut socket,
+                    response,
+                    false,
+                    range.as_deref(),
+                    Instant::now() + DIRECT_STREAM_OPERATION_DEADLINE,
+                )
                 .await
                 .unwrap();
         });
@@ -1898,5 +2361,177 @@ mod tests {
         let response = String::from_utf8(response).unwrap();
         assert!(response.starts_with("HTTP/1.1 503"));
         handler.await.unwrap();
+    }
+
+    #[test]
+    fn throughput_tracker_has_warmup_and_detects_sustained_low_rate() {
+        let started = Instant::now();
+        let mut tracker = ThroughputTracker::default();
+        assert!(!tracker.record(started, 1));
+        assert!(!tracker.record(started + Duration::from_secs(10), 1));
+        assert!(tracker.record(started + THROUGHPUT_WINDOW, 1));
+    }
+
+    #[test]
+    fn cross_origin_policy_preserves_only_explicit_safe_headers() {
+        assert_eq!(
+            cross_origin_header_value("User-Agent", "player"),
+            Some("player".into())
+        );
+        assert_eq!(
+            cross_origin_header_value("Accept", "video/*"),
+            Some("video/*".into())
+        );
+        assert_eq!(
+            cross_origin_header_value("Referer", "https://provider.example/path?secret=1"),
+            Some("https://provider.example/".into())
+        );
+        assert_eq!(
+            cross_origin_header_value("Origin", "https://provider.example/app"),
+            Some("https://provider.example/".into())
+        );
+        assert!(cross_origin_header_value("Cookie", "session=secret").is_none());
+        assert!(cross_origin_header_value("Authorization", "Bearer secret").is_none());
+        assert!(cross_origin_header_value("X-Api-Key", "secret").is_none());
+    }
+
+    #[tokio::test]
+    async fn direct_relay_closes_safely_on_expired_operation_deadline() {
+        let response = mock_http_response(
+            b"HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: 3\r\nConnection: close\r\n\r\nab",
+        )
+        .await;
+        let downstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = downstream.local_addr().unwrap();
+        let proxy = proxy();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = downstream.accept().await.unwrap();
+            proxy
+                .relay_direct_response(
+                    &mut socket,
+                    response,
+                    false,
+                    None,
+                    Instant::now() - Duration::from_secs(1),
+                )
+                .await
+                .unwrap();
+        });
+        let mut client = TcpStream::connect(address).await.unwrap();
+        let mut bytes = Vec::new();
+        client.read_to_end(&mut bytes).await.unwrap();
+        task.await.unwrap();
+        assert!(
+            String::from_utf8(bytes)
+                .unwrap()
+                .starts_with("HTTP/1.1 200")
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_relay_does_not_claim_complete_body_after_truncation() {
+        let response = mock_http_response(
+            b"HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: 5\r\nConnection: close\r\n\r\nabc",
+        )
+        .await;
+        let relayed = relay_direct_to_bytes(response, None).await;
+        let relayed_text = String::from_utf8(relayed).unwrap();
+        assert!(relayed_text.starts_with("HTTP/1.1 200"));
+        assert!(relayed_text.ends_with("\r\n\r\nabc"));
+        assert!(!relayed_text.ends_with("\r\n\r\nabcde"));
+    }
+
+    #[tokio::test]
+    async fn direct_relay_preserves_safe_client_error_and_maps_upstream_server_error() {
+        let response = mock_http_response(
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let relayed = relay_direct_to_bytes(response, None).await;
+        assert!(
+            String::from_utf8(relayed)
+                .unwrap()
+                .starts_with("HTTP/1.1 404")
+        );
+
+        let response = mock_http_response(
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let relayed = relay_direct_to_bytes(response, None).await;
+        assert!(
+            String::from_utf8(relayed)
+                .unwrap()
+                .starts_with("HTTP/1.1 502")
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_relay_head_does_not_read_or_forward_body() {
+        let response = mock_http_response(
+            b"HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: 5\r\nConnection: close\r\n\r\nabcde",
+        )
+        .await;
+        let downstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = downstream.local_addr().unwrap();
+        let proxy = proxy();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = downstream.accept().await.unwrap();
+            proxy
+                .relay_direct_response(
+                    &mut socket,
+                    response,
+                    true,
+                    None,
+                    Instant::now() + DIRECT_STREAM_OPERATION_DEADLINE,
+                )
+                .await
+                .unwrap();
+        });
+        let mut client = TcpStream::connect(address).await.unwrap();
+        let mut bytes = Vec::new();
+        client.read_to_end(&mut bytes).await.unwrap();
+        task.await.unwrap();
+        let output = String::from_utf8(bytes).unwrap();
+        assert!(output.starts_with("HTTP/1.1 200"));
+        assert!(output.ends_with("\r\n\r\n"));
+    }
+
+    #[tokio::test]
+    async fn aborting_direct_request_future_releases_semaphore_capacity() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut socket, _) = upstream.accept().await.unwrap();
+            let mut request = [0u8; 256];
+            let _ = socket.read(&mut request).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let proxy = proxy();
+        let direct_url = proxy
+            .direct_playback_url(
+                "source-1",
+                &format!("http://{upstream_address}/video.mp4"),
+                &[],
+            )
+            .unwrap();
+        let token = direct_url.rsplit('/').next().unwrap().to_string();
+        let downstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let downstream_address = downstream.local_addr().unwrap();
+        let request_proxy = proxy.clone();
+        let handler = tokio::spawn(async move {
+            let (mut socket, _) = downstream.accept().await.unwrap();
+            request_proxy
+                .serve_direct(&mut socket, "source-1", &token, &HashMap::new(), false)
+                .await
+        });
+        let client = TcpStream::connect(downstream_address).await.unwrap();
+        drop(client);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        handler.abort();
+        let _ = handler.await;
+        assert!(proxy.slots.clone().try_acquire_owned().is_ok());
+        upstream_task.abort();
+        let _ = upstream_task.await;
     }
 }
