@@ -13,6 +13,8 @@ const SAMPLE_LIMIT: usize = 32 * 1024 * 1024;
 const DRAMACHI_FAST_SAMPLE_LIMIT: usize = 1024 * 1024;
 const DRAMACHI_FALLBACK_SAMPLE_LIMIT: usize = 4 * 1024 * 1024;
 const DIRECT_SAMPLE_LIMIT: usize = 4 * 1024 * 1024;
+const HLS_MANIFEST_LIMIT: usize = 1024 * 1024;
+const HLS_MEDIA_LIMIT: usize = 8 * 1024 * 1024;
 const PROBE_STDOUT_LIMIT: usize = 64 * 1024;
 const PROBE_STDERR_LIMIT: usize = 64 * 1024;
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(25);
@@ -102,6 +104,9 @@ pub async fn verify_playback_source(
     source: &PlaybackSource,
 ) -> Result<CodecProbeResult, CodecProbeError> {
     let verification_started = std::time::Instant::now();
+    if source.provider == ProviderKind::AniZone {
+        return verify_hls_source(source).await;
+    }
     if !matches!(
         source.provider,
         ProviderKind::FourKHdHub | ProviderKind::Dramachi
@@ -243,6 +248,136 @@ pub async fn verify_playback_source(
         probe_result_category(&result)
     );
     result
+}
+
+async fn verify_hls_source(source: &PlaybackSource) -> Result<CodecProbeResult, CodecProbeError> {
+    let manifest_url = validate_media_url(&source.url).await?;
+    let client = guarded_media_client()?;
+    let manifest = download_hls_text(&client, manifest_url.clone(), &source.headers).await?;
+    let (variant_url, mut init_url, mut segment_url) =
+        select_hls_media_urls(&manifest_url, &manifest)?;
+    if let Some(variant_url) = variant_url {
+        let variant_manifest = download_hls_text(&client, variant_url.clone(), &source.headers).await?;
+        let (_, variant_init, variant_segment) = select_hls_media_urls(&variant_url, &variant_manifest)?;
+        init_url = variant_init.or(init_url);
+        segment_url = variant_segment;
+    }
+    let segment_url = segment_url.ok_or(CodecProbeError::MalformedProbeOutput)?;
+    let mut media = Vec::new();
+    if let Some(init_url) = init_url {
+        media.extend(download_hls_bytes(&client, init_url, &source.headers, HLS_MEDIA_LIMIT).await?);
+    }
+    media.extend(download_hls_bytes(&client, segment_url, &source.headers, HLS_MEDIA_LIMIT).await?);
+    if media.is_empty() {
+        return Err(CodecProbeError::EmptyMedia);
+    }
+    let ffprobe = ffprobe_executable().ok_or(CodecProbeError::ProbeUnavailable)?;
+    probe_sample_with_executable(&ffprobe, &media, PROBE_TIMEOUT).await
+}
+
+async fn download_hls_text(
+    client: &reqwest::Client,
+    url: reqwest::Url,
+    trusted_headers: &[(String, String)],
+) -> Result<String, CodecProbeError> {
+    let bytes = download_hls_bytes(client, url, trusted_headers, HLS_MANIFEST_LIMIT).await?;
+    String::from_utf8(bytes).map_err(|_| CodecProbeError::MalformedProbeOutput)
+}
+
+async fn download_hls_bytes(
+    client: &reqwest::Client,
+    url: reqwest::Url,
+    trusted_headers: &[(String, String)],
+    limit: usize,
+) -> Result<Vec<u8>, CodecProbeError> {
+    if url.scheme() != "https" {
+        return Err(CodecProbeError::InvalidMediaUrl);
+    }
+    crate::net::validate_public_url(url.as_str(), false)
+        .await
+        .map_err(|_| CodecProbeError::InvalidMediaUrl)?;
+    let mut request = client.get(url);
+    for (name, value) in trusted_headers.iter().take(16) {
+        if name.eq_ignore_ascii_case("referer") {
+            let referer = reqwest::Url::parse(value).map_err(|_| CodecProbeError::InvalidMediaUrl)?;
+            if referer.scheme() != "https" || !referer.username().is_empty() || referer.password().is_some() {
+                return Err(CodecProbeError::InvalidMediaUrl);
+            }
+            crate::net::validate_public_url(referer.as_str(), false)
+                .await
+                .map_err(|_| CodecProbeError::InvalidMediaUrl)?;
+            request = request.header(reqwest::header::REFERER, referer.as_str());
+        } else if name.eq_ignore_ascii_case("user-agent") {
+            if value.len() > 512 || value.contains(['\r', '\n']) {
+                return Err(CodecProbeError::InvalidMediaUrl);
+            }
+            request = request.header(reqwest::header::USER_AGENT, value);
+        }
+    }
+    let response = request.send().await.map_err(|_| CodecProbeError::MediaUnavailable)?;
+    crate::net::validate_public_url(response.url().as_str(), false)
+        .await
+        .map_err(|_| CodecProbeError::UnsafeRedirect)?;
+    if !response.status().is_success() {
+        return Err(CodecProbeError::MediaUnavailable);
+    }
+    let mut body = response.bytes_stream();
+    let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|_| CodecProbeError::MediaUnavailable)?;
+        if bytes.len().saturating_add(chunk.len()) > limit {
+            return Err(CodecProbeError::MediaUnavailable);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+fn select_hls_media_urls(
+    manifest_url: &reqwest::Url,
+    manifest: &str,
+) -> Result<(Option<reqwest::Url>, Option<reqwest::Url>, Option<reqwest::Url>), CodecProbeError> {
+    let lines = manifest.lines().map(str::trim).collect::<Vec<_>>();
+    if !lines.first().is_some_and(|line| line.eq_ignore_ascii_case("#EXTM3U")) {
+        return Err(CodecProbeError::MalformedProbeOutput);
+    }
+    let mut variant = None;
+    let mut init = None;
+    let mut segment = None;
+    let mut expect_variant = false;
+    for line in lines.iter().copied() {
+        if line.starts_with("#EXT-X-STREAM-INF") {
+            expect_variant = true;
+            continue;
+        }
+        if line.starts_with("#EXT-X-MAP:") {
+            if let Some(uri) = quoted_attribute(line, "URI") {
+                init = Some(manifest_url.join(&uri).map_err(|_| CodecProbeError::MalformedProbeOutput)?);
+            }
+            continue;
+        }
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let url = manifest_url.join(line).map_err(|_| CodecProbeError::MalformedProbeOutput)?;
+        if expect_variant && variant.is_none() {
+            variant = Some(url);
+            expect_variant = false;
+        } else if segment.is_none() {
+            segment = Some(url);
+        }
+    }
+    if let Some(variant_url) = variant {
+        return Ok((Some(variant_url), init, segment));
+    }
+    Ok((None, init, segment))
+}
+
+fn quoted_attribute(line: &str, name: &str) -> Option<String> {
+    let marker = format!("{name}=\"");
+    let start = line.find(&marker)? + marker.len();
+    let end = line[start..].find('"')? + start;
+    Some(line[start..end].to_string())
 }
 
 struct DownloadedSample {
@@ -748,6 +883,36 @@ mod tests {
             probe_fixture(hevc).await.unwrap(),
             CodecProbeResult::BlockedHevc("hevc".into())
         );
+    }
+
+    #[test]
+    fn hls_master_and_media_playlists_resolve_bounded_probe_targets() {
+        let master = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=100\n720/index.m3u8\n";
+        let base = reqwest::Url::parse("https://cdn.example/master.m3u8").unwrap();
+        let (variant, init, segment) = select_hls_media_urls(&base, master).unwrap();
+        assert_eq!(variant.unwrap().as_str(), "https://cdn.example/720/index.m3u8");
+        assert!(init.is_none());
+        assert!(segment.is_none());
+
+        let media = "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:4,\nseg0.m4s\n";
+        let variant_url = reqwest::Url::parse("https://cdn.example/720/index.m3u8").unwrap();
+        let (variant, init, segment) = select_hls_media_urls(&variant_url, media).unwrap();
+        assert!(variant.is_none());
+        assert_eq!(init.unwrap().as_str(), "https://cdn.example/720/init.mp4");
+        assert_eq!(segment.unwrap().as_str(), "https://cdn.example/720/seg0.m4s");
+    }
+
+    #[test]
+    fn malformed_hls_playlist_fails_closed() {
+        let base = reqwest::Url::parse("https://cdn.example/master.m3u8").unwrap();
+        assert!(matches!(
+            select_hls_media_urls(&base, "not a playlist"),
+            Err(CodecProbeError::MalformedProbeOutput)
+        ));
+        assert!(matches!(
+            select_hls_media_urls(&base, "#EXTM3U\n#EXTINF:4,\n"),
+            Err(CodecProbeError::MalformedProbeOutput)
+        ));
     }
 
     #[tokio::test]

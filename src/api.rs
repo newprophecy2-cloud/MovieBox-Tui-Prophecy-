@@ -393,8 +393,9 @@ fn release_has_usable_source(release: &Release) -> bool {
                     || mirror.resolver_url.to_ascii_lowercase().contains("m3u8")
             });
     }
-    source_codec_eligibility(release.codec.as_deref()) == SourceCodecEligibility::Verified
-        && has_valid_url
+    has_valid_url
+        && (source_codec_eligibility(release.codec.as_deref()) == SourceCodecEligibility::Verified
+            || release_requires_codec_probe(release))
 }
 
 fn release_has_verification_candidate(release: &Release) -> bool {
@@ -6519,117 +6520,181 @@ async fn playback_route(
         }
     };
     let content_label = identity.content_label();
-    let releases =
-        match tokio::time::timeout(OVERALL_TIMEOUT, cached_releases(&state, &source_ref)).await {
-            Ok(Ok(releases)) => releases,
-            Ok(Err(error)) => {
-                let (status, body) = provider_error(error, source_ref.p);
-                return write_raw_json(stream, status, &body, None).await;
-            }
-            Err(_) => {
-                let (status, body) = err(
-                    "REQUEST_DEADLINE_EXCEEDED",
-                    "The stream source request timed out.",
-                    Some(source_ref.p),
-                    504,
-                );
-                return write_raw_json(stream, status, &body, None).await;
-            }
+    let mut references = vec![source_ref.clone()];
+    if matches!(&identity, PlaybackIdentity::Episode { .. }) {
+        let fallback_source = OpaqueSource {
+            p: source_ref.p,
+            v: source_ref.v.clone(),
+            s: source_ref.s,
+            e: source_ref.e,
+            content_type: None,
+            f: None,
+            i: 0,
         };
+        append_unique_episode_references(
+            &mut references,
+            verified_fallback_episode_refs(&state, &fallback_source).await,
+        );
+    }
     let requested_language = (requested_audio != "auto")
         .then(|| crate::unified::normalize_language_code(requested_audio))
         .flatten();
-    let codec_eligible_releases = releases
-        .iter()
-        .filter(|release| release_has_usable_source(release))
-        .collect::<Vec<_>>();
-    if let Some((code, message)) = codec_ineligibility_error(&releases) {
-        let (status, body) = err(code, message, Some(source_ref.p), 415);
-        return write_raw_json(stream, status, &body, None).await;
-    }
-    let mut candidates: Vec<&Release> = codec_eligible_releases
-        .iter()
-        .copied()
-        .filter(|release| {
-            requested_language.as_deref().is_none_or(|requested| {
-                release
-                    .language
-                    .as_deref()
-                    .and_then(crate::unified::normalize_language_code)
-                    .as_deref()
-                    == Some(requested)
-            })
-        })
-        .collect();
-    let language_metadata_match = !candidates.is_empty();
-    // Automatic playback may use dual/multi-audio sources with no language tag.
-    // A user-selected language must never silently fall back to another language.
-    if candidates.is_empty() && requested_language.is_none() {
-        candidates = codec_eligible_releases;
-    }
-    candidates.sort_by_key(|release| std::cmp::Reverse(release.resolution_u64()));
-    let Some(_) = candidates.first().copied() else {
-        if let Some(language) = requested_language {
-            let (status, body) = err(
-                "AUDIO_LANGUAGE_UNAVAILABLE",
-                format!("No verified playable source is available for audio language {language}."),
-                Some(source_ref.p),
-                404,
-            );
-            return write_raw_json(stream, status, &body, None).await;
-        }
-        let (status, body) = err(
-            "NO_STREAM_SOURCE",
-            format!("The provider returned no stream sources for this {content_label}."),
-            Some(source_ref.p),
-            404,
-        );
-        return write_raw_json(stream, status, &body, None).await;
-    };
+    let mut selected_ref = source_ref.clone();
     let mut selected_release = None;
     let mut playback = None;
-    for candidate in candidates.iter().copied().take(3) {
-        match tokio::time::timeout(
-            OVERALL_TIMEOUT,
-            resolve_playback_candidate(&state, candidate),
+    let mut language_metadata_match = false;
+    let mut saw_playable_source = false;
+    let mut saw_incompatible_source = false;
+    let mut saw_provider_failure = false;
+    let deadline = Instant::now() + OVERALL_TIMEOUT;
+    for candidate_ref in references.into_iter().take(8) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            saw_provider_failure = true;
+            break;
+        }
+        let releases = match tokio::time::timeout(
+            remaining,
+            cached_releases(&state, &candidate_ref),
         )
         .await
         {
-            Ok(Ok(resolved)) => {
-                selected_release = Some(candidate);
-                playback = Some(resolved);
-                break;
-            }
+            Ok(Ok(releases)) => releases,
             Ok(Err(error)) => {
-                log::warn!(
-                    "playback candidate failed provider={} source={}: {}",
-                    candidate.provider,
-                    candidate.source_label(),
-                    error
-                );
+                saw_provider_failure = true;
+                log::warn!("playback provider failed provider={}: {}", candidate_ref.p, error);
+                continue;
             }
             Err(_) => {
-                log::warn!(
-                    "playback candidate timed out provider={} source={}",
-                    candidate.provider,
-                    candidate.source_label()
-                );
+                saw_provider_failure = true;
+                log::warn!("playback provider timed out provider={}", candidate_ref.p);
+                continue;
             }
+        };
+        let usable = releases
+            .iter()
+            .filter(|release| release_has_usable_source(release))
+            .collect::<Vec<_>>();
+        saw_playable_source |= !usable.is_empty();
+        let mut candidates = usable
+            .iter()
+            .copied()
+            .filter(|release| {
+                requested_language.as_deref().is_none_or(|requested| {
+                    release
+                        .language
+                        .as_deref()
+                        .and_then(crate::unified::normalize_language_code)
+                        .as_deref()
+                        == Some(requested)
+                })
+            })
+            .collect::<Vec<_>>();
+        language_metadata_match |= !candidates.is_empty();
+        if candidates.is_empty() && requested_language.is_none() {
+            candidates = usable;
+        }
+        candidates.sort_by_key(|release| std::cmp::Reverse(release.resolution_u64()));
+        for candidate in candidates.into_iter().take(3) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                saw_provider_failure = true;
+                break;
+            }
+            let resolved = match tokio::time::timeout(
+                remaining,
+                resolve_playback_candidate(&state, candidate),
+            )
+            .await
+            {
+                Ok(Ok(resolved)) => resolved,
+                Ok(Err(error)) => {
+                    saw_provider_failure = true;
+                    log::warn!("playback candidate failed provider={} source={}: {}", candidate.provider, candidate.source_label(), error);
+                    continue;
+                }
+                Err(_) => {
+                    saw_provider_failure = true;
+                    log::warn!("playback candidate timed out provider={} source={}", candidate.provider, candidate.source_label());
+                    continue;
+                }
+            };
+            if state.native_stream.supports_url(&resolved.url) {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    saw_provider_failure = true;
+                    break;
+                }
+                match tokio::time::timeout(
+                    remaining,
+                    crate::codec_verification::verify_playback_source(&resolved),
+                )
+                .await
+                {
+                    Ok(Ok(crate::codec_verification::CodecProbeResult::Allowed(_))) => {}
+                    Ok(Ok(crate::codec_verification::CodecProbeResult::BlockedHevc(_)))
+                    | Ok(Ok(crate::codec_verification::CodecProbeResult::Unsupported(_)))
+                    | Ok(Ok(crate::codec_verification::CodecProbeResult::NoVideoStream))
+                    | Ok(Err(_))
+                    | Err(_) => {
+                        saw_incompatible_source = true;
+                        continue;
+                    }
+                }
+            } else if source_codec_eligibility(candidate.codec.as_deref())
+                != SourceCodecEligibility::Verified
+            {
+                saw_incompatible_source = true;
+                continue;
+            }
+            selected_ref = candidate_ref.clone();
+            selected_release = Some(candidate.clone());
+            playback = Some(resolved);
+            break;
+        }
+        if playback.is_some() {
+            break;
         }
     }
     let Some(release) = selected_release else {
-        let (status, body) = err(
-            "PLAYBACK_RESOLUTION_FAILED",
-            "No eligible provider source could be resolved for the requested audio.",
-            Some(source_ref.p),
-            502,
-        );
+        if let Some(language) = requested_language {
+            if saw_playable_source && !language_metadata_match {
+                let (status, body) = err(
+                    "AUDIO_LANGUAGE_UNAVAILABLE",
+                    format!("No verified playable source is available for audio language {language}."),
+                    Some(source_ref.p),
+                    404,
+                );
+                return write_raw_json(stream, status, &body, None).await;
+            }
+        }
+        let (code, message, status) = if saw_incompatible_source {
+            (
+                "NO_COMPATIBLE_SOURCE",
+                "All eligible provider sources were incompatible or could not be verified."
+                    .to_string(),
+                415,
+            )
+        } else if saw_provider_failure {
+            (
+                "PLAYBACK_RESOLUTION_FAILED",
+                "No eligible provider source could be resolved for the requested audio.".to_string(),
+                502,
+            )
+        } else {
+            (
+                "NO_STREAM_SOURCE",
+                format!("The providers returned no stream sources for this {content_label}."),
+                404,
+            )
+        };
+        let (status, body) = err(code, message, Some(source_ref.p), status);
         return write_raw_json(stream, status, &body, None).await;
     };
     let playback = playback.expect("selected playback candidate always has a source");
     let source_id = match api_sources_for_content(
-        std::slice::from_ref(release),
-        &source_ref,
+        std::slice::from_ref(&release),
+        &selected_ref,
         Some(content_label),
     )
     .first()
@@ -6647,17 +6712,7 @@ async fn playback_route(
     };
     // Probe the resolved source for real audio tracks when possible. A failed probe
     // must not block playback (some HLS/DASH providers prevent ffprobe access).
-    let native_candidate = state.native_stream.supports_url(&playback.url);
-    let (probe_result, native_codec_result) = tokio::join!(
-        probe_media_bounded(&state, &playback.url, &playback.headers),
-        async {
-            if native_candidate {
-                Some(crate::codec_verification::verify_playback_source(&playback).await)
-            } else {
-                None
-            }
-        }
-    );
+    let probe_result = probe_media_bounded(&state, &playback.url, &playback.headers).await;
     let audio_tracks = match probe_result {
         Ok(probe) => probe
             .streams
@@ -6689,33 +6744,6 @@ async fn playback_route(
         Err(_) => Vec::new(),
     };
     let mut playback = playback;
-    if native_candidate {
-        match native_codec_result
-            .unwrap_or(Err(crate::codec_verification::CodecProbeError::ProbeFailed))
-        {
-            Ok(crate::codec_verification::CodecProbeResult::Allowed(_)) => {}
-            Ok(crate::codec_verification::CodecProbeResult::BlockedHevc(_)) => {
-                let (status, body) = err(
-                    "SOURCE_CODEC_BLOCKED",
-                    "H.265/HEVC sources are blocked by playback policy.",
-                    Some(source_ref.p),
-                    415,
-                );
-                return write_raw_json(stream, status, &body, None).await;
-            }
-            Ok(crate::codec_verification::CodecProbeResult::Unsupported(_))
-            | Ok(crate::codec_verification::CodecProbeResult::NoVideoStream)
-            | Err(_) => {
-                let (status, body) = err(
-                    "CODEC_UNVERIFIED",
-                    "The media video codec could not be positively verified as H.264.",
-                    Some(source_ref.p),
-                    415,
-                );
-                return write_raw_json(stream, status, &body, None).await;
-            }
-        }
-    }
     playback.url = source_playback_url(&state, &source_id, &playback.url, &playback.headers);
     playback.headers.clear();
     let mut body = playback_json(&playback);
@@ -7765,7 +7793,24 @@ async fn resolve_valid_direct_source(
         validation_started.elapsed().as_millis()
     );
     let mut verified_release = release.clone();
-    if matches!(
+    if release.provider == ProviderKind::AniZone {
+        match tokio::time::timeout(
+            PLAYBACK_RESOLUTION_TIMEOUT,
+            crate::codec_verification::verify_playback_source(&playback),
+        )
+        .await
+        {
+            Ok(Ok(crate::codec_verification::CodecProbeResult::Allowed(codec))) => {
+                verified_release.codec = Some(codec);
+            }
+            Ok(Ok(crate::codec_verification::CodecProbeResult::BlockedHevc(_))) => {
+                return Err("AniZone source blocked by H.265/HEVC playback policy".into());
+            }
+            Ok(Ok(_)) | Ok(Err(_)) | Err(_) => {
+                return Err("AniZone media codec could not be verified".into());
+            }
+        }
+    } else if matches!(
         release.provider,
         ProviderKind::FourKHdHub | ProviderKind::Dramachi
     ) && source_codec_eligibility(release.codec.as_deref()) == SourceCodecEligibility::Unverified
@@ -7841,12 +7886,10 @@ async fn verified_fallback_episode_refs(state: &ApiState, source: &OpaqueSource)
     } else {
         Vec::new()
     };
-    if mappings.is_empty()
-        && matches!(
-            source.p,
-            ProviderKind::FourKHdHub | ProviderKind::Dramachi | ProviderKind::AniZone
-        )
-    {
+    if matches!(
+        source.p,
+        ProviderKind::FourKHdHub | ProviderKind::Dramachi | ProviderKind::AniZone
+    ) {
         let details = tokio::time::timeout(
             DYNAMIC_DISCOVERY_TIMEOUT,
             state.service.details_typed(source.p, &source.v),
@@ -7866,7 +7909,7 @@ async fn verified_fallback_episode_refs(state: &ApiState, source: &OpaqueSource)
             if let Some(episode) = episode {
                 let provider_id = details.id.clone();
                 let known_details = vec![(provider_id.clone(), details.clone())];
-                mappings = discover_episode_mappings(
+                let discovered = discover_episode_mappings(
                     state,
                     std::slice::from_ref(&provider_id),
                     &known_details,
@@ -7875,6 +7918,7 @@ async fn verified_fallback_episode_refs(state: &ApiState, source: &OpaqueSource)
                     None,
                 )
                 .await;
+                append_unique_episode_references(&mut mappings, discovered);
             }
         }
     }
@@ -10384,6 +10428,54 @@ mod tests {
         assert!(references.iter().any(|reference| {
             reference.p == ProviderKind::AniZone && reference.e == 67
         }));
+    }
+
+    #[test]
+    fn partial_episode_mapping_is_preserved_when_discovery_is_empty() {
+        let mut references = vec![OpaqueRef {
+            p: ProviderKind::Dramachi,
+            v: "existing-title".into(),
+            s: 1,
+            e: 67,
+        }];
+        append_unique_episode_references(&mut references, Vec::new());
+        assert_eq!(references.len(), 1);
+        assert_eq!(references[0].p, ProviderKind::Dramachi);
+        assert_eq!(references[0].e, 67);
+    }
+
+    #[test]
+    fn episode_reference_deduplication_keeps_season_and_episode_identity() {
+        let mut references = Vec::new();
+        append_unique_episode_references(
+            &mut references,
+            vec![
+                OpaqueRef {
+                    p: ProviderKind::AniZone,
+                    v: "title".into(),
+                    s: 1,
+                    e: 67,
+                },
+                OpaqueRef {
+                    p: ProviderKind::AniZone,
+                    v: "title".into(),
+                    s: 2,
+                    e: 1,
+                },
+            ],
+        );
+        append_unique_episode_references(
+            &mut references,
+            vec![OpaqueRef {
+                p: ProviderKind::AniZone,
+                v: "title".into(),
+                s: 1,
+                e: 67,
+            }],
+        );
+        assert_eq!(references.len(), 2);
+        assert!(references.iter().any(|reference| reference.s == 1 && reference.e == 67));
+        assert!(references.iter().any(|reference| reference.s == 2 && reference.e == 1));
     }
 
     #[test]
