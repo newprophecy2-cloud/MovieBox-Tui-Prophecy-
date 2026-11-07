@@ -48,7 +48,7 @@ const SOURCE_TIMEOUT: Duration = Duration::from_millis(25);
 #[cfg(not(test))]
 const OVERALL_TIMEOUT: Duration = Duration::from_secs(45);
 #[cfg(test)]
-const OVERALL_TIMEOUT: Duration = Duration::from_millis(25);
+const OVERALL_TIMEOUT: Duration = Duration::from_secs(10);
 const BROWSE_TIMEOUT: Duration = Duration::from_secs(6);
 const CLASSIFICATION_TIMEOUT: Duration = Duration::from_secs(1);
 const PLAYBACK_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(20);
@@ -394,8 +394,7 @@ fn release_has_usable_source(release: &Release) -> bool {
             });
     }
     has_valid_url
-        && (source_codec_eligibility(release.codec.as_deref()) == SourceCodecEligibility::Verified
-            || release_requires_codec_probe(release))
+        && source_codec_eligibility(release.codec.as_deref()) == SourceCodecEligibility::Verified
 }
 
 fn release_has_verification_candidate(release: &Release) -> bool {
@@ -6520,6 +6519,7 @@ async fn playback_route(
         }
     };
     let content_label = identity.content_label();
+    let deadline = Instant::now() + OVERALL_TIMEOUT;
     let mut references = vec![source_ref.clone()];
     if matches!(&identity, PlaybackIdentity::Episode { .. }) {
         let fallback_source = OpaqueSource {
@@ -6531,10 +6531,17 @@ async fn playback_route(
             f: None,
             i: 0,
         };
-        append_unique_episode_references(
-            &mut references,
-            verified_fallback_episode_refs(&state, &fallback_source).await,
-        );
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if !remaining.is_zero() {
+            if let Ok(fallback_refs) = tokio::time::timeout(
+                remaining,
+                verified_fallback_episode_refs(&state, &fallback_source),
+            )
+            .await
+            {
+                append_unique_episode_references(&mut references, fallback_refs);
+            }
+        }
     }
     let requested_language = (requested_audio != "auto")
         .then(|| crate::unified::normalize_language_code(requested_audio))
@@ -6546,34 +6553,35 @@ async fn playback_route(
     let mut saw_playable_source = false;
     let mut saw_incompatible_source = false;
     let mut saw_provider_failure = false;
-    let deadline = Instant::now() + OVERALL_TIMEOUT;
     for candidate_ref in references.into_iter().take(8) {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             saw_provider_failure = true;
             break;
         }
-        let releases = match tokio::time::timeout(
-            remaining,
-            cached_releases(&state, &candidate_ref),
-        )
-        .await
-        {
-            Ok(Ok(releases)) => releases,
-            Ok(Err(error)) => {
-                saw_provider_failure = true;
-                log::warn!("playback provider failed provider={}: {}", candidate_ref.p, error);
-                continue;
-            }
-            Err(_) => {
-                saw_provider_failure = true;
-                log::warn!("playback provider timed out provider={}", candidate_ref.p);
-                continue;
-            }
-        };
+        let releases =
+            match tokio::time::timeout(remaining, cached_releases(&state, &candidate_ref)).await {
+                Ok(Ok(releases)) => releases,
+                Ok(Err(error)) => {
+                    saw_provider_failure = true;
+                    log::warn!(
+                        "playback provider failed provider={}: {}",
+                        candidate_ref.p,
+                        error
+                    );
+                    continue;
+                }
+                Err(_) => {
+                    saw_provider_failure = true;
+                    log::warn!("playback provider timed out provider={}", candidate_ref.p);
+                    continue;
+                }
+            };
         let usable = releases
             .iter()
-            .filter(|release| release_has_usable_source(release))
+            .filter(|release| {
+                release_has_usable_source(release) || release_requires_codec_probe(release)
+            })
             .collect::<Vec<_>>();
         saw_playable_source |= !usable.is_empty();
         let mut candidates = usable
@@ -6610,12 +6618,21 @@ async fn playback_route(
                 Ok(Ok(resolved)) => resolved,
                 Ok(Err(error)) => {
                     saw_provider_failure = true;
-                    log::warn!("playback candidate failed provider={} source={}: {}", candidate.provider, candidate.source_label(), error);
+                    log::warn!(
+                        "playback candidate failed provider={} source={}: {}",
+                        candidate.provider,
+                        candidate.source_label(),
+                        error
+                    );
                     continue;
                 }
                 Err(_) => {
                     saw_provider_failure = true;
-                    log::warn!("playback candidate timed out provider={} source={}", candidate.provider, candidate.source_label());
+                    log::warn!(
+                        "playback candidate timed out provider={} source={}",
+                        candidate.provider,
+                        candidate.source_label()
+                    );
                     continue;
                 }
             };
@@ -6641,11 +6658,24 @@ async fn playback_route(
                         continue;
                     }
                 }
-            } else if source_codec_eligibility(candidate.codec.as_deref())
-                != SourceCodecEligibility::Verified
-            {
-                saw_incompatible_source = true;
-                continue;
+            } else {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    saw_provider_failure = true;
+                    break;
+                }
+                match tokio::time::timeout(
+                    remaining,
+                    crate::codec_verification::verify_playback_source(&resolved),
+                )
+                .await
+                {
+                    Ok(Ok(crate::codec_verification::CodecProbeResult::Allowed(_))) => {}
+                    Ok(Ok(_)) | Ok(Err(_)) | Err(_) => {
+                        saw_incompatible_source = true;
+                        continue;
+                    }
+                }
             }
             selected_ref = candidate_ref.clone();
             selected_release = Some(candidate.clone());
@@ -6661,7 +6691,9 @@ async fn playback_route(
             if saw_playable_source && !language_metadata_match {
                 let (status, body) = err(
                     "AUDIO_LANGUAGE_UNAVAILABLE",
-                    format!("No verified playable source is available for audio language {language}."),
+                    format!(
+                        "No verified playable source is available for audio language {language}."
+                    ),
                     Some(source_ref.p),
                     404,
                 );
@@ -6678,7 +6710,8 @@ async fn playback_route(
         } else if saw_provider_failure {
             (
                 "PLAYBACK_RESOLUTION_FAILED",
-                "No eligible provider source could be resolved for the requested audio.".to_string(),
+                "No eligible provider source could be resolved for the requested audio."
+                    .to_string(),
                 502,
             )
         } else {
@@ -7810,25 +7843,27 @@ async fn resolve_valid_direct_source(
                 return Err("AniZone media codec could not be verified".into());
             }
         }
-    } else if matches!(
-        release.provider,
-        ProviderKind::FourKHdHub | ProviderKind::Dramachi
-    ) && source_codec_eligibility(release.codec.as_deref()) == SourceCodecEligibility::Unverified
-    {
+    } else {
         let verification_started = Instant::now();
         match crate::codec_verification::verify_playback_source(&playback)
             .await
-            .map_err(|_| "Provider media codec could not be verified".to_string())?
+            .map_err(|_| format!("{} media codec could not be verified", release.provider))?
         {
             crate::codec_verification::CodecProbeResult::Allowed(codec) => {
                 verified_release.codec = Some(codec);
             }
             crate::codec_verification::CodecProbeResult::BlockedHevc(_) => {
-                return Err("FourKHDHub source blocked by H.265/HEVC playback policy".into());
+                return Err(format!(
+                    "{} source blocked by H.265/HEVC playback policy",
+                    release.provider
+                ));
             }
             crate::codec_verification::CodecProbeResult::Unsupported(_)
             | crate::codec_verification::CodecProbeResult::NoVideoStream => {
-                return Err("FourKHDHub media codec is not supported by playback policy".into());
+                return Err(format!(
+                    "{} media codec is not supported by playback policy",
+                    release.provider
+                ));
             }
         }
         log::info!(
@@ -7946,6 +7981,7 @@ fn release_matches_episode(release: &Release, source: &OpaqueSource) -> bool {
 async fn try_direct_fallback(
     state: &ApiState,
     source: &OpaqueSource,
+    deadline: Instant,
 ) -> Option<((PlaybackSource, String, reqwest::Url), String, ProviderKind)> {
     // Retry the requested provider first so a failed high-quality mirror can
     // fall back to another validated source for the exact same episode. The
@@ -7958,7 +7994,15 @@ async fn try_direct_fallback(
         e: source.e,
     };
     let mut refs = vec![original_ref];
-    refs.extend(verified_fallback_episode_refs(state, source).await);
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return None;
+    }
+    let fallback_refs =
+        tokio::time::timeout(remaining, verified_fallback_episode_refs(state, source))
+            .await
+            .ok()?;
+    refs.extend(fallback_refs);
     refs.sort_by(|left, right| {
         (provider_priority(left.p), &left.v, left.s, left.e).cmp(&(
             provider_priority(right.p),
@@ -7978,8 +8022,12 @@ async fn try_direct_fallback(
         )) {
             continue;
         }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
         let Ok(alternate_releases) =
-            tokio::time::timeout(SOURCE_TIMEOUT, cached_releases(state, &fallback_ref))
+            tokio::time::timeout(remaining, cached_releases(state, &fallback_ref))
                 .await
                 .unwrap_or(Err(ProviderError::Unavailable("fallback timeout".into())))
         else {
@@ -8027,8 +8075,15 @@ async fn try_direct_fallback(
             if !attempted_sources.insert(candidate_source_id.clone()) {
                 continue;
             }
-            if let Ok(resolved) =
-                resolve_valid_direct_source(state, &candidate, source.content_type.as_deref()).await
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            if let Ok(Ok(resolved)) = tokio::time::timeout(
+                remaining,
+                resolve_valid_direct_source(state, &candidate, source.content_type.as_deref()),
+            )
+            .await
             {
                 return Some((resolved, candidate_source_id, candidate.provider));
             }
@@ -8069,11 +8124,16 @@ async fn direct_play_route(
         e: source.e,
     };
     let started = Instant::now();
+    let deadline = started + OVERALL_TIMEOUT;
     let mut selected_source_id = source_id.to_string();
     let mut selected_provider = source.p;
     let source_lookup_started = Instant::now();
-    let original_fetch =
-        tokio::time::timeout(SOURCE_TIMEOUT, cached_releases(&state, &reference)).await;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let original_fetch = if remaining.is_zero() {
+        tokio::time::timeout(Duration::ZERO, cached_releases(&state, &reference)).await
+    } else {
+        tokio::time::timeout(remaining, cached_releases(&state, &reference)).await
+    };
     log::info!(
         "direct_play_timing provider={} stage=source_lookup elapsed_ms={} outcome={}",
         source.p,
@@ -8104,16 +8164,24 @@ async fn direct_play_route(
             };
             match release {
                 Some(release) => {
-                    match resolve_valid_direct_source(
-                        &state,
-                        release,
-                        source.content_type.as_deref(),
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    match tokio::time::timeout(
+                        remaining,
+                        resolve_valid_direct_source(
+                            &state,
+                            release,
+                            source.content_type.as_deref(),
+                        ),
                     )
                     .await
                     {
-                        Ok(resolved) => Some(resolved),
-                        Err(error) => {
+                        Ok(Ok(resolved)) => Some(resolved),
+                        Ok(Err(error)) => {
                             original_resolution_error = Some(error);
+                            None
+                        }
+                        Err(_) => {
+                            original_resolution_error = Some("resolution timed out".to_string());
                             None
                         }
                     }
@@ -8147,9 +8215,10 @@ async fn direct_play_route(
         resolved
     } else {
         let fallback_started = Instant::now();
+        let remaining = deadline.saturating_duration_since(Instant::now());
         let fallback_attempt = tokio::time::timeout(
-            DIRECT_FALLBACK_TIMEOUT,
-            try_direct_fallback(&state, &source),
+            remaining.min(DIRECT_FALLBACK_TIMEOUT),
+            try_direct_fallback(&state, &source, deadline),
         )
         .await;
         let fallback_timed_out = fallback_attempt.is_err();
@@ -10422,12 +10491,16 @@ mod tests {
         );
 
         assert_eq!(references.len(), 2);
-        assert!(references.iter().any(|reference| {
-            reference.p == ProviderKind::Dramachi && reference.e == 67
-        }));
-        assert!(references.iter().any(|reference| {
-            reference.p == ProviderKind::AniZone && reference.e == 67
-        }));
+        assert!(
+            references
+                .iter()
+                .any(|reference| { reference.p == ProviderKind::Dramachi && reference.e == 67 })
+        );
+        assert!(
+            references
+                .iter()
+                .any(|reference| { reference.p == ProviderKind::AniZone && reference.e == 67 })
+        );
     }
 
     #[test]
@@ -10474,8 +10547,16 @@ mod tests {
             }],
         );
         assert_eq!(references.len(), 2);
-        assert!(references.iter().any(|reference| reference.s == 1 && reference.e == 67));
-        assert!(references.iter().any(|reference| reference.s == 2 && reference.e == 1));
+        assert!(
+            references
+                .iter()
+                .any(|reference| reference.s == 1 && reference.e == 67)
+        );
+        assert!(
+            references
+                .iter()
+                .any(|reference| reference.s == 2 && reference.e == 1)
+        );
     }
 
     #[test]
