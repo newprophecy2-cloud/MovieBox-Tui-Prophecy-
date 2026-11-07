@@ -25,7 +25,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     process::Command,
-    sync::{Mutex, Semaphore},
+    sync::{Mutex, Semaphore, mpsc},
     task::JoinSet,
 };
 
@@ -94,13 +94,14 @@ fn database_required() -> bool {
 
 fn configured_search_providers() -> Vec<ProviderKind> {
     let config = crate::config::load();
-    let mut providers = Vec::with_capacity(2);
+    let mut providers = Vec::with_capacity(PROVIDERS.len());
 
-    // These providers expose the common anime search/details contract and are
-    // safe to use from the HTTP API. MovieBox remains intentionally excluded
-    // here because its restricted playback policy is enforced by provider-
-    // specific routes; BDIX and addons stay opt-in and are not enabled by
-    // default. They remain available to the existing explicit provider paths.
+    // Search scope follows configuration. An enabled provider that is
+    // unavailable still participates and reports its failure; omitting it
+    // would turn an incomplete search into a false success.
+    if MOVIEBOX_PROVIDER_ENABLED && config.moviebox_enabled {
+        providers.push(ProviderKind::MovieBox);
+    }
     if config.fourkhdhub_enabled {
         providers.push(ProviderKind::FourKHdHub);
     }
@@ -109,6 +110,15 @@ fn configured_search_providers() -> Vec<ProviderKind> {
     }
     if config.anizone_enabled {
         providers.push(ProviderKind::AniZone);
+    }
+    if config.bdix_circleftp_enabled {
+        providers.push(ProviderKind::BdixCircleFtp);
+    }
+    if config.bdix_dhakaflix_enabled {
+        providers.push(ProviderKind::BdixDhakaFlix);
+    }
+    if config.addons_enabled {
+        providers.push(ProviderKind::Addons);
     }
     providers
 }
@@ -3861,46 +3871,226 @@ async fn search_sse(stream: &mut TcpStream, query: &str, state: ApiState) -> std
         );
         return write_raw_json(stream, s, &b, None).await;
     };
-    let eligible = cached_search(&state, &qv).await;
     write_headers(stream, 200, "text/event-stream", None).await?;
-    let canonical_ids = eligible.canonical_ids.clone();
-    for item in
-        crate::unified::group_catalog_items_with_aliases(eligible.items, &eligible.verified_aliases)
-    {
-        let canonical_id = canonical_ids
-            .get(&provider_mapping_key(&item.primary.id))
-            .cloned();
-        let payload =
-            serde_json::to_string(&serde_json::json!({"result":catalog(item, canonical_id)}))
-                .unwrap();
-        send_event(stream, "search_result", &payload).await?;
-    }
-    for (provider, status) in eligible.provider_status {
-        if status == "ok" {
-            continue;
-        }
-        let (code, event) = match status.as_str() {
-            "timeout" => ("PROVIDER_TIMEOUT", "search_provider_error"),
-            _ => ("UPSTREAM_UNAVAILABLE", "search_provider_error"),
-        };
-        let payload = serde_json::json!({
-            "provider": provider,
-            "code": code,
-            "message": if code == "NO_SOURCE_CONFIRMED" {
-                "No usable source was confirmed for the provider search results."
-            } else {
-                "The provider search did not complete successfully."
-            }
+    let providers = configured_search_providers();
+    send_event(
+        stream,
+        "search_started",
+        &serde_json::json!({
+            "query": qv,
+            "providers": providers.iter().map(|provider| provider.cache_key()).collect::<Vec<_>>(),
+            "replay": false
         })
-        .to_string();
-        send_event(stream, event, &payload).await?;
+        .to_string(),
+    )
+    .await?;
+
+    // The channel is deliberately bounded. Provider tasks can never enqueue an
+    // unbounded number of events while a client is slow or disconnected.
+    const EVENT_BUFFER: usize = 16;
+    let (sender, mut receiver) = mpsc::channel(EVENT_BUFFER);
+    let slots = Arc::new(Semaphore::new(SEARCH_PROVIDER_CONCURRENCY));
+    let mut tasks = JoinSet::new();
+    let intent = crate::language::parse_query(&qv);
+    let normalized_query = intent.title;
+    for provider in providers.iter().copied() {
+        let sender = sender.clone();
+        let service = Arc::clone(&state.service);
+        let query = normalized_query.clone();
+        let slots = Arc::clone(&slots);
+        tasks.spawn(async move {
+            let Some(_permit) = slots.acquire_owned().await.ok() else {
+                let _ = sender
+                    .send(SearchStreamEvent::Failed {
+                        provider,
+                        status: "concurrency_limit".into(),
+                    })
+                    .await;
+                return;
+            };
+            let result = tokio::time::timeout(
+                OVERALL_TIMEOUT,
+                search_provider_pages(service.capabilities(provider).supports_pagination, |page| {
+                    let service = Arc::clone(&service);
+                    let query = query.clone();
+                    async move { service.search_typed(provider, &query, page).await }
+                }),
+            )
+            .await;
+            let event = match result {
+                Ok(Ok(result)) => SearchStreamEvent::Succeeded {
+                    provider,
+                    items: result.items,
+                    partial_error: result.partial_error,
+                },
+                Ok(Err(error)) => SearchStreamEvent::Failed {
+                    provider,
+                    status: error.user_message(provider),
+                },
+                Err(_) => SearchStreamEvent::TimedOut { provider },
+            };
+            let _ = sender.send(event).await;
+        });
     }
+    drop(sender);
+
+    let mut provider_status = HashMap::new();
+    let mut failed = false;
+    let mut seen = std::collections::HashSet::new();
+    let mut sequence = 0usize;
+    while let Some(event) = receiver.recv().await {
+        match event {
+            SearchStreamEvent::Succeeded {
+                provider,
+                mut items,
+                partial_error,
+            } => {
+                let partial_status = partial_error
+                    .as_ref()
+                    .map(|error| error.user_message(provider));
+                provider_status.insert(
+                    provider.cache_key().to_string(),
+                    partial_status
+                        .as_ref()
+                        .map(|status| format!("partial: {status}"))
+                        .unwrap_or_else(|| "ok".to_string()),
+                );
+                if partial_error.is_some() {
+                    failed = true;
+                }
+                if let Some(language) = intent.language {
+                    for item in &mut items {
+                        crate::language::decorate_catalog_item(item, Some(language));
+                    }
+                }
+                let mut provider_count = 0usize;
+                for item in items {
+                    if !seen.insert(item.id.clone()) {
+                        continue;
+                    }
+                    sequence += 1;
+                    provider_count += 1;
+                    let provider_id = item.id.clone();
+                    let card = crate::unified::UnifiedCatalogItem {
+                        primary: item,
+                        provider_mappings: Vec::new(),
+                        provider_items: Vec::new(),
+                    };
+                    let payload = serde_json::json!({
+                        "result": catalog(card, None),
+                        "provider": provider_id.provider,
+                        "provider_id": provider_id.value,
+                        "sequence": sequence
+                    });
+                    if let Err(error) =
+                        send_event(stream, "search_result", &payload.to_string()).await
+                    {
+                        abort_search_tasks(&mut tasks).await;
+                        return Err(error);
+                    }
+                }
+                send_event(
+                    stream,
+                    "search_provider_complete",
+                    &serde_json::json!({
+                        "provider": provider,
+                        "count": provider_count,
+                        "partial": partial_error.is_some()
+                    })
+                    .to_string(),
+                )
+                .await?;
+                if let Some(error) = partial_error {
+                    send_event(
+                        stream,
+                        "search_provider_error",
+                        &serde_json::json!({
+                            "provider": provider,
+                            "code": "PARTIAL_PROVIDER_ERROR",
+                            "status": error.user_message(provider)
+                        })
+                        .to_string(),
+                    )
+                    .await?;
+                }
+            }
+            SearchStreamEvent::Failed { provider, status } => {
+                failed = true;
+                provider_status.insert(provider.cache_key().to_string(), status.clone());
+                send_event(
+                    stream,
+                    "search_provider_error",
+                    &serde_json::json!({
+                        "provider": provider,
+                        "code": "UPSTREAM_UNAVAILABLE",
+                        "status": status
+                    })
+                    .to_string(),
+                )
+                .await?;
+            }
+            SearchStreamEvent::TimedOut { provider } => {
+                failed = true;
+                provider_status.insert(provider.cache_key().to_string(), "timeout".to_string());
+                send_event(
+                    stream,
+                    "search_provider_error",
+                    &serde_json::json!({
+                        "provider": provider,
+                        "code": "PROVIDER_TIMEOUT",
+                        "status": "timeout"
+                    })
+                    .to_string(),
+                )
+                .await?;
+            }
+        }
+    }
+    abort_search_tasks(&mut tasks).await;
+
+    // The live stream intentionally does not write to the search cache. This
+    // prevents partial disconnects from being persisted as complete searches.
     send_event(
         stream,
         "search_complete",
-        &serde_json::json!({"partial":eligible.failed,"replay":false}).to_string(),
+        &serde_json::json!({
+            "partial": failed,
+            "providers": provider_status,
+            "replay": false
+        })
+        .to_string(),
     )
     .await
+}
+
+enum SearchStreamEvent {
+    Succeeded {
+        provider: ProviderKind,
+        items: Vec<CatalogItem>,
+        partial_error: Option<ProviderError>,
+    },
+    Failed {
+        provider: ProviderKind,
+        status: String,
+    },
+    TimedOut {
+        provider: ProviderKind,
+    },
+}
+
+async fn abort_search_tasks(tasks: &mut JoinSet<()>) {
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ProviderSearchPages {
+    items: Vec<CatalogItem>,
+    partial_error: Option<ProviderError>,
+}
+
+fn partial_provider_status(provider: ProviderKind, error: &ProviderError) -> String {
+    format!("partial: {}", error.user_message(provider))
 }
 
 async fn search_all(
@@ -3946,9 +4136,21 @@ async fn search_all(
     while let Some(joined) = tasks.join_next().await {
         match joined {
             Ok((p, r)) => match r {
-                Ok(Ok(mut v)) => {
-                    provider_status.insert(p.cache_key().to_string(), "ok".to_string());
-                    items.append(&mut v);
+                Ok(Ok(result)) => {
+                    let ProviderSearchPages {
+                        items: result_items,
+                        partial_error,
+                    } = result;
+                    if let Some(error) = partial_error {
+                        provider_status.insert(
+                            p.cache_key().to_string(),
+                            partial_provider_status(p, &error),
+                        );
+                        failed = true;
+                    } else {
+                        provider_status.insert(p.cache_key().to_string(), "ok".to_string());
+                    }
+                    items.extend(result_items);
                 }
                 Ok(Err(e)) => {
                     provider_status.insert(p.cache_key().to_string(), e.user_message(p));
@@ -3999,7 +4201,7 @@ async fn search_all(
 async fn search_provider_pages<F, Fut>(
     supports_pagination: bool,
     mut fetch: F,
-) -> Result<Vec<CatalogItem>, ProviderError>
+) -> Result<ProviderSearchPages, ProviderError>
 where
     F: FnMut(usize) -> Fut,
     Fut: Future<Output = Result<Vec<CatalogItem>, ProviderError>>,
@@ -4012,7 +4214,16 @@ where
     let mut all = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for page in pages {
-        let page_items = fetch(page).await?;
+        let page_items = match fetch(page).await {
+            Ok(items) => items,
+            Err(error) if all.is_empty() => return Err(error),
+            Err(error) => {
+                return Ok(ProviderSearchPages {
+                    items: all,
+                    partial_error: Some(error),
+                });
+            }
+        };
         if page_items.is_empty() {
             break;
         }
@@ -4022,7 +4233,10 @@ where
             }
         }
     }
-    Ok(all)
+    Ok(ProviderSearchPages {
+        items: all,
+        partial_error: None,
+    })
 }
 
 fn provider_mapping_key(id: &ProviderMediaId) -> String {
@@ -4525,9 +4739,10 @@ async fn discover_episode_mappings(
                 }),
             )
             .await;
-            let Ok(Ok(items)) = search else {
+            let Ok(Ok(result)) = search else {
                 return Vec::new();
             };
+            let items = result.items;
             let source_title = crate::unified::normalize_anime_title(&source_identity.title);
             let candidates = items
                 .into_iter()
@@ -4990,8 +5205,14 @@ async fn discover_unmapped_provider_details(
                 }),
             )
             .await;
-            let items = match search {
-                Ok(Ok(items)) => items,
+            let (items, pagination_status) = match search {
+                Ok(Ok(result)) => (
+                    result.items,
+                    result
+                        .partial_error
+                        .as_ref()
+                        .map(|error| partial_provider_status(provider, error)),
+                ),
                 Ok(Err(error)) => {
                     return (provider, None, error.user_message(provider));
                 }
@@ -5033,7 +5254,11 @@ async fn discover_unmapped_provider_details(
                 }
             }
             match verified.len() {
-                1 => (provider, verified.pop(), "ok".to_string()),
+                1 => (
+                    provider,
+                    verified.pop(),
+                    pagination_status.unwrap_or_else(|| "ok".to_string()),
+                ),
                 0 => (provider, None, "no_verified_match".to_string()),
                 _ => (provider, None, "ambiguous_match".to_string()),
             }
@@ -9407,7 +9632,7 @@ fn openapi() -> serde_json::Value {
             "/api/v1/k-dramas": {"get": {"responses": {"200": {"description": "Metadata-backed K-Drama catalogue"}}}},
             "/api/v1/k-dramas/{id}": {"get": {"responses": {"501": {"description": "Unsupported category"}}}},
             "/api/v1/categories": {"get": {"responses": {"200": {"description": "Supported content categories"}}}},
-            "/api/v1/anime/search/stream": {"get": {"responses": {"200": {"description": "SSE search_result, search_provider_error, search_complete events"}}}},
+            "/api/v1/anime/search/stream": {"get": {"description": "Incremental SSE search. Events are search_started, search_result (one independently completed provider result at a time), search_provider_complete, search_provider_error, and search_complete. search_provider_error includes provider, code, and status; search_complete includes partial, providers, and replay.", "responses": {"200": {"description": "SSE search_started, search_result, search_provider_complete, search_provider_error, and search_complete events"}}}},
             "/api/v1/anime/{anime_id}": {"get": {"description": "Legacy provider IDs remain accepted. Unified search IDs resolve eligible mapped providers concurrently and return successful details with per-provider status, canonical identity, and partial results.", "responses": {"200": {"description": "Aggregated anime details"}, "502": {"description": "No mapped provider returned details"}, "504": {"description": "Mapped provider details timed out"}}}},
             "/api/v1/anime/{anime_id}/seasons": {"get": {"description": "Unified season list with canonical season IDs, available episode counts, provider season numbers, and aggregated episodes.", "responses": {"200": {"description": "Unified season list"}}}},
             "/api/v1/anime/{anime_id}/episodes": {"get": {"description": "Observed episodes aggregated from successful mapped providers; missing numbers are included only when a provider returned an episode record.", "responses": {"200": {"description": "Unified episode list"}}}},
@@ -12138,7 +12363,7 @@ mod tests {
         });
         let (timed_out, successful) = tokio::join!(timeout, success);
         assert!(timed_out.is_err());
-        assert_eq!(successful.unwrap().len(), 1);
+        assert_eq!(successful.unwrap().items.len(), 1);
     }
 
     #[tokio::test]
@@ -12154,7 +12379,101 @@ mod tests {
         });
         let (failed, successful) = tokio::join!(failed, successful);
         assert!(matches!(failed, Err(ProviderError::Unavailable(_))));
-        assert_eq!(successful.unwrap().len(), 1);
+        assert_eq!(successful.unwrap().items.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn incremental_events_arrive_in_provider_completion_order() {
+        let (sender, mut receiver) = mpsc::channel(4);
+        let slow_sender = sender.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            slow_sender
+                .send(SearchStreamEvent::Succeeded {
+                    provider: ProviderKind::Dramachi,
+                    items: vec![mock_search_item(ProviderKind::Dramachi, "slow")],
+                    partial_error: None,
+                })
+                .await
+                .unwrap();
+        });
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            sender
+                .send(SearchStreamEvent::Succeeded {
+                    provider: ProviderKind::AniZone,
+                    items: vec![mock_search_item(ProviderKind::AniZone, "fast")],
+                    partial_error: None,
+                })
+                .await
+                .unwrap();
+        });
+        let first = tokio::time::timeout(Duration::from_millis(25), receiver.recv())
+            .await
+            .expect("fast provider must arrive before slow provider")
+            .expect("event channel should remain open");
+        assert!(matches!(
+            first,
+            SearchStreamEvent::Succeeded {
+                provider: ProviderKind::AniZone,
+                ..
+            }
+        ));
+        let second = receiver.recv().await.expect("slow provider event");
+        assert!(matches!(
+            second,
+            SearchStreamEvent::Succeeded {
+                provider: ProviderKind::Dramachi,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn incremental_provider_error_isolated_from_success_event() {
+        let (sender, mut receiver) = mpsc::channel(2);
+        sender
+            .send(SearchStreamEvent::Failed {
+                provider: ProviderKind::FourKHdHub,
+                status: "upstream unavailable".into(),
+            })
+            .await
+            .unwrap();
+        sender
+            .send(SearchStreamEvent::Succeeded {
+                provider: ProviderKind::AniZone,
+                items: vec![mock_search_item(ProviderKind::AniZone, "available")],
+                partial_error: None,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            receiver.recv().await,
+            Some(SearchStreamEvent::Failed {
+                provider: ProviderKind::FourKHdHub,
+                ..
+            })
+        ));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(SearchStreamEvent::Succeeded {
+                provider: ProviderKind::AniZone,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn disconnected_stream_cancels_outstanding_provider_tasks() {
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        tasks.spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        abort_search_tasks(&mut tasks).await;
+        assert!(tasks.join_next().await.is_none());
     }
 
     #[tokio::test]
@@ -12166,7 +12485,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(result.is_empty());
+        assert!(result.items.is_empty());
         assert_eq!(pages, vec![1]);
     }
 
@@ -12189,14 +12508,16 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(requested_pages, vec![1, 2, 3]);
-        assert_eq!(result.len(), 2);
+        assert_eq!(result.items.len(), 2);
         assert!(
             result
+                .items
                 .iter()
                 .any(|item| item.id.provider == ProviderKind::Dramachi)
         );
         assert!(
             result
+                .items
                 .iter()
                 .any(|item| item.id.provider == ProviderKind::FourKHdHub)
         );
@@ -12319,9 +12640,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(requested_pages, vec![1, 2, 3]);
-        assert_eq!(result.len(), 11);
+        assert_eq!(result.items.len(), 11);
         assert!(
             result
+                .items
                 .iter()
                 .any(|item| item.id.value == "anime-page-3-valid")
         );
@@ -12350,6 +12672,7 @@ mod tests {
             .unwrap();
             assert!(
                 result
+                    .items
                     .iter()
                     .any(|item| item.id.value == "target-candidate")
             );
@@ -12372,8 +12695,8 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(requested_pages, vec![1]);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].id.value, "item-page-1");
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0].id.value, "item-page-1");
     }
 
     #[tokio::test]
@@ -12388,8 +12711,96 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].id.value, "dup-id");
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0].id.value, "dup-id");
+    }
+
+    #[tokio::test]
+    async fn pagination_preserves_page_one_when_page_two_fails_and_reports_partial() {
+        let mut requested_pages = Vec::new();
+        let result = search_provider_pages(true, |page| {
+            requested_pages.push(page);
+            async move {
+                match page {
+                    1 => Ok(vec![mock_search_item(ProviderKind::Dramachi, "page-one")]),
+                    2 => Err(ProviderError::Parsing("page two fixture failure".into())),
+                    _ => Ok(Vec::new()),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(requested_pages, vec![1, 2]);
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0].id.value, "page-one");
+        let error = result.partial_error.expect("later-page error is retained");
+        assert_eq!(
+            error,
+            ProviderError::Parsing("page two fixture failure".into())
+        );
+        assert_eq!(
+            partial_provider_status(ProviderKind::Dramachi, &error),
+            "partial: Dramachi parse error."
+        );
+    }
+
+    #[tokio::test]
+    async fn pagination_preserves_pages_one_and_two_when_page_three_fails() {
+        let mut requested_pages = Vec::new();
+        let result = search_provider_pages(true, |page| {
+            requested_pages.push(page);
+            async move {
+                match page {
+                    1 => Ok(vec![mock_search_item(ProviderKind::AniZone, "page-one")]),
+                    2 => Ok(vec![mock_search_item(ProviderKind::AniZone, "page-two")]),
+                    3 => Err(ProviderError::Unavailable("page three unavailable".into())),
+                    _ => Ok(Vec::new()),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(requested_pages, vec![1, 2, 3]);
+        assert_eq!(result.items.len(), 2);
+        assert!(result.partial_error.is_some());
+        assert_eq!(
+            partial_provider_status(
+                ProviderKind::AniZone,
+                result.partial_error.as_ref().unwrap()
+            ),
+            "partial: AniZone unavailable: page three unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_provider_failure_does_not_discard_another_provider_success() {
+        let partial = search_provider_pages(true, |page| async move {
+            match page {
+                1 => Ok(vec![mock_search_item(
+                    ProviderKind::Dramachi,
+                    "partial-result",
+                )]),
+                2 => Err(ProviderError::Network("page two disconnected".into())),
+                _ => Ok(Vec::new()),
+            }
+        });
+        let successful = search_provider_pages(true, |page| async move {
+            if page == 1 {
+                Ok(vec![mock_search_item(
+                    ProviderKind::FourKHdHub,
+                    "independent-result",
+                )])
+            } else {
+                Ok(Vec::new())
+            }
+        });
+        let (partial, successful) = tokio::join!(partial, successful);
+        let partial = partial.unwrap();
+        let successful = successful.unwrap();
+        assert_eq!(partial.items[0].id.value, "partial-result");
+        assert!(partial.partial_error.is_some());
+        assert_eq!(successful.items[0].id.value, "independent-result");
+        assert!(successful.partial_error.is_none());
     }
 
     #[tokio::test]
@@ -12417,7 +12828,7 @@ mod tests {
         })
         .await;
         assert!(success.is_ok());
-        assert_eq!(success.unwrap().len(), 1);
+        assert_eq!(success.unwrap().items.len(), 1);
     }
 
     #[test]
