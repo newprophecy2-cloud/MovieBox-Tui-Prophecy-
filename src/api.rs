@@ -10,6 +10,7 @@ use futures::{
 use std::{
     collections::HashMap,
     future::Future,
+    pin::Pin,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -20,7 +21,7 @@ use base64::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -139,7 +140,7 @@ pub struct ApiState {
     playback_cache: Arc<Mutex<HashMap<String, PlaybackCacheEntry>>>,
     playback_inflight: Arc<Mutex<HashMap<String, SharedPlaybackFuture>>>,
     search_cache: Arc<Mutex<HashMap<String, SearchCacheEntry>>>,
-    redis_search: Option<redis::aio::MultiplexedConnection>,
+    redis_search: Option<Arc<dyn SearchRedisCache>>,
     remux_cache: crate::remux_cache::RemuxCache,
     native_stream: crate::api_native_stream::NativeStreamProxy,
     connection_slots: Arc<Semaphore>,
@@ -172,6 +173,63 @@ type SharedPlaybackFuture = Shared<BoxFuture<'static, Result<PlaybackSource, Str
 struct SearchCacheEntry {
     stored_at: Instant,
     result: SearchResultSet,
+}
+
+type SearchCacheFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ()>> + Send + 'a>>;
+
+trait SearchRedisCache: Send + Sync {
+    fn get<'a>(&'a self, key: &'a str) -> SearchCacheFuture<'a, Option<Vec<u8>>>;
+    fn set_ex<'a>(
+        &'a self,
+        key: &'a str,
+        ttl_seconds: u64,
+        payload: Vec<u8>,
+    ) -> SearchCacheFuture<'a, ()>;
+    fn delete<'a>(&'a self, key: &'a str) -> SearchCacheFuture<'a, ()>;
+}
+
+struct RedisSearchCacheConnection(redis::aio::MultiplexedConnection);
+
+impl SearchRedisCache for RedisSearchCacheConnection {
+    fn get<'a>(&'a self, key: &'a str) -> SearchCacheFuture<'a, Option<Vec<u8>>> {
+        Box::pin(async move {
+            let mut connection = self.0.clone();
+            let result: Result<Option<Vec<u8>>, _> = redis::cmd("GET")
+                .arg(key)
+                .query_async(&mut connection)
+                .await;
+            result.map_err(|_| ())
+        })
+    }
+
+    fn set_ex<'a>(
+        &'a self,
+        key: &'a str,
+        ttl_seconds: u64,
+        payload: Vec<u8>,
+    ) -> SearchCacheFuture<'a, ()> {
+        Box::pin(async move {
+            let mut connection = self.0.clone();
+            let result: Result<(), _> = redis::cmd("SETEX")
+                .arg(key)
+                .arg(ttl_seconds)
+                .arg(payload)
+                .query_async(&mut connection)
+                .await;
+            result.map_err(|_| ())
+        })
+    }
+
+    fn delete<'a>(&'a self, key: &'a str) -> SearchCacheFuture<'a, ()> {
+        Box::pin(async move {
+            let mut connection = self.0.clone();
+            let result: Result<(), _> = redis::cmd("DEL")
+                .arg(key)
+                .query_async(&mut connection)
+                .await;
+            result.map_err(|_| ())
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -237,6 +295,8 @@ struct SearchResponse {
     next_cursor: Option<String>,
     partial: bool,
     provider_status: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    provider_status_details: HashMap<String, SearchProviderStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     language_intent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -244,11 +304,56 @@ struct SearchResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<String>,
 }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "UPPERCASE")]
+enum SearchProviderState {
+    Success,
+    Empty,
+    Timeout,
+    Error,
+    Partial,
+    Disabled,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SearchProviderStatus {
+    provider: String,
+    status: SearchProviderState,
+    result_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pages_attempted: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pages_successful: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    duration_ms: Option<u64>,
+    /// Unix epoch milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    timestamp: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SearchProviderExecutionMetadata {
+    pages_attempted: Option<usize>,
+    pages_successful: Option<usize>,
+    duration_ms: u64,
+    timestamp_unix_ms: u64,
+}
+
+#[derive(Default)]
+struct SearchPageProgress {
+    pages_attempted: AtomicUsize,
+    pages_successful: AtomicUsize,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SearchResultSet {
     items: Vec<CatalogItem>,
     failed: bool,
     provider_status: HashMap<String, String>,
+    #[serde(default)]
+    provider_status_details: HashMap<String, SearchProviderStatus>,
     #[serde(default)]
     canonical_ids: HashMap<String, String>,
     #[serde(default)]
@@ -960,7 +1065,9 @@ pub async fn run() -> std::io::Result<()> {
         .parse::<u16>()
         .unwrap_or(8080);
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
-    let redis_search = init_redis_search_cache().await;
+    let redis_search = init_redis_search_cache().await.map(|connection| {
+        Arc::new(RedisSearchCacheConnection(connection)) as Arc<dyn SearchRedisCache>
+    });
     let catalog = match crate::catalog::CatalogStore::connect_from_env().await {
         Ok(catalog) => catalog.map(Arc::new),
         Err(error) => {
@@ -3711,6 +3818,15 @@ async fn search_json(stream: &mut TcpStream, query: &str, state: ApiState) -> st
         return write_raw_json(stream, s, &b, None).await;
     }
     let eligible = cached_search(&state, &qv).await;
+    let provider_status_details = if eligible.provider_status_details.is_empty() {
+        search_provider_status_details(
+            &eligible.items,
+            &eligible.provider_status,
+            &configured_search_providers(),
+        )
+    } else {
+        eligible.provider_status_details.clone()
+    };
     let items = crate::unified::group_catalog_items_with_aliases(
         eligible.items,
         &eligible.verified_aliases,
@@ -3758,6 +3874,7 @@ async fn search_json(stream: &mut TcpStream, query: &str, state: ApiState) -> st
         next_cursor,
         partial: failed,
         provider_status,
+        provider_status_details,
         language_intent: language_intent.map(|language| language.code().to_string()),
         verified_language_matches,
         message,
@@ -3766,40 +3883,31 @@ async fn search_json(stream: &mut TcpStream, query: &str, state: ApiState) -> st
 }
 
 async fn cached_search(state: &ApiState, query: &str) -> SearchResultSet {
-    let key = query.trim().to_ascii_lowercase();
+    let providers = configured_search_providers();
+    let key = search_cache_identity(query, &providers);
     {
         let cache = state.search_cache.lock().await;
         if let Some(entry) = cache.get(&key) {
-            if entry.stored_at.elapsed() < SEARCH_CACHE_TTL {
+            if entry.stored_at.elapsed() < SEARCH_CACHE_TTL && !entry.result.failed {
                 return filter_current_search_providers(entry.result.clone());
             }
         }
     }
 
-    if let Some(connection) = state.redis_search.as_ref() {
-        let mut connection = connection.clone();
-        let redis_key = format!("moviebox:search:v3:{key}");
-        let cached: Option<Vec<u8>> = redis::cmd("GET")
-            .arg(redis_key)
-            .query_async(&mut connection)
-            .await
-            .unwrap_or_default();
-        if let Some(payload) = cached {
-            if let Ok(result) = serde_json::from_slice::<SearchResultSet>(&payload) {
-                let mut memory = state.search_cache.lock().await;
-                memory.insert(
-                    key.clone(),
-                    SearchCacheEntry {
-                        stored_at: Instant::now(),
-                        result: result.clone(),
-                    },
-                );
-                return filter_current_search_providers(result);
-            }
-        }
+    if let Some(result) = read_redis_search_cache(state.redis_search.as_deref(), &key).await {
+        let mut memory = state.search_cache.lock().await;
+        memory.insert(
+            key.clone(),
+            SearchCacheEntry {
+                stored_at: Instant::now(),
+                result: result.clone(),
+            },
+        );
+        return filter_current_search_providers(result);
     }
 
-    let (items, failed, provider_status) = search_all(&state.service, query).await;
+    let (items, failed, provider_status, execution_metadata) =
+        search_all_for_providers_with_metadata(&state.service, query, providers).await;
     let mappings = items
         .iter()
         .map(|item| {
@@ -3816,33 +3924,33 @@ async fn cached_search(state: &ApiState, query: &str) -> SearchResultSet {
             .unwrap_or_default(),
         None => HashMap::new(),
     };
-    let result =
+    let mut result =
         persist_search_results(state, items, failed, provider_status, verified_aliases).await;
-    let mut cache = state.search_cache.lock().await;
-    if cache.len() >= SEARCH_CACHE_MAX_ENTRIES {
-        cache.retain(|_, entry| entry.stored_at.elapsed() < SEARCH_CACHE_TTL);
+    apply_execution_metadata(&mut result.provider_status_details, &execution_metadata);
+    // Failed/partial searches are never persisted as cache entries. In particular,
+    // a transient provider outage must not replace a complete result.
+    if is_complete_search_cacheable(&result) {
+        let mut cache = state.search_cache.lock().await;
         if cache.len() >= SEARCH_CACHE_MAX_ENTRIES {
-            cache.clear();
+            cache.retain(|_, entry| entry.stored_at.elapsed() < SEARCH_CACHE_TTL);
+            if cache.len() >= SEARCH_CACHE_MAX_ENTRIES {
+                cache.clear();
+            }
         }
-    }
-    cache.insert(
-        key.clone(),
-        SearchCacheEntry {
-            stored_at: Instant::now(),
-            result: result.clone(),
-        },
-    );
-    if let Some(connection) = state.redis_search.as_ref() {
-        if let Ok(payload) = serde_json::to_vec(&result) {
-            let mut connection = connection.clone();
-            let redis_key = format!("moviebox:search:v3:{key}");
-            let _: Result<(), _> = redis::cmd("SETEX")
-                .arg(redis_key)
-                .arg(SEARCH_CACHE_TTL.as_secs())
-                .arg(payload)
-                .query_async(&mut connection)
-                .await;
-        }
+        cache.insert(
+            key.clone(),
+            SearchCacheEntry {
+                stored_at: Instant::now(),
+                result: result.clone(),
+            },
+        );
+        write_redis_search_cache(
+            state.redis_search.as_deref(),
+            &key,
+            &result,
+            SEARCH_CACHE_TTL.as_secs(),
+        )
+        .await;
     }
     filter_current_search_providers(result)
 }
@@ -3856,6 +3964,189 @@ fn filter_current_search_providers(mut result: SearchResultSet) -> SearchResultS
         .provider_status
         .retain(|provider, _| enabled.iter().any(|kind| kind.cache_key() == provider));
     result
+}
+
+fn search_cache_identity(query: &str, providers: &[ProviderKind]) -> String {
+    let normalized_query = query.trim().to_ascii_lowercase();
+    let mut provider_names = providers
+        .iter()
+        .map(|provider| provider.cache_key())
+        .collect::<Vec<_>>();
+    provider_names.sort_unstable();
+    provider_names.dedup();
+    let mut hasher = Sha256::new();
+    hasher.update(b"moviebox-provider-search-v4\0");
+    hasher.update((normalized_query.len() as u64).to_be_bytes());
+    hasher.update(normalized_query.as_bytes());
+    for provider in provider_names {
+        hasher.update((provider.len() as u64).to_be_bytes());
+        hasher.update(provider.as_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    format!("moviebox:search:v4:{hex}")
+}
+
+fn decode_complete_search_cache_record(payload: &[u8]) -> Option<SearchResultSet> {
+    let result = serde_json::from_slice::<SearchResultSet>(payload).ok()?;
+    is_complete_search_cacheable(&result).then_some(result)
+}
+
+async fn read_redis_search_cache(
+    cache: Option<&dyn SearchRedisCache>,
+    key: &str,
+) -> Option<SearchResultSet> {
+    let cache = cache?;
+    match cache.get(key).await {
+        Ok(Some(payload)) => match decode_complete_search_cache_record(&payload) {
+            Some(result) => Some(result),
+            None => {
+                let _ = cache.delete(key).await;
+                None
+            }
+        },
+        Ok(None) | Err(()) => None,
+    }
+}
+
+async fn write_redis_search_cache(
+    cache: Option<&dyn SearchRedisCache>,
+    key: &str,
+    result: &SearchResultSet,
+    ttl_seconds: u64,
+) {
+    let (Some(cache), true) = (cache, is_complete_search_cacheable(result)) else {
+        return;
+    };
+    if let Ok(payload) = serde_json::to_vec(result) {
+        let _ = cache.set_ex(key, ttl_seconds, payload).await;
+    }
+}
+
+fn is_complete_search_cacheable(result: &SearchResultSet) -> bool {
+    !result.failed
+}
+
+fn search_provider_status_details(
+    items: &[CatalogItem],
+    legacy_status: &HashMap<String, String>,
+    enabled: &[ProviderKind],
+) -> HashMap<String, SearchProviderStatus> {
+    let mut counts = HashMap::new();
+    for provider in PROVIDERS {
+        counts.insert(
+            provider.cache_key().to_string(),
+            items
+                .iter()
+                .filter(|item| item.id.provider == provider)
+                .count(),
+        );
+    }
+    search_provider_status_details_from_counts(&counts, legacy_status, enabled)
+}
+
+fn search_provider_status_details_from_counts(
+    counts: &HashMap<String, usize>,
+    legacy_status: &HashMap<String, String>,
+    enabled: &[ProviderKind],
+) -> HashMap<String, SearchProviderStatus> {
+    PROVIDERS
+        .iter()
+        .map(|provider| {
+            let name = provider.cache_key().to_string();
+            let result_count = counts.get(&name).copied().unwrap_or_default();
+            let is_enabled = enabled.contains(provider);
+            let legacy = legacy_status.get(&name);
+            let (status, error_code, message) = if !is_enabled {
+                (SearchProviderState::Disabled, None, None)
+            } else if let Some(value) = legacy {
+                let normalized = value.to_ascii_lowercase();
+                if normalized == "ok" {
+                    if result_count == 0 {
+                        (SearchProviderState::Empty, None, None)
+                    } else {
+                        (SearchProviderState::Success, None, None)
+                    }
+                } else if normalized == "timeout" {
+                    (
+                        SearchProviderState::Timeout,
+                        Some("PROVIDER_TIMEOUT".into()),
+                        Some(value.clone()),
+                    )
+                } else if normalized.starts_with("partial:") {
+                    (
+                        SearchProviderState::Partial,
+                        Some("PARTIAL_PROVIDER_ERROR".into()),
+                        Some(value.clone()),
+                    )
+                } else {
+                    (
+                        SearchProviderState::Error,
+                        Some("UPSTREAM_UNAVAILABLE".into()),
+                        Some(value.clone()),
+                    )
+                }
+            } else {
+                (
+                    SearchProviderState::Error,
+                    Some("PROVIDER_STATUS_MISSING".into()),
+                    Some("Provider status was not reported.".into()),
+                )
+            };
+            (
+                name.clone(),
+                SearchProviderStatus {
+                    provider: name,
+                    status,
+                    result_count,
+                    pages_attempted: None,
+                    pages_successful: None,
+                    duration_ms: None,
+                    timestamp: None,
+                    error_code,
+                    message,
+                },
+            )
+        })
+        .collect()
+}
+
+fn execution_metadata(
+    supports_pagination: bool,
+    progress: &SearchPageProgress,
+    duration: Duration,
+) -> SearchProviderExecutionMetadata {
+    SearchProviderExecutionMetadata {
+        pages_attempted: supports_pagination
+            .then(|| progress.pages_attempted.load(Ordering::Relaxed)),
+        pages_successful: supports_pagination
+            .then(|| progress.pages_successful.load(Ordering::Relaxed)),
+        duration_ms: duration.as_millis().min(u64::MAX as u128) as u64,
+        timestamp_unix_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u64::MAX as u128) as u64,
+    }
+}
+
+fn apply_execution_metadata(
+    statuses: &mut HashMap<String, SearchProviderStatus>,
+    metadata: &HashMap<String, SearchProviderExecutionMetadata>,
+) {
+    for (provider, metrics) in metadata {
+        let Some(status) = statuses.get_mut(provider) else {
+            continue;
+        };
+        status.pages_attempted = metrics.pages_attempted;
+        status.pages_successful = metrics.pages_successful;
+        status.duration_ms = Some(metrics.duration_ms);
+        status.timestamp = Some(metrics.timestamp_unix_ms);
+    }
 }
 
 async fn search_sse(stream: &mut TcpStream, query: &str, state: ApiState) -> std::io::Result<()> {
@@ -3899,35 +4190,50 @@ async fn search_sse(stream: &mut TcpStream, query: &str, state: ApiState) -> std
         let query = normalized_query.clone();
         let slots = Arc::clone(&slots);
         tasks.spawn(async move {
+            let supports_pagination = service.capabilities(provider).supports_pagination;
+            let progress = Arc::new(SearchPageProgress::default());
             let Some(_permit) = slots.acquire_owned().await.ok() else {
                 let _ = sender
                     .send(SearchStreamEvent::Failed {
                         provider,
                         status: "concurrency_limit".into(),
+                        metadata: execution_metadata(
+                            supports_pagination,
+                            &progress,
+                            Duration::ZERO,
+                        ),
                     })
                     .await;
                 return;
             };
+            let started = Instant::now();
             let result = tokio::time::timeout(
                 OVERALL_TIMEOUT,
-                search_provider_pages(service.capabilities(provider).supports_pagination, |page| {
-                    let service = Arc::clone(&service);
-                    let query = query.clone();
-                    async move { service.search_typed(provider, &query, page).await }
-                }),
+                search_provider_pages_with_progress(
+                    supports_pagination,
+                    Arc::clone(&progress),
+                    |page| {
+                        let service = Arc::clone(&service);
+                        let query = query.clone();
+                        async move { service.search_typed(provider, &query, page).await }
+                    },
+                ),
             )
             .await;
+            let metadata = execution_metadata(supports_pagination, &progress, started.elapsed());
             let event = match result {
                 Ok(Ok(result)) => SearchStreamEvent::Succeeded {
                     provider,
                     items: result.items,
                     partial_error: result.partial_error,
+                    metadata,
                 },
                 Ok(Err(error)) => SearchStreamEvent::Failed {
                     provider,
-                    status: error.user_message(provider),
+                    status: safe_provider_search_error(provider, &error),
+                    metadata,
                 },
-                Err(_) => SearchStreamEvent::TimedOut { provider },
+                Err(_) => SearchStreamEvent::TimedOut { provider, metadata },
             };
             let _ = sender.send(event).await;
         });
@@ -3935,6 +4241,8 @@ async fn search_sse(stream: &mut TcpStream, query: &str, state: ApiState) -> std
     drop(sender);
 
     let mut provider_status = HashMap::new();
+    let mut provider_result_counts = HashMap::new();
+    let mut execution_metadata_by_provider = HashMap::new();
     let mut failed = false;
     let mut seen = std::collections::HashSet::new();
     let mut sequence = 0usize;
@@ -3944,10 +4252,12 @@ async fn search_sse(stream: &mut TcpStream, query: &str, state: ApiState) -> std
                 provider,
                 mut items,
                 partial_error,
+                metadata,
             } => {
+                execution_metadata_by_provider.insert(provider.cache_key().to_string(), metadata);
                 let partial_status = partial_error
                     .as_ref()
-                    .map(|error| error.user_message(provider));
+                    .map(|error| safe_provider_search_error(provider, error));
                 provider_status.insert(
                     provider.cache_key().to_string(),
                     partial_status
@@ -3963,6 +4273,7 @@ async fn search_sse(stream: &mut TcpStream, query: &str, state: ApiState) -> std
                         crate::language::decorate_catalog_item(item, Some(language));
                     }
                 }
+                let raw_provider_result_count = items.len();
                 let mut provider_count = 0usize;
                 for item in items {
                     if !seen.insert(item.id.clone()) {
@@ -3989,6 +4300,8 @@ async fn search_sse(stream: &mut TcpStream, query: &str, state: ApiState) -> std
                         return Err(error);
                     }
                 }
+                provider_result_counts
+                    .insert(provider.cache_key().to_string(), raw_provider_result_count);
                 send_event(
                     stream,
                     "search_provider_complete",
@@ -4007,14 +4320,19 @@ async fn search_sse(stream: &mut TcpStream, query: &str, state: ApiState) -> std
                         &serde_json::json!({
                             "provider": provider,
                             "code": "PARTIAL_PROVIDER_ERROR",
-                            "status": error.user_message(provider)
+                            "status": safe_provider_search_error(provider, &error)
                         })
                         .to_string(),
                     )
                     .await?;
                 }
             }
-            SearchStreamEvent::Failed { provider, status } => {
+            SearchStreamEvent::Failed {
+                provider,
+                status,
+                metadata,
+            } => {
+                execution_metadata_by_provider.insert(provider.cache_key().to_string(), metadata);
                 failed = true;
                 provider_status.insert(provider.cache_key().to_string(), status.clone());
                 send_event(
@@ -4029,7 +4347,8 @@ async fn search_sse(stream: &mut TcpStream, query: &str, state: ApiState) -> std
                 )
                 .await?;
             }
-            SearchStreamEvent::TimedOut { provider } => {
+            SearchStreamEvent::TimedOut { provider, metadata } => {
+                execution_metadata_by_provider.insert(provider.cache_key().to_string(), metadata);
                 failed = true;
                 provider_status.insert(provider.cache_key().to_string(), "timeout".to_string());
                 send_event(
@@ -4050,12 +4369,22 @@ async fn search_sse(stream: &mut TcpStream, query: &str, state: ApiState) -> std
 
     // The live stream intentionally does not write to the search cache. This
     // prevents partial disconnects from being persisted as complete searches.
+    let mut provider_status_details = search_provider_status_details_from_counts(
+        &provider_result_counts,
+        &provider_status,
+        &providers,
+    );
+    apply_execution_metadata(
+        &mut provider_status_details,
+        &execution_metadata_by_provider,
+    );
     send_event(
         stream,
         "search_complete",
         &serde_json::json!({
             "partial": failed,
             "providers": provider_status,
+            "provider_status_details": provider_status_details,
             "replay": false
         })
         .to_string(),
@@ -4068,13 +4397,16 @@ enum SearchStreamEvent {
         provider: ProviderKind,
         items: Vec<CatalogItem>,
         partial_error: Option<ProviderError>,
+        metadata: SearchProviderExecutionMetadata,
     },
     Failed {
         provider: ProviderKind,
         status: String,
+        metadata: SearchProviderExecutionMetadata,
     },
     TimedOut {
         provider: ProviderKind,
+        metadata: SearchProviderExecutionMetadata,
     },
 }
 
@@ -4090,77 +4422,136 @@ struct ProviderSearchPages {
 }
 
 fn partial_provider_status(provider: ProviderKind, error: &ProviderError) -> String {
-    format!("partial: {}", error.user_message(provider))
+    format!("partial: {}", safe_provider_search_error(provider, error))
+}
+
+fn safe_provider_search_error(provider: ProviderKind, error: &ProviderError) -> String {
+    let label = provider.label();
+    match error {
+        ProviderError::Network(message)
+            if message.to_ascii_lowercase().contains("timeout")
+                || message.to_ascii_lowercase().contains("timed out") =>
+        {
+            format!("{label} timed out.")
+        }
+        ProviderError::Network(_) => format!("Cannot reach {label}."),
+        ProviderError::RateLimited(Some(seconds)) => {
+            format!("Rate limited. Wait {seconds}s.")
+        }
+        ProviderError::RateLimited(None) => "Rate limited. Try later.".to_string(),
+        ProviderError::NotFound => "No results found.".to_string(),
+        ProviderError::Parsing(_) => format!("{label} parse error."),
+        ProviderError::Unavailable(message) => {
+            let status = message
+                .strip_prefix("HTTP status ")
+                .and_then(|value| value.split_whitespace().next())
+                .filter(|value| {
+                    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+                });
+            match status {
+                Some(code) => format!("{label} error ({code})."),
+                None => format!("{label} unavailable."),
+            }
+        }
+    }
 }
 
 async fn search_all(
     service: &Arc<MovieBoxService>,
     query: &str,
 ) -> (Vec<CatalogItem>, bool, HashMap<String, String>) {
+    let (items, failed, statuses, _) =
+        search_all_for_providers_with_metadata(service, query, configured_search_providers()).await;
+    (items, failed, statuses)
+}
+
+async fn search_all_for_providers_with_metadata(
+    service: &Arc<MovieBoxService>,
+    query: &str,
+    providers: Vec<ProviderKind>,
+) -> (
+    Vec<CatalogItem>,
+    bool,
+    HashMap<String, String>,
+    HashMap<String, SearchProviderExecutionMetadata>,
+) {
     let intent = crate::language::parse_query(query);
     let requested_language = intent.language;
     let normalized_query = intent.title;
     let mut tasks = JoinSet::new();
     let provider_slots = Arc::new(Semaphore::new(SEARCH_PROVIDER_CONCURRENCY));
-    for p in configured_search_providers() {
+    for p in providers {
         let svc = service.clone();
         let q = normalized_query.clone();
         let slots = Arc::clone(&provider_slots);
         tasks.spawn(async move {
+            let supports_pagination = svc.capabilities(p).supports_pagination;
+            let progress = Arc::new(SearchPageProgress::default());
             let permit = slots.acquire_owned().await;
             if permit.is_err() {
+                let metadata = execution_metadata(supports_pagination, &progress, Duration::ZERO);
                 return (
                     p,
                     Ok(Err(ProviderError::Unavailable(
                         "provider search concurrency limit reached".to_string(),
                     ))),
+                    metadata,
                 );
             }
-            (
-                p,
-                tokio::time::timeout(OVERALL_TIMEOUT, async move {
-                    search_provider_pages(svc.capabilities(p).supports_pagination, |page| {
+            let started = Instant::now();
+            let result = tokio::time::timeout(OVERALL_TIMEOUT, async {
+                search_provider_pages_with_progress(
+                    supports_pagination,
+                    Arc::clone(&progress),
+                    |page| {
                         let svc = Arc::clone(&svc);
                         let q = q.clone();
                         async move { svc.search_typed(p, &q, page).await }
-                    })
-                    .await
-                })
-                .await,
-            )
+                    },
+                )
+                .await
+            })
+            .await;
+            let metadata = execution_metadata(supports_pagination, &progress, started.elapsed());
+            (p, result, metadata)
         });
     }
     let mut items = Vec::new();
     let mut failed = false;
     let mut provider_status = HashMap::new();
+    let mut execution_metadata_by_provider = HashMap::new();
     while let Some(joined) = tasks.join_next().await {
         match joined {
-            Ok((p, r)) => match r {
-                Ok(Ok(result)) => {
-                    let ProviderSearchPages {
-                        items: result_items,
-                        partial_error,
-                    } = result;
-                    if let Some(error) = partial_error {
-                        provider_status.insert(
-                            p.cache_key().to_string(),
-                            partial_provider_status(p, &error),
-                        );
-                        failed = true;
-                    } else {
-                        provider_status.insert(p.cache_key().to_string(), "ok".to_string());
+            Ok((p, r, metadata)) => {
+                execution_metadata_by_provider.insert(p.cache_key().to_string(), metadata);
+                match r {
+                    Ok(Ok(result)) => {
+                        let ProviderSearchPages {
+                            items: result_items,
+                            partial_error,
+                        } = result;
+                        if let Some(error) = partial_error {
+                            provider_status.insert(
+                                p.cache_key().to_string(),
+                                partial_provider_status(p, &error),
+                            );
+                            failed = true;
+                        } else {
+                            provider_status.insert(p.cache_key().to_string(), "ok".to_string());
+                        }
+                        items.extend(result_items);
                     }
-                    items.extend(result_items);
+                    Ok(Err(e)) => {
+                        provider_status
+                            .insert(p.cache_key().to_string(), safe_provider_search_error(p, &e));
+                        failed = true;
+                    }
+                    Err(_) => {
+                        provider_status.insert(p.cache_key().to_string(), "timeout".to_string());
+                        failed = true;
+                    }
                 }
-                Ok(Err(e)) => {
-                    provider_status.insert(p.cache_key().to_string(), e.user_message(p));
-                    failed = true;
-                }
-                Err(_) => {
-                    provider_status.insert(p.cache_key().to_string(), "timeout".to_string());
-                    failed = true;
-                }
-            },
+            }
             Err(error) => {
                 log::error!("search provider task failed: {error}");
                 provider_status.insert(
@@ -4195,11 +4586,33 @@ async fn search_all(
         language_order
             .then_with(|| provider_priority(a.id.provider).cmp(&provider_priority(b.id.provider)))
     });
-    (items, failed, provider_status)
+    (
+        items,
+        failed,
+        provider_status,
+        execution_metadata_by_provider,
+    )
 }
 
 async fn search_provider_pages<F, Fut>(
     supports_pagination: bool,
+    fetch: F,
+) -> Result<ProviderSearchPages, ProviderError>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: Future<Output = Result<Vec<CatalogItem>, ProviderError>>,
+{
+    search_provider_pages_with_progress(
+        supports_pagination,
+        Arc::new(SearchPageProgress::default()),
+        fetch,
+    )
+    .await
+}
+
+async fn search_provider_pages_with_progress<F, Fut>(
+    supports_pagination: bool,
+    progress: Arc<SearchPageProgress>,
     mut fetch: F,
 ) -> Result<ProviderSearchPages, ProviderError>
 where
@@ -4214,8 +4627,12 @@ where
     let mut all = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for page in pages {
+        progress.pages_attempted.fetch_add(1, Ordering::Relaxed);
         let page_items = match fetch(page).await {
-            Ok(items) => items,
+            Ok(items) => {
+                progress.pages_successful.fetch_add(1, Ordering::Relaxed);
+                items
+            }
             Err(error) if all.is_empty() => return Err(error),
             Err(error) => {
                 return Ok(ProviderSearchPages {
@@ -4326,6 +4743,11 @@ async fn persist_search_results(
         }
     }
     SearchResultSet {
+        provider_status_details: search_provider_status_details(
+            &items,
+            &provider_status,
+            &configured_search_providers(),
+        ),
         items,
         failed,
         provider_status,
@@ -12346,6 +12768,289 @@ mod tests {
         }
     }
 
+    struct MockRedisSearchCache {
+        records: Mutex<HashMap<String, Vec<u8>>>,
+        fail_reads: bool,
+        fail_writes: bool,
+        fail_deletes: bool,
+    }
+
+    impl Default for MockRedisSearchCache {
+        fn default() -> Self {
+            Self {
+                records: Mutex::new(HashMap::new()),
+                fail_reads: false,
+                fail_writes: false,
+                fail_deletes: false,
+            }
+        }
+    }
+
+    impl SearchRedisCache for MockRedisSearchCache {
+        fn get<'a>(&'a self, key: &'a str) -> SearchCacheFuture<'a, Option<Vec<u8>>> {
+            Box::pin(async move {
+                if self.fail_reads {
+                    return Err(());
+                }
+                Ok(self.records.lock().await.get(key).cloned())
+            })
+        }
+
+        fn set_ex<'a>(
+            &'a self,
+            key: &'a str,
+            _ttl_seconds: u64,
+            payload: Vec<u8>,
+        ) -> SearchCacheFuture<'a, ()> {
+            Box::pin(async move {
+                if self.fail_writes {
+                    return Err(());
+                }
+                self.records.lock().await.insert(key.to_string(), payload);
+                Ok(())
+            })
+        }
+
+        fn delete<'a>(&'a self, key: &'a str) -> SearchCacheFuture<'a, ()> {
+            Box::pin(async move {
+                if self.fail_deletes {
+                    return Err(());
+                }
+                self.records.lock().await.remove(key);
+                Ok(())
+            })
+        }
+    }
+
+    fn complete_search_cache_fixture() -> SearchResultSet {
+        SearchResultSet {
+            items: vec![mock_search_item(ProviderKind::Dramachi, "cache-fixture")],
+            failed: false,
+            provider_status: HashMap::from([("dramachi".into(), "ok".into())]),
+            provider_status_details: HashMap::new(),
+            canonical_ids: HashMap::new(),
+            verified_aliases: HashMap::new(),
+        }
+    }
+
+    fn partial_search_cache_fixture() -> SearchResultSet {
+        SearchResultSet {
+            failed: true,
+            provider_status: HashMap::from([("dramachi".into(), "timeout".into())]),
+            ..complete_search_cache_fixture()
+        }
+    }
+
+    #[tokio::test]
+    async fn redis_mock_covers_read_write_success_failures_and_unavailability() {
+        let key = "moviebox:search:v4:fixture";
+        let result = complete_search_cache_fixture();
+        let success = MockRedisSearchCache::default();
+        write_redis_search_cache(Some(&success), key, &result, 60).await;
+        let loaded = read_redis_search_cache(Some(&success), key)
+            .await
+            .expect("mocked Redis read should return its written complete result");
+        assert_eq!(loaded.provider_status.get("dramachi").unwrap(), "ok");
+
+        let read_failure = MockRedisSearchCache {
+            fail_reads: true,
+            ..Default::default()
+        };
+        assert!(
+            read_redis_search_cache(Some(&read_failure), key)
+                .await
+                .is_none()
+        );
+
+        let write_failure = MockRedisSearchCache {
+            fail_writes: true,
+            ..Default::default()
+        };
+        write_redis_search_cache(Some(&write_failure), key, &result, 60).await;
+        assert!(write_failure.records.lock().await.is_empty());
+
+        assert!(read_redis_search_cache(None, key).await.is_none());
+        write_redis_search_cache(None, key, &result, 60).await;
+    }
+
+    #[tokio::test]
+    async fn redis_mock_rejects_corrupt_and_partial_records_and_failed_searches() {
+        let key = "moviebox:search:v4:fixture";
+        let corrupt = MockRedisSearchCache::default();
+        corrupt
+            .records
+            .lock()
+            .await
+            .insert(key.to_string(), b"corrupt payload".to_vec());
+        assert!(read_redis_search_cache(Some(&corrupt), key).await.is_none());
+        assert!(!corrupt.records.lock().await.contains_key(key));
+
+        let partial = MockRedisSearchCache::default();
+        let partial_result = partial_search_cache_fixture();
+        let partial_payload = serde_json::to_vec(&partial_result).unwrap();
+        partial
+            .records
+            .lock()
+            .await
+            .insert(key.to_string(), partial_payload);
+        assert!(read_redis_search_cache(Some(&partial), key).await.is_none());
+        assert!(!partial.records.lock().await.contains_key(key));
+        write_redis_search_cache(Some(&partial), key, &partial_result, 60).await;
+        assert!(!partial.records.lock().await.contains_key(key));
+    }
+
+    #[tokio::test]
+    async fn redis_and_memory_cache_use_the_same_provider_aware_key() {
+        let providers = [ProviderKind::Dramachi, ProviderKind::AniZone];
+        let key = search_cache_identity("  Anime Title  ", &providers);
+        let redis = MockRedisSearchCache::default();
+        let result = complete_search_cache_fixture();
+        write_redis_search_cache(Some(&redis), &key, &result, 60).await;
+        let memory: HashMap<String, SearchResultSet> = HashMap::from([(key.clone(), result)]);
+        assert!(memory.contains_key(&key));
+        assert!(read_redis_search_cache(Some(&redis), &key).await.is_some());
+        assert_ne!(
+            key,
+            search_cache_identity("anime title", &[ProviderKind::Dramachi])
+        );
+    }
+
+    #[test]
+    fn search_cache_identity_is_normalized_order_independent_and_provider_aware() {
+        let left = [ProviderKind::Dramachi, ProviderKind::AniZone];
+        let right = [ProviderKind::AniZone, ProviderKind::Dramachi];
+        let key = search_cache_identity("  Anime Title  ", &left);
+        assert_eq!(key, search_cache_identity("anime title", &right));
+        assert_ne!(key, search_cache_identity("different title", &right));
+        assert_ne!(
+            key,
+            search_cache_identity("anime title", &[ProviderKind::Dramachi])
+        );
+        assert!(!key.contains("Anime Title"));
+        assert!(!key.contains("token"));
+    }
+
+    #[test]
+    fn structured_search_status_classifies_outcomes_and_disabled_providers() {
+        let items = vec![mock_search_item(ProviderKind::Dramachi, "result")];
+        let legacy = HashMap::from([
+            ("dramachi".to_string(), "ok".to_string()),
+            ("anizone".to_string(), "ok".to_string()),
+            ("fourkhdhub".to_string(), "timeout".to_string()),
+            ("moviebox".to_string(), "upstream error".to_string()),
+            (
+                "bdix_circleftp".to_string(),
+                "partial: later page failed".to_string(),
+            ),
+        ]);
+        let enabled = [
+            ProviderKind::Dramachi,
+            ProviderKind::AniZone,
+            ProviderKind::FourKHdHub,
+            ProviderKind::MovieBox,
+            ProviderKind::BdixCircleFtp,
+        ];
+        let details = search_provider_status_details(&items, &legacy, &enabled);
+        assert_eq!(details["dramachi"].status, SearchProviderState::Success);
+        assert_eq!(details["dramachi"].result_count, 1);
+        assert_eq!(details["anizone"].status, SearchProviderState::Empty);
+        assert_eq!(details["fourkhdhub"].status, SearchProviderState::Timeout);
+        assert_eq!(details["moviebox"].status, SearchProviderState::Error);
+        assert_eq!(
+            details["bdix_circleftp"].status,
+            SearchProviderState::Partial
+        );
+        assert_eq!(
+            details["bdix_dhakaflix"].status,
+            SearchProviderState::Disabled
+        );
+    }
+
+    #[test]
+    fn provider_search_errors_never_expose_credentials_or_private_urls() {
+        let message = safe_provider_search_error(
+            ProviderKind::Dramachi,
+            &ProviderError::Unavailable(
+                "https://private.example/api?token=secret Bearer abc123".to_string(),
+            ),
+        );
+        assert_eq!(message, "Dramachi unavailable.");
+        assert!(!message.contains("private.example"));
+        assert!(!message.contains("secret"));
+        assert!(!message.contains("abc123"));
+    }
+
+    #[test]
+    fn old_and_new_search_cache_records_deserialize() {
+        let old = serde_json::json!({
+            "items": [],
+            "failed": false,
+            "provider_status": {"dramachi": "ok"}
+        });
+        let old_record: SearchResultSet = serde_json::from_value(old).unwrap();
+        assert!(old_record.provider_status_details.is_empty());
+        let old_structured: SearchResultSet = serde_json::from_value(serde_json::json!({
+            "items": [],
+            "failed": false,
+            "provider_status": {"dramachi": "ok"},
+            "provider_status_details": {
+                "dramachi": {
+                    "provider": "dramachi",
+                    "status": "EMPTY",
+                    "result_count": 0
+                }
+            }
+        }))
+        .unwrap();
+        let prior_details = &old_structured.provider_status_details["dramachi"];
+        assert_eq!(prior_details.status, SearchProviderState::Empty);
+        assert_eq!(prior_details.pages_attempted, None);
+        assert_eq!(prior_details.duration_ms, None);
+        let new = SearchResultSet {
+            items: vec![],
+            failed: false,
+            provider_status: HashMap::from([("dramachi".into(), "ok".into())]),
+            provider_status_details: HashMap::from([(
+                "dramachi".into(),
+                SearchProviderStatus {
+                    provider: "dramachi".into(),
+                    status: SearchProviderState::Empty,
+                    result_count: 0,
+                    pages_attempted: None,
+                    pages_successful: None,
+                    duration_ms: None,
+                    timestamp: None,
+                    error_code: None,
+                    message: None,
+                },
+            )]),
+            canonical_ids: HashMap::new(),
+            verified_aliases: HashMap::new(),
+        };
+        let roundtrip: SearchResultSet =
+            serde_json::from_slice(&serde_json::to_vec(&new).unwrap()).unwrap();
+        assert_eq!(
+            roundtrip.provider_status_details["dramachi"].status,
+            SearchProviderState::Empty
+        );
+    }
+
+    #[test]
+    fn corrupt_and_partial_search_cache_entries_are_rejected() {
+        assert!(decode_complete_search_cache_record(b"not json").is_none());
+        let partial = SearchResultSet {
+            items: vec![],
+            failed: true,
+            provider_status: HashMap::from([("dramachi".into(), "timeout".into())]),
+            provider_status_details: HashMap::new(),
+            canonical_ids: HashMap::new(),
+            verified_aliases: HashMap::new(),
+        };
+        let encoded = serde_json::to_vec(&partial).unwrap();
+        assert!(decode_complete_search_cache_record(&encoded).is_none());
+        assert!(!is_complete_search_cacheable(&partial));
+    }
+
     #[tokio::test]
     async fn deterministic_provider_timeout_does_not_cancel_successful_provider() {
         let timeout = tokio::time::timeout(
@@ -12393,6 +13098,7 @@ mod tests {
                     provider: ProviderKind::Dramachi,
                     items: vec![mock_search_item(ProviderKind::Dramachi, "slow")],
                     partial_error: None,
+                    metadata: SearchProviderExecutionMetadata::default(),
                 })
                 .await
                 .unwrap();
@@ -12404,6 +13110,7 @@ mod tests {
                     provider: ProviderKind::AniZone,
                     items: vec![mock_search_item(ProviderKind::AniZone, "fast")],
                     partial_error: None,
+                    metadata: SearchProviderExecutionMetadata::default(),
                 })
                 .await
                 .unwrap();
@@ -12436,6 +13143,7 @@ mod tests {
             .send(SearchStreamEvent::Failed {
                 provider: ProviderKind::FourKHdHub,
                 status: "upstream unavailable".into(),
+                metadata: SearchProviderExecutionMetadata::default(),
             })
             .await
             .unwrap();
@@ -12444,6 +13152,7 @@ mod tests {
                 provider: ProviderKind::AniZone,
                 items: vec![mock_search_item(ProviderKind::AniZone, "available")],
                 partial_error: None,
+                metadata: SearchProviderExecutionMetadata::default(),
             })
             .await
             .unwrap();
@@ -12561,6 +13270,7 @@ mod tests {
                 next_cursor: Some("cursor-2".into()),
                 partial: false,
                 provider_status: HashMap::new(),
+                provider_status_details: HashMap::new(),
                 language_intent: None,
                 verified_language_matches: None,
                 message: None,
@@ -12570,6 +13280,7 @@ mod tests {
                 next_cursor: None,
                 partial: false,
                 provider_status: HashMap::new(),
+                provider_status_details: HashMap::new(),
                 language_intent: None,
                 verified_language_matches: None,
                 message: None,
@@ -12588,6 +13299,7 @@ mod tests {
                 next_cursor: None,
                 partial: true,
                 provider_status: HashMap::from([("fourkhdhub".into(), "timeout".into())]),
+                provider_status_details: HashMap::new(),
                 language_intent: None,
                 verified_language_matches: None,
                 message: Some("Partial provider results".into()),
@@ -12716,6 +13428,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_execution_metadata_counts_attempted_and_successful_pages() {
+        let progress = Arc::new(SearchPageProgress::default());
+        let result =
+            search_provider_pages_with_progress(true, Arc::clone(&progress), |page| async move {
+                match page {
+                    1 => Ok(vec![mock_search_item(ProviderKind::Dramachi, "page-one")]),
+                    2 => Err(ProviderError::Unavailable("fixture failure".into())),
+                    _ => Ok(Vec::new()),
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+        let metadata = execution_metadata(true, &progress, Duration::from_millis(17));
+        assert_eq!(metadata.pages_attempted, Some(2));
+        assert_eq!(metadata.pages_successful, Some(1));
+        assert_eq!(metadata.duration_ms, 17);
+        assert!(metadata.timestamp_unix_ms > 0);
+
+        let legacy = HashMap::from([("dramachi".to_string(), "partial: page failed".to_string())]);
+        let enabled = [ProviderKind::Dramachi];
+        let mut details = search_provider_status_details(&result.items, &legacy, &enabled);
+        apply_execution_metadata(
+            &mut details,
+            &HashMap::from([("dramachi".to_string(), metadata.clone())]),
+        );
+        assert_eq!(details["dramachi"].status, SearchProviderState::Partial);
+        assert_eq!(details["dramachi"].result_count, 1);
+        assert_eq!(details["dramachi"].pages_attempted, Some(2));
+        assert_eq!(details["dramachi"].pages_successful, Some(1));
+        assert_eq!(details["dramachi"].duration_ms, Some(17));
+        assert_eq!(
+            details["dramachi"].timestamp,
+            Some(metadata.timestamp_unix_ms)
+        );
+
+        let non_paged_progress = SearchPageProgress::default();
+        let non_paged = execution_metadata(false, &non_paged_progress, Duration::from_millis(3));
+        assert_eq!(non_paged.pages_attempted, None);
+        assert_eq!(non_paged.pages_successful, None);
+    }
+
+    #[tokio::test]
     async fn pagination_preserves_page_one_when_page_two_fails_and_reports_partial() {
         let mut requested_pages = Vec::new();
         let result = search_provider_pages(true, |page| {
@@ -12768,7 +13523,7 @@ mod tests {
                 ProviderKind::AniZone,
                 result.partial_error.as_ref().unwrap()
             ),
-            "partial: AniZone unavailable: page three unavailable"
+            "partial: AniZone unavailable."
         );
     }
 
