@@ -5136,6 +5136,19 @@ fn matching_episode(
     titled.next().is_none().then_some(found)
 }
 
+fn append_unique_episode_references(target: &mut Vec<OpaqueRef>, discovered: Vec<OpaqueRef>) {
+    for reference in discovered {
+        if !target.iter().any(|existing| {
+            existing.p == reference.p
+                && existing.v == reference.v
+                && existing.s == reference.s
+                && existing.e == reference.e
+        }) {
+            target.push(reference);
+        }
+    }
+}
+
 async fn discover_episode_mappings(
     state: &ApiState,
     existing_mappings: &[ProviderMediaId],
@@ -6131,19 +6144,18 @@ async fn unified_anime_route(
                 })
             })
             .collect::<Vec<_>>();
-        if alternate_episode_refs.is_empty() {
-            alternate_episode_refs.extend(
-                discover_episode_mappings(
-                    &state,
-                    &mappings,
-                    &details,
-                    &episode_details,
-                    &selected_episode,
-                    unified.canonical_id.as_deref(),
-                )
-                .await,
-            );
-        }
+        append_unique_episode_references(
+            &mut alternate_episode_refs,
+            discover_episode_mappings(
+                &state,
+                &mappings,
+                &details,
+                &episode_details,
+                &selected_episode,
+                unified.canonical_id.as_deref(),
+            )
+            .await,
+        );
         return anime_episode_full_route(
             stream,
             parts[3],
@@ -10337,6 +10349,41 @@ mod tests {
             overview: None,
         };
         assert!(matching_episode(&untitled, &regular).is_none());
+    }
+
+    #[test]
+    fn incomplete_episode_mapping_adds_discovered_provider_without_duplicates() {
+        let mut references = vec![OpaqueRef {
+            p: ProviderKind::Dramachi,
+            v: "black-clover-dramachi".into(),
+            s: 1,
+            e: 67,
+        }];
+        append_unique_episode_references(
+            &mut references,
+            vec![
+                OpaqueRef {
+                    p: ProviderKind::Dramachi,
+                    v: "black-clover-dramachi".into(),
+                    s: 1,
+                    e: 67,
+                },
+                OpaqueRef {
+                    p: ProviderKind::AniZone,
+                    v: "black-clover-anizone".into(),
+                    s: 1,
+                    e: 67,
+                },
+            ],
+        );
+
+        assert_eq!(references.len(), 2);
+        assert!(references.iter().any(|reference| {
+            reference.p == ProviderKind::Dramachi && reference.e == 67
+        }));
+        assert!(references.iter().any(|reference| {
+            reference.p == ProviderKind::AniZone && reference.e == 67
+        }));
     }
 
     #[test]
