@@ -7620,7 +7620,9 @@ fn direct_safe_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
     headers
         .iter()
         .filter(|(name, _)| {
-            name.eq_ignore_ascii_case("referer") || name.eq_ignore_ascii_case("user-agent")
+            name.eq_ignore_ascii_case("referer")
+                || name.eq_ignore_ascii_case("user-agent")
+                || name.eq_ignore_ascii_case("origin")
         })
         .cloned()
         .collect()
@@ -7889,7 +7891,18 @@ async fn try_direct_fallback(
     state: &ApiState,
     source: &OpaqueSource,
 ) -> Option<((PlaybackSource, String, reqwest::Url), String, ProviderKind)> {
-    let mut refs = verified_fallback_episode_refs(state, source).await;
+    // Retry the requested provider first so a failed high-quality mirror can
+    // fall back to another validated source for the exact same episode. The
+    // original source fingerprint is skipped below, preventing an identical
+    // failed URL from being retried indefinitely.
+    let original_ref = OpaqueRef {
+        p: source.p,
+        v: source.v.clone(),
+        s: source.s,
+        e: source.e,
+    };
+    let mut refs = vec![original_ref];
+    refs.extend(verified_fallback_episode_refs(state, source).await);
     refs.sort_by(|left, right| {
         (provider_priority(left.p), &left.v, left.s, left.e).cmp(&(
             provider_priority(right.p),
@@ -7937,6 +7950,14 @@ async fn try_direct_fallback(
             )
         });
         for candidate in candidates.into_iter().take(3) {
+            if candidate.provider == source.p
+                && source
+                    .f
+                    .as_deref()
+                    .is_some_and(|fingerprint| release_fingerprint(&candidate) == fingerprint)
+            {
+                continue;
+            }
             let candidate_source_id = api_sources_for_content(
                 std::slice::from_ref(&candidate),
                 &fallback_ref,
@@ -10986,6 +11007,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_play_route_falls_back_to_another_source_from_same_provider() {
+        let primary = OpaqueRef {
+            p: ProviderKind::Dramachi,
+            v: "same-provider-title".into(),
+            s: 1,
+            e: 2,
+        };
+        let failed = verified_release(
+            primary.p,
+            "failed-1080p.mkv",
+            "http://127.0.0.1/expired.mkv",
+        );
+        let fallback = Release {
+            quality: Some("720p".into()),
+            ..verified_release(
+                primary.p,
+                "working-720p.mkv",
+                "https://cdn.example/working-720p.mkv",
+            )
+        };
+        let source_id = source_ref(&failed, &primary, 0);
+        let fallback_source_id = api_sources(std::slice::from_ref(&fallback), &primary)[0]
+            .id
+            .clone();
+        let (state, _root) = test_state().await;
+        cache_releases(&state, &primary, vec![failed, fallback]).await;
+
+        let (status, body) = invoke_direct_route(state, &source_id).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"]["source_id"], fallback_source_id);
+        assert_eq!(body["data"]["provider"], "dramachi");
+        assert_eq!(
+            body["data"]["playback_url"],
+            "https://cdn.example/working-720p.mkv"
+        );
+    }
+
+    #[tokio::test]
     async fn direct_play_route_preserves_primary_success_and_falls_back_for_missing_or_invalid_source()
      {
         let primary = OpaqueRef {
@@ -11495,11 +11554,12 @@ mod tests {
         let headers = vec![
             ("User-Agent".into(), "player".into()),
             ("Referer".into(), "https://provider.example/".into()),
+            ("Origin".into(), "https://provider.example".into()),
             ("Cookie".into(), "signed-cookie".into()),
             ("Authorization".into(), "Bearer secret".into()),
         ];
         let safe = direct_safe_headers(&headers);
-        assert_eq!(safe.len(), 2);
+        assert_eq!(safe.len(), 3);
         assert_eq!(
             direct_url_type(
                 &reqwest::Url::parse("https://cdn.example/master.m3u8").unwrap(),
