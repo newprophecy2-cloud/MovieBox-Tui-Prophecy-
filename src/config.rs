@@ -47,9 +47,9 @@ impl Default for Config {
             auto_update: true,
             last_update_check: 0,
             active_mode: "streaming".to_string(),
-            active_provider: ProviderKind::MovieBox,
+            active_provider: ProviderKind::FourKHdHub,
             active_theme: String::new(),
-            moviebox_enabled: true,
+            moviebox_enabled: false,
             fourkhdhub_enabled: true,
             dramachi_enabled: true,
             anizone_enabled: true,
@@ -467,7 +467,8 @@ mod tests {
     fn config_defaults_and_serde() {
         let config = Config::default();
         assert!(config.auto_update);
-        assert_eq!(config.active_provider, ProviderKind::MovieBox);
+        assert_eq!(config.active_provider, ProviderKind::FourKHdHub);
+        assert!(!config.moviebox_enabled);
         assert_eq!(config.remux_cache_ttl_seconds, 3_600);
         assert_eq!(config.remux_cache_max_bytes, 512 * 1024 * 1024);
         assert_eq!(config.max_concurrent_media_jobs, 1);

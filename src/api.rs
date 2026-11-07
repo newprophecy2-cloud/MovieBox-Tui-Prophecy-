@@ -67,7 +67,7 @@ const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_REQUEST_BODY_BYTES: usize = 256 * 1024;
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_API_CONNECTIONS: usize = 256;
-const MOVIEBOX_PROVIDER_ENABLED: bool = true;
+const MOVIEBOX_PROVIDER_ENABLED: bool = false;
 const REMUX_STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
 const REMUX_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(20);
 static REMUX_LIMITER: std::sync::LazyLock<Arc<Semaphore>> =
@@ -945,6 +945,11 @@ fn err(
     (status, serde_json::to_string(&body).unwrap())
 }
 fn provider_error(e: ProviderError, p: ProviderKind) -> (u16, String) {
+    log::warn!(
+        "provider_failure provider={} category={}",
+        p,
+        provider_error_category(&e)
+    );
     match e {
         ProviderError::NotFound => err("ANIME_NOT_FOUND", "The item was not found.", Some(p), 404),
         ProviderError::RateLimited(_) => err(
@@ -991,6 +996,55 @@ fn provider_error(e: ProviderError, p: ProviderKind) -> (u16, String) {
             Some(p),
             503,
         ),
+    }
+}
+fn provider_error_category(error: &ProviderError) -> &'static str {
+    match error {
+        ProviderError::Network(message) => {
+            let message = message.to_ascii_lowercase();
+            if message.contains("timeout") || message.contains("timed out") {
+                "timeout"
+            } else if message.contains("502") {
+                "upstream_http_error"
+            } else {
+                "connection_failure"
+            }
+        }
+        ProviderError::RateLimited(_) => "rate_limited",
+        ProviderError::NotFound => "not_found",
+        ProviderError::Parsing(_) => "parsing_failure",
+        ProviderError::Unavailable(message) => {
+            let message = message.to_ascii_lowercase();
+            if message.contains("no direct provider url") || message.contains("missing media url") {
+                "missing_media_url"
+            } else if message.contains("redirect") {
+                "redirect_failure"
+            } else if message.contains("codec") || message.contains("media") {
+                "media_validation_failure"
+            } else if message.contains("url") {
+                "invalid_media_url"
+            } else {
+                "provider_unavailable"
+            }
+        }
+    }
+}
+fn direct_resolution_category(error: &str) -> &'static str {
+    let error = error.to_ascii_lowercase();
+    if error.contains("timed out") || error.contains("timeout") {
+        "timeout"
+    } else if error.contains("no direct provider url") || error.contains("missing media url") {
+        "missing_media_url"
+    } else if error.contains("url rejected") || error.contains("invalid url") {
+        "invalid_media_url"
+    } else if error.contains("codec") || error.contains("compatibility") {
+        "codec_incompatibility"
+    } else if error.contains("redirect") {
+        "redirect_failure"
+    } else if error.contains("parse") || error.contains("json") || error.contains("html") {
+        "parsing_failure"
+    } else {
+        "direct_resolution_failure"
     }
 }
 fn parse_ref(value: &str) -> Result<OpaqueRef, (u16, String)> {
@@ -7190,6 +7244,11 @@ async fn releases_uncached(state: &ApiState, r: &OpaqueRef) -> Result<Vec<Releas
     let svc = &state.service;
     match r.p {
         ProviderKind::MovieBox => {
+            if !moviebox_provider_enabled() {
+                return Err(ProviderError::Unavailable(
+                    "MovieBox provider is disabled".into(),
+                ));
+            }
             crate::providers::ReleaseProvider::episode_streams(&svc.client, &r.v, r.s, r.e).await
         }
         ProviderKind::AniZone => {
@@ -7267,6 +7326,9 @@ fn api_sources_for_content(
     rs.iter()
         .enumerate()
         .filter(|(_, release)| {
+            if release.provider == ProviderKind::MovieBox && !moviebox_provider_enabled() {
+                return false;
+            }
             // Provider adapters may return a parseable release list containing
             // records for neighboring episodes. Unknown coordinates remain
             // usable for providers that do not expose them, but an explicit
@@ -8375,6 +8437,11 @@ async fn direct_play_route(
                 return write_raw_json(stream, status, &response, None).await;
             }
             let error = original_resolution_error.unwrap_or_else(|| "resolution failed".into());
+            log::warn!(
+                "direct_play_failure provider={} category={}",
+                source.p,
+                direct_resolution_category(&error)
+            );
             let (code, message, status) = if error == "source not found" {
                 ("SOURCE_NOT_FOUND", "The source was not found.", 404)
             } else if matches!(

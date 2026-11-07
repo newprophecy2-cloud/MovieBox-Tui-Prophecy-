@@ -21,8 +21,7 @@ pub enum ProviderKind {
 }
 
 impl ProviderKind {
-    pub const ENABLED: [Self; 6] = [
-        Self::MovieBox,
+    pub const ENABLED: [Self; 5] = [
         Self::FourKHdHub,
         Self::Dramachi,
         Self::BdixCircleFtp,

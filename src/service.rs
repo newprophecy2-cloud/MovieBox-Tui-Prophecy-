@@ -10,6 +10,8 @@ use crate::providers::fourkhdhub::FourKHdHubClient;
 use crate::providers::models::{CatalogItem, MediaDetails, ProviderError, ProviderKind};
 use crate::providers::moviebox::client::MovieBoxClient;
 
+const MOVIEBOX_ENABLED: bool = false;
+
 #[derive(Clone)]
 pub struct MovieBoxService {
     pub client: MovieBoxClient,
@@ -49,7 +51,8 @@ impl MovieBoxService {
 
     pub fn capabilities(&self, provider: ProviderKind) -> crate::providers::ProviderCapabilities {
         match provider {
-            ProviderKind::MovieBox => Provider::capabilities(&self.client),
+            ProviderKind::MovieBox if MOVIEBOX_ENABLED => Provider::capabilities(&self.client),
+            ProviderKind::MovieBox => crate::providers::ProviderCapabilities::default(),
             ProviderKind::AniZone => Provider::capabilities(&self.anizone_client),
             ProviderKind::FourKHdHub => self
                 .fourk_client
@@ -64,6 +67,9 @@ impl MovieBoxService {
     }
 
     pub async fn suggest(&self, query: &str) -> Result<Vec<String>, String> {
+        if !MOVIEBOX_ENABLED {
+            return Err("MovieBox provider is disabled".to_string());
+        }
         let payload = self
             .client
             .suggest(query)
@@ -78,6 +84,11 @@ impl MovieBoxService {
         query: &str,
         page: usize,
     ) -> Result<Vec<CatalogItem>, ProviderError> {
+        if provider == ProviderKind::MovieBox && !MOVIEBOX_ENABLED {
+            return Err(ProviderError::Unavailable(
+                "MovieBox provider is disabled".to_string(),
+            ));
+        }
         match provider {
             ProviderKind::MovieBox => Provider::search(&self.client, query, page).await,
             ProviderKind::AniZone => Provider::search(&self.anizone_client, query, page).await,
@@ -171,6 +182,11 @@ impl MovieBoxService {
         provider: ProviderKind,
         subject_id: &str,
     ) -> Result<MediaDetails, ProviderError> {
+        if provider == ProviderKind::MovieBox && !MOVIEBOX_ENABLED {
+            return Err(ProviderError::Unavailable(
+                "MovieBox provider is disabled".to_string(),
+            ));
+        }
         match provider {
             ProviderKind::MovieBox => Provider::details(&self.client, subject_id).await,
             ProviderKind::AniZone => Provider::details(&self.anizone_client, subject_id).await,
@@ -202,6 +218,9 @@ impl MovieBoxService {
         ),
         String,
     > {
+        if !MOVIEBOX_ENABLED {
+            return Err("MovieBox provider is disabled".to_string());
+        }
         let payload = self
             .client
             .get_homepage(tab_id, page)
@@ -214,6 +233,9 @@ impl MovieBoxService {
         &self,
         subject_id: &str,
     ) -> Option<(Option<String>, Option<String>, Option<String>)> {
+        if !MOVIEBOX_ENABLED {
+            return None;
+        }
         let payload = self.client.get_details(subject_id).await.ok()?;
         let text = |keys: &[&str]| {
             keys.iter().find_map(|key| {
@@ -233,6 +255,9 @@ impl MovieBoxService {
     }
 
     pub async fn fetch_collection_resolutions(&self, subject_id: &str) -> Result<Vec<u32>, String> {
+        if !MOVIEBOX_ENABLED {
+            return Err("MovieBox provider is disabled".to_string());
+        }
         self.client
             .fetch_collection_resolutions(subject_id)
             .await
@@ -247,6 +272,9 @@ impl MovieBoxService {
         season: usize,
         episode: usize,
     ) -> Result<Vec<crate::providers::models::SubtitleOption>, String> {
+        if !MOVIEBOX_ENABLED {
+            return Err("MovieBox provider is disabled".to_string());
+        }
         if !subject_id.is_empty() && !resource_id.is_empty() {
             let sid = subject_id.to_string();
             let rid = resource_id.to_string();
