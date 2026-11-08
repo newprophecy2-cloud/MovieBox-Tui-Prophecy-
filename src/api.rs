@@ -5271,6 +5271,9 @@ struct UnifiedEpisodeCandidate {
     episode: crate::providers::models::Episode,
 }
 
+type ProviderEpisodeCoordinate = (ProviderKind, String, usize, usize);
+type VerifiedEpisodePairs = HashSet<(ProviderEpisodeCoordinate, ProviderEpisodeCoordinate)>;
+
 fn normalized_episode_title(title: Option<&str>) -> Option<String> {
     title
         .map(crate::unified::normalize_anime_title)
@@ -5303,31 +5306,115 @@ fn is_generic_episode_title(title: Option<&str>) -> bool {
 }
 
 fn episode_special_marker(title: Option<&str>) -> bool {
-    title
-        .map(crate::unified::normalize_anime_title)
-        .is_some_and(|title| {
-            title.key.split_whitespace().any(|token| {
-                matches!(
-                    token,
-                    "special" | "ova" | "ona" | "movie" | "film" | "recap"
-                )
-            })
-        })
+    let Some(title) = title.map(crate::unified::normalize_anime_title) else {
+        return false;
+    };
+    let tokens = title.key.split_whitespace().collect::<Vec<_>>();
+    let Some(first) = tokens.first().copied() else {
+        return false;
+    };
+    let is_special_label = match first {
+        "ova" | "ona" | "recap" | "movie" | "film" => true,
+        "special" => {
+            tokens.len() == 1
+                || tokens.get(1).is_some_and(|token| *token == "episode")
+                || tokens[1..]
+                    .iter()
+                    .all(|token| token.chars().all(|character| character.is_ascii_digit()))
+        }
+        _ => false,
+    };
+    if is_special_label {
+        return true;
+    }
+    tokens.last() == Some(&"special")
+        && tokens.len() > 1
+        && is_generic_episode_title(Some(&tokens[..tokens.len() - 1].join(" ")))
 }
 
 fn episode_candidates_can_merge(
     left: &UnifiedEpisodeCandidate,
     right: &UnifiedEpisodeCandidate,
+    verified_pairs: &VerifiedEpisodePairs,
 ) -> bool {
-    left.episode.season == right.episode.season
-        && left.episode.number == right.episode.number
-        && left.anime_id.provider != right.anime_id.provider
-        && episode_special_marker(left.episode.title.as_deref())
-            == episode_special_marker(right.episode.title.as_deref())
-        && crate::unified::episode_titles_compatible(
-            left.episode.title.as_deref(),
-            right.episode.title.as_deref(),
-        )
+    if left.anime_id.provider == right.anime_id.provider
+        || episode_special_marker(left.episode.title.as_deref())
+            != episode_special_marker(right.episode.title.as_deref())
+    {
+        return false;
+    }
+    let left_coordinate = (
+        left.anime_id.provider,
+        left.anime_id.value.clone(),
+        left.episode.season,
+        left.episode.number,
+    );
+    let right_coordinate = (
+        right.anime_id.provider,
+        right.anime_id.value.clone(),
+        right.episode.season,
+        right.episode.number,
+    );
+    (left.episode.season == right.episode.season && left.episode.number == right.episode.number)
+        || verified_pairs.contains(&(left_coordinate.clone(), right_coordinate.clone()))
+        || verified_pairs.contains(&(right_coordinate, left_coordinate))
+}
+
+async fn verified_episode_pairs(
+    state: &ApiState,
+    candidates: &[UnifiedEpisodeCandidate],
+) -> VerifiedEpisodePairs {
+    let Some(store) = state.catalog.as_ref() else {
+        return HashSet::new();
+    };
+    let title_ids = candidates
+        .iter()
+        .map(|candidate| candidate.anime_id.value.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let Ok(rows) = store.resolved_episode_lookups_for_titles(&title_ids).await else {
+        return HashSet::new();
+    };
+    let candidate_coordinates = candidates
+        .iter()
+        .map(|candidate| {
+            (
+                candidate.anime_id.provider,
+                candidate.anime_id.value.clone(),
+                candidate.episode.season,
+                candidate.episode.number,
+            )
+        })
+        .collect::<HashSet<_>>();
+    let mut by_canonical_episode = HashMap::<String, Vec<ProviderEpisodeCoordinate>>::new();
+    for (canonical_episode_id, provider_key, title_id, season, episode) in rows {
+        let Some(provider) = ProviderKind::parse(&provider_key) else {
+            continue;
+        };
+        let coordinate = (provider, title_id, season, episode);
+        if candidate_coordinates.contains(&coordinate) {
+            by_canonical_episode
+                .entry(canonical_episode_id)
+                .or_default()
+                .push(coordinate);
+        }
+    }
+    let mut verified = VerifiedEpisodePairs::new();
+    for coordinates in by_canonical_episode.values_mut() {
+        for left in 0..coordinates.len() {
+            for right in (left + 1)..coordinates.len() {
+                if coordinates[left] != coordinates[right]
+                    && coordinates[left].0 != coordinates[right].0
+                    && !coordinates[..left].contains(&coordinates[left])
+                    && !coordinates[..right].contains(&coordinates[right])
+                {
+                    verified.insert((coordinates[left].clone(), coordinates[right].clone()));
+                }
+            }
+        }
+    }
+    verified
 }
 
 const DYNAMIC_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(8);
@@ -5541,8 +5628,15 @@ async fn discover_episode_mappings(
         all_details.sort_by_key(|(mapping, _)| provider_priority(mapping.provider));
         if !all_details.is_empty() {
             let canonical = canonical_id.unwrap_or("dynamic-anime").to_string();
-            let response =
-                unified_api_details(&all_details, &all_mappings, canonical, HashMap::new());
+            let candidates = episode_candidates(&all_details);
+            let verified_pairs = verified_episode_pairs(state, &candidates).await;
+            let response = unified_api_details(
+                &all_details,
+                &all_mappings,
+                canonical,
+                HashMap::new(),
+                &verified_pairs,
+            );
             let _ = persist_unified_details(state, &all_details, &all_mappings, &response).await;
         }
     }
@@ -6004,11 +6098,32 @@ async fn discover_unmapped_provider_details(
     (discovered, status)
 }
 
+fn episode_candidates(details: &[(ProviderMediaId, MediaDetails)]) -> Vec<UnifiedEpisodeCandidate> {
+    details
+        .iter()
+        .flat_map(|(anime_id, provider_details)| {
+            provider_details.seasons.iter().flat_map(move |season| {
+                season.episodes.iter().map(move |episode| {
+                    let mut episode = episode.clone();
+                    episode.provider_season_id = episode
+                        .provider_season_id
+                        .or_else(|| season.provider_season_id.clone());
+                    UnifiedEpisodeCandidate {
+                        anime_id: anime_id.clone(),
+                        episode,
+                    }
+                })
+            })
+        })
+        .collect()
+}
+
 fn unified_api_details(
     details: &[(ProviderMediaId, MediaDetails)],
     all_mappings: &[ProviderMediaId],
     canonical_id: String,
     provider_status: HashMap<String, String>,
+    verified_pairs: &VerifiedEpisodePairs,
 ) -> UnifiedApiDetails {
     let primary = &details[0].1;
     let id = encode(&UnifiedOpaqueRef {
@@ -6026,24 +6141,17 @@ fn unified_api_details(
     });
 
     let mut groups: Vec<Vec<UnifiedEpisodeCandidate>> = Vec::new();
-    let mut candidates = Vec::new();
+    let mut candidates = episode_candidates(details);
     let mut season_numbers = Vec::new();
-    for (anime_id, provider_details) in details {
+    for (_, provider_details) in details {
         for season in &provider_details.seasons {
             if !season_numbers.contains(&season.number) {
                 season_numbers.push(season.number);
             }
-            for episode in &season.episodes {
-                candidates.push(UnifiedEpisodeCandidate {
-                    anime_id: anime_id.clone(),
-                    episode: episode.clone(),
-                });
-            }
         }
     }
-    // Process providers in deterministic priority order. The existing gap helper
-    // identifies coordinates absent from the canonical list; a gap is filled only
-    // by this loop when a provider has returned a real episode record for it.
+    // Process providers in deterministic priority order. Every candidate here is
+    // a real provider record; only a resolved catalog identity may combine it.
     candidates.sort_by_key(|candidate| {
         (
             provider_priority(candidate.anime_id.provider),
@@ -6066,41 +6174,10 @@ fn unified_api_details(
         seen_provider_records.insert(key)
     });
     for candidate in candidates {
-        let expected_through = details
-            .iter()
-            .flat_map(|(_, item)| item.seasons.iter())
-            .filter(|season| season.number == candidate.episode.season)
-            .flat_map(|season| season.episodes.iter())
-            .map(|episode| episode.number)
-            .max()
-            .unwrap_or(candidate.episode.number);
-        let canonical_coordinates = groups
-            .iter()
-            .map(|group| {
-                let episode = &group[0].episode;
-                crate::unified::CanonicalEpisode {
-                    season: episode.season,
-                    episode: episode.number,
-                    title: episode.title.clone(),
-                    overview: episode.overview.clone(),
-                    mappings: Vec::new(),
-                    unresolved_mappings: Vec::new(),
-                }
-            })
-            .collect::<Vec<_>>();
-        let missing = crate::unified::missing_episode_numbers(
-            &canonical_coordinates,
-            candidate.episode.season,
-            expected_through,
-        );
-        if missing.contains(&candidate.episode.number) {
-            // This is a true observed gap fill: only the provider's returned record
-            // is added, and no title or provider ID is synthesized.
-            groups.push(vec![candidate]);
-        } else if let Some(group) = groups.iter_mut().find(|group| {
+        if let Some(group) = groups.iter_mut().find(|group| {
             group
                 .iter()
-                .all(|existing| episode_candidates_can_merge(existing, &candidate))
+                .all(|existing| episode_candidates_can_merge(existing, &candidate, verified_pairs))
         }) {
             group.push(candidate);
         } else {
@@ -6520,17 +6597,26 @@ async fn unified_anime_route(
             season_count: Some(details[0].1.seasons.len()),
         })
     });
+    let candidates = episode_candidates(&details);
+    let verified_pairs = verified_episode_pairs(&state, &candidates).await;
     let mut response = unified_api_details(
         &details,
         &mappings,
         canonical_id.clone(),
         provider_status.clone(),
+        &verified_pairs,
     );
     if let Some(persisted_id) =
         persist_unified_details(&state, &details, &mappings, &response).await
     {
         if persisted_id != canonical_id {
-            response = unified_api_details(&details, &mappings, persisted_id, provider_status);
+            response = unified_api_details(
+                &details,
+                &mappings,
+                persisted_id,
+                provider_status,
+                &verified_pairs,
+            );
         }
     }
     if parts.len() == 4 {
@@ -12458,7 +12544,7 @@ mod tests {
     }
 
     #[test]
-    fn unified_episode_coordinates_keep_conflicting_provider_titles_unresolved() {
+    fn unified_episode_coordinates_merge_different_provider_titles() {
         let primary_ref = OpaqueRef {
             p: ProviderKind::AniZone,
             v: "haibane-anizone".into(),
@@ -12481,14 +12567,283 @@ mod tests {
             (alternate.id.clone(), alternate),
         ];
         let mappings = details.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
-        let response =
-            unified_api_details(&details, &mappings, "local-haibane".into(), HashMap::new());
-        assert_eq!(response.seasons[0].episode_count, 2);
-        assert!(response.seasons[0].episodes.iter().all(|episode| {
-            episode.provider_lookups.len() == 1
-                && episode.provider_mappings.is_empty()
-                && episode.mapping_status == "unresolved"
-        }));
+        let response = unified_api_details(
+            &details,
+            &mappings,
+            "local-haibane".into(),
+            HashMap::new(),
+            &VerifiedEpisodePairs::new(),
+        );
+        assert_eq!(response.seasons[0].episode_count, 1);
+        assert_eq!(response.seasons[0].episodes[0].provider_lookups.len(), 2);
+        assert_eq!(response.seasons[0].episodes[0].mapping_status, "resolved");
+    }
+
+    #[test]
+    fn verified_canonical_episode_mapping_merges_conflicting_titles_and_keeps_provider_ids() {
+        let primary_ref = OpaqueRef {
+            p: ProviderKind::AniZone,
+            v: "title-a".into(),
+            s: 1,
+            e: 1,
+        };
+        let alternate_ref = OpaqueRef {
+            p: ProviderKind::Dramachi,
+            v: "title-b".into(),
+            s: 2,
+            e: 9,
+        };
+        let (mut primary, _, _) = test_anime_details(&primary_ref);
+        let (mut alternate, _, _) = test_anime_details(&alternate_ref);
+        primary.seasons[0].episodes[0].title = Some("Asta and Yuno".into());
+        primary.seasons[0].provider_season_id = Some("az-season-1".into());
+        primary.seasons[0].episodes[0].provider_episode_id = Some("az-episode-a".into());
+        alternate.seasons[0].episodes[0].title = Some("Black Clover S01E001".into());
+        alternate.seasons[0].provider_season_id = Some("dc-season-001".into());
+        alternate.seasons[0].episodes[0].provider_episode_id = Some("dc-episode-001".into());
+
+        let details = vec![
+            (primary.id.clone(), primary),
+            (alternate.id.clone(), alternate),
+        ];
+        let mappings = details.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
+        let a = (ProviderKind::AniZone, "title-a".into(), 1, 1);
+        let b = (ProviderKind::Dramachi, "title-b".into(), 2, 9);
+        let mut verified = VerifiedEpisodePairs::new();
+        verified.insert((a, b));
+        let response = unified_api_details(
+            &details,
+            &mappings,
+            "black-clover-canonical".into(),
+            HashMap::new(),
+            &verified,
+        );
+
+        assert_eq!(
+            response
+                .seasons
+                .iter()
+                .map(|season| season.episode_count)
+                .sum::<usize>(),
+            1
+        );
+        let episode = &response.seasons[0].episodes[0];
+        assert_eq!(episode.provider_lookups.len(), 2);
+        assert_eq!(episode.mapping_status, "resolved");
+        let az = episode
+            .provider_lookups
+            .iter()
+            .find(|lookup| lookup.provider == ProviderKind::AniZone)
+            .unwrap();
+        let drama = episode
+            .provider_lookups
+            .iter()
+            .find(|lookup| lookup.provider == ProviderKind::Dramachi)
+            .unwrap();
+        assert_eq!(az.provider_episode_id.as_deref(), Some("az-episode-a"));
+        assert_eq!(az.provider_season_id.as_deref(), Some("az-season-1"));
+        assert_eq!(drama.provider_episode_id.as_deref(), Some("dc-episode-001"));
+        assert_eq!(drama.provider_season_id.as_deref(), Some("dc-season-001"));
+    }
+
+    #[test]
+    fn full_coordinates_allow_title_conflicts_but_not_number_or_season_collisions() {
+        let a = UnifiedEpisodeCandidate {
+            anime_id: ProviderMediaId {
+                provider: ProviderKind::AniZone,
+                value: "title-a".into(),
+            },
+            episode: crate::providers::models::Episode {
+                season: 1,
+                number: 1,
+                title: Some("Homecoming".into()),
+                overview: None,
+                provider_episode_id: Some("episode-a".into()),
+                provider_season_id: Some("season-a".into()),
+            },
+        };
+        let mut b = a.clone();
+        b.anime_id.provider = ProviderKind::Dramachi;
+        b.anime_id.value = "title-b".into();
+        b.episode.title = Some("Naruto Shippuden S01E001".into());
+        b.episode.provider_episode_id = Some("episode-b".into());
+        b.episode.provider_season_id = Some("season-b".into());
+        assert!(episode_candidates_can_merge(
+            &a,
+            &b,
+            &VerifiedEpisodePairs::new()
+        ));
+
+        let mut different_season = b.clone();
+        different_season.episode.season = 2;
+        assert!(!episode_candidates_can_merge(
+            &a,
+            &different_season,
+            &VerifiedEpisodePairs::new()
+        ));
+        let mut different_episode = b.clone();
+        different_episode.episode.number = 2;
+        different_episode.episode.title = Some("Homecoming Returns".into());
+        assert!(!episode_candidates_can_merge(
+            &a,
+            &different_episode,
+            &VerifiedEpisodePairs::new()
+        ));
+
+        let mut verified = VerifiedEpisodePairs::new();
+        verified.insert((
+            (ProviderKind::AniZone, "title-a".into(), 1, 1),
+            (ProviderKind::Dramachi, "title-b".into(), 1, 1),
+        ));
+        let mut same_provider_duplicate = b.clone();
+        same_provider_duplicate.anime_id.provider = ProviderKind::AniZone;
+        assert!(!episode_candidates_can_merge(
+            &a,
+            &same_provider_duplicate,
+            &verified
+        ));
+
+        let mut special = b.clone();
+        special.episode.title = Some("Episode 1 Special".into());
+        assert!(!episode_candidates_can_merge(&a, &special, &verified));
+    }
+
+    #[test]
+    fn cross_provider_count_regressions_for_black_clover_and_naruto() {
+        let make_provider_details =
+            |provider: ProviderKind, id: &str, count: usize, prefix: &str| {
+                let provider_id = ProviderMediaId {
+                    provider,
+                    value: id.to_string(),
+                };
+                MediaDetails {
+                    id: provider_id,
+                    title: "Fixture anime".into(),
+                    media_type: MediaType::Series,
+                    year: Some("2005".into()),
+                    description: None,
+                    tagline: None,
+                    imdb_rating: None,
+                    director: None,
+                    stars: None,
+                    prints: None,
+                    audios: None,
+                    poster_url: None,
+                    duration: None,
+                    genres: Vec::new(),
+                    seasons: vec![Season {
+                        number: 1,
+                        provider_season_id: Some(format!("{prefix}-season-1")),
+                        episodes: (1..=count)
+                            .map(|number| crate::providers::models::Episode {
+                                season: 1,
+                                number,
+                                title: Some(format!("{prefix} title {number}")),
+                                overview: None,
+                                provider_episode_id: Some(format!("{prefix}-episode-{number}")),
+                                provider_season_id: Some(format!("{prefix}-season-1")),
+                            })
+                            .collect(),
+                    }],
+                    dubs: Vec::new(),
+                }
+            };
+        let fixture = |counts: &[(ProviderKind, &str, usize, &str)], canonical_count: usize| {
+            let details = counts
+                .iter()
+                .map(|(provider, id, count, prefix)| {
+                    let details = make_provider_details(*provider, id, *count, prefix);
+                    (details.id.clone(), details)
+                })
+                .collect::<Vec<_>>();
+            let mut verified = VerifiedEpisodePairs::new();
+            for number in 1..=canonical_count {
+                let coordinates = counts
+                    .iter()
+                    .filter(|(_, _, count, _)| *count >= number)
+                    .map(|(provider, id, _, _)| (*provider, (*id).to_string(), 1, number))
+                    .collect::<Vec<_>>();
+                for left in 0..coordinates.len() {
+                    for right in (left + 1)..coordinates.len() {
+                        verified.insert((coordinates[left].clone(), coordinates[right].clone()));
+                    }
+                }
+            }
+            let mappings = details.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
+            let result = unified_api_details(
+                &details,
+                &mappings,
+                "fixture-canonical-anime".into(),
+                HashMap::new(),
+                &verified,
+            );
+            (details, result)
+        };
+
+        let (black_clover_sources, black_clover) = fixture(
+            &[
+                (ProviderKind::AniZone, "bc-az", 170, "az"),
+                (ProviderKind::Dramachi, "bc-dc", 176, "dc"),
+                (ProviderKind::FourKHdHub, "bc-4k", 51, "fourk"),
+            ],
+            176,
+        );
+        let black_clover_records = black_clover_sources
+            .iter()
+            .map(|(_, detail)| {
+                detail
+                    .seasons
+                    .iter()
+                    .map(|season| season.episodes.len())
+                    .sum::<usize>()
+            })
+            .sum::<usize>();
+        assert_eq!(black_clover_records, 397);
+        assert_eq!(
+            black_clover
+                .seasons
+                .iter()
+                .map(|season| season.episode_count)
+                .sum::<usize>(),
+            176
+        );
+        assert!(
+            black_clover
+                .seasons
+                .iter()
+                .flat_map(|season| &season.episodes)
+                .all(|episode| episode.provider_lookups.len()
+                    == if episode.number <= 51 {
+                        3
+                    } else if episode.number <= 170 {
+                        2
+                    } else {
+                        1
+                    })
+        );
+
+        let (_, naruto) = fixture(
+            &[
+                (ProviderKind::AniZone, "ns-az", 500, "az"),
+                (ProviderKind::Dramachi, "ns-dc", 500, "dc"),
+            ],
+            500,
+        );
+        assert_eq!(
+            naruto
+                .seasons
+                .iter()
+                .map(|season| season.episode_count)
+                .sum::<usize>(),
+            500
+        );
+        assert!(
+            naruto
+                .seasons
+                .iter()
+                .flat_map(|season| &season.episodes)
+                .all(|episode| episode.provider_lookups.len() == 2)
+        );
     }
 
     #[test]

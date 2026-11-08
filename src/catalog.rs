@@ -1180,6 +1180,43 @@ impl CatalogStore {
             })
             .collect())
     }
+    /// Return the canonical episode UUID and provider coordinate for all
+    /// resolved lookups belonging to the supplied provider title IDs.
+    /// This is intentionally a bulk query so details aggregation does not
+    /// perform one catalog round trip per episode.
+    pub async fn resolved_episode_lookups_for_titles(
+        &self,
+        provider_title_ids: &[String],
+    ) -> Result<Vec<(String, String, String, usize, usize)>, CatalogError> {
+        if provider_title_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = self
+            .client
+            .lock()
+            .await
+            .query(
+                "SELECT DISTINCT l.episode_id::text, p.provider_key, l.provider_title_id,
+                            l.provider_season_number, l.provider_episode_number
+             FROM episode_provider_lookup_mappings l
+             JOIN provider_registry p ON p.id=l.provider_id
+             WHERE l.mapping_status='resolved' AND l.provider_title_id=ANY($1)",
+                &[&provider_title_ids],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get::<_, String>(0),
+                    row.get::<_, String>(1),
+                    row.get::<_, String>(2),
+                    row.get::<_, i32>(3).max(0) as usize,
+                    row.get::<_, i32>(4).max(0) as usize,
+                )
+            })
+            .collect())
+    }
     pub async fn list_sources(&self, id: &str) -> Result<Vec<Value>, CatalogError> {
         let r=self.client.lock().await.query("SELECT ps.id::text AS id,ps.episode_id::text AS episode_id,ps.provider_source_id,pr.provider_key,ps.source_reference,ps.quality_label,ps.video_codec,ps.audio_codec,ps.container_format,ps.resolution_width,ps.resolution_height,ps.source_status,ps.codec_verification_status,ps.expires_at::text AS expires_at FROM provider_sources ps JOIN provider_registry pr ON pr.id=ps.provider_id WHERE ps.episode_id=$1::text::uuid AND ps.source_status NOT IN('blocked','invalid') AND (ps.expires_at IS NULL OR ps.expires_at>now()) ORDER BY ps.resolution_height DESC NULLS LAST", &[&id]).await?;
         Ok(r.iter()
