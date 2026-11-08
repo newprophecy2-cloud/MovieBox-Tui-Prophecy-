@@ -413,6 +413,15 @@ fn release_requires_codec_probe(release: &Release) -> bool {
         && release_has_verification_candidate(release)
 }
 
+fn release_requires_playback_codec_verification(release: &Release) -> bool {
+    release.provider == ProviderKind::AniZone
+        || (matches!(
+            release.provider,
+            ProviderKind::FourKHdHub | ProviderKind::Dramachi
+        ) && source_codec_eligibility(release.codec.as_deref())
+            == SourceCodecEligibility::Unverified)
+}
+
 fn is_blocked_h265_codec(codec: Option<&str>) -> bool {
     source_codec_eligibility(codec) == SourceCodecEligibility::BlockedH265
 }
@@ -6811,7 +6820,7 @@ async fn playback_route(
                     continue;
                 }
             };
-            if state.native_stream.supports_url(&resolved.url) {
+            if release_requires_playback_codec_verification(candidate) {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     saw_provider_failure = true;
@@ -6826,28 +6835,27 @@ async fn playback_route(
                     Ok(Ok(crate::codec_verification::CodecProbeResult::Allowed(_))) => {}
                     Ok(Ok(crate::codec_verification::CodecProbeResult::BlockedHevc(_)))
                     | Ok(Ok(crate::codec_verification::CodecProbeResult::Unsupported(_)))
-                    | Ok(Ok(crate::codec_verification::CodecProbeResult::NoVideoStream))
-                    | Ok(Err(_))
-                    | Err(_) => {
+                    | Ok(Ok(crate::codec_verification::CodecProbeResult::NoVideoStream)) => {
                         saw_incompatible_source = true;
                         continue;
                     }
-                }
-            } else {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    saw_provider_failure = true;
-                    break;
-                }
-                match tokio::time::timeout(
-                    remaining,
-                    crate::codec_verification::verify_playback_source(&resolved),
-                )
-                .await
-                {
-                    Ok(Ok(crate::codec_verification::CodecProbeResult::Allowed(_))) => {}
-                    Ok(Ok(_)) | Ok(Err(_)) | Err(_) => {
-                        saw_incompatible_source = true;
+                    Ok(Err(error)) => {
+                        saw_provider_failure = true;
+                        log::warn!(
+                            "playback codec verification failed provider={} source={} code={}",
+                            candidate.provider,
+                            candidate.source_label(),
+                            error.code()
+                        );
+                        continue;
+                    }
+                    Err(_) => {
+                        saw_provider_failure = true;
+                        log::warn!(
+                            "playback codec verification timed out provider={} source={}",
+                            candidate.provider,
+                            candidate.source_label()
+                        );
                         continue;
                     }
                 }
@@ -8032,7 +8040,12 @@ async fn resolve_valid_direct_source(
                 return Err("AniZone media codec could not be verified".into());
             }
         }
-    } else {
+    } else if matches!(
+        release.provider,
+        ProviderKind::FourKHdHub | ProviderKind::Dramachi
+    ) && source_codec_eligibility(release.codec.as_deref())
+        == SourceCodecEligibility::Unverified
+    {
         let verification_started = Instant::now();
         match crate::codec_verification::verify_playback_source(&playback)
             .await
@@ -13012,6 +13025,43 @@ mod tests {
                 "unrecognized codec must fail closed: {codec:?}"
             );
         }
+    }
+
+    #[test]
+    fn playback_verification_only_skips_trusted_non_hls_codec_metadata() {
+        let release = |provider, codec: Option<&str>| Release {
+            provider,
+            filename: "episode.mkv".into(),
+            quality: Some("1080p".into()),
+            codec: codec.map(str::to_string),
+            language: None,
+            size_bytes: None,
+            season: Some(1),
+            episode: Some(1),
+            mirrors: vec![],
+            resource_id: None,
+        };
+
+        assert!(!release_requires_playback_codec_verification(&release(
+            ProviderKind::FourKHdHub,
+            Some("H.264"),
+        )));
+        assert!(release_requires_playback_codec_verification(&release(
+            ProviderKind::FourKHdHub,
+            None,
+        )));
+        assert!(release_requires_playback_codec_verification(&release(
+            ProviderKind::Dramachi,
+            Some("unknown"),
+        )));
+        assert!(release_requires_playback_codec_verification(&release(
+            ProviderKind::AniZone,
+            Some("H.264"),
+        )));
+        assert!(!release_requires_playback_codec_verification(&release(
+            ProviderKind::BdixCircleFtp,
+            Some("H.264"),
+        )));
     }
 
     #[test]
