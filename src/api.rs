@@ -435,6 +435,46 @@ fn direct_play_compatibility(provider: ProviderKind) -> &'static str {
     }
 }
 
+async fn verify_direct_playback_codec(
+    release: &Release,
+    playback: &PlaybackSource,
+) -> Result<Release, String> {
+    let mut verified_release = release.clone();
+    if release_requires_direct_play_codec_verification(release) {
+        let verification_started = Instant::now();
+        match crate::codec_verification::verify_playback_source(playback)
+            .await
+            .map_err(|_| format!("{} media codec could not be verified", release.provider))?
+        {
+            crate::codec_verification::CodecProbeResult::Allowed(codec) => {
+                verified_release.codec = Some(codec);
+            }
+            crate::codec_verification::CodecProbeResult::BlockedHevc(_) => {
+                return Err(format!(
+                    "{} source blocked by H.265/HEVC playback policy",
+                    release.provider
+                ));
+            }
+            crate::codec_verification::CodecProbeResult::Unsupported(_)
+            | crate::codec_verification::CodecProbeResult::NoVideoStream => {
+                return Err(format!(
+                    "confirmed_codec_incompatibility:{}",
+                    release.provider
+                ));
+            }
+            crate::codec_verification::CodecProbeResult::Unverified(_) => {
+                return Err("codec_unverified".into());
+            }
+        }
+        log::info!(
+            "direct_play_timing provider={} stage=codec_compatibility_verification elapsed_ms={} outcome=verified",
+            release.provider,
+            verification_started.elapsed().as_millis()
+        );
+    }
+    Ok(verified_release)
+}
+
 fn is_blocked_h265_codec(codec: Option<&str>) -> bool {
     source_codec_eligibility(codec) == SourceCodecEligibility::BlockedH265
 }
@@ -8063,39 +8103,7 @@ async fn resolve_valid_direct_source(
         release.provider,
         validation_started.elapsed().as_millis()
     );
-    let mut verified_release = release.clone();
-    if release_requires_direct_play_codec_verification(release) {
-        let verification_started = Instant::now();
-        match crate::codec_verification::verify_playback_source(&playback)
-            .await
-            .map_err(|_| format!("{} media codec could not be verified", release.provider))?
-        {
-            crate::codec_verification::CodecProbeResult::Allowed(codec) => {
-                verified_release.codec = Some(codec);
-            }
-            crate::codec_verification::CodecProbeResult::BlockedHevc(_) => {
-                return Err(format!(
-                    "{} source blocked by H.265/HEVC playback policy",
-                    release.provider
-                ));
-            }
-            crate::codec_verification::CodecProbeResult::Unsupported(_)
-            | crate::codec_verification::CodecProbeResult::NoVideoStream => {
-                return Err(format!(
-                    "confirmed_codec_incompatibility:{}",
-                    release.provider
-                ));
-            }
-            crate::codec_verification::CodecProbeResult::Unverified(_) => {
-                return Err("codec_unverified".into());
-            }
-        }
-        log::info!(
-            "direct_play_timing provider={} stage=codec_compatibility_verification elapsed_ms={} outcome=verified",
-            release.provider,
-            verification_started.elapsed().as_millis()
-        );
-    }
+    let verified_release = verify_direct_playback_codec(release, &playback).await?;
     let url_type = direct_url_type(&validated_url, &verified_release, content_type)
         .ok_or_else(|| "direct playback compatibility unknown".to_string())?;
     Ok((playback, url_type.to_string(), validated_url))
@@ -13098,6 +13106,45 @@ mod tests {
             ProviderKind::BdixCircleFtp,
             Some("H.264"),
         )));
+    }
+
+    #[tokio::test]
+    async fn anizone_direct_play_skips_sample_verification_and_keeps_codec_unverified() {
+        let release = Release {
+            provider: ProviderKind::AniZone,
+            filename: "Test Anime Episode 1".into(),
+            quality: None,
+            codec: None,
+            language: None,
+            size_bytes: None,
+            season: Some(1),
+            episode: Some(1),
+            mirrors: vec![crate::providers::models::SourceMirror {
+                label: "AniZone HLS".into(),
+                resolver_url: "https://127.0.0.1:9/master.m3u8".into(),
+                headers: vec![],
+                direct_file: false,
+            }],
+            resource_id: Some("1".into()),
+        };
+        let playback = PlaybackSource {
+            provider: ProviderKind::AniZone,
+            url: "https://127.0.0.1:9/master.m3u8".into(),
+            headers: vec![],
+            subtitle: None,
+            source_label: "AniZone HLS".into(),
+            max_height: None,
+        };
+
+        let result = verify_direct_playback_codec(&release, &playback)
+            .await
+            .expect("AniZone codec verification is intentionally bypassed");
+        assert_eq!(result.codec, None);
+        assert_eq!(direct_play_compatibility(result.provider), "unverified");
+        assert_eq!(
+            direct_url_type(&reqwest::Url::parse(&playback.url).unwrap(), &result, None),
+            Some("hls")
+        );
     }
 
     #[test]
