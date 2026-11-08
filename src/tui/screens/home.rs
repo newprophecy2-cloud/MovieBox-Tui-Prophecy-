@@ -3076,7 +3076,7 @@ mod tests {
             rendered.push('\n');
         }
         assert!(rendered.contains("Providers"));
-        assert!(rendered.contains("  ✓ MovieBox"));
+        assert!(!rendered.contains("MovieBox"));
         assert!(rendered.contains("    4KHDHub"));
         assert!(rendered.contains("    Dramachi"));
         assert!(!rendered.contains('●'));

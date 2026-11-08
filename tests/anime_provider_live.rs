@@ -320,6 +320,9 @@ async fn live_dramachi_upstream_byte_ranges() {
         Ok(moviebox_tui::codec_verification::CodecProbeResult::Unsupported(codec)) => {
             println!("DRAMACHI_ACCEPTANCE direct_play_policy=blocked-unknown-codec codec={codec}");
         }
+        Ok(moviebox_tui::codec_verification::CodecProbeResult::Unverified(reason)) => {
+            println!("DRAMACHI_ACCEPTANCE direct_play_policy=unverified reason={reason}");
+        }
         Ok(moviebox_tui::codec_verification::CodecProbeResult::NoVideoStream) => {
             println!("DRAMACHI_ACCEPTANCE direct_play_policy=blocked-no-video-stream");
         }

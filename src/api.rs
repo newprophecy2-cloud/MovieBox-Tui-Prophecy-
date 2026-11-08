@@ -1040,18 +1040,32 @@ fn provider_error_category(error: &ProviderError) -> &'static str {
 }
 fn direct_resolution_category(error: &str) -> &'static str {
     let error = error.to_ascii_lowercase();
-    if error.contains("timed out") || error.contains("timeout") {
-        "timeout"
+    if error.contains("confirmed_codec_incompatibility") {
+        "confirmed_codec_incompatibility"
+    } else if error.contains("codec_unverified") {
+        "codec_unverified"
+    } else if error.contains("ffprobe_failure") {
+        "ffprobe_failure"
+    } else if error.contains("invalid_media_sample") {
+        "invalid_media_sample"
+    } else if error.contains("hls_manifest_failure") {
+        "hls_manifest_failure"
+    } else if error.contains("hls_variant_failure") {
+        "hls_variant_failure"
+    } else if error.contains("hls_segment_failure") {
+        "hls_segment_failure"
+    } else if error.contains("hls_encryption_unsupported") {
+        "hls_encryption_unsupported"
+    } else if error.contains("provider_timeout") || error.contains("timeout") {
+        "provider_timeout"
+    } else if error.contains("provider_network_failure") {
+        "provider_network_failure"
     } else if error.contains("no direct provider url") || error.contains("missing media url") {
         "missing_media_url"
     } else if error.contains("url rejected") || error.contains("invalid url") {
         "invalid_media_url"
-    } else if error.contains("codec") || error.contains("compatibility") {
-        "codec_incompatibility"
     } else if error.contains("redirect") {
         "redirect_failure"
-    } else if error.contains("parse") || error.contains("json") || error.contains("html") {
-        "parsing_failure"
     } else {
         "direct_resolution_failure"
     }
@@ -2532,6 +2546,16 @@ async fn codec_verification_worker(state: ApiState, worker_id: usize) {
                     {
                         log::error!(
                             "codec verifier could not persist an unsupported-codec result: {error}"
+                        );
+                    }
+                }
+                Ok(crate::codec_verification::CodecProbeResult::Unverified(_)) => {
+                    if let Err(error) = catalog
+                        .fail_codec_verification(&job, "CODEC_UNVERIFIED", true)
+                        .await
+                    {
+                        log::error!(
+                            "codec verifier could not persist an unverified result: {error}"
                         );
                     }
                 }
@@ -6839,6 +6863,10 @@ async fn playback_route(
                         saw_incompatible_source = true;
                         continue;
                     }
+                    Ok(Ok(crate::codec_verification::CodecProbeResult::Unverified(_))) => {
+                        saw_provider_failure = true;
+                        continue;
+                    }
                     Ok(Err(error)) => {
                         saw_provider_failure = true;
                         log::warn!(
@@ -8033,12 +8061,30 @@ async fn resolve_valid_direct_source(
             Ok(Ok(crate::codec_verification::CodecProbeResult::Allowed(codec))) => {
                 verified_release.codec = Some(codec);
             }
-            Ok(Ok(crate::codec_verification::CodecProbeResult::BlockedHevc(_))) => {
-                return Err("AniZone source blocked by H.265/HEVC playback policy".into());
+            Ok(Ok(crate::codec_verification::CodecProbeResult::BlockedHevc(codec))) => {
+                log::warn!(
+                    "direct_play_verification provider=anizone result=confirmed_codec_incompatibility codec={codec}"
+                );
+                return Err("confirmed_codec_incompatibility".into());
             }
-            Ok(Ok(_)) | Ok(Err(_)) | Err(_) => {
-                return Err("AniZone media codec could not be verified".into());
+            Ok(Ok(crate::codec_verification::CodecProbeResult::Unsupported(codec))) => {
+                log::warn!(
+                    "direct_play_verification provider=anizone result=confirmed_codec_incompatibility codec={codec}"
+                );
+                return Err("confirmed_codec_incompatibility".into());
             }
+            Ok(Ok(crate::codec_verification::CodecProbeResult::Unverified(_)))
+            | Ok(Ok(crate::codec_verification::CodecProbeResult::NoVideoStream)) => {
+                return Err("codec_unverified".into());
+            }
+            Ok(Err(error)) => {
+                log::warn!(
+                    "direct_play_verification provider=anizone result={}",
+                    error.code()
+                );
+                return Err(error.code().to_ascii_lowercase());
+            }
+            Err(_) => return Err("provider_timeout".into()),
         }
     } else if matches!(
         release.provider,
@@ -8063,9 +8109,12 @@ async fn resolve_valid_direct_source(
             crate::codec_verification::CodecProbeResult::Unsupported(_)
             | crate::codec_verification::CodecProbeResult::NoVideoStream => {
                 return Err(format!(
-                    "{} media codec is not supported by playback policy",
+                    "confirmed_codec_incompatibility:{}",
                     release.provider
                 ));
+            }
+            crate::codec_verification::CodecProbeResult::Unverified(_) => {
+                return Err("codec_unverified".into());
             }
         }
         log::info!(
@@ -8843,6 +8892,7 @@ async fn write_verified_playback_response(
                 write_raw_json(stream, status, &body, None).await
             }
             Ok(crate::codec_verification::CodecProbeResult::Unsupported(_))
+            | Ok(crate::codec_verification::CodecProbeResult::Unverified(_))
             | Ok(crate::codec_verification::CodecProbeResult::NoVideoStream)
             | Err(_) => {
                 let (status, body) = err(
@@ -8927,6 +8977,7 @@ async fn write_verified_playback_response(
             write_raw_json(stream, status, &body, None).await
         }
         crate::codec_verification::CodecProbeResult::Unsupported(_)
+        | crate::codec_verification::CodecProbeResult::Unverified(_)
         | crate::codec_verification::CodecProbeResult::NoVideoStream => {
             let (status, body) = err(
                 "CODEC_UNVERIFIED",

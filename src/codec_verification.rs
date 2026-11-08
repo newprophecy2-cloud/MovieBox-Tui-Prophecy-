@@ -15,6 +15,8 @@ const DRAMACHI_FALLBACK_SAMPLE_LIMIT: usize = 4 * 1024 * 1024;
 const DIRECT_SAMPLE_LIMIT: usize = 4 * 1024 * 1024;
 const HLS_MANIFEST_LIMIT: usize = 1024 * 1024;
 const HLS_MEDIA_LIMIT: usize = 8 * 1024 * 1024;
+const HLS_MAX_PROBE_SEGMENTS: usize = 3;
+const HLS_MAX_PROBE_BYTES: usize = 24 * 1024 * 1024;
 const PROBE_STDOUT_LIMIT: usize = 64 * 1024;
 const PROBE_STDERR_LIMIT: usize = 64 * 1024;
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(25);
@@ -26,6 +28,7 @@ pub enum CodecProbeResult {
     Allowed(String),
     BlockedHevc(String),
     Unsupported(String),
+    Unverified(String),
     NoVideoStream,
 }
 
@@ -42,22 +45,22 @@ pub enum CodecProbeError {
     ProbeFailed,
     ProbeOutputLimit,
     MalformedProbeOutput,
+    EncryptedHls,
 }
 
 impl CodecProbeError {
     pub fn code(self) -> &'static str {
         match self {
-            Self::UnsupportedProvider => "VERIFICATION_PROVIDER_UNSUPPORTED",
-            Self::InvalidMediaUrl => "VERIFICATION_URL_INVALID",
-            Self::UnsafeRedirect => "VERIFICATION_REDIRECT_BLOCKED",
-            Self::DownloadTimeout => "MEDIA_PROBE_TIMEOUT",
-            Self::MediaUnavailable => "MEDIA_PROBE_FAILED",
-            Self::EmptyMedia => "MEDIA_PROBE_FAILED",
-            Self::ProbeUnavailable => "FFPROBE_UNAVAILABLE",
-            Self::ProbeTimeout => "MEDIA_PROBE_TIMEOUT",
-            Self::ProbeFailed => "MEDIA_PROBE_FAILED",
-            Self::ProbeOutputLimit => "MEDIA_PROBE_OUTPUT_LIMIT",
-            Self::MalformedProbeOutput => "MEDIA_PROBE_FAILED",
+            Self::UnsupportedProvider => "direct_resolution_failure",
+            Self::InvalidMediaUrl | Self::UnsafeRedirect => "invalid_media_url",
+            Self::DownloadTimeout | Self::ProbeTimeout => "provider_timeout",
+            Self::MediaUnavailable => "provider_network_failure",
+            Self::EmptyMedia => "invalid_media_sample",
+            Self::ProbeUnavailable | Self::ProbeFailed | Self::ProbeOutputLimit => {
+                "ffprobe_failure"
+            }
+            Self::MalformedProbeOutput => "invalid_media_sample",
+            Self::EncryptedHls => "hls_encryption_unsupported",
         }
     }
 
@@ -253,32 +256,65 @@ pub async fn verify_playback_source(
     result
 }
 
+#[derive(Debug)]
+struct HlsMediaTargets {
+    variant: Option<reqwest::Url>,
+    init: Option<reqwest::Url>,
+    segments: Vec<reqwest::Url>,
+    encrypted: bool,
+}
+
 async fn verify_hls_source(source: &PlaybackSource) -> Result<CodecProbeResult, CodecProbeError> {
     let manifest_url = validate_media_url(&source.url).await?;
     let client = guarded_media_client()?;
     let manifest = download_hls_text(&client, manifest_url.clone(), &source.headers).await?;
-    let (variant_url, mut init_url, mut segment_url) =
-        select_hls_media_urls(&manifest_url, &manifest)?;
-    if let Some(variant_url) = variant_url {
+    let mut targets = select_hls_media_targets(&manifest_url, &manifest)?;
+    if let Some(variant_url) = targets.variant.take() {
         let variant_manifest =
             download_hls_text(&client, variant_url.clone(), &source.headers).await?;
-        let (_, variant_init, variant_segment) =
-            select_hls_media_urls(&variant_url, &variant_manifest)?;
-        init_url = variant_init.or(init_url);
-        segment_url = variant_segment;
+        targets = select_hls_media_targets(&variant_url, &variant_manifest)?;
     }
-    let segment_url = segment_url.ok_or(CodecProbeError::MalformedProbeOutput)?;
+    if targets.encrypted {
+        return Err(CodecProbeError::EncryptedHls);
+    }
+    if targets.segments.is_empty() {
+        return Err(CodecProbeError::MalformedProbeOutput);
+    }
+
+    let ffprobe = ffprobe_executable().ok_or(CodecProbeError::ProbeUnavailable)?;
     let mut media = Vec::new();
-    if let Some(init_url) = init_url {
+    if let Some(init_url) = targets.init {
         media
             .extend(download_hls_bytes(&client, init_url, &source.headers, HLS_MEDIA_LIMIT).await?);
     }
-    media.extend(download_hls_bytes(&client, segment_url, &source.headers, HLS_MEDIA_LIMIT).await?);
-    if media.is_empty() {
-        return Err(CodecProbeError::EmptyMedia);
+    let mut last_error = CodecProbeError::ProbeFailed;
+    for (index, segment_url) in targets
+        .segments
+        .into_iter()
+        .take(HLS_MAX_PROBE_SEGMENTS)
+        .enumerate()
+    {
+        let segment =
+            download_hls_bytes(&client, segment_url, &source.headers, HLS_MEDIA_LIMIT).await?;
+        if segment.is_empty() {
+            return Err(CodecProbeError::EmptyMedia);
+        }
+        if media.len().saturating_add(segment.len()) > HLS_MAX_PROBE_BYTES {
+            break;
+        }
+        media.extend(segment);
+        log::debug!(
+            "hls_codec_verification probe_attempt={} segments={} sample_bytes={}",
+            index + 1,
+            index + 1,
+            media.len()
+        );
+        match probe_sample_with_executable(&ffprobe, &media, PROBE_TIMEOUT).await {
+            Ok(result) => return Ok(result),
+            Err(error) => last_error = error,
+        }
     }
-    let ffprobe = ffprobe_executable().ok_or(CodecProbeError::ProbeUnavailable)?;
-    probe_sample_with_executable(&ffprobe, &media, PROBE_TIMEOUT).await
+    Err(last_error)
 }
 
 async fn download_hls_text(
@@ -346,17 +382,10 @@ async fn download_hls_bytes(
     Ok(bytes)
 }
 
-fn select_hls_media_urls(
+fn select_hls_media_targets(
     manifest_url: &reqwest::Url,
     manifest: &str,
-) -> Result<
-    (
-        Option<reqwest::Url>,
-        Option<reqwest::Url>,
-        Option<reqwest::Url>,
-    ),
-    CodecProbeError,
-> {
+) -> Result<HlsMediaTargets, CodecProbeError> {
     let lines = manifest.lines().map(str::trim).collect::<Vec<_>>();
     if !lines
         .first()
@@ -366,14 +395,23 @@ fn select_hls_media_urls(
     }
     let mut variant = None;
     let mut init = None;
-    let mut segment = None;
+    let mut segments = Vec::new();
     let mut expect_variant = false;
+    let mut encrypted = false;
     for line in lines.iter().copied() {
         if line.starts_with("#EXT-X-STREAM-INF") {
             if expect_variant {
                 return Err(CodecProbeError::MalformedProbeOutput);
             }
             expect_variant = true;
+            continue;
+        }
+        if line.starts_with("#EXT-X-KEY:") {
+            let method = quoted_or_unquoted_attribute(line, "METHOD")
+                .ok_or(CodecProbeError::MalformedProbeOutput)?;
+            if !method.eq_ignore_ascii_case("NONE") {
+                encrypted = true;
+            }
             continue;
         }
         if line.starts_with("#EXT-X-MAP:") {
@@ -397,20 +435,30 @@ fn select_hls_media_urls(
         if expect_variant && variant.is_none() {
             variant = Some(url);
             expect_variant = false;
-        } else if segment.is_none() {
-            segment = Some(url);
+        } else if segments.len() < HLS_MAX_PROBE_SEGMENTS {
+            segments.push(url);
         }
     }
     if expect_variant {
         return Err(CodecProbeError::MalformedProbeOutput);
     }
-    if let Some(variant_url) = variant {
-        return Ok((Some(variant_url), init, segment));
-    }
-    if segment.is_none() {
+    if variant.is_none() && segments.is_empty() {
         return Err(CodecProbeError::MalformedProbeOutput);
     }
-    Ok((None, init, segment))
+    Ok(HlsMediaTargets {
+        variant,
+        init,
+        segments,
+        encrypted,
+    })
+}
+
+fn quoted_or_unquoted_attribute(line: &str, name: &str) -> Option<String> {
+    let marker = format!("{name}=");
+    let start = line.find(&marker)? + marker.len();
+    let value = &line[start..];
+    let end = value.find(',').unwrap_or(value.len());
+    Some(value[..end].trim_matches('"').trim().to_string())
 }
 
 fn quoted_attribute(line: &str, name: &str) -> Option<String> {
@@ -438,6 +486,7 @@ fn probe_result_category(result: &Result<CodecProbeResult, CodecProbeError>) -> 
         Ok(CodecProbeResult::Allowed(_)) => "h264-allowed",
         Ok(CodecProbeResult::BlockedHevc(_)) => "hevc-blocked",
         Ok(CodecProbeResult::Unsupported(_)) => "unsupported-codec",
+        Ok(CodecProbeResult::Unverified(_)) => "codec-unverified",
         Ok(CodecProbeResult::NoVideoStream) => "no-video-stream",
         Err(error) => error.code(),
     }
@@ -823,6 +872,10 @@ fn classify_probe_details(
         .map(|codec| codec.trim().to_ascii_lowercase())
         .filter(|codec| !codec.is_empty())
         .collect::<Vec<_>>();
+    let has_any_streams = !streams.is_empty();
+    let has_video_stream = streams
+        .iter()
+        .any(|stream| stream.codec_type.as_deref() == Some("video"));
     let video_codecs = streams
         .into_iter()
         .filter(|stream| stream.codec_type.as_deref() == Some("video"))
@@ -831,7 +884,13 @@ fn classify_probe_details(
         .filter(|codec| !codec.is_empty())
         .collect::<Vec<_>>();
     let codec = if video_codecs.is_empty() {
-        CodecProbeResult::NoVideoStream
+        if has_video_stream {
+            CodecProbeResult::Unverified("video-codec-missing".into())
+        } else if !has_any_streams {
+            CodecProbeResult::Unverified("no-stream-metadata".into())
+        } else {
+            CodecProbeResult::NoVideoStream
+        }
     } else if let Some(codec) = video_codecs.iter().find(|codec| is_hevc_codec(codec)) {
         CodecProbeResult::BlockedHevc(codec.clone())
     } else if let Some(codec) = video_codecs.iter().find(|codec| !is_allowed_codec(codec)) {
@@ -929,36 +988,48 @@ mod tests {
     fn hls_master_and_media_playlists_resolve_bounded_probe_targets() {
         let master = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=100\n720/index.m3u8\n";
         let base = reqwest::Url::parse("https://cdn.example/master.m3u8").unwrap();
-        let (variant, init, segment) = select_hls_media_urls(&base, master).unwrap();
+        let targets = select_hls_media_targets(&base, master).unwrap();
         assert_eq!(
-            variant.unwrap().as_str(),
+            targets.variant.unwrap().as_str(),
             "https://cdn.example/720/index.m3u8"
         );
-        assert!(init.is_none());
-        assert!(segment.is_none());
+        assert!(targets.init.is_none());
+        assert!(targets.segments.is_empty());
 
-        let media = "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:4,\nseg0.m4s\n";
+        let media =
+            "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:4,\nseg0.m4s\n#EXTINF:4,\nseg1.m4s\n";
         let variant_url = reqwest::Url::parse("https://cdn.example/720/index.m3u8").unwrap();
-        let (variant, init, segment) = select_hls_media_urls(&variant_url, media).unwrap();
-        assert!(variant.is_none());
-        assert_eq!(init.unwrap().as_str(), "https://cdn.example/720/init.mp4");
+        let targets = select_hls_media_targets(&variant_url, media).unwrap();
+        assert!(targets.variant.is_none());
         assert_eq!(
-            segment.unwrap().as_str(),
-            "https://cdn.example/720/seg0.m4s"
+            targets.init.unwrap().as_str(),
+            "https://cdn.example/720/init.mp4"
         );
+        assert_eq!(targets.segments.len(), 2);
     }
 
     #[test]
     fn malformed_hls_playlist_fails_closed() {
         let base = reqwest::Url::parse("https://cdn.example/master.m3u8").unwrap();
         assert!(matches!(
-            select_hls_media_urls(&base, "not a playlist"),
+            select_hls_media_targets(&base, "not a playlist"),
             Err(CodecProbeError::MalformedProbeOutput)
         ));
         assert!(matches!(
-            select_hls_media_urls(&base, "#EXTM3U\n#EXTINF:4,\n"),
+            select_hls_media_targets(&base, "#EXTM3U\n#EXTINF:4,\n"),
             Err(CodecProbeError::MalformedProbeOutput)
         ));
+    }
+
+    #[test]
+    fn encrypted_hls_is_detected_and_fails_closed() {
+        let base = reqwest::Url::parse("https://cdn.example/media.m3u8").unwrap();
+        let targets = select_hls_media_targets(
+            &base,
+            "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"key\"\n#EXTINF:4,\nseg.ts\n",
+        )
+        .unwrap();
+        assert!(targets.encrypted);
     }
 
     #[tokio::test]
@@ -1025,6 +1096,10 @@ mod tests {
                 .unwrap(),
             CodecProbeResult::NoVideoStream
         );
+        assert_eq!(
+            classify_probe_json(br#"{"streams":[{"codec_type":"video"}]}"#).unwrap(),
+            CodecProbeResult::Unverified("video-codec-missing".into())
+        );
         assert!(classify_probe_json(b"{").is_err());
     }
 
@@ -1088,20 +1163,21 @@ mod tests {
             Err(CodecProbeError::ProbeUnavailable)
         );
 
-        let nonzero = write_test_executable("#!/usr/bin/python3\nraise SystemExit(7)\n");
+        let nonzero = write_test_executable("#!/usr/bin/env python3\nraise SystemExit(7)\n");
         assert_eq!(
             probe_sample_with_executable(&nonzero, b"x", Duration::from_secs(1)).await,
             Err(CodecProbeError::ProbeFailed)
         );
 
-        let timeout = write_test_executable("#!/usr/bin/python3\nimport time\ntime.sleep(30)\n");
+        let timeout =
+            write_test_executable("#!/usr/bin/env python3\nimport time\ntime.sleep(30)\n");
         assert_eq!(
             probe_sample_with_executable(&timeout, b"x", Duration::from_millis(30)).await,
             Err(CodecProbeError::ProbeTimeout)
         );
 
         let large = write_test_executable(
-            "#!/usr/bin/python3\nimport sys\nsys.stdout.write('x' * 70000)\n",
+            "#!/usr/bin/env python3\nimport sys\nsys.stdout.write('x' * 70000)\n",
         );
         assert_eq!(
             probe_sample_with_executable(&large, b"x", Duration::from_secs(1)).await,
@@ -1109,14 +1185,14 @@ mod tests {
         );
 
         let large_stderr = write_test_executable(
-            "#!/usr/bin/python3\nimport sys\nsys.stderr.write('x' * 70000)\n",
+            "#!/usr/bin/env python3\nimport sys\nsys.stderr.write('x' * 70000)\n",
         );
         assert_eq!(
             probe_sample_with_executable(&large_stderr, b"x", Duration::from_secs(1)).await,
             Err(CodecProbeError::ProbeOutputLimit)
         );
 
-        let malformed = write_test_executable("#!/usr/bin/python3\nprint('{bad json')\n");
+        let malformed = write_test_executable("#!/usr/bin/env python3\nprint('{bad json')\n");
         assert_eq!(
             probe_sample_with_executable(&malformed, b"x", Duration::from_secs(1)).await,
             Err(CodecProbeError::MalformedProbeOutput)
