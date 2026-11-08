@@ -2682,20 +2682,31 @@ mod tests {
                             number: 1,
                             title: None,
                             overview: None,
+
+                            provider_episode_id: None,
+                            provider_season_id: None,
                         },
                         Episode {
                             season: 1,
                             number: 2,
                             title: None,
                             overview: None,
+
+                            provider_episode_id: None,
+                            provider_season_id: None,
                         },
                         Episode {
                             season: 1,
                             number: 10,
                             title: None,
                             overview: None,
+
+                            provider_episode_id: None,
+                            provider_season_id: None,
                         },
                     ],
+
+                    provider_season_id: None,
                 }],
                 dubs: vec![],
             }),
@@ -2707,20 +2718,31 @@ mod tests {
                         number: 1,
                         title: None,
                         overview: None,
+
+                        provider_episode_id: None,
+                        provider_season_id: None,
                     },
                     Episode {
                         season: 1,
                         number: 2,
                         title: None,
                         overview: None,
+
+                        provider_episode_id: None,
+                        provider_season_id: None,
                     },
                     Episode {
                         season: 1,
                         number: 10,
                         title: None,
                         overview: None,
+
+                        provider_episode_id: None,
+                        provider_season_id: None,
                     },
                 ],
+
+                provider_season_id: None,
             }],
             available_episode_numbers: vec![vec![1, 2, 10]],
             details_pane: crate::tui::state::DetailsPane::Episodes,
@@ -2780,7 +2802,12 @@ mod tests {
                                 .to_string(),
                         ),
                         overview: None,
+
+                        provider_episode_id: None,
+                        provider_season_id: None,
                     }],
+
+                    provider_season_id: None,
                 }],
                 dubs: vec![],
             }),
@@ -2794,7 +2821,12 @@ mod tests {
                             .to_string(),
                     ),
                     overview: None,
+
+                    provider_episode_id: None,
+                    provider_season_id: None,
                 }],
+
+                provider_season_id: None,
             }],
             available_episode_numbers: vec![vec![1]],
             details_pane: crate::tui::state::DetailsPane::Episodes,
@@ -2863,12 +2895,16 @@ mod tests {
                 seasons: vec![Season {
                     number: 1,
                     episodes: vec![],
+
+                    provider_season_id: None,
                 }],
                 dubs: vec![],
             }),
             available_seasons: vec![Season {
                 number: 1,
                 episodes: vec![],
+
+                provider_season_id: None,
             }],
             ..Default::default()
         };
@@ -2987,8 +3023,17 @@ mod tests {
                 duration: Some("45m".to_string()),
                 seasons: vec![Season {
                     number: 1,
-                    episodes: (1..=7).map(|n| Episode { season: 1, number: n, title: None, overview: None }).collect(),
-                }],
+                    episodes: (1..=7).map(|n| Episode {
+                        season: 1,
+                        number: n,
+                        title: None,
+                        overview: None,
+                        provider_episode_id: None,
+                        provider_season_id: None,
+                    }).collect(),
+
+        provider_season_id: None,
+    }],
                 dubs: vec![
                     AudioTrackOption { subject_id: "1".to_string(), language: "Original".to_string(), label: "Original".to_string() },
                     AudioTrackOption { subject_id: "2".to_string(), language: "Hindi".to_string(), label: "Hindi".to_string() },
@@ -2998,8 +3043,17 @@ mod tests {
             }),
             available_seasons: vec![Season {
                 number: 1,
-                episodes: (1..=7).map(|n| Episode { season: 1, number: n, title: None, overview: None }).collect(),
-            }],
+                episodes: (1..=7).map(|n| Episode {
+                    season: 1,
+                    number: n,
+                    title: None,
+                    overview: None,
+                    provider_episode_id: None,
+                    provider_season_id: None,
+                }).collect(),
+
+        provider_season_id: None,
+    }],
             available_episode_numbers: vec![vec![1, 2, 3]],
             details_pane: crate::tui::state::DetailsPane::Languages,
             ..Default::default()
@@ -3694,14 +3748,22 @@ mod tests {
                             number: 1,
                             title: Some("Pilot Episode".to_string()),
                             overview: Some("Episode 1 overview text.".to_string()),
+
+                            provider_episode_id: None,
+                            provider_season_id: None,
                         },
                         Episode {
                             season: 1,
                             number: 2,
                             title: None,
                             overview: None,
+
+                            provider_episode_id: None,
+                            provider_season_id: None,
                         },
                     ],
+
+                    provider_season_id: None,
                 }],
                 dubs: vec![],
             }),
@@ -3713,14 +3775,22 @@ mod tests {
                         number: 1,
                         title: Some("Pilot Episode".to_string()),
                         overview: Some("Episode 1 overview text.".to_string()),
+
+                        provider_episode_id: None,
+                        provider_season_id: None,
                     },
                     Episode {
                         season: 1,
                         number: 2,
                         title: None,
                         overview: None,
+
+                        provider_episode_id: None,
+                        provider_season_id: None,
                     },
                 ],
+
+                provider_season_id: None,
             }],
             available_episode_numbers: vec![vec![1, 2]],
             details_pane: crate::tui::state::DetailsPane::Languages,

@@ -967,7 +967,12 @@ impl App {
                             number: 1,
                             title: None,
                             overview: None,
+
+                            provider_episode_id: None,
+                            provider_season_id: None,
                         }],
+
+                        provider_season_id: None,
                     }];
                 } else {
                     self.state.available_seasons.clear();

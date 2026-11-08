@@ -192,6 +192,11 @@ impl AniZoneClient {
         let data = self.scrape_series(slug).await?;
         let title = data.series_title.unwrap_or_else(|| slug.replace('-', " "));
         let episodes = parse_episodes(&data.items);
+        let season_number = episodes
+            .iter()
+            .filter_map(|episode| episode.season)
+            .min()
+            .unwrap_or(1);
         Ok(MediaDetails {
             id: ProviderMediaId {
                 provider: ProviderKind::AniZone,
@@ -211,16 +216,19 @@ impl AniZoneClient {
             duration: None,
             genres: Vec::new(),
             seasons: vec![Season {
-                number: 1,
+                number: season_number,
                 episodes: episodes
                     .into_iter()
                     .map(|episode| Episode {
-                        season: 1,
+                        season: episode.season.unwrap_or(season_number),
                         number: episode.number,
                         title: episode.title,
                         overview: episode.description,
+                        provider_episode_id: Some(episode.source_number.to_string()),
+                        provider_season_id: episode.season.map(|season| season.to_string()),
                     })
                     .collect(),
+                provider_season_id: Some(season_number.to_string()),
             }],
             dubs: Vec::new(),
         })
@@ -521,6 +529,7 @@ struct SearchItem {
 }
 #[derive(Debug)]
 struct ParsedEpisode {
+    season: Option<usize>,
     number: usize,
     source_number: usize,
     title: Option<String>,
@@ -619,6 +628,7 @@ fn parse_episodes(items: &[Value]) -> Vec<ParsedEpisode> {
                 return None;
             }
             Some(ParsedEpisode {
+                season: parse_season_number(item),
                 number: source_number,
                 source_number,
                 title: pick_title(item.get("title_list"))
@@ -632,6 +642,13 @@ fn parse_episodes(items: &[Value]) -> Vec<ParsedEpisode> {
         .collect::<Vec<_>>();
     episodes.sort_by_key(|item| item.number);
     episodes
+}
+fn parse_season_number(item: &Value) -> Option<usize> {
+    ["season", "season_number", "seasonNumber"]
+        .iter()
+        .find_map(|key| item.get(*key).and_then(Value::as_u64))
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0)
 }
 fn merge_items(existing: Vec<Value>, incoming: Vec<Value>) -> Vec<Value> {
     let mut merged = existing;

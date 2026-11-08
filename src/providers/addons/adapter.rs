@@ -110,8 +110,13 @@ pub fn meta_detail_to_media_details(detail: &MetaDetail) -> MediaDetails {
                     number: ep_num,
                     title: ep_title,
                     overview: ep_overview,
+
+                    provider_episode_id: None,
+                    provider_season_id: None,
                 })
                 .collect(),
+
+            provider_season_id: None,
         })
         .collect::<Vec<_>>();
 

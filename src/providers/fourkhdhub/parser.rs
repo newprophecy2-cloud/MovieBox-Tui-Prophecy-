@@ -304,6 +304,9 @@ fn parse_seasons(document: &Html) -> Result<Vec<Season>, FourKHdHubError> {
                 number: episode,
                 title: None,
                 overview: None,
+
+                provider_episode_id: None,
+                provider_season_id: None,
             });
     }
     Ok(seasons
@@ -311,6 +314,8 @@ fn parse_seasons(document: &Html) -> Result<Vec<Season>, FourKHdHubError> {
         .map(|(number, episodes)| Season {
             number,
             episodes: episodes.into_values().collect(),
+
+            provider_season_id: None,
         })
         .collect())
 }

@@ -397,8 +397,11 @@ async fn test_series_details_defaults_to_season_one_when_no_history() {
                     number: e,
                     title: None,
                     overview: None,
+                    provider_episode_id: None,
+                    provider_season_id: None,
                 })
                 .collect(),
+            provider_season_id: None,
         })
         .collect();
 
@@ -479,8 +482,11 @@ async fn test_series_details_resumes_watch_history() {
                     number: e,
                     title: None,
                     overview: None,
+                    provider_episode_id: None,
+                    provider_season_id: None,
                 })
                 .collect(),
+            provider_season_id: None,
         })
         .collect();
 
@@ -546,8 +552,11 @@ async fn test_series_details_preserves_season_and_episode_on_language_switch() {
                     number: e,
                     title: None,
                     overview: None,
+                    provider_episode_id: None,
+                    provider_season_id: None,
                 })
                 .collect(),
+            provider_season_id: None,
         })
         .collect();
 

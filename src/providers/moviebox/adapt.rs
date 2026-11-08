@@ -364,6 +364,9 @@ pub fn moviebox_details_json_to_media_details(
                             number: ep_num as usize,
                             title: None,
                             overview: None,
+
+                            provider_episode_id: None,
+                            provider_season_id: None,
                         });
                     }
                 }
@@ -374,12 +377,16 @@ pub fn moviebox_details_json_to_media_details(
                         number: ep_num,
                         title: None,
                         overview: None,
+
+                        provider_episode_id: None,
+                        provider_season_id: None,
                     });
                 }
             }
             seasons.push(Season {
                 number: se_num,
                 episodes,
+                provider_season_id: None,
             });
         }
     }

@@ -52,6 +52,7 @@ pub struct DramachiClient {
 
 fn season_from_episode_result(
     season_number: usize,
+    provider_season_id: &str,
     result: Result<Vec<DramachiEpisodeItem>, DramachiError>,
 ) -> Result<Season, DramachiError> {
     let episodes = result?;
@@ -65,6 +66,8 @@ fn season_from_episode_result(
                 number,
                 title: Some(clean_episode_title(&episode.f_title)),
                 overview: None,
+                provider_episode_id: (!episode.fid.trim().is_empty()).then(|| episode.fid.clone()),
+                provider_season_id: Some(provider_season_id.to_string()),
             });
         }
     }
@@ -72,6 +75,7 @@ fn season_from_episode_result(
     Ok(Season {
         number: season_number,
         episodes: mapped,
+        provider_season_id: Some(provider_season_id.to_string()),
     })
 }
 
@@ -366,7 +370,7 @@ impl DramachiClient {
                         let rip_clone = rip.clone();
                         async move {
                             let episodes = self.fetch_episodes(title_id, &rip_clone).await;
-                            season_from_episode_result(season_num, episodes)
+                            season_from_episode_result(season_num, &rip_clone, episodes)
                         }
                     })
                     .collect();
@@ -519,6 +523,8 @@ impl DramachiClient {
                             .as_ref()
                             .and_then(|v| v.first())
                             .map(|v| v.rip.clone());
+                    } else {
+                        return Ok(Vec::new());
                     }
                 }
                 if resolved_rip.is_none() {
@@ -697,14 +703,14 @@ mod tests {
 
     #[test]
     fn empty_episode_response_does_not_create_a_placeholder_episode() {
-        let season = season_from_episode_result(1, Ok(Vec::new())).unwrap();
+        let season = season_from_episode_result(1, "Season 01", Ok(Vec::new())).unwrap();
         assert!(season.episodes.is_empty());
     }
 
     #[test]
     fn episode_fetch_failure_is_preserved_as_an_error() {
         assert!(matches!(
-            season_from_episode_result(1, Err(DramachiError::NotFound)),
+            season_from_episode_result(1, "Season 01", Err(DramachiError::NotFound)),
             Err(DramachiError::NotFound)
         ));
     }

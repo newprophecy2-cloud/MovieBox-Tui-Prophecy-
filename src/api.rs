@@ -8,7 +8,7 @@ use futures::{
     future::{BoxFuture, Shared},
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     future::Future,
     pin::Pin,
     sync::Arc,
@@ -646,6 +646,8 @@ struct UnifiedApiEpisode {
 struct UnifiedEpisodeProviderLookup {
     provider: ProviderKind,
     provider_title_id: String,
+    provider_season_id: Option<String>,
+    provider_episode_id: Option<String>,
     provider_season_number: usize,
     provider_episode_number: usize,
     lookup_reference: String,
@@ -5629,8 +5631,7 @@ async fn persist_unified_details(
                     .find(|season| season.number == unified_season.number)
                     .map(|season| crate::catalog::UnifiedAnimeProviderSeasonInput {
                         provider_key: mapping.provider.cache_key().to_string(),
-                        // Provider adapters do not currently expose stable season IDs.
-                        provider_season_id: None,
+                        provider_season_id: season.provider_season_id.clone(),
                         provider_season_number: Some(season.number as i32),
                         metadata: serde_json::json!({
                             "episode_count": season.episodes.len(),
@@ -5653,9 +5654,27 @@ async fn persist_unified_details(
                 overview: episode.overview.clone(),
                 release_date: None,
                 thumbnail_url: None,
-                // Episode objects currently expose only a season/number lookup, not
-                // an upstream episode ID. Do not persist a fabricated provider ID.
-                provider_episodes: Vec::new(),
+                provider_episodes: episode
+                    .provider_lookups
+                    .iter()
+                    .filter_map(|lookup| {
+                        lookup
+                            .provider_episode_id
+                            .as_ref()
+                            .map(|provider_episode_id| {
+                                crate::catalog::UnifiedAnimeProviderEpisodeInput {
+                                    provider_key: lookup.provider.cache_key().to_string(),
+                                    provider_episode_id: provider_episode_id.clone(),
+                                    provider_episode_number: Some(
+                                        lookup.provider_episode_number as i32,
+                                    ),
+                                    metadata: serde_json::json!({
+                                        "provider_season_id": lookup.provider_season_id,
+                                    }),
+                                }
+                            })
+                    })
+                    .collect(),
                 provider_lookups: episode
                     .provider_lookups
                     .iter()
@@ -6032,6 +6051,20 @@ fn unified_api_details(
             candidate.episode.number,
         )
     });
+    let mut seen_provider_records = HashSet::new();
+    candidates.retain(|candidate| {
+        let key = (
+            candidate.anime_id.provider,
+            candidate.anime_id.value.clone(),
+            candidate.episode.season,
+            candidate.episode.number,
+            candidate.episode.title.clone(),
+            candidate.episode.overview.clone(),
+            candidate.episode.provider_episode_id.clone(),
+            candidate.episode.provider_season_id.clone(),
+        );
+        seen_provider_records.insert(key)
+    });
     for candidate in candidates {
         let expected_through = details
             .iter()
@@ -6148,6 +6181,8 @@ fn unified_api_details(
                 .map(|candidate| UnifiedEpisodeProviderLookup {
                     provider: candidate.anime_id.provider,
                     provider_title_id: candidate.anime_id.value.clone(),
+                    provider_season_id: candidate.episode.provider_season_id.clone(),
+                    provider_episode_id: candidate.episode.provider_episode_id.clone(),
                     provider_season_number: candidate.episode.season,
                     provider_episode_number: candidate.episode.number,
                     lookup_reference: encode(&OpaqueRef {
@@ -6185,9 +6220,7 @@ fn unified_api_details(
                         .find(|season| season.number == number)
                         .map(|season| ApiSeasonProviderMapping {
                             provider: anime_id.provider,
-                            // Existing provider adapters expose season numbers but
-                            // not stable season IDs; keep the upstream ID missing.
-                            provider_season_id: None,
+                            provider_season_id: season.provider_season_id.clone(),
                             provider_season_number: Some(season.number),
                         })
                 })
@@ -10628,7 +10661,12 @@ mod tests {
                     number,
                     title: Some(title.into()),
                     overview: None,
+
+                    provider_episode_id: None,
+                    provider_season_id: None,
                 }],
+
+                provider_season_id: None,
             }],
             dubs: Vec::new(),
         }
@@ -10641,6 +10679,9 @@ mod tests {
             number: 52,
             title: Some("A New Beginning".into()),
             overview: None,
+
+            provider_episode_id: None,
+            provider_season_id: None,
         };
         let conflicting = synthetic_anime(ProviderKind::Dramachi, 1, 52, "The Wrong Beginning");
         assert!(matching_episode(&source, &conflicting).is_none());
@@ -10660,6 +10701,9 @@ mod tests {
             number: 4,
             title: Some("The Battle Begins".into()),
             overview: None,
+
+            provider_episode_id: None,
+            provider_season_id: None,
         };
         let candidate = synthetic_anime(ProviderKind::AniZone, 1, 56, "The Battle Begins");
         let matched = matching_episode(&source, &candidate).unwrap();
@@ -10678,6 +10722,9 @@ mod tests {
                 number,
                 title: Some(title.into()),
                 overview: None,
+
+                provider_episode_id: None,
+                provider_season_id: None,
             };
             let mut candidate = synthetic_anime(ProviderKind::Dramachi, 1, number, title);
             candidate.id.value = format!("dramachi-black-clover-ep-{number}");
@@ -10696,6 +10743,9 @@ mod tests {
             number: 52,
             title: Some("Black Clover OVA".into()),
             overview: None,
+
+            provider_episode_id: None,
+            provider_season_id: None,
         };
         let regular = synthetic_anime(ProviderKind::Dramachi, 1, 53, "A New Beginning");
         assert!(matching_episode(&special, &regular).is_none());
@@ -10704,6 +10754,9 @@ mod tests {
             number: 52,
             title: None,
             overview: None,
+
+            provider_episode_id: None,
+            provider_season_id: None,
         };
         assert!(matching_episode(&untitled, &regular).is_none());
     }
@@ -10978,7 +11031,12 @@ mod tests {
                     number: 5,
                     title: Some("Descent".into()),
                     overview: None,
+
+                    provider_episode_id: None,
+                    provider_season_id: None,
                 }],
+
+                provider_season_id: None,
             }],
             dubs: vec![],
         };
@@ -11000,6 +11058,9 @@ mod tests {
             number: 5,
             title: None,
             overview: None,
+
+            provider_episode_id: None,
+            provider_season_id: None,
         };
         let decoded = decode::<OpaqueRef>(&episode_ref(&id, &episode)).unwrap();
         assert_eq!(decoded.p, ProviderKind::MovieBox);
@@ -11132,6 +11193,9 @@ mod tests {
             number: reference.e,
             title: Some("Test episode".into()),
             overview: Some("Test overview".into()),
+
+            provider_episode_id: None,
+            provider_season_id: None,
         };
         let details_result = MediaDetails {
             id: id.clone(),
@@ -11151,6 +11215,8 @@ mod tests {
             seasons: vec![Season {
                 number: reference.s,
                 episodes: vec![episode.clone()],
+
+                provider_season_id: None,
             }],
             dubs: vec![],
         };
@@ -13390,7 +13456,12 @@ mod tests {
                     number: 1,
                     title: Some("Enter: Naruto Uzumaki!".into()),
                     overview: None,
+
+                    provider_episode_id: None,
+                    provider_season_id: None,
                 }],
+
+                provider_season_id: None,
             }],
             dubs: vec![],
         };
@@ -14526,6 +14597,9 @@ mod tests {
             number: 10,
             title: Some("Destiny".into()),
             overview: None,
+
+            provider_episode_id: None,
+            provider_season_id: None,
         };
         let candidate = synthetic_anime(ProviderKind::Dramachi, 1, 10, "Destiny");
         let matched = matching_episode(&source, &candidate);
@@ -14542,6 +14616,9 @@ mod tests {
             number: 10,
             title: Some("Destiny".into()),
             overview: None,
+
+            provider_episode_id: None,
+            provider_season_id: None,
         };
         let candidate1 = synthetic_anime(ProviderKind::Dramachi, 1, 10, "Destiny");
         let candidate2 = synthetic_anime(ProviderKind::AniZone, 1, 10, "Destiny");
@@ -14556,6 +14633,9 @@ mod tests {
             number: 10,
             title: Some("Destiny".into()),
             overview: None,
+
+            provider_episode_id: None,
+            provider_season_id: None,
         };
         let candidate = synthetic_anime(ProviderKind::Dramachi, 1, 11, "A Different Day");
         assert!(matching_episode(&source, &candidate).is_none());
@@ -14568,6 +14648,9 @@ mod tests {
             number: 10,
             title: Some("Black Clover OVA 1".into()),
             overview: None,
+
+            provider_episode_id: None,
+            provider_season_id: None,
         };
         let regular = synthetic_anime(ProviderKind::Dramachi, 1, 10, "Destiny");
         assert!(matching_episode(&special, &regular).is_none());
@@ -14580,6 +14663,9 @@ mod tests {
             number: 1,
             title: Some("Episode 1".into()),
             overview: None,
+
+            provider_episode_id: None,
+            provider_season_id: None,
         };
         let candidate = synthetic_anime(ProviderKind::AniZone, 1, 1, "Episode 1");
         assert!(matching_episode(&source, &candidate).is_none());
@@ -14592,6 +14678,9 @@ mod tests {
             number: 10,
             title: Some("The Light That Pierces Darkness".into()),
             overview: None,
+
+            provider_episode_id: None,
+            provider_season_id: None,
         };
         let candidate = synthetic_anime(
             ProviderKind::Dramachi,

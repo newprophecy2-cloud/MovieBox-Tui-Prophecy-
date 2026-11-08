@@ -121,12 +121,16 @@ impl CircleFtpClient {
                                 number: e_idx + 1,
                                 title: ep_title,
                                 overview: None,
+
+                                provider_episode_id: None,
+                                provider_season_id: None,
                             });
                         }
                     }
                     seasons.push(Season {
                         number: s_idx + 1,
                         episodes,
+                        provider_season_id: None,
                     });
                 }
             }

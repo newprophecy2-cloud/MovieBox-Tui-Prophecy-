@@ -112,12 +112,18 @@ pub struct Episode {
     pub number: usize,
     pub title: Option<String>,
     pub overview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_episode_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_season_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Season {
     pub number: usize,
     pub episodes: Vec<Episode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_season_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
