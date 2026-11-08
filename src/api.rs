@@ -422,6 +422,19 @@ fn release_requires_playback_codec_verification(release: &Release) -> bool {
             == SourceCodecEligibility::Unverified)
 }
 
+fn release_requires_direct_play_codec_verification(release: &Release) -> bool {
+    release.provider != ProviderKind::AniZone
+        && release_requires_playback_codec_verification(release)
+}
+
+fn direct_play_compatibility(provider: ProviderKind) -> &'static str {
+    if provider == ProviderKind::AniZone {
+        "unverified"
+    } else {
+        "verified"
+    }
+}
+
 fn is_blocked_h265_codec(codec: Option<&str>) -> bool {
     source_codec_eligibility(codec) == SourceCodecEligibility::BlockedH265
 }
@@ -8051,47 +8064,7 @@ async fn resolve_valid_direct_source(
         validation_started.elapsed().as_millis()
     );
     let mut verified_release = release.clone();
-    if release.provider == ProviderKind::AniZone {
-        match tokio::time::timeout(
-            PLAYBACK_RESOLUTION_TIMEOUT,
-            crate::codec_verification::verify_playback_source(&playback),
-        )
-        .await
-        {
-            Ok(Ok(crate::codec_verification::CodecProbeResult::Allowed(codec))) => {
-                verified_release.codec = Some(codec);
-            }
-            Ok(Ok(crate::codec_verification::CodecProbeResult::BlockedHevc(codec))) => {
-                log::warn!(
-                    "direct_play_verification provider=anizone result=confirmed_codec_incompatibility codec={codec}"
-                );
-                return Err("confirmed_codec_incompatibility".into());
-            }
-            Ok(Ok(crate::codec_verification::CodecProbeResult::Unsupported(codec))) => {
-                log::warn!(
-                    "direct_play_verification provider=anizone result=confirmed_codec_incompatibility codec={codec}"
-                );
-                return Err("confirmed_codec_incompatibility".into());
-            }
-            Ok(Ok(crate::codec_verification::CodecProbeResult::Unverified(_)))
-            | Ok(Ok(crate::codec_verification::CodecProbeResult::NoVideoStream)) => {
-                return Err("codec_unverified".into());
-            }
-            Ok(Err(error)) => {
-                log::warn!(
-                    "direct_play_verification provider=anizone result={}",
-                    error.code()
-                );
-                return Err(error.code().to_ascii_lowercase());
-            }
-            Err(_) => return Err("provider_timeout".into()),
-        }
-    } else if matches!(
-        release.provider,
-        ProviderKind::FourKHdHub | ProviderKind::Dramachi
-    ) && source_codec_eligibility(release.codec.as_deref())
-        == SourceCodecEligibility::Unverified
-    {
+    if release_requires_direct_play_codec_verification(release) {
         let verification_started = Instant::now();
         match crate::codec_verification::verify_playback_source(&playback)
             .await
@@ -8556,7 +8529,7 @@ async fn direct_play_route(
             "source_id": selected_source_id,
             "playback_url": validated_url.to_string(),
             "url_type": url_type,
-            "compatibility": "verified",
+            "compatibility": direct_play_compatibility(selected_provider),
             "content_type": null,
             "expires_at": null,
             "requires_headers": !headers.is_empty(),
@@ -10564,7 +10537,7 @@ fn openapi() -> serde_json::Value {
                                 "source_id": {"type": "string"},
                                 "playback_url": {"type": "string", "format": "uri"},
                                 "url_type": {"type": "string", "enum": ["hls", "dash", "direct"]},
-                                "compatibility": {"const": "verified"},
+                                "compatibility": {"type": "string", "enum": ["verified", "unverified"]},
                                 "content_type": {"type": ["string", "null"]},
                                 "expires_at": {"type": ["string", "null"]},
                                 "requires_headers": {"type": "boolean"},
@@ -13079,7 +13052,7 @@ mod tests {
     }
 
     #[test]
-    fn playback_verification_only_skips_trusted_non_hls_codec_metadata() {
+    fn direct_play_verification_bypasses_anizone_without_changing_shared_policy() {
         let release = |provider, codec: Option<&str>| Release {
             provider,
             filename: "episode.mkv".into(),
@@ -13093,22 +13066,34 @@ mod tests {
             resource_id: None,
         };
 
-        assert!(!release_requires_playback_codec_verification(&release(
+        assert!(!release_requires_direct_play_codec_verification(&release(
             ProviderKind::FourKHdHub,
             Some("H.264"),
         )));
-        assert!(release_requires_playback_codec_verification(&release(
+        assert!(release_requires_direct_play_codec_verification(&release(
             ProviderKind::FourKHdHub,
             None,
         )));
-        assert!(release_requires_playback_codec_verification(&release(
+        assert!(release_requires_direct_play_codec_verification(&release(
             ProviderKind::Dramachi,
             Some("unknown"),
+        )));
+        assert!(!release_requires_direct_play_codec_verification(&release(
+            ProviderKind::AniZone,
+            Some("H.264"),
         )));
         assert!(release_requires_playback_codec_verification(&release(
             ProviderKind::AniZone,
             Some("H.264"),
         )));
+        assert_eq!(
+            direct_play_compatibility(ProviderKind::AniZone),
+            "unverified"
+        );
+        assert_eq!(
+            direct_play_compatibility(ProviderKind::FourKHdHub),
+            "verified"
+        );
         assert!(!release_requires_playback_codec_verification(&release(
             ProviderKind::BdixCircleFtp,
             Some("H.264"),
