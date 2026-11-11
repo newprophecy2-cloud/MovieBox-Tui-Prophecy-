@@ -233,6 +233,7 @@ pub fn parse_releases(
             filename: filename.clone(),
             mirrors: Vec::new(),
             resource_id: None,
+            subtitles: Vec::new(),
         });
         for mirror in mirrors {
             if !release

@@ -283,6 +283,8 @@ pub struct Release {
     pub episode: Option<usize>,
     pub mirrors: Vec<SourceMirror>,
     #[serde(default)]
+    pub subtitles: Vec<SubtitleOption>,
+    #[serde(default)]
     pub resource_id: Option<String>,
 }
 impl Release {
@@ -525,6 +527,7 @@ mod tests {
             episode: None,
             mirrors: Vec::new(),
             resource_id: None,
+            subtitles: Vec::new(),
         };
 
         assert_eq!(make_release(Some("4K")).resolution_u64(), 2160);

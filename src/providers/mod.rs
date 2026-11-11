@@ -3,6 +3,7 @@ pub mod bdix;
 pub mod dramachi;
 pub mod fourkhdhub;
 pub mod kari;
+pub(crate) mod kari_anime;
 pub mod models;
 pub mod moviebox;
 pub mod tv;

@@ -505,6 +505,7 @@ mod tests {
             episode: None,
             mirrors: Vec::new(),
             resource_id: None,
+            subtitles: Vec::new(),
         };
         assert!(
             client

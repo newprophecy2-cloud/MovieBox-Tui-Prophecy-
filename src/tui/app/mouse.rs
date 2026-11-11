@@ -1348,6 +1348,7 @@ mod tests {
             episode: None,
             mirrors: vec![],
             resource_id: None,
+            subtitles: Vec::new(),
         }];
         app.state.resource_list_state.select(Some(0));
 

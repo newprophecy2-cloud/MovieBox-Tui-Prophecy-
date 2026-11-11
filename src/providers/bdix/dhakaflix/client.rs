@@ -405,6 +405,7 @@ impl DhakaFlixClient {
                                     direct_file: true,
                                 }],
                                 resource_id: None,
+                                subtitles: Vec::new(),
                             });
                         }
                     }

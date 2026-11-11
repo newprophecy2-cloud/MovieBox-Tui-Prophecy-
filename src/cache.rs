@@ -949,6 +949,7 @@ mod tests {
                 direct_file: true,
             }],
             resource_id: Some("res1".to_string()),
+            subtitles: Vec::new(),
         };
         assert_eq!(min_stream_cookie_expiry(&[release]), Some(1899999999));
     }

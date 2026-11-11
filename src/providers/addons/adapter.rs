@@ -576,6 +576,7 @@ pub fn stream_item_to_release(
             direct_file: true,
         }],
         resource_id: None,
+        subtitles: Vec::new(),
     })
 }
 

@@ -311,6 +311,7 @@ impl KariClient {
                 direct_file: false,
             }],
             resource_id: None,
+            subtitles: Vec::new(),
         }])
     }
 
@@ -355,6 +356,7 @@ impl KariClient {
             episode: Some(episode),
             mirrors,
             resource_id: None,
+            subtitles: Vec::new(),
         }])
     }
 }
@@ -373,6 +375,18 @@ impl Provider for KariClient {
         }
     }
     async fn search(&self, query: &str, _page: usize) -> Result<Vec<CatalogItem>, ProviderError> {
+        match self.kind {
+            ProviderKind::Anikoto => {
+                return crate::providers::kari_anime::anikoto::search(&self.http, query).await;
+            }
+            ProviderKind::Miruro => {
+                return crate::providers::kari_anime::miruro::search(&self.http, query).await;
+            }
+            ProviderKind::Anidream => {
+                return crate::providers::kari_anime::anidream::search(&self.http, query).await;
+            }
+            _ => {}
+        }
         let value = self.anilist(Some(query), None).await?;
         let media = value
             .get("data")
@@ -393,6 +407,18 @@ impl Provider for KariClient {
         }
     }
     async fn details(&self, id: &str) -> Result<MediaDetails, ProviderError> {
+        match self.kind {
+            ProviderKind::Anikoto => {
+                return crate::providers::kari_anime::anikoto::details(&self.http, id).await;
+            }
+            ProviderKind::Miruro => {
+                return crate::providers::kari_anime::miruro::details(&self.http, id).await;
+            }
+            ProviderKind::Anidream => {
+                return crate::providers::kari_anime::anidream::details(&self.http, id).await;
+            }
+            _ => {}
+        }
         let id = id.parse::<i64>().map_err(|_| {
             ProviderError::Parsing("provider ID is not an AniList numeric ID".into())
         })?;
@@ -418,13 +444,21 @@ impl ReleaseProvider for KariClient {
         match self.kind {
             ProviderKind::Anivault => self.resolve_anivault(id, season, episode).await,
             ProviderKind::Anipm => self.resolve_anipm(id, season, episode).await,
-            ProviderKind::Anicine
-            | ProviderKind::Anikoto
-            | ProviderKind::Miruro
-            | ProviderKind::Anidream => Err(ProviderError::Unavailable(format!(
-                "{} resolver is implemented as a native adapter but upstream live resolution is not yet verified",
-                self.kind.label()
-            ))),
+            ProviderKind::Anicine => {
+                crate::providers::kari_anime::anicine::resolve(&self.http, id, season, episode)
+                    .await
+            }
+            ProviderKind::Anikoto => {
+                crate::providers::kari_anime::anikoto::resolve(&self.http, id, season, episode)
+                    .await
+            }
+            ProviderKind::Miruro => {
+                crate::providers::kari_anime::miruro::resolve(&self.http, id, season, episode).await
+            }
+            ProviderKind::Anidream => {
+                crate::providers::kari_anime::anidream::resolve(&self.http, id, season, episode)
+                    .await
+            }
             _ => Err(ProviderError::Unavailable("invalid Kari provider".into())),
         }
     }

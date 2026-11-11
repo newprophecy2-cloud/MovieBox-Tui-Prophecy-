@@ -550,6 +550,7 @@ impl DramachiClient {
                                     direct_file: true,
                                 }],
                                 resource_id: Some(ep_fid),
+                                subtitles: Vec::new(),
                             })
                         }
                         Err(err) => {

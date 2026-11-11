@@ -558,6 +558,7 @@ pub fn moviebox_resource_item_to_release(item: &serde_json::Value) -> Release {
         episode,
         mirrors,
         resource_id,
+        subtitles: Vec::new(),
     }
 }
 
@@ -792,6 +793,7 @@ pub fn moviebox_play_info_json_to_releases(
                 episode: if episode > 0 { Some(episode) } else { None },
                 mirrors: vec![mirror],
                 resource_id: stream_id.clone(),
+                subtitles: Vec::new(),
             });
         }
     }

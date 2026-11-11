@@ -4372,7 +4372,7 @@ async fn playback_route(
                 .first()
                 .map(|mirror| mirror.headers.clone())
                 .unwrap_or_default(),
-            subtitle: None,
+            subtitle: release.subtitles.first().map(|track| track.url.clone()),
             source_label: release.source_label().to_string(),
             max_height: release
                 .quality
@@ -5333,7 +5333,7 @@ async fn resolve_direct_provider_source(
             .first()
             .map(|mirror| mirror.headers.clone())
             .unwrap_or_default(),
-        subtitle: None,
+        subtitle: source.subtitles.first().map(|track| track.url.clone()),
         source_label: source.source_label().to_string(),
         max_height: None,
     })
@@ -5678,7 +5678,7 @@ async fn cached_playback_source(
                             .first()
                             .map(|mirror| mirror.headers.clone())
                             .unwrap_or_default(),
-                        subtitle: None,
+                        subtitle: release.subtitles.first().map(|track| track.url.clone()),
                         source_label: release.source_label().to_string(),
                         max_height: release
                             .quality
@@ -5962,7 +5962,7 @@ fn direct_transcode_playback_source(source: &Release) -> Option<PlaybackSource> 
         provider: source.provider,
         url: url.to_string(),
         headers: mirror.headers.clone(),
-        subtitle: None,
+        subtitle: source.subtitles.first().map(|track| track.url.clone()),
         source_label: mirror.label.clone(),
         max_height: source
             .quality
@@ -7721,6 +7721,7 @@ mod tests {
             episode: Some(5),
             mirrors: vec![],
             resource_id: None,
+            subtitles: Vec::new(),
         };
         let source = source_ref(&release, &episode, 0);
         let decoded = decode::<OpaqueSource>(&source).unwrap();
@@ -7748,6 +7749,7 @@ mod tests {
             episode: Some(5),
             mirrors: vec![],
             resource_id: Some("resource-a".into()),
+            subtitles: Vec::new(),
         };
         let second = Release {
             filename: "show.s02e05.720p.mkv".into(),
@@ -7785,6 +7787,7 @@ mod tests {
                 direct_file: true,
             }],
             resource_id: None,
+            subtitles: Vec::new(),
         };
         let first_fingerprint = release_fingerprint(&first);
         first.mirrors[0].resolver_url = "https://cdn-b.example/episode.mkv".into();
@@ -7828,6 +7831,7 @@ mod tests {
                     episode: None,
                     mirrors: vec![],
                     resource_id: None,
+                    subtitles: Vec::new(),
                 },
                 None,
             ),
@@ -7847,6 +7851,7 @@ mod tests {
                     episode: None,
                     mirrors: vec![],
                     resource_id: None,
+                    subtitles: Vec::new(),
                 },
                 None,
             ),
@@ -7866,6 +7871,7 @@ mod tests {
                     episode: None,
                     mirrors: vec![],
                     resource_id: None,
+                    subtitles: Vec::new(),
                 },
                 Some("video/mp4"),
             ),
@@ -7891,6 +7897,7 @@ mod tests {
                 direct_file: false,
             }],
             resource_id: None,
+            subtitles: Vec::new(),
         };
         assert_eq!(
             direct_url_type(
@@ -7928,6 +7935,7 @@ mod tests {
                 direct_file: false,
             }],
             resource_id: None,
+            subtitles: Vec::new(),
         };
         assert_eq!(
             direct_url_type(
@@ -8159,6 +8167,7 @@ mod tests {
                 direct_file: false,
             }],
             resource_id: None,
+            subtitles: Vec::new(),
         };
         assert!(release_has_verification_candidate(&release));
         assert!(!release_has_usable_source(&release));
@@ -8190,6 +8199,7 @@ mod tests {
             episode: Some(2),
             mirrors: vec![],
             resource_id: None,
+            subtitles: Vec::new(),
         };
         let mut source: OpaqueSource =
             decode(&source_ref(&release, &episode, 0)).expect("encoded source reference");
@@ -8284,6 +8294,7 @@ mod tests {
                 direct_file: true,
             }],
             resource_id: None,
+            subtitles: Vec::new(),
         };
         let playback = direct_transcode_playback_source(&source).unwrap();
         assert_eq!(playback.url, "https://cdn.example/video.mkv");
@@ -8339,6 +8350,7 @@ mod tests {
                 direct_file: false,
             }],
             resource_id: None,
+            subtitles: Vec::new(),
         };
         assert!(direct_transcode_playback_source(&source).is_none());
         assert_eq!(
@@ -8452,6 +8464,7 @@ mod tests {
             episode: Some(1),
             mirrors: vec![],
             resource_id: None,
+            subtitles: Vec::new(),
         };
         assert!(!release_has_usable_source(&release));
         release
@@ -8521,6 +8534,7 @@ mod tests {
             episode: Some(1),
             mirrors: vec![],
             resource_id: None,
+            subtitles: Vec::new(),
         };
         let releases = vec![
             release(Some("HEVC"), "hevc.mkv"),
@@ -8564,6 +8578,7 @@ mod tests {
             episode: Some(0),
             mirrors: vec![],
             resource_id: Some("resource-1".into()),
+            subtitles: Vec::new(),
         };
         let transport_ref = OpaqueRef {
             p: ProviderKind::MovieBox,

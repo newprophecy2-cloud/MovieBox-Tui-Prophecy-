@@ -1215,6 +1215,7 @@ mod tests {
                 direct_file: true,
             }],
             resource_id: Some("98765".to_string()),
+            subtitles: Vec::new(),
         }];
         app.state.resource_list_state.select(Some(0));
 
@@ -1242,6 +1243,7 @@ mod tests {
             episode: None,
             mirrors: vec![],
             resource_id: None,
+            subtitles: Vec::new(),
         }];
         app.state.resource_list_state.select(Some(0));
 
@@ -1336,6 +1338,7 @@ mod tests {
                 direct_file: true,
             }],
             resource_id: Some("12345".to_string()),
+            subtitles: Vec::new(),
         }];
         app.state.resource_list_state.select(Some(0));
 
@@ -1380,6 +1383,7 @@ mod tests {
                     direct_file: true,
                 }],
                 resource_id: Some("123".to_string()),
+                subtitles: Vec::new(),
             },
             Release {
                 provider: ProviderKind::MovieBox,
@@ -1397,6 +1401,7 @@ mod tests {
                     direct_file: true,
                 }],
                 resource_id: Some("123".to_string()),
+                subtitles: Vec::new(),
             },
             Release {
                 provider: ProviderKind::MovieBox,
@@ -1414,6 +1419,7 @@ mod tests {
                     direct_file: true,
                 }],
                 resource_id: Some("123".to_string()),
+                subtitles: Vec::new(),
             },
         ];
 

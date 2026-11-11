@@ -1878,6 +1878,7 @@ mod tests {
                     direct_file: false,
                 }],
                 resource_id: None,
+                subtitles: Vec::new(),
             },
             Release {
                 provider: ProviderKind::FourKHdHub,
@@ -1895,6 +1896,7 @@ mod tests {
                     direct_file: false,
                 }],
                 resource_id: None,
+                subtitles: Vec::new(),
             },
         ];
 
@@ -2121,6 +2123,7 @@ mod tests {
                 episode: None,
                 mirrors: vec![],
                 resource_id: None,
+                subtitles: Vec::new(),
             },
             Release {
                 provider: ProviderKind::FourKHdHub,
@@ -2133,6 +2136,7 @@ mod tests {
                 episode: None,
                 mirrors: vec![],
                 resource_id: None,
+                subtitles: Vec::new(),
             },
             Release {
                 provider: ProviderKind::FourKHdHub,
@@ -2145,6 +2149,7 @@ mod tests {
                 episode: None,
                 mirrors: vec![],
                 resource_id: None,
+                subtitles: Vec::new(),
             },
         ];
 

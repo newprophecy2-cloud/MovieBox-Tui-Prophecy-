@@ -2129,6 +2129,7 @@ mod tests {
                         direct_file: false,
                     }],
                     resource_id: None,
+                    subtitles: Vec::new(),
                 },
                 Release {
                     provider: ProviderKind::MovieBox,
@@ -2146,6 +2147,7 @@ mod tests {
                         direct_file: false,
                     }],
                     resource_id: None,
+                    subtitles: Vec::new(),
                 },
                 Release {
                     provider: ProviderKind::MovieBox,
@@ -2163,6 +2165,7 @@ mod tests {
                         direct_file: false,
                     }],
                     resource_id: None,
+                    subtitles: Vec::new(),
                 },
             ],
             details_pane: crate::tui::state::DetailsPane::Streams,
@@ -2270,6 +2273,7 @@ mod tests {
                     direct_file: true,
                 }],
                 resource_id: None,
+                subtitles: Vec::new(),
             }],
             details_pane: crate::tui::state::DetailsPane::Streams,
             ..Default::default()
@@ -2336,6 +2340,7 @@ mod tests {
                     direct_file: true,
                 }],
                 resource_id: None,
+                subtitles: Vec::new(),
             }],
             details_pane: crate::tui::state::DetailsPane::Streams,
             ..Default::default()
@@ -2398,6 +2403,7 @@ mod tests {
                     episode: None,
                     mirrors: vec![],
                     resource_id: None,
+                    subtitles: Vec::new(),
                 },
                 Release {
                     provider: ProviderKind::MovieBox,
@@ -2410,6 +2416,7 @@ mod tests {
                     episode: None,
                     mirrors: vec![],
                     resource_id: None,
+                    subtitles: Vec::new(),
                 },
             ],
             details_pane: crate::tui::state::DetailsPane::Streams,
@@ -2488,6 +2495,7 @@ mod tests {
                 episode: None,
                 mirrors: vec![],
                 resource_id: None,
+                subtitles: Vec::new(),
             }],
             details_pane: crate::tui::state::DetailsPane::Streams,
             ..Default::default()
@@ -3462,6 +3470,7 @@ mod tests {
                 episode: None,
                 mirrors: vec![],
                 resource_id: Some("res-1".to_string()),
+                subtitles: Vec::new(),
             }],
             details_pane: crate::tui::state::DetailsPane::Streams,
             show_overview_modal: true,
