@@ -1428,6 +1428,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
                         crate::providers::models::ProviderKind::Dramachi => {
                             "Dramachi CDN".to_string()
                         }
+                        _ => file.provider.label().to_string(),
                     }
                 };
 

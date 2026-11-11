@@ -161,6 +161,12 @@ pub fn provider_origin_tag(provider: ProviderKind) -> &'static str {
         ProviderKind::BdixDhakaFlix => "[DhakaFlix]",
         ProviderKind::Addons => "[Addon]",
         ProviderKind::Dramachi => "[Dramachi]",
+        ProviderKind::Anivault => "[AniVault]",
+        ProviderKind::Anipm => "[Ani.pm]",
+        ProviderKind::Anicine => "[AniCine]",
+        ProviderKind::Anikoto => "[Anikoto]",
+        ProviderKind::Miruro => "[Miruro]",
+        ProviderKind::Anidream => "[AniDream]",
     }
 }
 
@@ -183,6 +189,12 @@ pub fn provider_badge_span<'a>(
             ProviderKind::BdixDhakaFlix => theme.sapphire,
             ProviderKind::Addons => theme.accent,
             ProviderKind::Dramachi => theme.rosewater,
+            ProviderKind::Anivault => theme.teal,
+            ProviderKind::Anipm => theme.rating,
+            ProviderKind::Anicine => theme.sapphire,
+            ProviderKind::Anikoto => theme.lavender,
+            ProviderKind::Miruro => theme.accent,
+            ProviderKind::Anidream => theme.rosewater,
         };
         Span::styled(tag, style)
     }

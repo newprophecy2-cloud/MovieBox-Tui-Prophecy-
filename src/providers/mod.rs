@@ -2,9 +2,47 @@ pub mod addons;
 pub mod bdix;
 pub mod dramachi;
 pub mod fourkhdhub;
+pub mod kari;
 pub mod models;
 pub mod moviebox;
 pub mod tv;
+
+pub mod anivault {
+    pub type Client = super::kari::KariClient;
+    pub fn new() -> Client {
+        Client::new(super::models::ProviderKind::Anivault)
+    }
+}
+pub mod anipm {
+    pub type Client = super::kari::KariClient;
+    pub fn new() -> Client {
+        Client::new(super::models::ProviderKind::Anipm)
+    }
+}
+pub mod anicine {
+    pub type Client = super::kari::KariClient;
+    pub fn new() -> Client {
+        Client::new(super::models::ProviderKind::Anicine)
+    }
+}
+pub mod anikoto {
+    pub type Client = super::kari::KariClient;
+    pub fn new() -> Client {
+        Client::new(super::models::ProviderKind::Anikoto)
+    }
+}
+pub mod miruro {
+    pub type Client = super::kari::KariClient;
+    pub fn new() -> Client {
+        Client::new(super::models::ProviderKind::Miruro)
+    }
+}
+pub mod anidream {
+    pub type Client = super::kari::KariClient;
+    pub fn new() -> Client {
+        Client::new(super::models::ProviderKind::Anidream)
+    }
+}
 
 pub use tv as m3u;
 

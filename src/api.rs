@@ -64,13 +64,19 @@ const REMUX_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(20);
 static REMUX_LIMITER: std::sync::LazyLock<Arc<Semaphore>> =
     std::sync::LazyLock::new(|| Arc::new(Semaphore::new(2)));
 static REMUX_DEBUG_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-const PROVIDERS: [ProviderKind; 6] = [
+const PROVIDERS: [ProviderKind; 12] = [
     ProviderKind::MovieBox,
     ProviderKind::FourKHdHub,
     ProviderKind::Dramachi,
     ProviderKind::BdixCircleFtp,
     ProviderKind::BdixDhakaFlix,
     ProviderKind::Addons,
+    ProviderKind::Anikoto,
+    ProviderKind::Anicine,
+    ProviderKind::Anivault,
+    ProviderKind::Anipm,
+    ProviderKind::Miruro,
+    ProviderKind::Anidream,
 ];
 
 fn moviebox_provider_enabled() -> bool {
@@ -84,14 +90,30 @@ fn database_required() -> bool {
 }
 
 fn configured_search_providers() -> Vec<ProviderKind> {
-    // The HTTP anime API intentionally uses one deterministic provider.
-    // Keep the configuration fields for the desktop/TUI clients, but do not
-    // fan out web requests to providers that are not part of this deployment.
-    if crate::config::load().fourkhdhub_enabled {
-        vec![ProviderKind::FourKHdHub]
-    } else {
-        Vec::new()
+    let config = crate::config::load();
+    let mut providers = Vec::new();
+    if config.fourkhdhub_enabled {
+        providers.push(ProviderKind::FourKHdHub);
     }
+    if config.anivault_enabled {
+        providers.push(ProviderKind::Anivault);
+    }
+    if config.anipm_enabled {
+        providers.push(ProviderKind::Anipm);
+    }
+    if config.anicine_enabled {
+        providers.push(ProviderKind::Anicine);
+    }
+    if config.anikoto_enabled {
+        providers.push(ProviderKind::Anikoto);
+    }
+    if config.miruro_enabled {
+        providers.push(ProviderKind::Miruro);
+    }
+    if config.anidream_enabled {
+        providers.push(ProviderKind::Anidream);
+    }
+    providers
 }
 
 fn provider_priority(provider: ProviderKind) -> usize {
@@ -4666,6 +4688,30 @@ async fn releases_uncached(state: &ApiState, r: &OpaqueRef) -> Result<Vec<Releas
             } else {
                 Ok(releases)
             }
+        }
+        ProviderKind::Anivault => {
+            crate::providers::ReleaseProvider::episode_streams(&svc.anivault_client, &r.v, r.s, r.e)
+                .await
+        }
+        ProviderKind::Anipm => {
+            crate::providers::ReleaseProvider::episode_streams(&svc.anipm_client, &r.v, r.s, r.e)
+                .await
+        }
+        ProviderKind::Anicine => {
+            crate::providers::ReleaseProvider::episode_streams(&svc.anicine_client, &r.v, r.s, r.e)
+                .await
+        }
+        ProviderKind::Anikoto => {
+            crate::providers::ReleaseProvider::episode_streams(&svc.anikoto_client, &r.v, r.s, r.e)
+                .await
+        }
+        ProviderKind::Miruro => {
+            crate::providers::ReleaseProvider::episode_streams(&svc.miruro_client, &r.v, r.s, r.e)
+                .await
+        }
+        ProviderKind::Anidream => {
+            crate::providers::ReleaseProvider::episode_streams(&svc.anidream_client, &r.v, r.s, r.e)
+                .await
         }
     }
 }

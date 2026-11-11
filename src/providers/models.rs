@@ -16,15 +16,33 @@ pub enum ProviderKind {
     Addons,
     #[serde(rename = "dramachi")]
     Dramachi,
+    #[serde(rename = "anivault")]
+    Anivault,
+    #[serde(rename = "anipm")]
+    Anipm,
+    #[serde(rename = "anicine")]
+    Anicine,
+    #[serde(rename = "anikoto")]
+    Anikoto,
+    #[serde(rename = "miruro")]
+    Miruro,
+    #[serde(rename = "anidream")]
+    Anidream,
 }
 
 impl ProviderKind {
-    pub const ENABLED: [Self; 5] = [
+    pub const ENABLED: [Self; 11] = [
         Self::MovieBox,
         Self::FourKHdHub,
         Self::Dramachi,
         Self::BdixCircleFtp,
         Self::BdixDhakaFlix,
+        Self::Anivault,
+        Self::Anipm,
+        Self::Anicine,
+        Self::Anikoto,
+        Self::Miruro,
+        Self::Anidream,
     ];
 
     pub const fn cache_key(self) -> &'static str {
@@ -35,6 +53,12 @@ impl ProviderKind {
             Self::BdixDhakaFlix => "bdix_dhakaflix",
             Self::Addons => "addons",
             Self::Dramachi => "dramachi",
+            Self::Anivault => "anivault",
+            Self::Anipm => "anipm",
+            Self::Anicine => "anicine",
+            Self::Anikoto => "anikoto",
+            Self::Miruro => "miruro",
+            Self::Anidream => "anidream",
         }
     }
 
@@ -46,6 +70,12 @@ impl ProviderKind {
             Self::BdixDhakaFlix => "DhakaFlix (BDIX)",
             Self::Addons => "Addons",
             Self::Dramachi => "Dramachi",
+            Self::Anivault => "AniVault",
+            Self::Anipm => "Ani.pm",
+            Self::Anicine => "AniCine",
+            Self::Anikoto => "Anikoto",
+            Self::Miruro => "Miruro",
+            Self::Anidream => "AniDream",
         }
     }
 
@@ -57,6 +87,12 @@ impl ProviderKind {
             "bdix_dhakaflix" | "dhakaflix (bdix)" => Some(Self::BdixDhakaFlix),
             "addons" | "addon" => Some(Self::Addons),
             "dramachi" => Some(Self::Dramachi),
+            "anivault" => Some(Self::Anivault),
+            "anipm" => Some(Self::Anipm),
+            "anicine" => Some(Self::Anicine),
+            "anikoto" => Some(Self::Anikoto),
+            "miruro" => Some(Self::Miruro),
+            "anidream" => Some(Self::Anidream),
             _ => None,
         }
     }
@@ -287,6 +323,12 @@ impl Release {
                 ProviderKind::Addons => "Addon",
                 ProviderKind::Dramachi => "Dramachi",
                 ProviderKind::MovieBox => "Direct",
+                ProviderKind::Anivault => "AniVault",
+                ProviderKind::Anipm => "Ani.pm",
+                ProviderKind::Anicine => "AniCine",
+                ProviderKind::Anikoto => "Anikoto",
+                ProviderKind::Miruro => "Miruro",
+                ProviderKind::Anidream => "AniDream",
             })
     }
 

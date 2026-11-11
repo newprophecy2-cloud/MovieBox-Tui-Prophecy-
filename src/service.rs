@@ -17,6 +17,12 @@ pub struct MovieBoxService {
     pub dhakaflix_client: DhakaFlixClient,
     pub addon_client: crate::providers::addons::AddonClient,
     pub dramachi_client: crate::providers::dramachi::DramachiClient,
+    pub anivault_client: crate::providers::anivault::Client,
+    pub anipm_client: crate::providers::anipm::Client,
+    pub anicine_client: crate::providers::anicine::Client,
+    pub anikoto_client: crate::providers::anikoto::Client,
+    pub miruro_client: crate::providers::miruro::Client,
+    pub anidream_client: crate::providers::anidream::Client,
     pub http_client: reqwest::Client,
 }
 
@@ -40,6 +46,12 @@ impl MovieBoxService {
             dhakaflix_client: DhakaFlixClient::new(),
             addon_client: crate::providers::addons::AddonClient::new(),
             dramachi_client: crate::providers::dramachi::DramachiClient::new(),
+            anivault_client: crate::providers::anivault::new(),
+            anipm_client: crate::providers::anipm::new(),
+            anicine_client: crate::providers::anicine::new(),
+            anikoto_client: crate::providers::anikoto::new(),
+            miruro_client: crate::providers::miruro::new(),
+            anidream_client: crate::providers::anidream::new(),
             http_client,
         }
     }
@@ -56,6 +68,12 @@ impl MovieBoxService {
             ProviderKind::BdixDhakaFlix => Provider::capabilities(&self.dhakaflix_client),
             ProviderKind::Addons => Provider::capabilities(&self.addon_client),
             ProviderKind::Dramachi => Provider::capabilities(&self.dramachi_client),
+            ProviderKind::Anivault => Provider::capabilities(&self.anivault_client),
+            ProviderKind::Anipm => Provider::capabilities(&self.anipm_client),
+            ProviderKind::Anicine => Provider::capabilities(&self.anicine_client),
+            ProviderKind::Anikoto => Provider::capabilities(&self.anikoto_client),
+            ProviderKind::Miruro => Provider::capabilities(&self.miruro_client),
+            ProviderKind::Anidream => Provider::capabilities(&self.anidream_client),
         }
     }
 
@@ -90,6 +108,12 @@ impl MovieBoxService {
             }
             ProviderKind::Addons => Provider::search(&self.addon_client, query, page).await,
             ProviderKind::Dramachi => Provider::search(&self.dramachi_client, query, page).await,
+            ProviderKind::Anivault => Provider::search(&self.anivault_client, query, page).await,
+            ProviderKind::Anipm => Provider::search(&self.anipm_client, query, page).await,
+            ProviderKind::Anicine => Provider::search(&self.anicine_client, query, page).await,
+            ProviderKind::Anikoto => Provider::search(&self.anikoto_client, query, page).await,
+            ProviderKind::Miruro => Provider::search(&self.miruro_client, query, page).await,
+            ProviderKind::Anidream => Provider::search(&self.anidream_client, query, page).await,
         }
     }
 
@@ -182,6 +206,12 @@ impl MovieBoxService {
             }
             ProviderKind::Addons => Provider::details(&self.addon_client, subject_id).await,
             ProviderKind::Dramachi => Provider::details(&self.dramachi_client, subject_id).await,
+            ProviderKind::Anivault => Provider::details(&self.anivault_client, subject_id).await,
+            ProviderKind::Anipm => Provider::details(&self.anipm_client, subject_id).await,
+            ProviderKind::Anicine => Provider::details(&self.anicine_client, subject_id).await,
+            ProviderKind::Anikoto => Provider::details(&self.anikoto_client, subject_id).await,
+            ProviderKind::Miruro => Provider::details(&self.miruro_client, subject_id).await,
+            ProviderKind::Anidream => Provider::details(&self.anidream_client, subject_id).await,
         }
     }
 

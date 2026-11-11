@@ -26,6 +26,12 @@ pub struct Config {
     pub streaming_enabled: bool,
     pub tv_enabled: bool,
     pub addons_enabled: bool,
+    pub anivault_enabled: bool,
+    pub anipm_enabled: bool,
+    pub anicine_enabled: bool,
+    pub anikoto_enabled: bool,
+    pub miruro_enabled: bool,
+    pub anidream_enabled: bool,
     pub default_player: Option<String>,
     pub download_dir: Option<String>,
     pub vlc_path: Option<String>,
@@ -48,7 +54,7 @@ impl Default for Config {
             active_mode: "streaming".to_string(),
             active_provider: ProviderKind::MovieBox,
             active_theme: String::new(),
-            moviebox_enabled: true,
+            moviebox_enabled: false,
             fourkhdhub_enabled: true,
             dramachi_enabled: true,
             bdix_circleftp_enabled: false,
@@ -57,6 +63,12 @@ impl Default for Config {
             streaming_enabled: true,
             tv_enabled: true,
             addons_enabled: false,
+            anivault_enabled: false,
+            anipm_enabled: false,
+            anicine_enabled: false,
+            anikoto_enabled: false,
+            miruro_enabled: false,
+            anidream_enabled: false,
             default_player: None,
             download_dir: None,
             vlc_path: None,
@@ -363,12 +375,43 @@ pub fn load() -> Config {
                     config.bdix_circleftp_enabled = true;
                     config.bdix_dhakaflix_enabled = true;
                 }
-                return config;
+                return apply_provider_env(config);
             }
         }
         rotate_corrupt_file(&path, "config");
     }
-    Config::default()
+    apply_provider_env(Config::default())
+}
+
+fn apply_provider_env(mut config: Config) -> Config {
+    fn flag(name: &str) -> Option<bool> {
+        std::env::var(name).ok().and_then(|value| {
+            match value.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => Some(true),
+                "0" | "false" | "no" | "off" => Some(false),
+                _ => None,
+            }
+        })
+    }
+    if let Some(value) = flag("ANIVAULT_ENABLED") {
+        config.anivault_enabled = value;
+    }
+    if let Some(value) = flag("ANIPM_ENABLED") {
+        config.anipm_enabled = value;
+    }
+    if let Some(value) = flag("ANICINE_ENABLED") {
+        config.anicine_enabled = value;
+    }
+    if let Some(value) = flag("ANIKOTO_ENABLED") {
+        config.anikoto_enabled = value;
+    }
+    if let Some(value) = flag("MIRURO_ENABLED") {
+        config.miruro_enabled = value;
+    }
+    if let Some(value) = flag("ANIDREAM_ENABLED") {
+        config.anidream_enabled = value;
+    }
+    config
 }
 
 pub fn save(config: &Config) {
