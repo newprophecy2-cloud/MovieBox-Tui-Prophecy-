@@ -1,5 +1,6 @@
 #![recursion_limit = "256"]
 
+pub mod anilist;
 pub mod api;
 pub(crate) mod api_native_stream;
 pub mod cache;
@@ -19,6 +20,7 @@ pub mod player;
 pub(crate) mod progressive_remux;
 pub mod providers;
 pub mod proxy;
+pub mod rate_limit;
 pub mod remux_cache;
 pub mod service;
 pub mod tui;

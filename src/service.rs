@@ -23,6 +23,7 @@ pub struct MovieBoxService {
     pub anikoto_client: crate::providers::anikoto::Client,
     pub miruro_client: crate::providers::miruro::Client,
     pub anidream_client: crate::providers::anidream::Client,
+    pub anilist: crate::anilist::AniListCoordinator,
     pub http_client: reqwest::Client,
 }
 
@@ -52,6 +53,7 @@ impl MovieBoxService {
             anikoto_client: crate::providers::anikoto::new(),
             miruro_client: crate::providers::miruro::new(),
             anidream_client: crate::providers::anidream::new(),
+            anilist: crate::anilist::AniListCoordinator::new(http_client.clone()),
             http_client,
         }
     }

@@ -13,15 +13,20 @@ fn encode_component(value: &str) -> String {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct AniPmNativeId {
-    source: String,
+    #[serde(default)]
+    source: Option<String>,
     id: i64,
-    slug: String,
+    #[serde(default)]
+    slug: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    language: Option<String>,
 }
 
 #[derive(Clone)]
 pub struct KariClient {
     pub kind: ProviderKind,
     http: reqwest::Client,
+    limiter: crate::rate_limit::HostLimiter,
 }
 
 impl KariClient {
@@ -30,7 +35,11 @@ impl KariClient {
             .timeout(Duration::from_secs(20))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        Self { kind, http }
+        Self {
+            kind,
+            http,
+            limiter: crate::rate_limit::HostLimiter::new(2, std::time::Duration::from_millis(150)),
+        }
     }
 
     fn base(&self) -> &'static str {
@@ -50,6 +59,10 @@ impl KariClient {
     }
 
     async fn anipm_json(&self, path: &str) -> Result<Value, ProviderError> {
+        let _permit =
+            self.limiter.acquire().await.map_err(|_| {
+                ProviderError::Unavailable("Ani.pm request budget timed out".into())
+            })?;
         let url = format!("{}{}", self.base(), path);
         let response = self
             .http
@@ -61,6 +74,9 @@ impl KariClient {
             .await
             .map_err(|e| ProviderError::Network(e.to_string()))?;
         let status = response.status();
+        self.limiter
+            .record_response(status, response.headers())
+            .await;
         if status.as_u16() == 429 {
             let retry = response
                 .headers()
@@ -85,6 +101,10 @@ impl KariClient {
     }
 
     async fn search_anipm(&self, query: &str) -> Result<Vec<CatalogItem>, ProviderError> {
+        let _permit =
+            self.limiter.acquire().await.map_err(|_| {
+                ProviderError::Unavailable("Ani.pm request budget timed out".into())
+            })?;
         let mut url = reqwest::Url::parse(&format!("{}/api/anime/search", self.base()))
             .map_err(|e| ProviderError::Parsing(e.to_string()))?;
         url.query_pairs_mut().append_pair("q", query.trim());
@@ -98,6 +118,9 @@ impl KariClient {
             .await
             .map_err(|e| ProviderError::Network(e.to_string()))?;
         let status = response.status();
+        self.limiter
+            .record_response(status, response.headers())
+            .await;
         if status.as_u16() == 429 {
             let retry = response
                 .headers()
@@ -129,7 +152,7 @@ impl KariClient {
                 .trim();
             // External-catalog records lack a provider-native ID; native-only mode
             // accepts only records the provider exposes through its Settlar catalog.
-            if !source.eq_ignore_ascii_case("settlar") {
+            if !source.is_empty() && !source.eq_ignore_ascii_case("settlar") {
                 continue;
             }
             let Some(native_id) = row
@@ -143,14 +166,14 @@ impl KariClient {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .trim();
-            let slug = row.get("slug").and_then(Value::as_str).unwrap_or("").trim();
-            if native_id <= 0 || title.is_empty() || slug.is_empty() {
+            if native_id <= 0 || title.is_empty() {
                 continue;
             }
             let identity = AniPmNativeId {
-                source: source.to_ascii_lowercase(),
+                source: (!source.is_empty()).then(|| source.to_ascii_lowercase()),
                 id: native_id,
-                slug: slug.to_owned(),
+                slug: row.get("slug").and_then(Value::as_str).map(str::to_owned),
+                language: None,
             };
             let value = serde_json::to_string(&identity)
                 .map_err(|e| ProviderError::Parsing(e.to_string()))?;
@@ -192,7 +215,12 @@ impl KariClient {
     async fn details_anipm(&self, raw_id: &str) -> Result<MediaDetails, ProviderError> {
         let identity: AniPmNativeId = serde_json::from_str(raw_id)
             .map_err(|_| ProviderError::Parsing("Ani.pm native identity is invalid".into()))?;
-        if identity.source != "settlar" || identity.id <= 0 || identity.slug.is_empty() {
+        if identity
+            .source
+            .as_deref()
+            .is_some_and(|source| !source.eq_ignore_ascii_case("settlar"))
+            || identity.id <= 0
+        {
             return Err(ProviderError::Parsing(
                 "Ani.pm identity is not a supported native Settlar resource".into(),
             ));
@@ -324,7 +352,12 @@ impl KariClient {
     ) -> Result<Vec<Release>, ProviderError> {
         let identity: AniPmNativeId = serde_json::from_str(id)
             .map_err(|_| ProviderError::Parsing("Ani.pm native identity is invalid".into()))?;
-        if identity.source != "settlar" || identity.id <= 0 {
+        if identity
+            .source
+            .as_deref()
+            .is_some_and(|source| !source.eq_ignore_ascii_case("settlar"))
+            || identity.id <= 0
+        {
             return Err(ProviderError::Parsing(
                 "Ani.pm playback requires a native Settlar ID".into(),
             ));
@@ -335,11 +368,13 @@ impl KariClient {
                 .header(REFERER, "https://ani.pm/")
                 .header(ACCEPT, "application/json")
         };
+        let language = identity.language.as_deref().unwrap_or("sub");
         let boot_url = format!(
-            "{}/api/anime/playback-bootstrap/settlar/{}?ep={}&lang=sub",
+            "{}/api/anime/playback-bootstrap/settlar/{}?ep={}&lang={}",
             self.base(),
             identity.id,
-            episode
+            episode,
+            encode_component(language)
         );
         let boot = headers(client.get(boot_url))
             .send()
@@ -365,22 +400,35 @@ impl KariClient {
         if boot.get("source").and_then(Value::as_str) != Some("settlar")
             || boot.get("id").and_then(Value::as_i64) != Some(identity.id)
             || boot.get("episode").and_then(Value::as_u64) != Some(episode as u64)
-            || boot.get("effectiveLanguage").and_then(Value::as_str) != Some("sub")
+            || boot.get("effectiveLanguage").and_then(Value::as_str) != Some(language)
         {
             return Err(ProviderError::Parsing(
                 "Ani.pm native playback response identity/audio mismatch".into(),
             ));
         }
         let selection = boot
-            .get("settlarSelection")
+            .get(if language.eq_ignore_ascii_case("dub") {
+                "settlarDubSelection"
+            } else {
+                "settlarSelection"
+            })
             .and_then(Value::as_str)
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| {
-                ProviderError::Unavailable(
-                    "Ani.pm has no native subtitle selection for this episode".into(),
-                )
+                ProviderError::Unavailable(format!(
+                    "Ani.pm has no native {language} selection for this episode"
+                ))
             })?;
-        let session = headers(client.get(format!("{}/api/anime/settlar/session?selection={}&provider=anipm&ep={}&channel=sub&telemetry=0", self.base(), encode_component(selection), episode))).send().await.map_err(|e| ProviderError::Network(e.to_string()))?;
+        let session = headers(client.get(format!(
+            "{}/api/anime/settlar/session?selection={}&provider=anipm&ep={}&channel={}&telemetry=0",
+            self.base(),
+            encode_component(selection),
+            episode,
+            encode_component(language)
+        )))
+        .send()
+        .await
+        .map_err(|e| ProviderError::Network(e.to_string()))?;
         let session: Value = session
             .json()
             .await

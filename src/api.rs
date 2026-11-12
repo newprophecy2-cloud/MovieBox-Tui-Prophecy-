@@ -46,6 +46,7 @@ const CLASSIFICATION_TIMEOUT: Duration = Duration::from_secs(1);
 const PLAYBACK_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(20);
 const SEARCH_SOURCE_CHECK_TIMEOUT: Duration = Duration::from_secs(45);
 const SEARCH_SOURCE_CHECK_CONCURRENCY: usize = 8;
+const SEARCH_SOURCE_CHECK_MAX_ITEMS: usize = 12;
 const TRACK_PROBE_TIMEOUT: Duration = Duration::from_secs(45);
 const CODEC_VERIFICATION_WORKERS: usize = 2;
 const CODEC_VERIFICATION_LEASE_SECONDS: i32 = 120;
@@ -3783,7 +3784,10 @@ async fn catalog_item_source_eligibility(
             e: 0,
         }]
     } else {
-        episode_refs
+        // Search needs only a bounded representative signal. Full episode/source
+        // discovery belongs to playback; probing every episode amplified one
+        // catalog search into an upstream fan-out.
+        episode_refs.into_iter().take(1).collect()
     };
 
     let mut check_failed = false;
@@ -3815,7 +3819,12 @@ async fn eligible_search(
     mut provider_status: HashMap<String, String>,
 ) -> EligibleSearch {
     let mut tasks = JoinSet::new();
-    for item in items {
+    let mut unchecked = Vec::new();
+    for (index, item) in items.into_iter().enumerate() {
+        if index >= SEARCH_SOURCE_CHECK_MAX_ITEMS {
+            unchecked.push(item);
+            continue;
+        }
         let state = state.clone();
         let semaphore = Arc::clone(&state.search_source_check_slots);
         tasks.spawn(async move {
@@ -3859,6 +3868,9 @@ async fn eligible_search(
             }
         }
     }
+    // Unchecked catalog entries are valid search results, but their source state
+    // is intentionally unknown rather than falsely reported as failed.
+    eligible.extend(unchecked);
     for provider in configured_search_providers() {
         let key = provider.cache_key().to_string();
         if provider_failed.contains(&provider) {
