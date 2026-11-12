@@ -4,21 +4,18 @@ use crate::providers::models::{
 };
 use crate::providers::{Provider, ProviderCapabilities, ReleaseProvider};
 use reqwest::header::{ACCEPT, REFERER, USER_AGENT};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::time::Duration;
-
-const ANILIST_URL: &str = "https://graphql.anilist.co";
-const ANILIST_QUERY: &str = r#"query ($search: String, $id: Int) {
-  Page(page: 1, perPage: 20) { media(search: $search, type: ANIME) {
-    id idMal format episodes seasonYear title { english romaji native }
-    description(asHtml: false) coverImage { large } genres
-  }}
-  Media(id: $id, type: ANIME) { id idMal format episodes seasonYear title { english romaji native }
-    description(asHtml: false) coverImage { large } genres }
-}"#;
 
 fn encode_component(value: &str) -> String {
     url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct AniPmNativeId {
+    source: String,
+    id: i64,
+    slug: String,
 }
 
 #[derive(Clone)]
@@ -52,123 +49,247 @@ impl KariClient {
         self.kind.cache_key()
     }
 
-    async fn anilist(&self, search: Option<&str>, id: Option<i64>) -> Result<Value, ProviderError> {
-        let body = json!({
-            "query": ANILIST_QUERY,
-            "variables": {"search": search, "id": id},
-        });
+    async fn anipm_json(&self, path: &str) -> Result<Value, ProviderError> {
+        let url = format!("{}{}", self.base(), path);
         let response = self
             .http
-            .post(ANILIST_URL)
+            .get(&url)
+            .header(USER_AGENT, crate::net::DEFAULT_BROWSER_USER_AGENT)
+            .header(REFERER, "https://ani.pm/")
             .header(ACCEPT, "application/json")
-            .header(USER_AGENT, crate::net::APP_HTTP_USER_AGENT)
-            .json(&body)
             .send()
             .await
             .map_err(|e| ProviderError::Network(e.to_string()))?;
         let status = response.status();
-        let value: Value = response
-            .json()
-            .await
-            .map_err(|e| ProviderError::Parsing(e.to_string()))?;
+        if status.as_u16() == 429 {
+            let retry = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok());
+            return Err(ProviderError::RateLimited(retry));
+        }
+        if status.as_u16() == 404 {
+            return Err(ProviderError::NotFound);
+        }
         if !status.is_success() {
             return Err(ProviderError::Unavailable(format!(
-                "HTTP status {}",
+                "Ani.pm HTTP status {}",
                 status.as_u16()
             )));
         }
-        if value.get("errors").is_some() {
-            return Err(ProviderError::Unavailable(
-                "AniList returned an error".into(),
+        response
+            .json()
+            .await
+            .map_err(|e| ProviderError::Parsing(format!("Ani.pm JSON: {e}")))
+    }
+
+    async fn search_anipm(&self, query: &str) -> Result<Vec<CatalogItem>, ProviderError> {
+        let mut url = reqwest::Url::parse(&format!("{}/api/anime/search", self.base()))
+            .map_err(|e| ProviderError::Parsing(e.to_string()))?;
+        url.query_pairs_mut().append_pair("q", query.trim());
+        let response = self
+            .http
+            .get(url)
+            .header(USER_AGENT, crate::net::DEFAULT_BROWSER_USER_AGENT)
+            .header(REFERER, "https://ani.pm/")
+            .header(ACCEPT, "application/json")
+            .send()
+            .await
+            .map_err(|e| ProviderError::Network(e.to_string()))?;
+        let status = response.status();
+        if status.as_u16() == 429 {
+            let retry = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok());
+            return Err(ProviderError::RateLimited(retry));
+        }
+        if !status.is_success() {
+            return Err(ProviderError::Unavailable(format!(
+                "Ani.pm search HTTP status {}",
+                status.as_u16()
+            )));
+        }
+        let value: Value = response
+            .json()
+            .await
+            .map_err(|e| ProviderError::Parsing(format!("Ani.pm search JSON: {e}")))?;
+        let rows = value
+            .get("items")
+            .and_then(Value::as_array)
+            .ok_or_else(|| ProviderError::Parsing("Ani.pm search has no items array".into()))?;
+        let mut output = Vec::new();
+        for row in rows {
+            let source = row
+                .get("source")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            // External-catalog records lack a provider-native ID; native-only mode
+            // accepts only records the provider exposes through its Settlar catalog.
+            if !source.eq_ignore_ascii_case("settlar") {
+                continue;
+            }
+            let Some(native_id) = row
+                .get("id")
+                .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))
+            else {
+                continue;
+            };
+            let title = row
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            let slug = row.get("slug").and_then(Value::as_str).unwrap_or("").trim();
+            if native_id <= 0 || title.is_empty() || slug.is_empty() {
+                continue;
+            }
+            let identity = AniPmNativeId {
+                source: source.to_ascii_lowercase(),
+                id: native_id,
+                slug: slug.to_owned(),
+            };
+            let value = serde_json::to_string(&identity)
+                .map_err(|e| ProviderError::Parsing(e.to_string()))?;
+            let poster = row
+                .get("poster")
+                .and_then(Value::as_str)
+                .and_then(|raw| reqwest::Url::parse(self.base()).ok()?.join(raw).ok())
+                .map(|u| u.to_string());
+            output.push(CatalogItem {
+                id: ProviderMediaId {
+                    provider: self.kind,
+                    value,
+                },
+                title: title.to_owned(),
+                media_type: if row
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|v| v.eq_ignore_ascii_case("movie"))
+                {
+                    MediaType::Movie
+                } else {
+                    MediaType::Series
+                },
+                year: row
+                    .get("year")
+                    .and_then(Value::as_i64)
+                    .map(|n| n.to_string()),
+                poster_url: poster,
+                season_count: Some(1),
+            });
+        }
+        if output.is_empty() {
+            Err(ProviderError::NotFound)
+        } else {
+            Ok(output)
+        }
+    }
+
+    async fn details_anipm(&self, raw_id: &str) -> Result<MediaDetails, ProviderError> {
+        let identity: AniPmNativeId = serde_json::from_str(raw_id)
+            .map_err(|_| ProviderError::Parsing("Ani.pm native identity is invalid".into()))?;
+        if identity.source != "settlar" || identity.id <= 0 || identity.slug.is_empty() {
+            return Err(ProviderError::Parsing(
+                "Ani.pm identity is not a supported native Settlar resource".into(),
             ));
         }
-        Ok(value)
-    }
-
-    fn title(media: &Value) -> String {
-        ["english", "romaji", "native"]
-            .iter()
-            .find_map(|key| {
-                media
-                    .get("title")?
-                    .get(*key)?
-                    .as_str()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_owned)
-            })
-            .unwrap_or_default()
-    }
-
-    fn media_to_catalog(&self, media: &Value) -> Option<CatalogItem> {
-        let id = media.get("id")?.as_i64()?.to_string();
-        let title = Self::title(media);
-        if title.is_empty() {
-            return None;
-        }
-        let media_type = if media
-            .get("format")
-            .and_then(Value::as_str)
-            .is_some_and(|v| v.eq_ignore_ascii_case("MOVIE"))
+        let mut value = match self
+            .anipm_json(&format!("/api/anime/series/{}", identity.id))
+            .await
         {
-            MediaType::Movie
-        } else {
-            MediaType::Series
+            Ok(v) => v,
+            Err(ProviderError::NotFound) => {
+                self.anipm_json(&format!("/api/anime/ani/{}", identity.id))
+                    .await?
+            }
+            Err(e) => return Err(e),
         };
-        Some(CatalogItem {
-            id: ProviderMediaId {
-                provider: self.kind,
-                value: id,
-            },
-            title,
-            media_type,
-            year: media
-                .get("seasonYear")
-                .and_then(Value::as_i64)
-                .map(|v| v.to_string()),
-            poster_url: media
-                .get("coverImage")
-                .and_then(|v| v.get("large"))
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            season_count: Some(1),
-        })
-    }
-
-    fn details_from_media(&self, media: &Value) -> Result<MediaDetails, ProviderError> {
-        let item = self.media_to_catalog(media).ok_or_else(|| {
-            ProviderError::Parsing("AniList media has no usable title or ID".into())
-        })?;
-        let count = media
-            .get("episodes")
-            .and_then(Value::as_i64)
-            .unwrap_or(1)
-            .max(1) as usize;
-        let episodes = (1..=count)
-            .flat_map(|episode| {
-                [
-                    crate::providers::models::Episode {
-                        season: 1,
-                        number: episode,
-                        title: Some(format!("Episode {episode}")),
-                        overview: None,
-                    },
-                    crate::providers::models::Episode {
-                        season: 1,
-                        number: episode,
-                        title: Some(format!("Episode {episode} (Dub)")),
-                        overview: None,
-                    },
-                ]
-            })
+        if value.get("id").and_then(Value::as_i64) != Some(identity.id) {
+            return Err(ProviderError::Parsing(
+                "Ani.pm detail identity mismatch".into(),
+            ));
+        }
+        let title = value
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_owned();
+        if title.is_empty() {
+            return Err(ProviderError::Parsing("Ani.pm detail has no title".into()));
+        }
+        let mut episodes = Vec::new();
+        let mut dub_count = 0usize;
+        for row in value
+            .get_mut("episodes")
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten()
+        {
+            if row.get("sub").and_then(Value::as_bool) != Some(true) {
+                continue;
+            }
+            let Some(number) = row
+                .get("number")
+                .and_then(Value::as_u64)
+                .map(|n| n as usize)
+                .filter(|n| *n > 0)
+            else {
+                continue;
+            };
+            if row.get("dub").and_then(Value::as_bool) == Some(true) {
+                dub_count += 1;
+            }
+            episodes.push(crate::providers::models::Episode {
+                season: 1,
+                number,
+                title: row.get("title").and_then(Value::as_str).map(str::to_owned),
+                overview: row
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            });
+        }
+        episodes.sort_by_key(|e| e.number);
+        episodes.dedup_by_key(|e| e.number);
+        let poster = value
+            .get("poster")
+            .and_then(Value::as_str)
+            .and_then(|raw| reqwest::Url::parse(self.base()).ok()?.join(raw).ok())
+            .map(|u| u.to_string());
+        let genres = value
+            .get("genres")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
             .collect();
         Ok(MediaDetails {
-            id: item.id,
-            title: item.title,
-            media_type: item.media_type,
-            year: item.year,
-            description: media
-                .get("description")
+            id: ProviderMediaId {
+                provider: self.kind,
+                value: raw_id.to_owned(),
+            },
+            title,
+            media_type: if value
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|v| v.eq_ignore_ascii_case("movie"))
+            {
+                MediaType::Movie
+            } else {
+                MediaType::Series
+            },
+            year: value
+                .get("year")
+                .and_then(Value::as_i64)
+                .map(|n| n.to_string()),
+            description: value
+                .get("synopsis")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
             tagline: None,
@@ -176,19 +297,17 @@ impl KariClient {
             director: None,
             stars: None,
             prints: None,
-            audios: Some("sub,dub".into()),
-            poster_url: item.poster_url,
-            duration: None,
-            genres: media
-                .get("genres")
-                .and_then(Value::as_array)
-                .map(|a| {
-                    a.iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_owned)
-                        .collect()
-                })
-                .unwrap_or_default(),
+            audios: Some(if dub_count > 0 {
+                "sub; dub availability is not exposed by this API contract".into()
+            } else {
+                "sub".into()
+            }),
+            poster_url: poster,
+            duration: value
+                .get("duration")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            genres,
             seasons: vec![Season {
                 number: 1,
                 episodes,
@@ -197,63 +316,69 @@ impl KariClient {
         })
     }
 
-    async fn resolve_anivault(
-        &self,
-        id: &str,
-        season: usize,
-        episode: usize,
-    ) -> Result<Vec<Release>, ProviderError> {
-        let url = format!(
-            "{}/api/watch/anivault/{}/{}/sub",
-            self.base(),
-            encode_component(id),
-            episode
-        );
-        let value = self
-            .http
-            .get(&url)
-            .header(USER_AGENT, crate::net::DEFAULT_BROWSER_USER_AGENT)
-            .header(ACCEPT, "application/json")
-            .send()
-            .await
-            .map_err(|e| ProviderError::Network(e.to_string()))?
-            .json::<Value>()
-            .await
-            .map_err(|e| ProviderError::Parsing(e.to_string()))?;
-        self.release_from_watch(value, season, episode).await
-    }
-
     async fn resolve_anipm(
         &self,
         id: &str,
         _season: usize,
         episode: usize,
     ) -> Result<Vec<Release>, ProviderError> {
+        let identity: AniPmNativeId = serde_json::from_str(id)
+            .map_err(|_| ProviderError::Parsing("Ani.pm native identity is invalid".into()))?;
+        if identity.source != "settlar" || identity.id <= 0 {
+            return Err(ProviderError::Parsing(
+                "Ani.pm playback requires a native Settlar ID".into(),
+            ));
+        }
         let client = &self.http;
         let headers = |b: reqwest::RequestBuilder| {
             b.header(USER_AGENT, crate::net::DEFAULT_BROWSER_USER_AGENT)
                 .header(REFERER, "https://ani.pm/")
                 .header(ACCEPT, "application/json")
         };
-        let boot = headers(client.get(format!(
-            "{}/api/anime/playback-bootstrap/anilist/{}?ep={}&lang=sub",
+        let boot_url = format!(
+            "{}/api/anime/playback-bootstrap/settlar/{}?ep={}&lang=sub",
             self.base(),
-            id,
+            identity.id,
             episode
-        )))
-        .send()
-        .await
-        .map_err(|e| ProviderError::Network(e.to_string()))?;
+        );
+        let boot = headers(client.get(boot_url))
+            .send()
+            .await
+            .map_err(|e| ProviderError::Network(e.to_string()))?;
+        let status = boot.status();
+        if status.as_u16() == 429 {
+            return Err(ProviderError::RateLimited(None));
+        }
+        if status.as_u16() == 404 {
+            return Err(ProviderError::NotFound);
+        }
+        if !status.is_success() {
+            return Err(ProviderError::Unavailable(format!(
+                "Ani.pm playback bootstrap HTTP {}",
+                status.as_u16()
+            )));
+        }
         let boot: Value = boot
             .json()
             .await
-            .map_err(|e| ProviderError::Parsing(e.to_string()))?;
+            .map_err(|e| ProviderError::Parsing(format!("Ani.pm bootstrap JSON: {e}")))?;
+        if boot.get("source").and_then(Value::as_str) != Some("settlar")
+            || boot.get("id").and_then(Value::as_i64) != Some(identity.id)
+            || boot.get("episode").and_then(Value::as_u64) != Some(episode as u64)
+            || boot.get("effectiveLanguage").and_then(Value::as_str) != Some("sub")
+        {
+            return Err(ProviderError::Parsing(
+                "Ani.pm native playback response identity/audio mismatch".into(),
+            ));
+        }
         let selection = boot
             .get("settlarSelection")
             .and_then(Value::as_str)
-            .filter(|v| !v.is_empty())
+            .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| {
-                ProviderError::Unavailable("Ani.pm did not return a playback selection".into())
+                ProviderError::Unavailable(
+                    "Ani.pm has no native subtitle selection for this episode".into(),
+                )
             })?;
         let session = headers(client.get(format!("{}/api/anime/settlar/session?selection={}&provider=anipm&ep={}&channel=sub&telemetry=0", self.base(), encode_component(selection), episode))).send().await.map_err(|e| ProviderError::Network(e.to_string()))?;
         let session: Value = session
@@ -376,58 +501,25 @@ impl Provider for KariClient {
     }
     async fn search(&self, query: &str, _page: usize) -> Result<Vec<CatalogItem>, ProviderError> {
         match self.kind {
-            ProviderKind::Anikoto => {
-                return crate::providers::kari_anime::anikoto::search(&self.http, query).await;
-            }
-            ProviderKind::Miruro => {
-                return crate::providers::kari_anime::miruro::search(&self.http, query).await;
-            }
-            ProviderKind::Anidream => {
-                return crate::providers::kari_anime::anidream::search(&self.http, query).await;
-            }
-            _ => {}
-        }
-        let value = self.anilist(Some(query), None).await?;
-        let media = value
-            .get("data")
-            .and_then(|v| v.get("Page"))
-            .and_then(|v| v.get("media"))
-            .and_then(Value::as_array)
-            .ok_or_else(|| {
-                ProviderError::Parsing("AniList search response missing media".into())
-            })?;
-        let out = media
-            .iter()
-            .filter_map(|v| self.media_to_catalog(v))
-            .collect::<Vec<_>>();
-        if out.is_empty() {
-            Err(ProviderError::NotFound)
-        } else {
-            Ok(out)
+            ProviderKind::Anipm => self.search_anipm(query).await,
+            ProviderKind::Anikoto => crate::providers::kari_anime::anikoto::search(&self.http, query).await,
+            ProviderKind::Miruro => crate::providers::kari_anime::miruro::search(&self.http, query).await,
+            ProviderKind::Anidream => Err(ProviderError::Unavailable("AniDream is blocked by the native-only identity requirement: original Kari maps the browse ID to an external catalog ID and its playback contract has no verified native identity".into())),
+            ProviderKind::Anivault => Err(ProviderError::Unavailable("AniVault native search is blocked: its documented /api/search endpoint returned HTTP 404 and no provider-native episode identity has been verified".into())),
+            ProviderKind::Anicine => Err(ProviderError::Unavailable("AniCine native search is blocked: no verified provider-native catalog endpoint has been identified".into())),
+            _ => Err(ProviderError::Unavailable("invalid Kari provider".into())),
         }
     }
     async fn details(&self, id: &str) -> Result<MediaDetails, ProviderError> {
         match self.kind {
-            ProviderKind::Anikoto => {
-                return crate::providers::kari_anime::anikoto::details(&self.http, id).await;
-            }
-            ProviderKind::Miruro => {
-                return crate::providers::kari_anime::miruro::details(&self.http, id).await;
-            }
-            ProviderKind::Anidream => {
-                return crate::providers::kari_anime::anidream::details(&self.http, id).await;
-            }
-            _ => {}
+            ProviderKind::Anipm => self.details_anipm(id).await,
+            ProviderKind::Anikoto => crate::providers::kari_anime::anikoto::details(&self.http, id).await,
+            ProviderKind::Miruro => crate::providers::kari_anime::miruro::details(&self.http, id).await,
+            ProviderKind::Anidream => Err(ProviderError::Unavailable("AniDream native details are blocked because the verified upstream workflow requires an external catalog-scoped ID".into())),
+            ProviderKind::Anivault => Err(ProviderError::Unavailable("AniVault native details are blocked: no native search/detail identity is available from the verified upstream API".into())),
+            ProviderKind::Anicine => Err(ProviderError::Unavailable("AniCine native details are blocked: no provider-native anime catalog route has been verified".into())),
+            _ => Err(ProviderError::Unavailable("invalid Kari provider".into())),
         }
-        let id = id.parse::<i64>().map_err(|_| {
-            ProviderError::Parsing("provider ID is not an AniList numeric ID".into())
-        })?;
-        let value = self.anilist(None, Some(id)).await?;
-        let media = value
-            .get("data")
-            .and_then(|v| v.get("Media"))
-            .ok_or(ProviderError::NotFound)?;
-        self.details_from_media(media)
     }
 }
 
@@ -442,12 +534,9 @@ impl ReleaseProvider for KariClient {
             return Err(ProviderError::Parsing("invalid episode identity".into()));
         }
         match self.kind {
-            ProviderKind::Anivault => self.resolve_anivault(id, season, episode).await,
+            ProviderKind::Anivault => Err(ProviderError::Unavailable("AniVault playback is blocked until a verified native ID path is available".into())),
             ProviderKind::Anipm => self.resolve_anipm(id, season, episode).await,
-            ProviderKind::Anicine => {
-                crate::providers::kari_anime::anicine::resolve(&self.http, id, season, episode)
-                    .await
-            }
+            ProviderKind::Anicine => Err(ProviderError::Unavailable("AniCine playback is blocked until its external-catalog mapping can be replaced with a verified native identity".into())),
             ProviderKind::Anikoto => {
                 crate::providers::kari_anime::anikoto::resolve(&self.http, id, season, episode)
                     .await
@@ -455,10 +544,7 @@ impl ReleaseProvider for KariClient {
             ProviderKind::Miruro => {
                 crate::providers::kari_anime::miruro::resolve(&self.http, id, season, episode).await
             }
-            ProviderKind::Anidream => {
-                crate::providers::kari_anime::anidream::resolve(&self.http, id, season, episode)
-                    .await
-            }
+ProviderKind::Anidream => Err(ProviderError::Unavailable("AniDream playback is blocked because its verified server function requires an external catalog-scoped ID".into())),
             _ => Err(ProviderError::Unavailable("invalid Kari provider".into())),
         }
     }

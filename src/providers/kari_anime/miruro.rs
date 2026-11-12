@@ -6,9 +6,7 @@ use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 
 const BASE: &str = "https://miruro.cx";
-const ANILIST: &str = "https://graphql.anilist.co";
 const UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
-const ANILIST_QUERY: &str = "query ($id: Int) { Media(id: $id, type: ANIME) { id idMal format episodes seasonYear title { english romaji native } description(asHtml: false) coverImage { large } genres } }";
 
 #[derive(Debug, serde::Deserialize)]
 struct Doc {
@@ -111,14 +109,15 @@ fn hydrated_chunk(body: &str, key: &str) -> Result<Vec<Value>, ProviderError> {
     )))
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct Item {
     show_id: String,
-    anilist: String,
     title: String,
     format: String,
     year: Option<String>,
     cover: Option<String>,
+    description: Option<String>,
+    genres: Vec<String>,
 }
 fn catalog_items(body: &str) -> Result<Vec<Item>, ProviderError> {
     for doc in parse_docs(body)? {
@@ -135,15 +134,6 @@ fn catalog_items(body: &str) -> Result<Vec<Item>, ProviderError> {
             };
             let mut out = Vec::new();
             for raw in items {
-                let Some(ext) = raw.get("external_ids") else {
-                    continue;
-                };
-                let aid = ext
-                    .get("anilist")
-                    .and_then(Value::as_array)
-                    .and_then(|a| a.iter().find_map(Value::as_str))
-                    .unwrap_or("")
-                    .trim();
                 let title = raw
                     .get("title")
                     .and_then(|v| {
@@ -156,16 +146,24 @@ fn catalog_items(body: &str) -> Result<Vec<Item>, ProviderError> {
                     })
                     .unwrap_or("");
                 let show_id = raw.get("id").and_then(Value::as_str).unwrap_or("").trim();
-                if aid.is_empty() || title.is_empty() || show_id.is_empty() {
+                if title.is_empty() || show_id.is_empty() {
                     continue;
                 }
-                // Only digit AniList IDs can represent the exact external mapping.
-                if !aid.bytes().all(|b| b.is_ascii_digit()) {
-                    continue;
-                }
+                let description = raw
+                    .get("description")
+                    .or_else(|| raw.get("synopsis"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                let genres = raw
+                    .get("genres")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect();
                 out.push(Item {
                     show_id: show_id.into(),
-                    anilist: aid.into(),
                     title: title.into(),
                     format: raw
                         .get("format")
@@ -181,6 +179,8 @@ fn catalog_items(body: &str) -> Result<Vec<Item>, ProviderError> {
                         .get("cover_url")
                         .and_then(Value::as_str)
                         .and_then(valid_url),
+                    description,
+                    genres,
                 });
             }
             return Ok(out);
@@ -250,86 +250,25 @@ async fn get_text(http: &reqwest::Client, raw: &str) -> Result<String, ProviderE
         .await
         .map_err(|e| ProviderError::Parsing(format!("Miruro response body: {e}")))
 }
-async fn anilist_media(http: &reqwest::Client, id: &str) -> Result<Value, ProviderError> {
-    let num = id
-        .trim()
-        .parse::<i64>()
-        .ok()
-        .filter(|n| *n > 0)
-        .ok_or_else(|| {
-            ProviderError::Parsing("Miruro identity must be a positive AniList ID".into())
-        })?;
-    let response = http
-        .post(ANILIST)
-        .header(reqwest::header::USER_AGENT, UA)
-        .header(reqwest::header::ACCEPT, "application/json")
-        .json(&json!({"query": ANILIST_QUERY, "variables": {"id": num}}))
-        .send()
-        .await
-        .map_err(|e| ProviderError::Network(e.to_string()))?;
-    let status = response.status();
-    if status.as_u16() == 429 {
-        return Err(ProviderError::RateLimited(None));
+fn decode_native_id(raw: &str) -> Result<Item, ProviderError> {
+    let item: Item = serde_json::from_str(raw)
+        .map_err(|_| ProviderError::Parsing("Miruro native show identity is invalid".into()))?;
+    if item.show_id.trim().is_empty() || item.title.trim().is_empty() {
+        return Err(ProviderError::Parsing(
+            "Miruro native show identity is incomplete".into(),
+        ));
     }
-    let value: Value = response
-        .json()
-        .await
-        .map_err(|e| ProviderError::Parsing(format!("AniList JSON: {e}")))?;
-    if !status.is_success() {
-        return Err(ProviderError::Unavailable(format!(
-            "AniList HTTP status {}",
-            status.as_u16()
-        )));
-    }
-    value
-        .get("data")
-        .and_then(|v| v.get("Media"))
-        .filter(|v| !v.is_null())
-        .cloned()
-        .ok_or(ProviderError::NotFound)
+    Ok(item)
 }
-fn titles(media: &Value) -> Vec<String> {
-    ["english", "romaji", "native"]
-        .iter()
-        .filter_map(|key| media.get("title")?.get(*key)?.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-        .collect()
-}
-async fn find_item(
+async fn resolve_coords(
     http: &reqwest::Client,
-    anilist_id: &str,
-    title: &str,
-) -> Result<Item, ProviderError> {
-    let url = format!("{BASE}/search/__data.json?q={}", encode_component(title));
-    let items = catalog_items(&get_text(http, &url).await?)?;
-    items
-        .into_iter()
-        .find(|it| it.anilist == anilist_id)
-        .ok_or(ProviderError::NotFound)
-}
-async fn resolve_coords(http: &reqwest::Client, id: &str) -> Result<(Item, String), ProviderError> {
-    let media = anilist_media(http, id).await?;
-    let aid = media
-        .get("id")
-        .and_then(Value::as_i64)
-        .ok_or_else(|| ProviderError::Parsing("AniList response has no numeric identity".into()))?
-        .to_string();
-    let mut found = None;
-    for title in titles(&media) {
-        match find_item(http, &aid, &title).await {
-            Ok(item) => {
-                found = Some(item);
-                break;
-            }
-            Err(ProviderError::NotFound) => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    let item = found.ok_or(ProviderError::NotFound)?;
+    raw_id: &str,
+) -> Result<(Item, String), ProviderError> {
+    let item = decode_native_id(raw_id)?;
     let probe = get_text(http, &watch_path(&item.show_id, "x", 1)).await?;
-    let slug = redirect_slug(&probe).unwrap_or_else(|| "x".into());
+    let slug = redirect_slug(&probe).ok_or_else(|| {
+        ProviderError::Unavailable("Miruro did not return a native watch slug".into())
+    })?;
     Ok((item, slug))
 }
 async fn watch_data(
@@ -703,7 +642,7 @@ pub(crate) async fn search(
         .map(|item| CatalogItem {
             id: ProviderMediaId {
                 provider: ProviderKind::Miruro,
-                value: item.anilist,
+                value: serde_json::to_string(&item).unwrap_or_default(),
             },
             title: item.title,
             media_type: if item.format.eq_ignore_ascii_case("MOVIE") {
@@ -727,32 +666,13 @@ pub(crate) async fn details(
     http: &reqwest::Client,
     id: &str,
 ) -> Result<MediaDetails, ProviderError> {
-    let media = anilist_media(http, id).await?;
-    let aid = media
-        .get("id")
-        .and_then(Value::as_i64)
-        .ok_or_else(|| ProviderError::Parsing("AniList detail has no numeric ID".into()))?
-        .to_string();
-    let mut found = None;
-    for title in titles(&media) {
-        match find_item(http, &aid, &title).await {
-            Ok(item) => {
-                found = Some(item);
-                break;
-            }
-            Err(ProviderError::NotFound) => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    let item = found.ok_or(ProviderError::NotFound)?;
-    let probe = get_text(http, &watch_path(&item.show_id, "x", 1)).await?;
-    let slug = redirect_slug(&probe).unwrap_or_else(|| "x".into());
+    let (item, slug) = resolve_coords(http, id).await?;
     let (watch, _) = watch_data(http, &item, &slug, 1).await?;
     let episodes = episode_rows(&watch)?;
     Ok(MediaDetails {
         id: ProviderMediaId {
             provider: ProviderKind::Miruro,
-            value: aid,
+            value: id.to_owned(),
         },
         title: item.title,
         media_type: if item.format.eq_ignore_ascii_case("MOVIE") {
@@ -761,10 +681,7 @@ pub(crate) async fn details(
             MediaType::Series
         },
         year: item.year,
-        description: media
-            .get("description")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
+        description: item.description,
         tagline: None,
         imdb_rating: None,
         director: None,
@@ -773,16 +690,7 @@ pub(crate) async fn details(
         audios: None,
         poster_url: item.cover,
         duration: None,
-        genres: media
-            .get("genres")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default(),
+        genres: item.genres,
         seasons: vec![Season {
             number: 1,
             episodes,
@@ -810,14 +718,14 @@ pub(crate) async fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    const SEARCH: &str = r#"{"type":"data","nodes":[{"type":"data","data":[0]},{"type":"data","data":[{"mode":1,"items":2},"anime",[3],{"id":4,"external_ids":5,"title":7,"format":10,"season_year":11,"cover_url":12},"SHOWID",{"anilist":6},["20"],{"english":8,"romaji":9},"Naruto","NARUTO","TV",2002,"https://cover.example.com/naruto.jpg"]}]}"#;
+    const SEARCH: &str = r#"{"type":"data","nodes":[{"type":"data","data":[0]},{"type":"data","data":[{"mode":1,"items":2},"anime",[3],{"id":4,"title":5,"format":8,"season_year":9,"cover_url":10},"SHOWID",{"english":6,"romaji":7},"Naruto","NARUTO","TV",2002,"https://cover.example.com/naruto.jpg"]}]}"#;
     const EPISODES: &str = r#"{"type":"chunk","id":1,"data":[{"episodes":1,"currentEpisode":2},[3],1,{"id":4,"number":5,"title":6,"filler":7},"ep1",1,"Enter",false]}"#;
     const TRACKS: &str = r#"{"type":"chunk","id":2,"data":[{"episodeNumber":1,"tracks":1,"providerOrder":2},[3],["bee"],{"track":4,"providers":5},"ssub",[6],{"provider":7,"servers":8,"subtitles":19},"bee",[9],{"server":10,"headers":11,"streams":13,"embed":18},"Vidstream-1",{"Referer":12},"https://megaplay.buzz/",[14],{"url":15,"format":16,"quality":17},"https://cdn.example.com/master.m3u8?token=abc","hls","",null,[20],{"language":21,"label":22,"file":23,"default":24},"en","English","https://cdn.example.com/en.vtt",true]}"#;
     #[test]
     fn devalue_search_fixture_maps_exact_external_id() {
         let items = catalog_items(SEARCH).unwrap();
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].anilist, "20");
+        assert_eq!(items[0].show_id, "SHOWID");
         assert_eq!(items[0].show_id, "SHOWID");
         assert_eq!(items[0].title, "Naruto");
     }
