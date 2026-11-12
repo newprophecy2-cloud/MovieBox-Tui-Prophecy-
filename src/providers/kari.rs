@@ -1,6 +1,6 @@
 use crate::providers::models::{
-    CatalogItem, MediaDetails, MediaType, ProviderError, ProviderKind, ProviderMediaId, Release,
-    Season, SourceMirror,
+    AudioTrackOption, CatalogItem, MediaDetails, MediaType, ProviderError, ProviderKind,
+    ProviderMediaId, Release, Season, SourceMirror,
 };
 use crate::providers::{Provider, ProviderCapabilities, ReleaseProvider};
 use reqwest::header::{ACCEPT, REFERER, USER_AGENT};
@@ -22,11 +22,31 @@ struct AniPmNativeId {
     language: Option<String>,
 }
 
+fn anipm_audio_options(
+    identity: &AniPmNativeId,
+    has_sub: bool,
+    has_dub: bool,
+) -> Result<Vec<AudioTrackOption>, ProviderError> {
+    [("sub", has_sub), ("dub", has_dub)]
+        .into_iter()
+        .filter(|(_, available)| *available)
+        .map(|(language, _)| {
+            let mut sibling = identity.clone();
+            sibling.language = Some(language.to_string());
+            Ok(AudioTrackOption {
+                subject_id: serde_json::to_string(&sibling)
+                    .map_err(|error| ProviderError::Parsing(error.to_string()))?,
+                language: language.to_ascii_uppercase(),
+                label: language.to_ascii_uppercase(),
+            })
+        })
+        .collect()
+}
+
 #[derive(Clone)]
 pub struct KariClient {
     pub kind: ProviderKind,
     http: reqwest::Client,
-    limiter: crate::rate_limit::HostLimiter,
 }
 
 impl KariClient {
@@ -35,11 +55,7 @@ impl KariClient {
             .timeout(Duration::from_secs(20))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        Self {
-            kind,
-            http,
-            limiter: crate::rate_limit::HostLimiter::new(2, std::time::Duration::from_millis(150)),
-        }
+        Self { kind, http }
     }
 
     fn base(&self) -> &'static str {
@@ -220,6 +236,18 @@ impl KariClient {
                 "Ani.pm identity is not a supported native Settlar resource".into(),
             ));
         }
+        let requested_language = identity
+            .language
+            .as_deref()
+            .map(|language| language.trim().to_ascii_lowercase());
+        if requested_language
+            .as_deref()
+            .is_some_and(|language| !matches!(language, "sub" | "dub"))
+        {
+            return Err(ProviderError::Parsing(
+                "Ani.pm audio selection must be sub or dub".into(),
+            ));
+        }
         let mut value = match self
             .anipm_json(&format!("/api/anime/series/{}", identity.id))
             .await
@@ -245,15 +273,39 @@ impl KariClient {
         if title.is_empty() {
             return Err(ProviderError::Parsing("Ani.pm detail has no title".into()));
         }
-        let mut episodes = Vec::new();
-        let mut dub_count = 0usize;
-        for row in value
-            .get_mut("episodes")
-            .and_then(Value::as_array_mut)
-            .into_iter()
-            .flatten()
+        let rows = value
+            .get("episodes")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let has_sub = rows
+            .iter()
+            .any(|row| row.get("sub").and_then(Value::as_bool) == Some(true));
+        let has_dub = rows
+            .iter()
+            .any(|row| row.get("dub").and_then(Value::as_bool) == Some(true));
+        if requested_language.as_deref() == Some("sub") && !has_sub
+            || requested_language.as_deref() == Some("dub") && !has_dub
         {
-            if row.get("sub").and_then(Value::as_bool) != Some(true) {
+            return Err(ProviderError::Unavailable(
+                "Ani.pm has no episodes for the requested audio language".into(),
+            ));
+        }
+        let active_language = requested_language.as_deref().or(if has_sub {
+            Some("sub")
+        } else if has_dub {
+            Some("dub")
+        } else {
+            None
+        });
+        let mut episodes = Vec::new();
+        for row in &rows {
+            let available = match active_language {
+                Some("sub") => row.get("sub").and_then(Value::as_bool) == Some(true),
+                Some("dub") => row.get("dub").and_then(Value::as_bool) == Some(true),
+                _ => false,
+            };
+            if !available {
                 continue;
             }
             let Some(number) = row
@@ -264,9 +316,6 @@ impl KariClient {
             else {
                 continue;
             };
-            if row.get("dub").and_then(Value::as_bool) == Some(true) {
-                dub_count += 1;
-            }
             episodes.push(crate::providers::models::Episode {
                 season: 1,
                 number,
@@ -279,6 +328,15 @@ impl KariClient {
         }
         episodes.sort_by_key(|e| e.number);
         episodes.dedup_by_key(|e| e.number);
+        let audio_options = anipm_audio_options(&identity, has_sub, has_dub)?;
+        let detail_id = if requested_language.is_none() && active_language == Some("dub") {
+            let mut dub_identity = identity.clone();
+            dub_identity.language = Some("dub".into());
+            serde_json::to_string(&dub_identity)
+                .map_err(|error| ProviderError::Parsing(error.to_string()))?
+        } else {
+            raw_id.to_owned()
+        };
         let poster = value
             .get("poster")
             .and_then(Value::as_str)
@@ -295,7 +353,7 @@ impl KariClient {
         Ok(MediaDetails {
             id: ProviderMediaId {
                 provider: self.kind,
-                value: raw_id.to_owned(),
+                value: detail_id,
             },
             title,
             media_type: if value
@@ -320,11 +378,12 @@ impl KariClient {
             director: None,
             stars: None,
             prints: None,
-            audios: Some(if dub_count > 0 {
-                "sub; dub availability is not exposed by this API contract".into()
-            } else {
-                "sub".into()
-            }),
+            audios: match (has_sub, has_dub) {
+                (true, true) => Some("sub; dub".into()),
+                (true, false) => Some("sub".into()),
+                (false, true) => Some("dub".into()),
+                (false, false) => None,
+            },
             poster_url: poster,
             duration: value
                 .get("duration")
@@ -335,16 +394,22 @@ impl KariClient {
                 number: 1,
                 episodes,
             }],
-            dubs: vec![],
+            dubs: audio_options,
         })
     }
 
     async fn resolve_anipm(
         &self,
         id: &str,
-        _season: usize,
+        season: usize,
         episode: usize,
     ) -> Result<Vec<Release>, ProviderError> {
+        if season != 1 {
+            return Err(ProviderError::Unavailable(
+                "Ani.pm native playback exposes only season 1; another season cannot be verified"
+                    .into(),
+            ));
+        }
         let identity: AniPmNativeId = serde_json::from_str(id)
             .map_err(|_| ProviderError::Parsing("Ani.pm native identity is invalid".into()))?;
         if identity
@@ -363,13 +428,23 @@ impl KariClient {
                 .header(REFERER, "https://ani.pm/")
                 .header(ACCEPT, "application/json")
         };
-        let language = identity.language.as_deref().unwrap_or("sub");
+        let language = identity
+            .language
+            .as_deref()
+            .unwrap_or("sub")
+            .trim()
+            .to_ascii_lowercase();
+        if !matches!(language.as_str(), "sub" | "dub") {
+            return Err(ProviderError::Parsing(
+                "Ani.pm audio selection must be sub or dub".into(),
+            ));
+        }
         let boot_url = format!(
             "{}/api/anime/playback-bootstrap/settlar/{}?ep={}&lang={}",
             self.base(),
             identity.id,
             episode,
-            encode_component(language)
+            encode_component(&language)
         );
         let _boot_permit = crate::rate_limit::acquire_url(&boot_url)
             .await
@@ -399,7 +474,10 @@ impl KariClient {
         if boot.get("source").and_then(Value::as_str) != Some("settlar")
             || boot.get("id").and_then(Value::as_i64) != Some(identity.id)
             || boot.get("episode").and_then(Value::as_u64) != Some(episode as u64)
-            || boot.get("effectiveLanguage").and_then(Value::as_str) != Some(language)
+            || !boot
+                .get("effectiveLanguage")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.eq_ignore_ascii_case(&language))
         {
             return Err(ProviderError::Parsing(
                 "Ani.pm native playback response identity/audio mismatch".into(),
@@ -423,7 +501,7 @@ impl KariClient {
             self.base(),
             encode_component(selection),
             episode,
-            encode_component(language)
+            encode_component(&language)
         );
         let _session_permit = crate::rate_limit::acquire_url(&session_url)
             .await
@@ -432,7 +510,22 @@ impl KariClient {
             .send()
             .await
             .map_err(|e| ProviderError::Network(e.to_string()))?;
-        crate::rate_limit::observe_url(&session_url, session.status(), session.headers()).await;
+        let status = session.status();
+        crate::rate_limit::observe_url(&session_url, status, session.headers()).await;
+        if status.as_u16() == 429 {
+            let retry =
+                crate::rate_limit::retry_after(session.headers()).map(|delay| delay.as_secs());
+            return Err(ProviderError::RateLimited(retry));
+        }
+        if status.as_u16() == 404 {
+            return Err(ProviderError::NotFound);
+        }
+        if !status.is_success() {
+            return Err(ProviderError::Unavailable(format!(
+                "Ani.pm session HTTP status {}",
+                status.as_u16()
+            )));
+        }
         let session: Value = session
             .json()
             .await
@@ -465,7 +558,22 @@ impl KariClient {
             .send()
             .await
             .map_err(|e| ProviderError::Network(e.to_string()))?;
-        crate::rate_limit::observe_url(&playback_url, playback.status(), playback.headers()).await;
+        let status = playback.status();
+        crate::rate_limit::observe_url(&playback_url, status, playback.headers()).await;
+        if status.as_u16() == 429 {
+            let retry =
+                crate::rate_limit::retry_after(playback.headers()).map(|delay| delay.as_secs());
+            return Err(ProviderError::RateLimited(retry));
+        }
+        if status.as_u16() == 404 {
+            return Err(ProviderError::NotFound);
+        }
+        if !status.is_success() {
+            return Err(ProviderError::Unavailable(format!(
+                "Ani.pm playback HTTP status {}",
+                status.as_u16()
+            )));
+        }
         let playback: Value = playback
             .json()
             .await
@@ -482,7 +590,7 @@ impl KariClient {
             filename: format!("{}-{}.m3u8", id, episode),
             quality: Some("1080p".into()),
             codec: None,
-            language: Some("ja".into()),
+            language: Some(language),
             size_bytes: None,
             season: Some(1),
             episode: Some(episode),
@@ -548,11 +656,15 @@ impl Provider for KariClient {
         self.kind
     }
     fn capabilities(&self) -> ProviderCapabilities {
+        let has_native_adapter = matches!(
+            self.kind,
+            ProviderKind::Anipm | ProviderKind::Anikoto | ProviderKind::Miruro
+        );
         ProviderCapabilities {
-            supports_search: true,
+            supports_search: has_native_adapter,
             supports_pagination: false,
-            supports_series: true,
-            supports_subtitles: true,
+            supports_series: has_native_adapter,
+            supports_subtitles: matches!(self.kind, ProviderKind::Anikoto | ProviderKind::Miruro),
             supports_homepage: false,
         }
     }
@@ -603,6 +715,46 @@ impl ReleaseProvider for KariClient {
             }
 ProviderKind::Anidream => Err(ProviderError::Unavailable("AniDream playback is blocked because its verified server function requires an external catalog-scoped ID".into())),
             _ => Err(ProviderError::Unavailable("invalid Kari provider".into())),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn anipm_rejects_unverified_non_one_season_before_network_access() {
+        let client = KariClient::new(ProviderKind::Anipm);
+        assert!(matches!(
+            client.resolve_anipm("not-used", 2, 1).await,
+            Err(ProviderError::Unavailable(_))
+        ));
+    }
+
+    #[test]
+    fn unimplemented_kari_adapters_do_not_advertise_search_capabilities() {
+        for kind in [
+            ProviderKind::Anivault,
+            ProviderKind::Anicine,
+            ProviderKind::Anidream,
+        ] {
+            assert!(!KariClient::new(kind).capabilities().supports_search);
+        }
+        for kind in [
+            ProviderKind::Anipm,
+            ProviderKind::Anikoto,
+            ProviderKind::Miruro,
+        ] {
+            assert!(KariClient::new(kind).capabilities().supports_search);
+        }
+        assert!(
+            !KariClient::new(ProviderKind::Anipm)
+                .capabilities()
+                .supports_subtitles
+        );
+        for kind in [ProviderKind::Anikoto, ProviderKind::Miruro] {
+            assert!(KariClient::new(kind).capabilities().supports_subtitles);
         }
     }
 }

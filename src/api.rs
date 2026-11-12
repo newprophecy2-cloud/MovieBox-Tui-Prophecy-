@@ -328,6 +328,22 @@ fn releases_have_usable_source(releases: &[Release]) -> bool {
     releases.iter().any(release_has_usable_source)
 }
 
+fn provider_source_status(
+    playable: bool,
+    check_failed: bool,
+    no_source: bool,
+) -> Option<&'static str> {
+    if playable {
+        Some("ok")
+    } else if check_failed {
+        Some("source_check_failed")
+    } else if no_source {
+        Some("no_source_confirmed")
+    } else {
+        None
+    }
+}
+
 fn provider_error_means_no_source(error: &ProviderError) -> bool {
     matches!(error, ProviderError::NotFound)
         || matches!(
@@ -3873,12 +3889,12 @@ async fn eligible_search(
     eligible.extend(unchecked);
     for provider in configured_search_providers() {
         let key = provider.cache_key().to_string();
-        if provider_failed.contains(&provider) {
-            provider_status.insert(key, "source_check_failed".to_string());
-        } else if provider_playable.contains(&provider) {
-            provider_status.insert(key, "ok".to_string());
-        } else if provider_no_source.contains(&provider) {
-            provider_status.insert(key, "no_source_confirmed".to_string());
+        if let Some(status) = provider_source_status(
+            provider_playable.contains(&provider),
+            provider_failed.contains(&provider),
+            provider_no_source.contains(&provider),
+        ) {
+            provider_status.insert(key, status.to_string());
         }
     }
     eligible.sort_by(|a, b| {
@@ -4434,6 +4450,8 @@ async fn playback_route(
             }
         }
     );
+    let kari_h264_verified =
+        kari_codec_policy && probe_result.as_ref().is_ok_and(kari_probe_confirms_h264);
     let audio_tracks = match probe_result {
         Ok(probe) => probe
             .streams
@@ -4465,6 +4483,15 @@ async fn playback_route(
         Err(_) => Vec::new(),
     };
     let mut playback = playback;
+    if kari_codec_policy && !kari_h264_verified {
+        let (status, body) = err(
+            "CODEC_UNVERIFIED",
+            "Kari playback requires a positively verified H.264 video stream.",
+            Some(source_ref.p),
+            415,
+        );
+        return write_raw_json(stream, status, &body, None).await;
+    }
     if native_candidate && !kari_codec_policy {
         match native_codec_result
             .unwrap_or(Err(crate::codec_verification::CodecProbeError::ProbeFailed))
@@ -5279,6 +5306,19 @@ fn direct_safe_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
         .collect()
 }
 
+fn kari_probe_confirms_h264(probe: &ProbeOutput) -> bool {
+    let video_codecs: Vec<_> = probe
+        .streams
+        .iter()
+        .filter(|stream| stream.codec_type.as_deref() == Some("video"))
+        .filter_map(|stream| stream.codec_name.as_deref())
+        .collect();
+    !video_codecs.is_empty()
+        && video_codecs
+            .iter()
+            .all(|codec| crate::codec_verification::is_allowed_codec(codec))
+}
+
 fn direct_url_type(
     url: &reqwest::Url,
     release: &Release,
@@ -5786,6 +5826,27 @@ async fn write_verified_playback_response(
         }
     };
     if is_kari_provider(provider) {
+        let probe = match probe_media_bounded(state, &playback.url, &playback.headers).await {
+            Ok(probe) => probe,
+            Err(_) => {
+                let (status, body) = err(
+                    "CODEC_UNVERIFIED",
+                    "Kari playback requires a positively verified H.264 video stream.",
+                    Some(provider),
+                    415,
+                );
+                return write_raw_json(stream, status, &body, None).await;
+            }
+        };
+        if !kari_probe_confirms_h264(&probe) {
+            let (status, body) = err(
+                "SOURCE_CODEC_BLOCKED",
+                "Kari playback is available only when FFprobe confirms H.264 video.",
+                Some(provider),
+                415,
+            );
+            return write_raw_json(stream, status, &body, None).await;
+        }
         let mut backend_playback = playback;
         backend_playback.url = source_playback_url(
             state,
@@ -8006,6 +8067,42 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn kari_playback_requires_ffprobe_verified_h264_video() {
+        let probe = |codec: Option<&str>| ProbeOutput {
+            streams: codec
+                .map(|codec| ProbeStream {
+                    index: Some(0),
+                    codec_name: Some(codec.to_owned()),
+                    codec_type: Some("video".into()),
+                    channels: None,
+                    disposition: None,
+                    tags: None,
+                })
+                .into_iter()
+                .collect(),
+        };
+        assert!(kari_probe_confirms_h264(&probe(Some("h264"))));
+        assert!(kari_probe_confirms_h264(&probe(Some("avc1.640028"))));
+        assert!(!kari_probe_confirms_h264(&probe(Some("hevc"))));
+        assert!(!kari_probe_confirms_h264(&probe(Some("vp9"))));
+        assert!(!kari_probe_confirms_h264(&probe(None)));
+    }
+
+    #[test]
+    fn playable_provider_status_takes_precedence_over_failed_candidate() {
+        assert_eq!(provider_source_status(true, true, false), Some("ok"));
+        assert_eq!(
+            provider_source_status(false, true, true),
+            Some("source_check_failed")
+        );
+        assert_eq!(
+            provider_source_status(false, false, true),
+            Some("no_source_confirmed")
+        );
+        assert_eq!(provider_source_status(false, false, false), None);
     }
 
     #[test]

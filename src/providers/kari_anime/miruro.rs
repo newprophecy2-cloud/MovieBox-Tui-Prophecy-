@@ -242,7 +242,8 @@ async fn get_text(http: &reqwest::Client, raw: &str) -> Result<String, ProviderE
     let status = response.status();
     crate::rate_limit::observe_url(&url_string, status, response.headers()).await;
     if status.as_u16() == 429 {
-        return Err(ProviderError::RateLimited(None));
+        let retry = crate::rate_limit::retry_after(response.headers()).map(|delay| delay.as_secs());
+        return Err(ProviderError::RateLimited(retry));
     }
     if !status.is_success() {
         return Err(ProviderError::Unavailable(format!(
@@ -715,6 +716,12 @@ pub(crate) async fn resolve(
             "Miruro episode identity must be one-based".into(),
         ));
     }
+    if season != 1 {
+        return Err(ProviderError::Unavailable(
+            "Miruro native episode data exposes season 1 only; another season cannot be verified"
+                .into(),
+        ));
+    }
     let (item, slug) = resolve_coords(http, id).await?;
     let (body, _) = watch_data(http, &item, &slug, episode).await?;
     releases(&body, season, episode)
@@ -798,5 +805,13 @@ mod tests {
     fn only_supported_stream_urls_are_retained() {
         assert!(valid_url("javascript:alert(1)").is_none());
         assert!(is_dead("https://cdn.shiora.top/a.m3u8"));
+    }
+
+    #[tokio::test]
+    async fn resolve_rejects_unverified_season_before_network_access() {
+        let error = resolve(&reqwest::Client::new(), "not-used", 2, 1)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::Unavailable(_)));
     }
 }

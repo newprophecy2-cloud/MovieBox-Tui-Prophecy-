@@ -182,9 +182,12 @@ pub(crate) async fn resolve_embed(
         .await
         .map_err(|e| ProviderError::Network(e.to_string()))?;
     let status = page.status();
+    crate::rate_limit::observe_url(embed.as_str(), status, page.headers()).await;
     if !status.is_success() {
         return Err(if status.as_u16() == 429 {
-            ProviderError::RateLimited(None)
+            ProviderError::RateLimited(
+                crate::rate_limit::retry_after(page.headers()).map(|delay| delay.as_secs()),
+            )
         } else {
             ProviderError::Unavailable(format!("MegaPlay embed HTTP status {}", status.as_u16()))
         });
@@ -220,9 +223,12 @@ pub(crate) async fn resolve_embed(
         .await
         .map_err(|e| ProviderError::Network(e.to_string()))?;
     let status = response.status();
+    crate::rate_limit::observe_url(&endpoint, status, response.headers()).await;
     if !status.is_success() {
         return Err(if status.as_u16() == 429 {
-            ProviderError::RateLimited(None)
+            ProviderError::RateLimited(
+                crate::rate_limit::retry_after(response.headers()).map(|delay| delay.as_secs()),
+            )
         } else {
             ProviderError::Unavailable(format!(
                 "MegaPlay getSources HTTP status {}",

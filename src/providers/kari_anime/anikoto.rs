@@ -94,11 +94,19 @@ async fn get_text(http: &Client, url: &str, referer: &str) -> Result<String, Pro
         .send()
         .await
         .map_err(req_error)?;
-    crate::rate_limit::observe_url(url, r.status(), r.headers()).await;
-    if !r.status().is_success() {
+    let status = r.status();
+    crate::rate_limit::observe_url(url, status, r.headers()).await;
+    if status.as_u16() == 429 {
+        let retry = crate::rate_limit::retry_after(r.headers()).map(|delay| delay.as_secs());
+        return Err(ProviderError::RateLimited(retry));
+    }
+    if status.as_u16() == 404 {
+        return Err(ProviderError::NotFound);
+    }
+    if !status.is_success() {
         return Err(ProviderError::Unavailable(format!(
             "HTTP status {}",
-            r.status().as_u16()
+            status.as_u16()
         )));
     }
     r.text()
@@ -139,6 +147,7 @@ async fn native_episode_html(
 ) -> Result<String, ProviderError> {
     let aid = native_id(http, candidate).await?;
     let url = format!("{SITE}/ajax/episode/list/{aid}");
+    let observation_url = url.clone();
     let _permit = crate::rate_limit::acquire_url(&url)
         .await
         .map_err(ProviderError::Unavailable)?;
@@ -147,13 +156,19 @@ async fn native_episode_html(
         .send()
         .await
         .map_err(req_error)?;
-    if response.status().as_u16() == 429 {
-        return Err(ProviderError::RateLimited(None));
+    let status = response.status();
+    crate::rate_limit::observe_url(&observation_url, status, response.headers()).await;
+    if status.as_u16() == 429 {
+        let retry = crate::rate_limit::retry_after(response.headers()).map(|delay| delay.as_secs());
+        return Err(ProviderError::RateLimited(retry));
     }
-    if !response.status().is_success() {
+    if status.as_u16() == 404 {
+        return Err(ProviderError::NotFound);
+    }
+    if !status.is_success() {
         return Err(ProviderError::Unavailable(format!(
             "Anikoto episode-list HTTP {}",
-            response.status().as_u16()
+            status.as_u16()
         )));
     }
     let raw: Value = response
@@ -245,10 +260,13 @@ pub(crate) async fn details(
     let candidate = decode_native_id(native_ref)?;
     let html = native_episode_html(http, &candidate).await?;
     let s_no = season(&candidate.name);
-    let episodes = episodes_from_html(&html, s_no)
+    let rows = episodes_from_html(&html, s_no);
+    let has_sub = rows.iter().any(|row| row.3);
+    let has_dub = rows.iter().any(|row| row.4);
+    let episodes = rows
         .into_iter()
-        .filter_map(|(n, t, _, sub, _, _)| {
-            sub.then_some(Episode {
+        .filter_map(|(n, t, _, sub, dub, _)| {
+            (sub || dub).then_some(Episode {
                 season: s_no,
                 number: n,
                 title: Some(t),
@@ -270,7 +288,12 @@ pub(crate) async fn details(
         director: None,
         stars: None,
         prints: None,
-        audios: Some("sub".into()),
+        audios: match (has_sub, has_dub) {
+            (true, true) => Some("sub; dub".into()),
+            (true, false) => Some("sub".into()),
+            (false, true) => Some("dub".into()),
+            (false, false) => None,
+        },
         poster_url: None,
         duration: None,
         genres: vec![],
@@ -289,6 +312,11 @@ pub(crate) async fn resolve(
     episode: usize,
 ) -> Result<Vec<Release>, ProviderError> {
     let candidate = decode_native_id(native_ref)?;
+    if requested_season != season(&candidate.name) {
+        return Err(ProviderError::Unavailable(format!(
+            "Anikoto cannot verify season {requested_season} from the native episode list"
+        )));
+    }
     let aid = native_id(http, &candidate).await?;
     let html = native_episode_html(http, &candidate).await?;
     let watch = format!("{SITE}/watch/{}", candidate.slug);
@@ -302,11 +330,11 @@ pub(crate) async fn resolve(
                 "Anikoto episode {requested_season}x{episode} unavailable"
             ))
         })?;
-    // Use only the requested audio. Existing Release API does not carry audio as a separate selector; provider uses sub by default.
+    // Prefer sub when present; preserve dub-only episodes rather than dropping them.
     let category = if wanted.3 {
         "sub"
     } else if wanted.4 {
-        return Err(ProviderError::Unavailable("requested episode is dub-only; audio selection is not represented in resolve arguments".into()));
+        "dub"
     } else {
         return Err(ProviderError::Unavailable(
             "requested subtitle audio is unavailable".into(),
@@ -319,11 +347,27 @@ pub(crate) async fn resolve(
     let _permit = crate::rate_limit::acquire_url(&sl_url)
         .await
         .map_err(ProviderError::Unavailable)?;
-    let list = headers(http.get(sl_url), &watch)
+    let list = headers(http.get(&sl_url), &watch)
         .header("X-Requested-With", "XMLHttpRequest")
         .send()
         .await
-        .map_err(req_error)?
+        .map_err(req_error)?;
+    let list_status = list.status();
+    crate::rate_limit::observe_url(&sl_url, list_status, list.headers()).await;
+    if list_status.as_u16() == 429 {
+        let retry = crate::rate_limit::retry_after(list.headers()).map(|delay| delay.as_secs());
+        return Err(ProviderError::RateLimited(retry));
+    }
+    if list_status.as_u16() == 404 {
+        return Err(ProviderError::NotFound);
+    }
+    if !list_status.is_success() {
+        return Err(ProviderError::Unavailable(format!(
+            "Anikoto server-list HTTP {}",
+            list_status.as_u16()
+        )));
+    }
+    let list = list
         .json::<Value>()
         .await
         .map_err(|e| ProviderError::Parsing(e.to_string()))?;
@@ -374,20 +418,40 @@ pub(crate) async fn resolve(
                 continue;
             }
         };
-        let val = match headers(http.get(ep_url), &watch)
+        let response = match headers(http.get(&ep_url), &watch)
             .header("X-Requested-With", "XMLHttpRequest")
             .send()
             .await
         {
-            Ok(r) => match r.json::<Value>().await {
-                Ok(v) => v,
-                Err(e) => {
-                    last = Some(ProviderError::Parsing(e.to_string()));
-                    continue;
-                }
-            },
+            Ok(response) => response,
             Err(e) => {
                 last = Some(req_error(e));
+                continue;
+            }
+        };
+        let status = response.status();
+        crate::rate_limit::observe_url(&ep_url, status, response.headers()).await;
+        if status.as_u16() == 429 {
+            let retry =
+                crate::rate_limit::retry_after(response.headers()).map(|delay| delay.as_secs());
+            last = Some(ProviderError::RateLimited(retry));
+            continue;
+        }
+        if status.as_u16() == 404 {
+            last = Some(ProviderError::NotFound);
+            continue;
+        }
+        if !status.is_success() {
+            last = Some(ProviderError::Unavailable(format!(
+                "Anikoto server HTTP {}",
+                status.as_u16()
+            )));
+            continue;
+        }
+        let val = match response.json::<Value>().await {
+            Ok(value) => value,
+            Err(error) => {
+                last = Some(ProviderError::Parsing(error.to_string()));
                 continue;
             }
         };
@@ -469,13 +533,17 @@ mod tests {
     #[test]
     fn parses_episode_audio_and_data_ids() {
         let x = episodes_from_html(
-            r#"<a data-num="2" data-ids="77" data-sub="1" data-dub="0">2 Test</a>"#,
+            r#"<a data-num="2" data-ids="77" data-sub="1" data-dub="0">2 Test</a><a data-num="3" data-ids="78" data-sub="0" data-dub="1">3 Dub only</a>"#,
             1,
         );
+        assert_eq!(x.len(), 2);
         assert_eq!(x[0].0, 2);
         assert_eq!(x[0].2, "77");
         assert!(x[0].3);
         assert!(!x[0].4);
+        assert_eq!(x[1].2, "78");
+        assert!(!x[1].3);
+        assert!(x[1].4);
     }
     #[test]
     fn parses_watch_search_fixture() {
@@ -485,5 +553,17 @@ mod tests {
         );
         assert_eq!(x[0].slug, "example");
         assert_eq!(x[0].id.as_deref(), Some("42"));
+    }
+
+    #[tokio::test]
+    async fn resolve_rejects_unverified_requested_season_before_network_access() {
+        let candidate = Candidate {
+            slug: "native-show".into(),
+            name: "Native Show".into(),
+            id: Some("42".into()),
+        };
+        let identity = serde_json::to_string(&candidate).unwrap();
+        let error = resolve(&Client::new(), &identity, 2, 1).await.unwrap_err();
+        assert!(matches!(error, ProviderError::Unavailable(_)));
     }
 }
