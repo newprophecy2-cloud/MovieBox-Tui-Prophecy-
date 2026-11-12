@@ -77,3 +77,21 @@ Final safety state:
 ```
 
 The branch remains `kari` and HEAD remains `85464aaee6ae7ee8d9d8a0df5f4a1a6be668fc8e`. No commit, push, PR, deployment, VPS/production access, APK modification, Firebase modification, destructive Git command, or remote-branch change was performed. Existing user work was preserved.
+
+## Phase 2 verification addendum — 2026-11-12
+
+The GitHub `kari` branch was cloned from `newprophecy2-cloud/MovieBox-Tui-Prophecy-`. The remote branch was already at `ada78533515a24f0dafb7ce5189be8d73415648f`, with the requested `85464aaee6ae7ee8d9d8a0df5f4a1a6be668fc8e` as its parent. No prior uncommitted working-tree changes were present in the GitHub checkout.
+
+This follow-up adds a process-wide host registry API in `src/rate_limit.rs`. `acquire_url` keys cancellation-safe semaphore acquisition by the actual URL host, and `observe_url` records sanitized host/status data and adaptive 429/5xx cooldowns. The shared hooks are integrated into Ani.pm metadata/search/playback (including the dynamic Settlar embed host), Anikoto native watch/AJAX/server paths, MegaPlay embed/source discovery, Miruro’s common HTTP helper, Dramachi title/search/episode/file paths, and FourKHDHub health/page/preflight paths. Provider-specific cooldown state remains isolated by host. AniVault, AniCine, and AniDream remain blocked because no verified native upstream contract exists; no endpoint or identity was invented.
+
+AniList now enforces an actual rolling 24-request/60-second process-local budget in addition to its 2.5-second minimum interval, one-request concurrency limit, cache, negative cache, singleflight, cooldown header handling, circuit breaker, timeout, and cancellation-safe waits. AniList GraphQL remains POST and is not automatically retried, consistent with the unsafe-POST rule.
+
+Validation completed without live upstream acceptance:
+
+- `cargo fmt --all -- --check`: PASS.
+- `cargo check --lib`: PASS.
+- `cargo test --lib`: PASS — 578 passed, 0 failed.
+- `git diff --check`: PASS.
+- Live Termux acceptance was not run because this environment is a sandbox rather than the requested Termux device; no live provider results are claimed.
+
+This addendum does not claim a complete all-backend transport replacement: remaining raw HTTP paths include some addon, CircleFTP, DhakaFlix, MovieBox, proxy/media, TV, updater, and subtitle/poster paths, and the AniList coordinator has no active production metadata consumer in the current source. Those are explicit remaining integration items rather than fabricated completion claims.

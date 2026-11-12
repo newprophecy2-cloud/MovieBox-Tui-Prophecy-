@@ -117,6 +117,9 @@ impl DramachiClient {
             self.base_url,
             encode_param(title_id)
         );
+        let _permit = crate::rate_limit::acquire_url(&url)
+            .await
+            .map_err(DramachiError::Parsing)?;
         let resp = self.client.get(&url).send().await?.error_for_status()?;
         let data: DramachiTitleDetailsResponse = resp
             .json()
@@ -149,6 +152,9 @@ impl DramachiClient {
             page.max(1)
         );
 
+        let _permit = crate::rate_limit::acquire_url(&url)
+            .await
+            .map_err(DramachiError::Parsing)?;
         let resp = self.client.get(&url).send().await?.error_for_status()?;
         let data: DramachiSearchResponse = resp
             .json()
@@ -381,6 +387,9 @@ impl DramachiClient {
             encode_param(title_id)
         );
 
+        let _permit = crate::rate_limit::acquire_url(&url)
+            .await
+            .map_err(DramachiError::Parsing)?;
         let resp = self.client.get(&url).send().await?.error_for_status()?;
         let data: DramachiEpisodeListResponse = resp
             .json()
@@ -410,6 +419,9 @@ impl DramachiClient {
             encode_param(disk)
         );
 
+        let _permit = crate::rate_limit::acquire_url(&url)
+            .await
+            .map_err(DramachiError::Parsing)?;
         let resp = self.client.get(&url).send().await?;
         let data: DramachiFileInfoResponse = resp.json().await.map_err(|e| {
             DramachiError::Parsing(format!("failed to parse getFile response: {e}"))

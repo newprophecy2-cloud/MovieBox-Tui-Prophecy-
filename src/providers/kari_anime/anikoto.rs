@@ -87,10 +87,14 @@ fn candidate_html(html: &str, ajax: bool) -> Vec<Candidate> {
     out
 }
 async fn get_text(http: &Client, url: &str, referer: &str) -> Result<String, ProviderError> {
+    let _permit = crate::rate_limit::acquire_url(url)
+        .await
+        .map_err(ProviderError::Unavailable)?;
     let r = headers(http.get(url), referer)
         .send()
         .await
         .map_err(req_error)?;
+    crate::rate_limit::observe_url(url, r.status(), r.headers()).await;
     if !r.status().is_success() {
         return Err(ProviderError::Unavailable(format!(
             "HTTP status {}",
@@ -135,6 +139,9 @@ async fn native_episode_html(
 ) -> Result<String, ProviderError> {
     let aid = native_id(http, candidate).await?;
     let url = format!("{SITE}/ajax/episode/list/{aid}");
+    let _permit = crate::rate_limit::acquire_url(&url)
+        .await
+        .map_err(ProviderError::Unavailable)?;
     let response = headers(http.get(url), &format!("{SITE}/watch/{}", candidate.slug))
         .header("X-Requested-With", "XMLHttpRequest")
         .send()
@@ -309,6 +316,9 @@ pub(crate) async fn resolve(
         "{SITE}/ajax/server/list?servers={}",
         url::form_urlencoded::byte_serialize(wanted.2.as_bytes()).collect::<String>()
     );
+    let _permit = crate::rate_limit::acquire_url(&sl_url)
+        .await
+        .map_err(ProviderError::Unavailable)?;
     let list = headers(http.get(sl_url), &watch)
         .header("X-Requested-With", "XMLHttpRequest")
         .send()
@@ -357,6 +367,13 @@ pub(crate) async fn resolve(
             "{SITE}/ajax/server?get={}",
             url::form_urlencoded::byte_serialize(link.as_bytes()).collect::<String>()
         );
+        let _permit = match crate::rate_limit::acquire_url(&ep_url).await {
+            Ok(permit) => permit,
+            Err(error) => {
+                last = Some(ProviderError::Unavailable(error));
+                continue;
+            }
+        };
         let val = match headers(http.get(ep_url), &watch)
             .header("X-Requested-With", "XMLHttpRequest")
             .send()

@@ -59,11 +59,10 @@ impl KariClient {
     }
 
     async fn anipm_json(&self, path: &str) -> Result<Value, ProviderError> {
-        let _permit =
-            self.limiter.acquire().await.map_err(|_| {
-                ProviderError::Unavailable("Ani.pm request budget timed out".into())
-            })?;
         let url = format!("{}{}", self.base(), path);
+        let _permit = crate::rate_limit::acquire_url(&url)
+            .await
+            .map_err(ProviderError::Unavailable)?;
         let response = self
             .http
             .get(&url)
@@ -74,9 +73,7 @@ impl KariClient {
             .await
             .map_err(|e| ProviderError::Network(e.to_string()))?;
         let status = response.status();
-        self.limiter
-            .record_response(status, response.headers())
-            .await;
+        crate::rate_limit::observe_url(&url, status, response.headers()).await;
         if status.as_u16() == 429 {
             let retry = response
                 .headers()
@@ -101,13 +98,13 @@ impl KariClient {
     }
 
     async fn search_anipm(&self, query: &str) -> Result<Vec<CatalogItem>, ProviderError> {
-        let _permit =
-            self.limiter.acquire().await.map_err(|_| {
-                ProviderError::Unavailable("Ani.pm request budget timed out".into())
-            })?;
         let mut url = reqwest::Url::parse(&format!("{}/api/anime/search", self.base()))
             .map_err(|e| ProviderError::Parsing(e.to_string()))?;
         url.query_pairs_mut().append_pair("q", query.trim());
+        let url_string = url.to_string();
+        let _permit = crate::rate_limit::acquire_url(&url_string)
+            .await
+            .map_err(ProviderError::Unavailable)?;
         let response = self
             .http
             .get(url)
@@ -118,9 +115,7 @@ impl KariClient {
             .await
             .map_err(|e| ProviderError::Network(e.to_string()))?;
         let status = response.status();
-        self.limiter
-            .record_response(status, response.headers())
-            .await;
+        crate::rate_limit::observe_url(&url_string, status, response.headers()).await;
         if status.as_u16() == 429 {
             let retry = response
                 .headers()
@@ -376,11 +371,15 @@ impl KariClient {
             episode,
             encode_component(language)
         );
-        let boot = headers(client.get(boot_url))
+        let _boot_permit = crate::rate_limit::acquire_url(&boot_url)
+            .await
+            .map_err(ProviderError::Unavailable)?;
+        let boot = headers(client.get(&boot_url))
             .send()
             .await
             .map_err(|e| ProviderError::Network(e.to_string()))?;
         let status = boot.status();
+        crate::rate_limit::observe_url(&boot_url, status, boot.headers()).await;
         if status.as_u16() == 429 {
             return Err(ProviderError::RateLimited(None));
         }
@@ -419,16 +418,21 @@ impl KariClient {
                     "Ani.pm has no native {language} selection for this episode"
                 ))
             })?;
-        let session = headers(client.get(format!(
+        let session_url = format!(
             "{}/api/anime/settlar/session?selection={}&provider=anipm&ep={}&channel={}&telemetry=0",
             self.base(),
             encode_component(selection),
             episode,
             encode_component(language)
-        )))
-        .send()
-        .await
-        .map_err(|e| ProviderError::Network(e.to_string()))?;
+        );
+        let _session_permit = crate::rate_limit::acquire_url(&session_url)
+            .await
+            .map_err(ProviderError::Unavailable)?;
+        let session = headers(client.get(&session_url))
+            .send()
+            .await
+            .map_err(|e| ProviderError::Network(e.to_string()))?;
+        crate::rate_limit::observe_url(&session_url, session.status(), session.headers()).await;
         let session: Value = session
             .json()
             .await
@@ -446,17 +450,22 @@ impl KariClient {
             .ok_or_else(|| {
                 ProviderError::Unavailable("Ani.pm embed has no session token".into())
             })?;
+        let playback_url = format!(
+            "https://embed.settlar.io/api/embed/session?t={}",
+            encode_component(&token)
+        );
+        let _playback_permit = crate::rate_limit::acquire_url(&playback_url)
+            .await
+            .map_err(ProviderError::Unavailable)?;
         let playback = client
-            .get(format!(
-                "https://embed.settlar.io/api/embed/session?t={}",
-                encode_component(&token)
-            ))
+            .get(&playback_url)
             .header(USER_AGENT, crate::net::DEFAULT_BROWSER_USER_AGENT)
             .header(REFERER, embed)
             .header(ACCEPT, "application/json")
             .send()
             .await
             .map_err(|e| ProviderError::Network(e.to_string()))?;
+        crate::rate_limit::observe_url(&playback_url, playback.status(), playback.headers()).await;
         let playback: Value = playback
             .json()
             .await

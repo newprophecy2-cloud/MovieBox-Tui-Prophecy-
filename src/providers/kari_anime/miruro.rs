@@ -227,6 +227,10 @@ fn redirect_slug(body: &str) -> Option<String> {
 
 async fn get_text(http: &reqwest::Client, raw: &str) -> Result<String, ProviderError> {
     let url = crate::net::validate_url_syntax(raw, false).map_err(ProviderError::Parsing)?;
+    let url_string = url.to_string();
+    let _permit = crate::rate_limit::acquire_url(&url_string)
+        .await
+        .map_err(ProviderError::Unavailable)?;
     let response = http
         .get(url)
         .header(reqwest::header::USER_AGENT, UA)
@@ -236,6 +240,7 @@ async fn get_text(http: &reqwest::Client, raw: &str) -> Result<String, ProviderE
         .await
         .map_err(|e| ProviderError::Network(e.to_string()))?;
     let status = response.status();
+    crate::rate_limit::observe_url(&url_string, status, response.headers()).await;
     if status.as_u16() == 429 {
         return Err(ProviderError::RateLimited(None));
     }

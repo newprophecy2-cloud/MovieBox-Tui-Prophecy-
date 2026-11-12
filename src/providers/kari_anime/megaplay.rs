@@ -171,6 +171,9 @@ pub(crate) async fn resolve_embed(
     use crate::providers::models::ProviderError;
     let embed =
         crate::net::validate_url_syntax(embed_url, false).map_err(ProviderError::Parsing)?;
+    let _embed_permit = crate::rate_limit::acquire_url(embed.as_str())
+        .await
+        .map_err(ProviderError::Unavailable)?;
     let page = client
         .get(embed.clone())
         .header(reqwest::header::USER_AGENT, user_agent)
@@ -204,6 +207,9 @@ pub(crate) async fn resolve_embed(
         embed.host_str().unwrap_or_default(),
         file_id
     );
+    let _sources_permit = crate::rate_limit::acquire_url(&endpoint)
+        .await
+        .map_err(ProviderError::Unavailable)?;
     let response = client
         .get(&endpoint)
         .header(reqwest::header::USER_AGENT, user_agent)

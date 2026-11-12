@@ -8,6 +8,52 @@ const DEFAULT_SPACING: Duration = Duration::from_millis(100);
 const MAX_COOLDOWN: Duration = Duration::from_secs(300);
 const MAX_5XX_RETRIES: usize = 2;
 
+static GLOBAL_HOST_REGISTRY: std::sync::OnceLock<HostLimiterRegistry> = std::sync::OnceLock::new();
+
+/// Process-wide host coordination shared by all provider clients.
+pub fn global_host_registry() -> &'static HostLimiterRegistry {
+    GLOBAL_HOST_REGISTRY.get_or_init(HostLimiterRegistry::default)
+}
+
+/// Acquire coordination for the actual destination host. Dropping the owned
+/// permit is cancellation-safe and releases the concurrency slot.
+pub async fn acquire_url(url: &str) -> Result<OwnedSemaphorePermit, String> {
+    let parsed = reqwest::Url::parse(url).map_err(|_| "invalid request URL".to_string())?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "request URL has no host".to_string())?;
+    global_host_registry()
+        .for_host(host)
+        .await
+        .acquire()
+        .await
+        .map_err(|_| "request limiter wait timed out".to_string())
+}
+
+/// Record only sanitized host/status information and adaptive cooldown data.
+pub async fn observe_url(
+    url: &str,
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+) {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return;
+    };
+    let Some(host) = parsed.host_str() else {
+        return;
+    };
+    global_host_registry()
+        .for_host(host)
+        .await
+        .record_response(status, headers)
+        .await;
+    log::debug!(
+        "coordinated upstream response host={} status={}",
+        host,
+        status.as_u16()
+    );
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetryClass {
     SafeIdempotent,

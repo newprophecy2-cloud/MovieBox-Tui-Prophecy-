@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -24,6 +24,7 @@ type SharedLookup = Shared<BoxFuture<'static, Result<Option<Value>, String>>>;
 pub struct AniListCoordinator {
     client: reqwest::Client,
     limiter: crate::rate_limit::HostLimiter,
+    budget: Arc<Mutex<VecDeque<Instant>>>,
     cache: Arc<Mutex<HashMap<String, CacheEntry>>>,
     inflight: Arc<Mutex<HashMap<String, SharedLookup>>>,
     circuit: Arc<Mutex<CircuitState>>,
@@ -49,6 +50,7 @@ impl AniListCoordinator {
                 MAX_CONCURRENT_REQUESTS,
                 MIN_REQUEST_INTERVAL,
             ),
+            budget: Arc::new(Mutex::new(VecDeque::with_capacity(REQUESTS_PER_MINUTE))),
             cache: Arc::new(Mutex::new(HashMap::new())),
             inflight: Arc::new(Mutex::new(HashMap::new())),
             circuit: Arc::new(Mutex::new(CircuitState::default())),
@@ -139,6 +141,9 @@ impl AniListCoordinator {
             }
         }
 
+        tokio::time::timeout(Duration::from_secs(20), self.acquire_budget())
+            .await
+            .map_err(|_| "AniList global budget wait timed out".to_string())?;
         let _permit = self.limiter.acquire().await.map_err(|_| {
             "AniList request timed out while waiting for the global budget".to_string()
         })?;
@@ -176,6 +181,32 @@ impl AniListCoordinator {
             .and_then(|page| page.get("media"));
         self.record_failure(false).await;
         Ok(media.filter(|value| !value.is_null()).cloned())
+    }
+
+    async fn acquire_budget(&self) {
+        loop {
+            let wait = {
+                let mut budget = self.budget.lock().await;
+                let now = Instant::now();
+                while budget
+                    .front()
+                    .is_some_and(|stamp| now.duration_since(*stamp) >= Duration::from_secs(60))
+                {
+                    budget.pop_front();
+                }
+                if budget.len() < REQUESTS_PER_MINUTE {
+                    budget.push_back(now);
+                    return;
+                }
+                budget
+                    .front()
+                    .map(|stamp| Duration::from_secs(60).saturating_sub(now.duration_since(*stamp)))
+                    .unwrap_or_default()
+            };
+            if !wait.is_zero() {
+                tokio::time::sleep(wait).await;
+            }
+        }
     }
 
     async fn record_failure(&self, failure: bool) {

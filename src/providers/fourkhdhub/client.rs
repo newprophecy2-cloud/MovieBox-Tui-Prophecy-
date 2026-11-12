@@ -85,7 +85,16 @@ impl FourKHdHubClient {
     }
 
     pub async fn health_check(&self) -> Result<(), FourKHdHubError> {
+        let _permit = crate::rate_limit::acquire_url(self.base_url.as_str())
+            .await
+            .map_err(FourKHdHubError::Parse)?;
         let response = self.client.get(self.base_url.clone()).send().await?;
+        crate::rate_limit::observe_url(
+            self.base_url.as_str(),
+            response.status(),
+            response.headers(),
+        )
+        .await;
         if !response.status().is_success() {
             return Err(FourKHdHubError::Parse(format!(
                 "health check returned {}",
@@ -309,6 +318,9 @@ impl FourKHdHubClient {
     ) -> Result<(String, bool), FourKHdHubError> {
         let probe = async {
             let validated_url = self.validate_public_playback_url(url).await?;
+            let _permit = crate::rate_limit::acquire_url(&validated_url)
+                .await
+                .map_err(FourKHdHubError::Parse)?;
             let mut request = self
                 .client
                 .get(&validated_url)
@@ -359,6 +371,9 @@ impl FourKHdHubClient {
                         ))
                     })?;
                 let wrapped = self.validate_public_playback_url(&wrapped).await?;
+                let _wrapped_permit = crate::rate_limit::acquire_url(&wrapped)
+                    .await
+                    .map_err(FourKHdHubError::Parse)?;
                 let mut wrapped_request = self
                     .client
                     .get(&wrapped)
@@ -421,7 +436,12 @@ impl FourKHdHubClient {
     }
 
     async fn fetch_text(&self, url: Url) -> Result<String, FourKHdHubError> {
+        let url_string = url.to_string();
+        let _permit = crate::rate_limit::acquire_url(&url_string)
+            .await
+            .map_err(FourKHdHubError::Parse)?;
         let response = self.client.get(url).send().await?.error_for_status()?;
+        crate::rate_limit::observe_url(&url_string, response.status(), response.headers()).await;
         Ok(response.text().await?)
     }
 
