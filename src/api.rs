@@ -250,8 +250,25 @@ fn source_codec_eligibility(codec: Option<&str>) -> SourceCodecEligibility {
     }
 }
 
+fn is_kari_provider(provider: ProviderKind) -> bool {
+    matches!(
+        provider,
+        ProviderKind::Anivault
+            | ProviderKind::Anipm
+            | ProviderKind::Anicine
+            | ProviderKind::Anikoto
+            | ProviderKind::Miruro
+            | ProviderKind::Anidream
+    )
+}
+
+fn release_codec_is_eligible(release: &Release) -> bool {
+    is_kari_provider(release.provider)
+        || source_codec_eligibility(release.codec.as_deref()) == SourceCodecEligibility::Verified
+}
+
 fn release_has_usable_source(release: &Release) -> bool {
-    source_codec_eligibility(release.codec.as_deref()) == SourceCodecEligibility::Verified
+    release_codec_is_eligible(release)
         && release.mirrors.iter().any(|mirror| {
             !mirror.resolver_url.trim().is_empty()
                 && crate::net::validate_url_syntax(&mirror.resolver_url, true).is_ok()
@@ -272,6 +289,9 @@ fn is_blocked_h265_codec(codec: Option<&str>) -> bool {
 
 fn codec_ineligibility_error(releases: &[Release]) -> Option<(&'static str, &'static str)> {
     if releases.is_empty()
+        || releases
+            .iter()
+            .all(|release| is_kari_provider(release.provider))
         || releases.iter().any(|release| {
             source_codec_eligibility(release.codec.as_deref()) == SourceCodecEligibility::Verified
         })
@@ -4391,10 +4411,11 @@ async fn playback_route(
     // Probe the resolved source for real audio tracks when possible. A failed probe
     // must not block playback (some HLS/DASH providers prevent ffprobe access).
     let native_candidate = state.native_stream.supports_url(&playback.url);
+    let kari_codec_policy = is_kari_provider(source_ref.p);
     let (probe_result, native_codec_result) = tokio::join!(
         probe_media_bounded(&state, &playback.url, &playback.headers),
         async {
-            if native_candidate {
+            if native_candidate && !kari_codec_policy {
                 Some(crate::codec_verification::verify_playback_source(&playback).await)
             } else {
                 None
@@ -4432,7 +4453,7 @@ async fn playback_route(
         Err(_) => Vec::new(),
     };
     let mut playback = playback;
-    if native_candidate {
+    if native_candidate && !kari_codec_policy {
         match native_codec_result
             .unwrap_or(Err(crate::codec_verification::CodecProbeError::ProbeFailed))
         {
@@ -4725,9 +4746,7 @@ fn api_sources_for_content(
 ) -> Vec<ApiSource> {
     rs.iter()
         .enumerate()
-        .filter(|(_, release)| {
-            source_codec_eligibility(release.codec.as_deref()) == SourceCodecEligibility::Verified
-        })
+        .filter(|(_, release)| release_codec_is_eligible(release))
         .map(|(i, r)| ApiSource {
             id: source_ref_for_content(r, episode, i, content_type),
             label: r.source_label().to_string(),
@@ -5754,6 +5773,17 @@ async fn write_verified_playback_response(
             return write_raw_json(stream, status, &body, None).await;
         }
     };
+    if is_kari_provider(provider) {
+        let mut backend_playback = playback;
+        backend_playback.url = source_playback_url(
+            state,
+            source_id,
+            &backend_playback.url,
+            &backend_playback.headers,
+        );
+        backend_playback.headers.clear();
+        return write_json(stream, 200, &playback_json(&backend_playback), None).await;
+    }
     if state.native_stream.supports_url(&playback.url) {
         return match crate::codec_verification::verify_playback_source(&playback).await {
             Ok(crate::codec_verification::CodecProbeResult::Allowed(_)) => {
@@ -5945,7 +5975,7 @@ fn is_public_transcode_ip(address: std::net::IpAddr) -> bool {
 }
 
 fn direct_transcode_playback_source(source: &Release) -> Option<PlaybackSource> {
-    if source_codec_eligibility(source.codec.as_deref()) != SourceCodecEligibility::Verified {
+    if !release_codec_is_eligible(source) {
         return None;
     }
     if source.provider == ProviderKind::FourKHdHub {
@@ -6553,6 +6583,17 @@ async fn transcode_source(
     };
     let debug_id = REMUX_DEBUG_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     if let Some(seek_seconds) = seek_seconds {
+        if is_kari_provider(source.provider) {
+            return crate::progressive_remux::serve_from_timestamp(
+                stream,
+                &validated_url,
+                &playback.headers,
+                seek_seconds,
+                state.remux_cache.job_timeout(),
+                debug_id,
+            )
+            .await;
+        }
         match crate::codec_verification::inspect_direct_playback_source(&playback).await {
             Ok(evidence) if evidence.range_supported => {
                 crate::progressive_remux::serve_from_timestamp(
@@ -8481,6 +8522,91 @@ mod tests {
         release.codec = Some("H.264/AVC".into());
         assert!(release_has_usable_source(&release));
         assert!(releases_have_usable_source(&[release]));
+    }
+
+    #[test]
+    fn kari_sources_bypass_codec_metadata_but_keep_url_validation() {
+        let kari_providers = [
+            ProviderKind::Anivault,
+            ProviderKind::Anipm,
+            ProviderKind::Anicine,
+            ProviderKind::Anikoto,
+            ProviderKind::Miruro,
+            ProviderKind::Anidream,
+        ];
+        for provider in kari_providers {
+            let mut release = Release {
+                provider,
+                filename: "episode.m3u8".into(),
+                quality: Some("1080p".into()),
+                codec: None,
+                language: None,
+                size_bytes: None,
+                season: Some(1),
+                episode: Some(1),
+                mirrors: vec![crate::providers::models::SourceMirror {
+                    label: "Kari stream".into(),
+                    resolver_url: "https://cdn.example/episode.m3u8".into(),
+                    headers: vec![],
+                    direct_file: false,
+                }],
+                resource_id: None,
+                subtitles: Vec::new(),
+            };
+            let episode = OpaqueRef {
+                p: provider,
+                v: "kari-title".into(),
+                s: 1,
+                e: 1,
+            };
+            assert!(is_kari_provider(provider));
+            assert!(release_has_usable_source(&release));
+            assert!(codec_ineligibility_error(std::slice::from_ref(&release)).is_none());
+            assert_eq!(api_sources(&[release.clone()], &episode).len(), 1);
+
+            release.mirrors[0].resolver_url = "not-a-url".into();
+            assert!(!release_has_usable_source(&release));
+        }
+    }
+
+    #[test]
+    fn non_kari_unknown_codec_still_fails_closed() {
+        let release = Release {
+            provider: ProviderKind::Addons,
+            filename: "episode.m3u8".into(),
+            quality: Some("1080p".into()),
+            codec: None,
+            language: None,
+            size_bytes: None,
+            season: Some(1),
+            episode: Some(1),
+            mirrors: vec![crate::providers::models::SourceMirror {
+                label: "Addon stream".into(),
+                resolver_url: "https://cdn.example/episode.m3u8".into(),
+                headers: vec![],
+                direct_file: false,
+            }],
+            resource_id: None,
+            subtitles: Vec::new(),
+        };
+        assert!(!is_kari_provider(release.provider));
+        assert!(!release_has_usable_source(&release));
+        assert_eq!(
+            codec_ineligibility_error(std::slice::from_ref(&release)).map(|error| error.0),
+            Some("CODEC_UNVERIFIED")
+        );
+        assert!(
+            api_sources(
+                &[release],
+                &OpaqueRef {
+                    p: ProviderKind::Addons,
+                    v: "addon-title".into(),
+                    s: 1,
+                    e: 1,
+                }
+            )
+            .is_empty()
+        );
     }
 
     #[test]
