@@ -734,6 +734,11 @@ impl AniZoneClient {
         season: usize,
         episode: usize,
     ) -> Result<Vec<Release>, AniZoneError> {
+        let (season, episode) = if season == 0 && episode == 0 {
+            (1, 1)
+        } else {
+            (season, episode)
+        };
         if season != 1 {
             return Err(AniZoneError::Parse(
                 "AniZone does not expose an explicit multi-season mapping".into(),

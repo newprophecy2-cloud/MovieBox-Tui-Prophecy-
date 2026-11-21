@@ -42,7 +42,7 @@ const MAX_QUERY: usize = 200;
 const DEFAULT_LIMIT: usize = 20;
 const MAX_LIMIT: usize = 100;
 #[cfg(not(test))]
-const SOURCE_TIMEOUT: Duration = Duration::from_secs(15);
+const SOURCE_TIMEOUT: Duration = Duration::from_secs(25);
 #[cfg(test)]
 const SOURCE_TIMEOUT: Duration = Duration::from_millis(25);
 #[cfg(not(test))]
@@ -966,6 +966,25 @@ fn catalog(
 }
 fn details(d: MediaDetails) -> ApiDetails {
     let provider_id = d.id.clone();
+    let is_movie = d.media_type == MediaType::Movie;
+    let title_for_movie = d.title.clone();
+    let mut seasons: Vec<ApiSeason> = d
+        .seasons
+        .into_iter()
+        .map(|s| season(s, &provider_id))
+        .collect();
+    if is_movie && seasons.is_empty() {
+        seasons.push(ApiSeason {
+            number: 1,
+            episodes: vec![ApiEpisode {
+                id: provider_ref(&provider_id, 0, 0),
+                season: 1,
+                number: 1,
+                title: Some(title_for_movie),
+                overview: d.description.clone(),
+            }],
+        });
+    }
     ApiDetails {
         id: provider_ref(&d.id, 0, 0),
         title: d.title,
@@ -981,11 +1000,7 @@ fn details(d: MediaDetails) -> ApiDetails {
         poster_url: d.poster_url,
         duration: d.duration,
         genres: d.genres,
-        seasons: d
-            .seasons
-            .into_iter()
-            .map(|s| season(s, &provider_id))
-            .collect(),
+        seasons,
         audio: d.dubs,
     }
 }
@@ -5085,7 +5100,11 @@ async fn movie_route(
                 return write_raw_json(stream, s, &b, None).await;
             }
         };
-    if details_result.media_type != MediaType::Movie {
+    if details_result.media_type != MediaType::Movie
+        && !(r.p == ProviderKind::AniZone
+            && details_result.seasons.len() == 1
+            && details_result.seasons[0].episodes.len() == 1)
+    {
         let (s, b) = err(
             "NOT_A_MOVIE",
             "The requested item is not a movie.",
@@ -6173,6 +6192,7 @@ fn unified_api_details(
             }
         }
     }
+    season_numbers.sort_by_key(|&n| (n == 0, n));
     // Process providers in deterministic priority order. Every candidate here is
     // a real provider record; only a resolved catalog identity may combine it.
     candidates.sort_by_key(|candidate| {
@@ -6308,7 +6328,7 @@ fn unified_api_details(
         });
     }
 
-    let seasons = season_numbers
+    let mut seasons: Vec<UnifiedApiSeason> = season_numbers
         .into_iter()
         .map(|number| {
             let season_mappings = details
@@ -6341,6 +6361,53 @@ fn unified_api_details(
             }
         })
         .collect();
+    if primary.media_type == MediaType::Movie && seasons.is_empty() {
+        let movie_mappings: Vec<ApiProviderMapping> = details
+            .iter()
+            .map(|(anime_id, _)| ApiProviderMapping {
+                id: provider_ref(anime_id, 0, 0),
+                provider: anime_id.provider,
+            })
+            .collect();
+        let movie_lookups: Vec<UnifiedEpisodeProviderLookup> = details
+            .iter()
+            .map(|(anime_id, provider_details)| UnifiedEpisodeProviderLookup {
+                provider: anime_id.provider,
+                provider_title_id: anime_id.value.clone(),
+                provider_season_id: None,
+                provider_episode_id: None,
+                provider_season_number: 0,
+                provider_episode_number: 0,
+                lookup_reference: provider_ref(anime_id, 0, 0),
+                provider_title: Some(provider_details.title.clone()),
+            })
+            .collect();
+        let movie_season_mappings: Vec<ApiSeasonProviderMapping> = details
+            .iter()
+            .map(|(anime_id, _)| ApiSeasonProviderMapping {
+                provider: anime_id.provider,
+                provider_season_id: None,
+                provider_season_number: Some(1),
+            })
+            .collect();
+        seasons.push(UnifiedApiSeason {
+            canonical_id: format!("{canonical_id}:season:1"),
+            number: 1,
+            episode_count: 1,
+            provider_mappings: movie_season_mappings,
+            episodes: vec![UnifiedApiEpisode {
+                id: provider_ref(&details[0].0, 0, 0),
+                canonical_id: format!("{canonical_id}:episode:1:1"),
+                provider_mappings: movie_mappings,
+                provider_lookups: movie_lookups,
+                mapping_status: "resolved".to_string(),
+                season: 1,
+                number: 1,
+                title: Some(primary.title.clone()),
+                overview: primary.description.clone(),
+            }],
+        });
+    }
 
     let provider_mappings = all_mappings
         .iter()
@@ -6504,7 +6571,25 @@ async fn unified_anime_route(
             .iter()
             .flat_map(|season| season.episodes.iter())
             .find(|episode| episode.season == episode_ref.s && episode.number == episode_ref.e)
-            .cloned();
+            .cloned()
+            .or_else(|| {
+                if episode_details.media_type == MediaType::Movie
+                    && episode_details.seasons.is_empty()
+                    && episode_ref.s == 0
+                    && episode_ref.e == 0
+                {
+                    Some(crate::providers::models::Episode {
+                        season: 0,
+                        number: 0,
+                        title: Some(episode_details.title.clone()),
+                        overview: episode_details.description.clone(),
+                        provider_episode_id: None,
+                        provider_season_id: None,
+                    })
+                } else {
+                    None
+                }
+            });
         let Some(selected_episode) = selected_episode else {
             let (status, body) = err(
                 "EPISODE_NOT_FOUND",
@@ -6519,6 +6604,18 @@ async fn unified_anime_route(
             .filter_map(|(mapping, provider_details)| {
                 if mapping.provider == episode_ref.p && mapping.value == episode_ref.v {
                     return None;
+                }
+                if episode_details.media_type == MediaType::Movie
+                    && episode_ref.s == 0
+                    && episode_ref.e == 0
+                    && provider_details.media_type == MediaType::Movie
+                {
+                    return Some(OpaqueRef {
+                        p: mapping.provider,
+                        v: mapping.value.clone(),
+                        s: 0,
+                        e: 0,
+                    });
                 }
                 let episode = matching_episode(&selected_episode, provider_details)?;
                 if episode_special_marker(selected_episode.title.as_deref())
@@ -7285,7 +7382,10 @@ async fn anime_episode_full_route(
         .seasons
         .iter()
         .flat_map(|season| season.episodes.iter())
-        .find(|episode| episode.season == episode_ref.s && episode.number == episode_ref.e)
+        .find(|episode| {
+            episode.id == episode_id
+                || (episode.season == episode_ref.s && episode.number == episode_ref.e)
+        })
         .cloned();
     let Some(selected_episode) = selected_episode else {
         let (status, body) = err(

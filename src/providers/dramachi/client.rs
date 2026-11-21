@@ -645,13 +645,22 @@ impl DramachiClient {
 }
 
 fn extract_leading_season_number(name: &str) -> Option<usize> {
-    let lower = name.to_ascii_lowercase();
-    let after_season = lower.strip_prefix("season")?.trim();
-    let num_str: String = after_season
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
-    num_str.parse::<usize>().ok()
+    let lower = name.trim().to_ascii_lowercase();
+    for prefix in ["season", "part", "cour", "s"] {
+        if let Some(rest) = lower.strip_prefix(prefix) {
+            let trimmed = rest.trim_start_matches([' ', '-', '.', '_']);
+            let num_str: String = trimmed
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if let Ok(num) = num_str.parse::<usize>()
+                && num > 0
+            {
+                return Some(num);
+            }
+        }
+    }
+    None
 }
 
 fn parse_episode_number(f_title: &str) -> Option<usize> {
