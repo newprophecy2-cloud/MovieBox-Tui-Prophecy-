@@ -67,7 +67,7 @@ const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_REQUEST_BODY_BYTES: usize = 256 * 1024;
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_API_CONNECTIONS: usize = 256;
-const MOVIEBOX_PROVIDER_ENABLED: bool = false;
+const MOVIEBOX_PROVIDER_ENABLED: bool = true;
 const REMUX_STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
 const REMUX_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(20);
 static REMUX_LIMITER: std::sync::LazyLock<Arc<Semaphore>> =
@@ -393,6 +393,9 @@ fn release_has_usable_source(release: &Release) -> bool {
                     || mirror.resolver_url.to_ascii_lowercase().contains("m3u8")
             });
     }
+    if release.provider == ProviderKind::MovieBox {
+        return has_valid_url;
+    }
     has_valid_url
         && source_codec_eligibility(release.codec.as_deref()) == SourceCodecEligibility::Verified
 }
@@ -428,7 +431,7 @@ fn release_requires_direct_play_codec_verification(release: &Release) -> bool {
 }
 
 fn direct_play_compatibility(provider: ProviderKind) -> &'static str {
-    if provider == ProviderKind::AniZone {
+    if matches!(provider, ProviderKind::AniZone | ProviderKind::MovieBox) {
         "unverified"
     } else {
         "verified"
@@ -442,28 +445,45 @@ async fn verify_direct_playback_codec(
     let mut verified_release = release.clone();
     if release_requires_direct_play_codec_verification(release) {
         let verification_started = Instant::now();
-        match crate::codec_verification::verify_playback_source(playback)
-            .await
-            .map_err(|_| format!("{} media codec could not be verified", release.provider))?
-        {
-            crate::codec_verification::CodecProbeResult::Allowed(codec) => {
+        match crate::codec_verification::verify_playback_source(playback).await {
+            Ok(crate::codec_verification::CodecProbeResult::Allowed(codec)) => {
                 verified_release.codec = Some(codec);
             }
-            crate::codec_verification::CodecProbeResult::BlockedHevc(_) => {
+            Ok(crate::codec_verification::CodecProbeResult::BlockedHevc(_)) => {
                 return Err(format!(
                     "{} source blocked by H.265/HEVC playback policy",
                     release.provider
                 ));
             }
-            crate::codec_verification::CodecProbeResult::Unsupported(_)
-            | crate::codec_verification::CodecProbeResult::NoVideoStream => {
+            Ok(crate::codec_verification::CodecProbeResult::Unsupported(_))
+            | Ok(crate::codec_verification::CodecProbeResult::NoVideoStream) => {
                 return Err(format!(
                     "confirmed_codec_incompatibility:{}",
                     release.provider
                 ));
             }
-            crate::codec_verification::CodecProbeResult::Unverified(_) => {
+            Ok(crate::codec_verification::CodecProbeResult::Unverified(_)) => {
+                if release.provider == ProviderKind::Dramachi {
+                    log::warn!(
+                        "direct_play_timing provider={} stage=codec_compatibility_verification elapsed_ms={} outcome=unverified_allowed",
+                        release.provider,
+                        verification_started.elapsed().as_millis()
+                    );
+                    return Ok(verified_release);
+                }
                 return Err("codec_unverified".into());
+            }
+            Err(error) => {
+                if release.provider == ProviderKind::Dramachi {
+                    log::warn!(
+                        "direct_play_timing provider={} stage=codec_compatibility_verification elapsed_ms={} outcome=probe_skipped code={}",
+                        release.provider,
+                        verification_started.elapsed().as_millis(),
+                        error.code()
+                    );
+                    return Ok(verified_release);
+                }
+                return Err(format!("{} media codec could not be verified", release.provider));
             }
         }
         log::info!(
@@ -483,7 +503,10 @@ fn codec_ineligibility_error(releases: &[Release]) -> Option<(&'static str, &'st
     if releases.is_empty()
         || releases.iter().any(|release| {
             source_codec_eligibility(release.codec.as_deref()) == SourceCodecEligibility::Verified
-                || (release.provider == ProviderKind::AniZone && release_has_usable_source(release))
+                || (matches!(
+                    release.provider,
+                    ProviderKind::AniZone | ProviderKind::MovieBox
+                ) && release_has_usable_source(release))
                 || release_requires_codec_probe(release)
         })
     {
@@ -7036,27 +7059,58 @@ async fn playback_route(
                         continue;
                     }
                     Ok(Ok(crate::codec_verification::CodecProbeResult::Unverified(_))) => {
-                        saw_provider_failure = true;
-                        continue;
+                        if !matches!(
+                            candidate.provider,
+                            ProviderKind::Dramachi | ProviderKind::AniZone
+                        ) {
+                            saw_provider_failure = true;
+                            continue;
+                        }
+                        log::warn!(
+                            "playback codec unverified, allowing direct playback provider={} source={}",
+                            candidate.provider,
+                            candidate.source_label()
+                        );
                     }
                     Ok(Err(error)) => {
-                        saw_provider_failure = true;
+                        if !matches!(
+                            candidate.provider,
+                            ProviderKind::Dramachi | ProviderKind::AniZone
+                        ) {
+                            saw_provider_failure = true;
+                            log::warn!(
+                                "playback codec verification failed provider={} source={} code={}",
+                                candidate.provider,
+                                candidate.source_label(),
+                                error.code()
+                            );
+                            continue;
+                        }
                         log::warn!(
-                            "playback codec verification failed provider={} source={} code={}",
+                            "playback codec verification skipped provider={} source={} code={}",
                             candidate.provider,
                             candidate.source_label(),
                             error.code()
                         );
-                        continue;
                     }
                     Err(_) => {
-                        saw_provider_failure = true;
+                        if !matches!(
+                            candidate.provider,
+                            ProviderKind::Dramachi | ProviderKind::AniZone
+                        ) {
+                            saw_provider_failure = true;
+                            log::warn!(
+                                "playback codec verification timed out provider={} source={}",
+                                candidate.provider,
+                                candidate.source_label()
+                            );
+                            continue;
+                        }
                         log::warn!(
-                            "playback codec verification timed out provider={} source={}",
+                            "playback codec verification timed out, allowing direct playback provider={} source={}",
                             candidate.provider,
                             candidate.source_label()
                         );
-                        continue;
                     }
                 }
             }
@@ -7546,8 +7600,10 @@ fn api_sources_for_content(
                 && release.episode.is_none_or(|number| number == episode.e)
                 && (source_codec_eligibility(release.codec.as_deref())
                     == SourceCodecEligibility::Verified
-                    || (release.provider == ProviderKind::AniZone
-                        && release_has_usable_source(release))
+                    || (matches!(
+                        release.provider,
+                        ProviderKind::AniZone | ProviderKind::MovieBox
+                    ) && release_has_usable_source(release))
                     || release_requires_codec_probe(release))
         })
         .filter(|(_, release)| {
@@ -8121,15 +8177,20 @@ fn direct_url_type(
     } else if matches!(
         content_type.as_str(),
         "video/mp4" | "video/webm" | "video/x-matroska"
-    ) || (release
-        .codec
-        .as_deref()
-        .is_some_and(is_supported_direct_codec)
-        && (release.provider == ProviderKind::FourKHdHub
-            || release
-                .mirrors
-                .first()
-                .is_some_and(|mirror| mirror.direct_file)))
+    ) || (release.provider == ProviderKind::MovieBox
+        && release
+            .mirrors
+            .first()
+            .is_some_and(|mirror| mirror.direct_file))
+        || (release
+            .codec
+            .as_deref()
+            .is_some_and(is_supported_direct_codec)
+            && (release.provider == ProviderKind::FourKHdHub
+                || release
+                    .mirrors
+                    .first()
+                    .is_some_and(|mirror| mirror.direct_file)))
     {
         Some("direct")
     } else {
@@ -8606,6 +8667,18 @@ async fn direct_play_route(
             );
             let (code, message, status) = if error == "source not found" {
                 ("SOURCE_NOT_FOUND", "The source was not found.", 404)
+            } else if error.contains("H.265/HEVC") {
+                (
+                    "CODEC_UNVERIFIED",
+                    "H.265/HEVC sources are blocked by playback policy.",
+                    415,
+                )
+            } else if error.starts_with("confirmed_codec_incompatibility:") {
+                (
+                    "CODEC_UNVERIFIED",
+                    "The inspected video codec is not permitted by playback policy.",
+                    415,
+                )
             } else if matches!(
                 error.as_str(),
                 "resolved URL rejected" | "direct playback compatibility unknown"

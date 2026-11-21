@@ -62,24 +62,19 @@ impl crate::providers::ReleaseProvider for client::MovieBoxClient {
         season: usize,
         episode: usize,
     ) -> Result<Vec<crate::providers::models::Release>, ProviderError> {
-        let (play_info_res, resources_res) = tokio::join!(
+        let resource_path = episode_resource_path(id, season, episode);
+        let details_path = format!("/wefeed-mobile-bff/subject-api/get?subjectId={id}");
+        let (details_res, play_info_res, resources_res) = tokio::join!(
+            self.get(&details_path),
             self.get_play_info(id, season, episode),
-            self.get_resources(
-                id,
-                season,
-                episode,
-                if episode > 0 {
-                    (episode - 1) / 20 + 1
-                } else {
-                    1
-                },
-                None,
-                20,
-            )
+            self.get(&resource_path)
         );
 
         let mut releases = Vec::new();
         let mut seen_urls = std::collections::HashSet::new();
+        let mut placeholders = 0;
+        let mut play_info_error = None;
+
         let expected_duration = resources_res
             .as_ref()
             .ok()
@@ -89,49 +84,120 @@ impl crate::providers::ReleaseProvider for client::MovieBoxClient {
             .map(|json| adapt::moviebox_invalid_play_info_urls(json, expected_duration))
             .unwrap_or_default();
 
-        if let Ok(json) = play_info_res {
-            for rel in adapt::moviebox_play_info_json_to_releases_for_episode(
-                &json,
-                season,
-                episode,
-                self.user_agent(),
-                expected_duration,
-            ) {
-                if let Some(url) = rel.direct_url() {
-                    let base = url.split('?').next().unwrap_or(url).to_string();
-                    if !base.is_empty() {
-                        seen_urls.insert(base);
+        match details_res {
+            Ok(json) => {
+                for rel in adapt::moviebox_detector_json_to_releases(
+                    &json,
+                    season,
+                    episode,
+                    self.user_agent(),
+                ) {
+                    if let Some(url) = rel.direct_url() {
+                        let base = url.split('?').next().unwrap_or(url).to_string();
+                        if !base.is_empty() && !seen_urls.insert(base) {
+                            continue;
+                        }
                     }
-                }
-                releases.push(rel);
-            }
-        }
-
-        if let Ok(res_json) = resources_res {
-            for rel in adapt::moviebox_resource_json_to_releases(&res_json) {
-                if let Some(url) = rel.direct_url() {
-                    let base = url.split('?').next().unwrap_or(url).to_string();
-                    if invalid_play_info_urls.contains(&base) {
-                        continue;
-                    }
-                    if !base.is_empty() && seen_urls.contains(&base) {
-                        continue;
-                    }
-                    seen_urls.insert(base);
-                }
-                if (season == 0 && episode == 0)
-                    || (rel.season == Some(season) && rel.episode == Some(episode))
-                    || (rel.season.is_none() && rel.episode.is_none())
-                {
                     releases.push(rel);
                 }
             }
+            Err(error) => log::warn!("moviebox subject details failed: {error}"),
+        }
+
+        match play_info_res {
+            Ok(json) => {
+                placeholders += placeholder_stream_count(&json);
+                for rel in adapt::moviebox_play_info_json_to_releases_for_episode(
+                    &json,
+                    season,
+                    episode,
+                    self.user_agent(),
+                    expected_duration,
+                ) {
+                    if let Some(url) = rel.direct_url() {
+                        let base = url.split('?').next().unwrap_or(url).to_string();
+                        if !base.is_empty() && !seen_urls.insert(base) {
+                            continue;
+                        }
+                    }
+                    releases.push(rel);
+                }
+            }
+            Err(error) => {
+                log::warn!("moviebox play-info failed: {error}");
+                play_info_error = Some(error);
+            }
+        }
+
+        let items = match resources_res {
+            Ok(payload) => payload
+                .get("list")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            Err(error) if releases.is_empty() => {
+                log::warn!("moviebox resource listing failed: {error}");
+                let page = episode.saturating_sub(1) / 20 + 1;
+                self.fetch_resource_page(id, season, episode, 0, page)
+                    .await
+                    .map_err(ProviderError::from)?
+                    .0
+            }
+            Err(error) => {
+                log::warn!("moviebox resource listing failed: {error}");
+                Vec::new()
+            }
+        };
+        for item in items {
+            let mut rel = adapt::moviebox_resource_item_to_release(&item);
+            if (season != 0 || episode != 0)
+                && (rel.season != Some(season) || rel.episode != Some(episode))
+            {
+                continue;
+            }
+            if rel.mirrors.is_empty() {
+                let origin = item
+                    .get("resourceLink")
+                    .or_else(|| item.get("url"))
+                    .and_then(Value::as_str)
+                    .filter(|url| adapt::is_deprecation_notice_url(url));
+                let (Some(resource_id), Some(origin)) = (rel.resource_id.as_deref(), origin) else {
+                    continue;
+                };
+                placeholders += 1;
+                let payload = match self.get_resource_position(id, resource_id, origin).await {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        log::warn!("moviebox direct file recovery failed: {error}");
+                        continue;
+                    }
+                };
+                let Some(recovered) = adapt::moviebox_resource_position_json_to_release(
+                    &payload,
+                    &rel,
+                    self.user_agent(),
+                ) else {
+                    continue;
+                };
+                rel = recovered;
+            }
+            if let Some(url) = rel.direct_url() {
+                let base = url.split('?').next().unwrap_or(url).to_string();
+                if invalid_play_info_urls.contains(&base) {
+                    continue;
+                }
+                if !base.is_empty() && !seen_urls.insert(base) {
+                    continue;
+                }
+            }
+            releases.push(rel);
         }
 
         if releases.is_empty() {
-            return Err(ProviderError::Unavailable(
-                "No stream sources available".to_string(),
-            ));
+            log::warn!(
+                "moviebox returned no playable files for {id} s{season}e{episode} ({placeholders} placeholder clips)"
+            );
+            return Err(empty_streams_error(placeholders, play_info_error));
         }
 
         releases.sort_by(|left, right| {
@@ -149,6 +215,16 @@ use client::{MovieBoxClient, ScraperError};
 use serde_json::{Value, json};
 
 impl MovieBoxClient {
+    pub async fn get_resource_position(
+        &self,
+        subject_id: &str,
+        resource_id: &str,
+        failed_url: &str,
+    ) -> Result<Value, ScraperError> {
+        self.get(&resource_position_path(subject_id, resource_id, failed_url))
+            .await
+    }
+
     pub async fn get_play_info(
         &self,
         subject_id: &str,
@@ -330,6 +406,55 @@ impl MovieBoxClient {
     }
 }
 
+fn resource_position_path(subject_id: &str, resource_id: &str, failed_url: &str) -> String {
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("subjectId", subject_id)
+        .append_pair("resourceId", resource_id)
+        .append_pair("failUrl", failed_url)
+        .append_pair("failCode", "404")
+        .append_pair("resourceNum", "0")
+        .append_pair("isVip", "true")
+        .finish();
+    format!("/wefeed-mobile-bff/subject-api/resource-position/v2?{query}")
+}
+
+pub const PLACEHOLDER_ONLY_MESSAGE: &str =
+    "MovieBox is serving a placeholder clip instead of this title";
+
+fn placeholder_stream_count(payload: &Value) -> usize {
+    payload
+        .get("data")
+        .unwrap_or(payload)
+        .get("streams")
+        .and_then(Value::as_array)
+        .map_or(0, |streams| {
+            streams
+                .iter()
+                .filter_map(|stream| stream.get("url").and_then(Value::as_str))
+                .filter(|url| adapt::is_deprecation_notice_url(url))
+                .count()
+        })
+}
+
+fn empty_streams_error(
+    placeholders: usize,
+    play_info_error: Option<ScraperError>,
+) -> ProviderError {
+    if placeholders > 0 {
+        ProviderError::Unavailable(PLACEHOLDER_ONLY_MESSAGE.to_string())
+    } else if let Some(error) = play_info_error {
+        ProviderError::from(error)
+    } else {
+        ProviderError::Unavailable("No stream sources available".to_string())
+    }
+}
+
+fn episode_resource_path(subject_id: &str, season: usize, episode: usize) -> String {
+    format!(
+        "/wefeed-mobile-bff/subject-api/resource/v2?subjectId={subject_id}&page=1&perPage=20&all=0&startPosition=1&endPosition=1&pagerMode=2&resolution=0&se={season}&epFrom={episode}&epTo={episode}&isVip=true"
+    )
+}
+
 pub fn resource_page_path(
     subject_id: &str,
     season: usize,
@@ -361,6 +486,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_episode_resource_path_targets_exact_episode() {
+        for (season, episode) in [(0, 0), (5, 1), (2, 25)] {
+            let path = episode_resource_path("123", season, episode);
+            let url = url::Url::parse(&format!("https://example.com{path}")).unwrap();
+            let params: std::collections::HashMap<_, _> = url.query_pairs().collect();
+            assert_eq!(url.path(), "/wefeed-mobile-bff/subject-api/resource/v2");
+            assert_eq!(params["subjectId"], "123");
+            assert_eq!(params["se"], season.to_string());
+            assert_eq!(params["epFrom"], episode.to_string());
+            assert_eq!(params["epTo"], episode.to_string());
+            assert_eq!(params["page"], "1");
+        }
+    }
+
+    #[test]
+    fn test_resource_position_path_encodes_failed_url() {
+        let origin = "https://cdn.example.com/notice.mp4?sign=a+b&t=123";
+        let path = resource_position_path("123", "456", origin);
+        let url = url::Url::parse(&format!("https://example.com{path}")).unwrap();
+        let params: std::collections::HashMap<_, _> = url.query_pairs().collect();
+        assert_eq!(
+            url.path(),
+            "/wefeed-mobile-bff/subject-api/resource-position/v2"
+        );
+        assert_eq!(params["subjectId"], "123");
+        assert_eq!(params["resourceId"], "456");
+        assert_eq!(params["failUrl"], origin);
+        assert_eq!(params["failCode"], "404");
+        assert_eq!(params["resourceNum"], "0");
+        assert_eq!(params["isVip"], "true");
+        assert_eq!(params.len(), 6);
+    }
+
+    #[test]
     fn test_resource_page_path_movie() {
         let path = resource_page_path("12345", 0, 0, 0, 1);
         assert_eq!(
@@ -385,5 +544,36 @@ mod tests {
             path,
             "/wefeed-mobile-bff/subject-api/resource?subjectId=67890&se=1&ep=10&page=2&perPage=20&resolution=1080"
         );
+    }
+
+    #[test]
+    fn test_placeholder_stream_count_detects_upgrade_clip() {
+        let payload = json!({"data": {"streams": [
+            {"url": "https://macdn.aoneroom.com/other/2026/10/10/notice.mp4"},
+            {"url": "https://bcdn.hakunaymatata.com/resource/real.mp4"},
+        ]}});
+        assert_eq!(placeholder_stream_count(&payload), 1);
+        assert_eq!(placeholder_stream_count(&json!({})), 0);
+    }
+
+    #[test]
+    fn test_empty_streams_error_explains_placeholder_only_titles() {
+        let err = empty_streams_error(2, Some(ScraperError::HostsExhausted));
+        assert_eq!(
+            err.to_string(),
+            format!("Provider is temporarily unavailable: {PLACEHOLDER_ONLY_MESSAGE}")
+        );
+        assert!(!err.to_string().contains("No stream sources"));
+    }
+
+    #[test]
+    fn test_empty_streams_error_surfaces_api_failure() {
+        let err = empty_streams_error(0, Some(ScraperError::ApiStatus(503)));
+        assert_eq!(
+            err.to_string(),
+            "Provider is temporarily unavailable: HTTP status 503"
+        );
+        let err = empty_streams_error(0, None);
+        assert!(err.to_string().contains("No stream sources"));
     }
 }

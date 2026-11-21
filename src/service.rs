@@ -10,7 +10,7 @@ use crate::providers::fourkhdhub::FourKHdHubClient;
 use crate::providers::models::{CatalogItem, MediaDetails, ProviderError, ProviderKind};
 use crate::providers::moviebox::client::MovieBoxClient;
 
-const MOVIEBOX_ENABLED: bool = false;
+const MOVIEBOX_ENABLED: bool = true;
 
 #[derive(Clone)]
 pub struct MovieBoxService {

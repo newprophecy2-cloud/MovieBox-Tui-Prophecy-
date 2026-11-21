@@ -484,11 +484,17 @@ impl DramachiClient {
             .or_else(|| file_info.f_title.clone())
             .unwrap_or_else(|| format!("{fid}.mkv"));
 
-        let stream_url = format!(
-            "https://{}/cdn/{}",
-            host_info.host.trim_end_matches('/'),
-            raw_url.trim_start_matches('/')
-        );
+        let stream_url = if raw_url.starts_with("https://") || raw_url.starts_with("http://") {
+            raw_url.to_string()
+        } else {
+            let clean_host = host_info
+                .host
+                .trim()
+                .trim_start_matches("https://")
+                .trim_start_matches("http://")
+                .trim_end_matches('/');
+            format!("https://{}/cdn/{}", clean_host, raw_url.trim_start_matches('/'))
+        };
 
         Ok((stream_url, filename))
     }
@@ -517,7 +523,22 @@ impl DramachiClient {
             if let Some(seasons_map) = &data.seasons {
                 if season > 0 {
                     let target_season_key = format!("Season {:02}", season);
-                    if let Some(group) = seasons_map.get(&target_season_key) {
+                    let matched_group = seasons_map
+                        .get(&target_season_key)
+                        .or_else(|| {
+                            seasons_map
+                                .iter()
+                                .find(|(k, _)| extract_leading_season_number(k) == Some(season))
+                                .map(|(_, g)| g)
+                        })
+                        .or_else(|| {
+                            if seasons_map.len() == 1 {
+                                seasons_map.values().next()
+                            } else {
+                                None
+                            }
+                        });
+                    if let Some(group) = matched_group {
                         resolved_rip = group
                             .versions
                             .as_ref()

@@ -6,10 +6,13 @@ use crate::providers::{Provider, ProviderCapabilities, ReleaseProvider};
 use reqwest::{Client, Url};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 const BASE_URL: &str = "https://anizone.to";
-const DEFAULT_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+const DEFAULT_SUB_SERVER_URL: &str = "https://anizone-prophecy-sub-server.onrender.com";
+const DEFAULT_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0";
 const MAX_HTML_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PAGES: usize = 64;
 const PAGE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -38,6 +41,8 @@ impl From<AniZoneError> for ProviderError {
 pub struct AniZoneClient {
     client: Client,
     base_url: Url,
+    sub_server_url: Option<Url>,
+    prefer_sub_server: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone)]
@@ -74,7 +79,29 @@ impl Default for AniZoneClient {
 
 impl AniZoneClient {
     pub fn new() -> Self {
-        Self::with_base_url(BASE_URL).expect("static AniZone URL must parse")
+        let mut client = Self::with_base_url(BASE_URL).expect("static AniZone URL must parse");
+        let sub_url = match std::env::var("ANIZONE_SUB_SERVER_URL") {
+            Ok(val) => {
+                let trimmed = val.trim();
+                if trimmed.is_empty() {
+                    Some(DEFAULT_SUB_SERVER_URL.to_string())
+                } else if trimmed.eq_ignore_ascii_case("direct")
+                    || trimmed.eq_ignore_ascii_case("off")
+                {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            }
+            Err(_) => Some(DEFAULT_SUB_SERVER_URL.to_string()),
+        };
+        if let Some(raw) = sub_url
+            && let Ok(parsed) = Url::parse(raw.trim_end_matches('/'))
+            && (parsed.scheme() == "https" || parsed.scheme() == "http")
+        {
+            client.sub_server_url = Some(parsed);
+        }
+        client
     }
 
     pub fn with_base_url(base: &str) -> Result<Self, AniZoneError> {
@@ -87,7 +114,289 @@ impl AniZoneClient {
             .timeout(PAGE_TIMEOUT)
             .build()
             .map_err(AniZoneError::Network)?;
-        Ok(Self { client, base_url })
+        Ok(Self {
+            client,
+            base_url,
+            sub_server_url: None,
+            prefer_sub_server: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    fn should_fallback_to_sub_server(&self, err: &AniZoneError) -> bool {
+        if self.sub_server_url.is_none() {
+            return false;
+        }
+        match err {
+            AniZoneError::Network(req_err) => req_err
+                .status()
+                .is_some_and(|s| s == reqwest::StatusCode::FORBIDDEN || s == reqwest::StatusCode::TOO_MANY_REQUESTS),
+            _ => false,
+        }
+    }
+
+    async fn fetch_sub_server_json(&self, url: Url) -> Result<Value, AniZoneError> {
+        let response = self
+            .client
+            .get(url)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .send()
+            .await?;
+        let status = response.status();
+        let body: Value = response.json().await?;
+        if body.get("status").and_then(Value::as_str) == Some("error") {
+            let code = body
+                .pointer("/error/code")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let message = body
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .unwrap_or("AniZone sub-server error");
+            if code == "NOT_FOUND" || status == reqwest::StatusCode::NOT_FOUND {
+                return Err(AniZoneError::NotFound);
+            }
+            return Err(AniZoneError::Parse(message.to_string()));
+        }
+        if !status.is_success() {
+            return Err(AniZoneError::Parse(format!(
+                "AniZone sub-server returned HTTP {}",
+                status.as_u16()
+            )));
+        }
+        Ok(body)
+    }
+
+    async fn search_via_sub_server(
+        &self,
+        sub_base: &Url,
+        query: &str,
+        page: usize,
+    ) -> Result<Vec<CatalogItem>, AniZoneError> {
+        let mut url = sub_base
+            .join("api/v1/anime/search")
+            .map_err(|e| AniZoneError::Parse(e.to_string()))?;
+        url.query_pairs_mut()
+            .append_pair("q", query)
+            .append_pair("page", &page.max(1).to_string());
+        let body = self.fetch_sub_server_json(url).await?;
+        let items = body
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or_else(|| AniZoneError::Parse("missing search data array".into()))?;
+        Ok(items
+            .iter()
+            .filter_map(|item| {
+                let slug = item.get("id")?.as_str()?.to_string();
+                let title = item.get("title")?.as_str()?.to_string();
+                let kind = item
+                    .get("media_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("series");
+                let year = item
+                    .get("year")
+                    .and_then(Value::as_i64)
+                    .map(|y| y.to_string());
+                let poster_url = item
+                    .get("poster")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                Some(CatalogItem {
+                    id: ProviderMediaId {
+                        provider: ProviderKind::AniZone,
+                        value: slug,
+                    },
+                    title,
+                    media_type: if kind.eq_ignore_ascii_case("movie") {
+                        MediaType::Movie
+                    } else {
+                        MediaType::Series
+                    },
+                    year,
+                    poster_url,
+                    season_count: None,
+                })
+            })
+            .collect())
+    }
+
+    async fn details_via_sub_server(
+        &self,
+        sub_base: &Url,
+        slug: &str,
+    ) -> Result<MediaDetails, AniZoneError> {
+        let url = sub_base
+            .join(&format!("api/v1/anime/{slug}"))
+            .map_err(|e| AniZoneError::Parse(e.to_string()))?;
+        let body = self.fetch_sub_server_json(url).await?;
+        let data = body
+            .get("data")
+            .ok_or_else(|| AniZoneError::Parse("missing details data".into()))?;
+        let title = data
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| slug.replace('-', " "));
+        let seasons_arr = data
+            .get("seasons")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let seasons = seasons_arr
+            .into_iter()
+            .filter_map(|s| {
+                let s_num = s.get("number").and_then(Value::as_u64).unwrap_or(1) as usize;
+                let eps = s
+                    .get("episodes")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|ep| {
+                        let number = ep.get("number").and_then(Value::as_u64)? as usize;
+                        let ep_season =
+                            ep.get("season").and_then(Value::as_u64).unwrap_or(s_num as u64)
+                                as usize;
+                        let ep_id = ep
+                            .get("provider_episode_id")
+                            .or_else(|| ep.get("id"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                            .unwrap_or_else(|| number.to_string());
+                        Some(Episode {
+                            season: ep_season,
+                            number,
+                            title: ep.get("title").and_then(Value::as_str).map(str::to_string),
+                            overview: ep
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                            provider_episode_id: Some(ep_id),
+                            provider_season_id: Some(ep_season.to_string()),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                Some(Season {
+                    number: s_num,
+                    episodes: eps,
+                    provider_season_id: Some(s_num.to_string()),
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(MediaDetails {
+            id: ProviderMediaId {
+                provider: ProviderKind::AniZone,
+                value: slug.to_string(),
+            },
+            title,
+            media_type: MediaType::Series,
+            year: None,
+            description: None,
+            tagline: None,
+            imdb_rating: None,
+            director: None,
+            stars: None,
+            prints: None,
+            audios: None,
+            poster_url: None,
+            duration: None,
+            genres: Vec::new(),
+            seasons,
+            dubs: Vec::new(),
+        })
+    }
+
+    async fn releases_via_sub_server(
+        &self,
+        sub_base: &Url,
+        slug: &str,
+        season: usize,
+        episode: usize,
+    ) -> Result<Vec<Release>, AniZoneError> {
+        let url = sub_base
+            .join(&format!("api/v1/anime/{slug}/episodes/{episode}/sources"))
+            .map_err(|e| AniZoneError::Parse(e.to_string()))?;
+        let body = self.fetch_sub_server_json(url).await?;
+        let data = body
+            .get("data")
+            .ok_or_else(|| AniZoneError::Parse("missing sources data".into()))?;
+        let sources = data
+            .get("sources")
+            .and_then(Value::as_array)
+            .ok_or(AniZoneError::NotFound)?;
+        let first = sources.first().ok_or(AniZoneError::NotFound)?;
+        let hls = first
+            .get("url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AniZoneError::Parse("missing AniZone source URL".into()))?
+            .to_string();
+        let mut headers = Vec::new();
+        if let Some(hdr_obj) = first.get("headers").and_then(Value::as_object) {
+            for (k, v) in hdr_obj {
+                if let Some(val) = v.as_str() {
+                    headers.push((k.clone(), val.to_string()));
+                }
+            }
+        }
+        if headers.is_empty() {
+            headers.push((
+                "Referer".to_string(),
+                format!("{BASE_URL}/anime/{slug}/{episode}"),
+            ));
+            headers.push(("User-Agent".to_string(), DEFAULT_UA.to_string()));
+        }
+        let sub_arr = data.get("subtitles").and_then(Value::as_array);
+        let sub_count = sub_arr.map(|s| s.len()).unwrap_or(0);
+        if sub_count > 0 {
+            headers.push(("X-AniZone-Subtitle-Count".into(), sub_count.to_string()));
+        }
+        if let Some(best_sub) = sub_arr.and_then(|subs| {
+            subs.iter()
+                .max_by_key(|item| {
+                    let is_default = item
+                        .get("default")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let has_lang = item
+                        .get("language")
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| !s.is_empty());
+                    let has_label = item
+                        .get("label")
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| !s.is_empty());
+                    let is_vtt = item
+                        .get("format")
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| s.eq_ignore_ascii_case("vtt"));
+                    (is_default, has_lang, has_label, is_vtt)
+                })
+                .and_then(|item| item.get("url").and_then(Value::as_str))
+                .map(str::to_string)
+        }) {
+            headers.push(("X-AniZone-Subtitle-Url".into(), best_sub));
+        }
+        let resource_id = data
+            .get("source_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| episode.to_string());
+        Ok(vec![Release {
+            provider: ProviderKind::AniZone,
+            filename: format!("{slug} Episode {episode}"),
+            quality: None,
+            codec: None,
+            language: None,
+            size_bytes: None,
+            season: Some(season),
+            episode: Some(episode),
+            mirrors: vec![SourceMirror {
+                label: "AniZone HLS".into(),
+                resolver_url: hls,
+                headers,
+                direct_file: false,
+            }],
+            resource_id: Some(resource_id),
+        }])
     }
 
     fn url(&self, path: &str) -> Url {
@@ -101,32 +410,60 @@ impl AniZoneClient {
         url: Url,
         headers: &[(&str, String)],
     ) -> Result<(String, Vec<String>), AniZoneError> {
-        let mut request = self
-            .client
-            .get(url)
-            .header("User-Agent", DEFAULT_UA)
-            .header("Accept-Language", "en-US,en;q=0.9")
-            .header(
-                "Accept",
-                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            );
-        for (name, value) in headers {
-            request = request.header(*name, value);
+        let mut last_err = None;
+        for attempt in 0..=2u32 {
+            let mut request = self
+                .client
+                .get(url.clone())
+                .header("User-Agent", DEFAULT_UA)
+                .header("Accept-Language", "en-US,en;q=0.9")
+                .header(
+                    "Accept",
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                );
+            for (name, value) in headers {
+                request = request.header(*name, value);
+            }
+            match request.send().await {
+                Ok(response) => {
+                    let status = response.status();
+                    if status.is_success() {
+                        let cookies = response
+                            .headers()
+                            .get_all(reqwest::header::SET_COOKIE)
+                            .iter()
+                            .filter_map(|value| value.to_str().ok().map(ToOwned::to_owned))
+                            .collect::<Vec<_>>();
+                        let bytes = response.bytes().await?;
+                        if bytes.len() > MAX_HTML_BYTES {
+                            return Err(AniZoneError::Parse("response exceeded size limit".into()));
+                        }
+                        let text = String::from_utf8(bytes.to_vec())
+                            .map_err(|_| AniZoneError::Parse("response was not UTF-8".into()))?;
+                        return Ok((text, cookies));
+                    }
+                    let retryable = matches!(
+                        status.as_u16(),
+                        408 | 429 | 500 | 502 | 503 | 504
+                    );
+                    let err = response.error_for_status().unwrap_err();
+                    if !retryable || attempt == 2 {
+                        return Err(AniZoneError::Network(err));
+                    }
+                    last_err = Some(err);
+                }
+                Err(err) => {
+                    if attempt == 2 {
+                        return Err(AniZoneError::Network(err));
+                    }
+                    last_err = Some(err);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(500 * u64::from(attempt + 1))).await;
         }
-        let response = request.send().await?.error_for_status()?;
-        let cookies = response
-            .headers()
-            .get_all(reqwest::header::SET_COOKIE)
-            .iter()
-            .filter_map(|value| value.to_str().ok().map(ToOwned::to_owned))
-            .collect::<Vec<_>>();
-        let bytes = response.bytes().await?;
-        if bytes.len() > MAX_HTML_BYTES {
-            return Err(AniZoneError::Parse("response exceeded size limit".into()));
-        }
-        let text = String::from_utf8(bytes.to_vec())
-            .map_err(|_| AniZoneError::Parse("response was not UTF-8".into()))?;
-        Ok((text, cookies))
+        Err(AniZoneError::Network(
+            last_err.expect("retry loop must capture an error"),
+        ))
     }
 
     async fn fetch_page(&self, path: &str) -> Result<(String, Vec<String>), AniZoneError> {
@@ -139,6 +476,30 @@ impl AniZoneClient {
         if query.is_empty() {
             return Ok(Vec::new());
         }
+        if self.prefer_sub_server.load(Ordering::Relaxed)
+            && let Some(sub_base) = &self.sub_server_url
+        {
+            return self.search_via_sub_server(sub_base, query, page).await;
+        }
+        match self.search_direct(query, page).await {
+            Ok(items) => Ok(items),
+            Err(err) if self.should_fallback_to_sub_server(&err) => {
+                if let Some(sub_base) = &self.sub_server_url {
+                    log::warn!("anizone direct search blocked ({err}); falling back to sub-server");
+                    self.prefer_sub_server.store(true, Ordering::Relaxed);
+                    return self.search_via_sub_server(sub_base, query, page).await;
+                }
+                Err(err)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn search_direct(
+        &self,
+        query: &str,
+        page: usize,
+    ) -> Result<Vec<CatalogItem>, AniZoneError> {
         let mut url = self.url("/anime");
         url.query_pairs_mut().append_pair("search", query);
         let (html, cookies) = self
@@ -189,6 +550,26 @@ impl AniZoneClient {
 
     pub async fn details(&self, slug: &str) -> Result<MediaDetails, AniZoneError> {
         let slug = validate_slug(slug)?;
+        if self.prefer_sub_server.load(Ordering::Relaxed)
+            && let Some(sub_base) = &self.sub_server_url
+        {
+            return self.details_via_sub_server(sub_base, slug).await;
+        }
+        match self.details_direct(slug).await {
+            Ok(details) => Ok(details),
+            Err(err) if self.should_fallback_to_sub_server(&err) => {
+                if let Some(sub_base) = &self.sub_server_url {
+                    log::warn!("anizone direct details blocked ({err}); falling back to sub-server");
+                    self.prefer_sub_server.store(true, Ordering::Relaxed);
+                    return self.details_via_sub_server(sub_base, slug).await;
+                }
+                Err(err)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn details_direct(&self, slug: &str) -> Result<MediaDetails, AniZoneError> {
         let data = self.scrape_series(slug).await?;
         let title = data.series_title.unwrap_or_else(|| slug.replace('-', " "));
         let episodes = parse_episodes(&data.items);
@@ -359,6 +740,37 @@ impl AniZoneClient {
             ));
         }
         let slug = validate_slug(slug)?;
+        if self.prefer_sub_server.load(Ordering::Relaxed)
+            && let Some(sub_base) = &self.sub_server_url
+        {
+            return self
+                .releases_via_sub_server(sub_base, slug, season, episode)
+                .await;
+        }
+        match self.releases_direct(slug, season, episode).await {
+            Ok(releases) => Ok(releases),
+            Err(err) if self.should_fallback_to_sub_server(&err) => {
+                if let Some(sub_base) = &self.sub_server_url {
+                    log::warn!(
+                        "anizone direct releases blocked ({err}); falling back to sub-server"
+                    );
+                    self.prefer_sub_server.store(true, Ordering::Relaxed);
+                    return self
+                        .releases_via_sub_server(sub_base, slug, season, episode)
+                        .await;
+                }
+                Err(err)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn releases_direct(
+        &self,
+        slug: &str,
+        season: usize,
+        episode: usize,
+    ) -> Result<Vec<Release>, AniZoneError> {
         let data = self.scrape_series(slug).await?;
         let source_number = parse_episodes(&data.items)
             .into_iter()
@@ -409,8 +821,32 @@ impl AniZoneClient {
             .as_deref()
             .and_then(|value| value.parse::<usize>().ok())
             .ok_or_else(|| AniZoneError::Parse("missing AniZone episode identity".into()))?;
+        let slug = validate_slug(slug)?;
+        if let Some(mirror) = release.mirrors.first()
+            && mirror.resolver_url.starts_with("https://")
+        {
+            let subtitle = mirror
+                .headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("X-AniZone-Subtitle-Url"))
+                .map(|(_, v)| v.clone());
+            let headers = mirror
+                .headers
+                .iter()
+                .filter(|(k, _)| !k.to_ascii_lowercase().starts_with("x-anizone-"))
+                .cloned()
+                .collect();
+            return Ok(PlaybackSource {
+                provider: ProviderKind::AniZone,
+                url: mirror.resolver_url.clone(),
+                headers,
+                subtitle,
+                source_label: "AniZone HLS".into(),
+                max_height: None,
+            });
+        }
         let watch = self
-            .scrape_watch(validate_slug(slug)?, source_number)
+            .scrape_watch(slug, source_number)
             .await?;
         let subtitle = watch
             .subtitles

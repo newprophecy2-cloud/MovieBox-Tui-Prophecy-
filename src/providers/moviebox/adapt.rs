@@ -568,6 +568,133 @@ pub fn moviebox_resource_item_to_release(item: &serde_json::Value) -> Release {
     }
 }
 
+pub fn moviebox_resource_position_json_to_release(
+    payload: &serde_json::Value,
+    original: &Release,
+    user_agent: &str,
+) -> Option<Release> {
+    let resource_id = original.resource_id.as_deref()?;
+    let data = payload.get("data").unwrap_or(payload);
+    let items = data.get("list")?.as_array()?;
+    for item in items {
+        let candidate = moviebox_resource_item_to_release(item);
+        if candidate.resource_id.as_deref() != Some(resource_id)
+            || candidate.season != original.season
+            || candidate.episode != original.episode
+        {
+            continue;
+        }
+        let Some(url) = candidate.direct_url() else {
+            continue;
+        };
+        let Ok(parsed) = url::Url::parse(url) else {
+            continue;
+        };
+        if !matches!(parsed.scheme(), "http" | "https") {
+            continue;
+        }
+        let mut release = original.clone();
+        release.mirrors = candidate.mirrors;
+        if candidate.size_bytes.is_some() {
+            release.size_bytes = candidate.size_bytes;
+        }
+        for mirror in &mut release.mirrors {
+            mirror.direct_file = true;
+            mirror.headers = vec![("User-Agent".to_string(), user_agent.to_string())];
+        }
+        return Some(release);
+    }
+    None
+}
+
+pub fn moviebox_detector_json_to_releases(
+    details: &serde_json::Value,
+    season: usize,
+    episode: usize,
+    user_agent: &str,
+) -> Vec<Release> {
+    let data = details.get("data").unwrap_or(details);
+    let Some(detectors) = data.get("resourceDetectors").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let title = data.get("title").and_then(|v| v.as_str()).unwrap_or("");
+
+    let mut items = Vec::new();
+    for detector in detectors {
+        let list = detector
+            .get("resolutionList")
+            .and_then(|v| v.as_array())
+            .filter(|list| !list.is_empty());
+        if let Some(list) = list {
+            items.extend(list.iter().cloned());
+            continue;
+        }
+        let Some(download_url) = detector.get("downloadUrl").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let source = detector
+            .get("resourceLink")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let mut item = serde_json::json!({
+            "title": title,
+            "resourceLink": download_url,
+            "se": 0,
+            "ep": 0,
+        });
+        for (from, to) in [
+            ("firstSize", "size"),
+            ("codecName", "codecName"),
+            ("resourceId", "resourceId"),
+            ("uploadBy", "uploadBy"),
+        ] {
+            if let Some(value) = detector.get(from) {
+                item[to] = value.clone();
+            }
+        }
+        if let Some(resolution) = resolution_from_source_link(source) {
+            item["resolution"] = resolution.into();
+        }
+        items.push(item);
+    }
+
+    let mut releases = Vec::new();
+    for item in &items {
+        let mut release = moviebox_resource_item_to_release(item);
+        if release.season.unwrap_or(0) != season || release.episode.unwrap_or(0) != episode {
+            continue;
+        }
+        let Some(url) = release.direct_url() else {
+            continue;
+        };
+        if !url::Url::parse(url).is_ok_and(|u| matches!(u.scheme(), "http" | "https")) {
+            continue;
+        }
+        for mirror in &mut release.mirrors {
+            mirror.direct_file = true;
+            mirror.headers = vec![("User-Agent".to_string(), user_agent.to_string())];
+        }
+        releases.push(release);
+    }
+    releases
+}
+
+fn resolution_from_source_link(link: &str) -> Option<u64> {
+    let upper = link.to_ascii_uppercase();
+    let bytes = upper.as_bytes();
+    upper.match_indices('P').find_map(|(idx, _)| {
+        let start = bytes[..idx]
+            .iter()
+            .rposition(|b| !b.is_ascii_digit())
+            .map_or(0, |pos| pos + 1);
+        let digits = &upper[start..idx];
+        (3..=4)
+            .contains(&digits.len())
+            .then(|| digits.parse().ok())
+            .flatten()
+    })
+}
+
 pub fn is_deprecation_notice_url(url: &str) -> bool {
     let lower = url.to_ascii_lowercase();
     lower.contains("1c7de0bd3393702d9191801f15f88f8d")
@@ -892,6 +1019,172 @@ pub fn moviebox_play_info_json_to_releases_for_episode(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_resource_position_reports_recovered_file_size() {
+        let original = moviebox_resource_item_to_release(&json!({
+            "resourceId": "42",
+            "resourceLink": "https://macdn.aoneroom.com/other/2026/10/10/notice.mp4",
+            "resolution": 720,
+            "size": "824720",
+            "se": 0,
+            "ep": 0
+        }));
+        let payload = json!({"data": {"list": [{
+            "resourceId": "42",
+            "resourceLink": "https://cdn.example.com/resource/movie.mp4?sign=abc&t=123",
+            "size": "1473204930",
+            "se": 0,
+            "ep": 0
+        }]}});
+        let recovered =
+            moviebox_resource_position_json_to_release(&payload, &original, "TestAgent")
+                .expect("recover original file");
+        assert_eq!(recovered.size_bytes, Some(1473204930));
+    }
+
+    #[test]
+    fn test_resource_position_recovers_file_and_preserves_release_metadata() {
+        let original = moviebox_resource_item_to_release(&json!({
+            "resourceId": 6154402015721538488_i64,
+            "title": "Example Movie",
+            "resourceLink": "https://macdn.aoneroom.com/other/2026/10/10/notice.mp4",
+            "resolution": 1080,
+            "codecName": "hevc",
+            "size": "1010288591",
+            "se": 0,
+            "ep": 0
+        }));
+        assert!(original.mirrors.is_empty());
+        let payload = json!({"data": {"list": [{
+            "resourceId": "6154402015721538488",
+            "resourceLink": "https://cdn.example.com/resource/movie.mp4?sign=abc&t=123",
+            "se": 0,
+            "ep": 0
+        }]}});
+        let recovered =
+            moviebox_resource_position_json_to_release(&payload, &original, "TestAgent")
+                .expect("recover original file");
+        assert_eq!(recovered.filename, original.filename);
+        assert_eq!(recovered.quality.as_deref(), Some("1080p"));
+        assert_eq!(recovered.codec, original.codec);
+        assert_eq!(recovered.size_bytes, Some(1010288591));
+        assert_eq!(recovered.resource_id, original.resource_id);
+        assert_eq!(
+            recovered.direct_url(),
+            Some("https://cdn.example.com/resource/movie.mp4?sign=abc&t=123")
+        );
+        assert!(recovered.mirrors[0].direct_file);
+        assert_eq!(
+            recovered.mirrors[0].headers,
+            vec![("User-Agent".to_string(), "TestAgent".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_resource_position_rejects_notices_wrong_resources_and_wrong_episodes() {
+        let original = moviebox_resource_item_to_release(&json!({
+            "resourceId": "episode2",
+            "se": "1",
+            "ep": "2"
+        }));
+        for item in [
+            json!({"resourceId": "episode1", "se": 1, "ep": 2,
+                "resourceLink": "https://cdn.example.com/another.mp4"}),
+            json!({"resourceId": "episode2", "se": 1, "ep": 1,
+                "resourceLink": "https://cdn.example.com/wrong-episode.mp4"}),
+            json!({"resourceId": "episode2", "se": 2, "ep": 2,
+                "resourceLink": "https://cdn.example.com/wrong-season.mp4"}),
+            json!({"resourceId": "episode2", "se": 1, "ep": 2,
+                "resourceLink": "https://macdn.aoneroom.com/other/2026/10/10/notice.mp4"}),
+            json!({"resourceId": "episode2", "se": 1, "ep": 2,
+                "resourceLink": "file:///tmp/movie.mp4"}),
+            json!({"resourceId": "episode2", "se": 1, "ep": 2,
+                "resourceLink": ""}),
+        ] {
+            assert!(
+                moviebox_resource_position_json_to_release(
+                    &json!({"list": [item]}),
+                    &original,
+                    "TestAgent"
+                )
+                .is_none()
+            );
+        }
+        for payload in [json!({}), json!({"list": []}), json!({"data": null})] {
+            assert!(
+                moviebox_resource_position_json_to_release(&payload, &original, "TestAgent")
+                    .is_none()
+            );
+        }
+
+        let payload = json!({"list": [
+            {"resourceId": "episode1", "se": 1, "ep": 1,
+                "resourceLink": "https://cdn.example.com/episode1.mp4"},
+            {"resourceId": "episode2", "se": 1, "ep": 2,
+                "resourceLink": "https://cdn.example.com/episode2.mp4"}
+        ]});
+        let recovered =
+            moviebox_resource_position_json_to_release(&payload, &original, "TestAgent")
+                .expect("recover matching episode only");
+        assert_eq!(recovered.season, Some(1));
+        assert_eq!(recovered.episode, Some(2));
+        assert_eq!(
+            recovered.direct_url(),
+            Some("https://cdn.example.com/episode2.mp4")
+        );
+    }
+
+    #[test]
+    fn test_detector_releases_use_signed_files_with_user_agent_only() {
+        let notice =
+            "https://macdn.aoneroom.com/other/2026/10/10/notice.mp4";
+        let details = json!({"title": "Dune", "resourceDetectors": [
+            {"downloadUrl": "https://cdn.example.com/a.mp4?sign=x", "resolutionList": [
+                {"resourceId": "r480", "se": 0, "ep": 0, "resolution": 480, "size": "537628837",
+                    "uploadBy": "up", "resourceLink": "https://cdn.example.com/a.mp4?sign=x"},
+                {"resourceId": "r1080", "se": 0, "ep": 0, "resolution": 1080,
+                    "resourceLink": notice},
+                {"resourceId": "rbad", "se": 0, "ep": 0, "resourceLink": "ftp://cdn/x.mp4"}
+            ]},
+            {"downloadUrl": "https://cdn.example.com/b.mp4?sign=y", "firstSize": "675055348",
+                "resourceId": "single", "codecName": "hevc",
+                "resourceLink": "https://source.example/Inception-480P-h265"},
+            {"type": 1, "downloadUrl": "", "resolutionList": []}
+        ]});
+
+        let releases = moviebox_detector_json_to_releases(&details, 0, 0, "TestAgent");
+        assert_eq!(releases.len(), 2);
+        assert_eq!(releases[0].resource_id.as_deref(), Some("r480"));
+        assert_eq!(releases[0].size_bytes, Some(537_628_837));
+        assert_eq!(releases[1].resource_id.as_deref(), Some("single"));
+        assert_eq!(releases[1].quality.as_deref(), Some("480p"));
+        assert_eq!(releases[1].size_bytes, Some(675_055_348));
+        for release in &releases {
+            let mirror = &release.mirrors[0];
+            assert!(mirror.direct_file);
+            assert_eq!(
+                mirror.headers,
+                vec![("User-Agent".to_string(), "TestAgent".to_string())]
+            );
+        }
+
+        assert!(moviebox_detector_json_to_releases(&details, 1, 1, "TestAgent").is_empty());
+        assert!(moviebox_detector_json_to_releases(&json!({}), 0, 0, "TestAgent").is_empty());
+    }
+
+    #[test]
+    fn test_resolution_from_source_link() {
+        assert_eq!(
+            resolution_from_source_link("https://x/Inception-480P-h265"),
+            Some(480)
+        );
+        assert_eq!(
+            resolution_from_source_link("https://x/movie_1080P-.html/season-0"),
+            Some(1080)
+        );
+        assert_eq!(resolution_from_source_link("https://x/plain-page"), None);
+    }
 
     #[test]
     fn test_moviebox_search_json_to_catalog() {
