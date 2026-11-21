@@ -25,3 +25,4 @@ pub mod service;
 pub mod tui;
 pub mod unified;
 pub mod updater;
+pub mod v3;
