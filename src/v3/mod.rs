@@ -1,3 +1,4 @@
+pub mod audio_id;
 pub mod audio_sources;
 pub mod matching;
 pub mod models;
