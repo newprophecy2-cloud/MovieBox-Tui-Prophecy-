@@ -8,9 +8,63 @@ use crate::v3::session::{
 };
 use std::collections::{BTreeMap, HashSet};
 
+fn fold_latin_char(ch: char) -> char {
+    match ch {
+        'á' | 'à' | 'â' | 'ä' | 'ã' | 'å' | 'Á' | 'À' | 'Â' | 'Ä' | 'Ã' | 'Å' => 'a',
+        'é' | 'è' | 'ê' | 'ë' | 'É' | 'È' | 'Ê' | 'Ë' => 'e',
+        'í' | 'ì' | 'î' | 'ï' | 'Í' | 'Ì' | 'Î' | 'Ï' => 'i',
+        'ó' | 'ò' | 'ô' | 'ö' | 'õ' | 'Ó' | 'Ò' | 'Ô' | 'Ö' | 'Õ' => 'o',
+        'ú' | 'ù' | 'û' | 'ü' | 'Ú' | 'Ù' | 'Û' | 'Ü' => 'u',
+        'ñ' | 'Ñ' => 'n',
+        'ç' | 'Ç' => 'c',
+        _ => ch,
+    }
+}
+
+fn is_season_range_token(tok: &str) -> bool {
+    let lower = tok.trim().to_ascii_lowercase();
+    if let Some((left, right)) = lower.split_once('-') {
+        let l_ok = left.starts_with('s')
+            && left.len() >= 2
+            && left[1..].chars().all(|c| c.is_ascii_digit());
+        let r_ok = right.starts_with('s')
+            && right.len() >= 2
+            && right[1..].chars().all(|c| c.is_ascii_digit());
+        return l_ok && r_ok;
+    }
+    // Single trailing "S1" / "S01" pack suffix (not "Season 2")
+    lower.starts_with('s')
+        && lower.len() >= 2
+        && lower.len() <= 3
+        && lower[1..].chars().all(|c| c.is_ascii_digit())
+}
+
+fn has_dub_or_pack_tag(raw: &str) -> bool {
+    let lower = raw.to_ascii_lowercase();
+    if [
+        "[hindi]",
+        "[english]",
+        "[japanese]",
+        "[sub]",
+        "[dub]",
+        "(hindi)",
+        "(english)",
+        "(dub)",
+        "(sub)",
+        "hindi dub",
+        "english dub",
+    ]
+    .iter()
+    .any(|tag| lower.contains(tag))
+    {
+        return true;
+    }
+    raw.split_whitespace().any(is_season_range_token)
+}
+
 pub fn normalize_title_for_match(raw: &str) -> String {
     let mut s = raw.trim().to_string();
-    // Strip trailing bracketed/parenthesized tags like [Hindi], [English], (2022), S1-S4
+    // Strip trailing bracketed/parenthesized tags like [Hindi], [English], (2022), (Dub), and S1-S2 suffixes
     loop {
         let trimmed = s.trim();
         let stripped = if let Some(idx) = trimmed.rfind('[')
@@ -20,12 +74,23 @@ pub fn normalize_title_for_match(raw: &str) -> String {
         } else if let Some(idx) = trimmed.rfind('(')
             && trimmed.ends_with(')')
         {
-            let inner = &trimmed[idx + 1..trimmed.len() - 1];
-            if inner.len() == 4 && inner.chars().all(|c| c.is_ascii_digit()) {
+            let inner = trimmed[idx + 1..trimmed.len() - 1]
+                .trim()
+                .to_ascii_lowercase();
+            let is_year = inner.len() == 4 && inner.chars().all(|c| c.is_ascii_digit());
+            let is_lang_or_mode = matches!(
+                inner.as_str(),
+                "dub" | "sub" | "hindi" | "english" | "japanese" | "tv" | "uncensored"
+            );
+            if is_year || is_lang_or_mode {
                 trimmed[..idx].trim()
             } else {
                 break;
             }
+        } else if let Some((head, tail)) = trimmed.rsplit_once(char::is_whitespace)
+            && is_season_range_token(tail)
+        {
+            head.trim()
         } else {
             break;
         };
@@ -37,7 +102,8 @@ pub fn normalize_title_for_match(raw: &str) -> String {
 
     let mut out = String::with_capacity(s.len());
     let mut prev_space = false;
-    for ch in s.chars() {
+    for raw_ch in s.chars() {
+        let ch = fold_latin_char(raw_ch);
         if ch.is_ascii_alphanumeric() {
             out.push(ch.to_ascii_lowercase());
             prev_space = false;
@@ -57,14 +123,24 @@ fn has_special_or_sequel_marker(raw: &str) -> Option<&'static str> {
         "movie",
         "theatrical",
         "part 2",
+        "part 3",
         "season 2",
+        "second season",
         "season 3",
+        "third season",
+        "final season",
         "shippuden",
+        "shippûden",
         "boruto",
         "brotherhood",
     ] {
         if lower.contains(marker) {
-            return Some(marker);
+            return Some(match marker {
+                "shippûden" => "shippuden",
+                "second season" => "season 2",
+                "third season" => "season 3",
+                other => other,
+            });
         }
     }
     None
@@ -72,11 +148,6 @@ fn has_special_or_sequel_marker(raw: &str) -> Option<&'static str> {
 
 pub fn anime_match_confidence(a: &NormalizedAnime, b: &CanonicalAnime) -> MatchConfidence {
     if a.media_type != b.media_type {
-        return MatchConfidence::NoMatch;
-    }
-    if let (Some(ya), Some(yb)) = (a.year, b.year)
-        && ya.abs_diff(yb) > 1
-    {
         return MatchConfidence::NoMatch;
     }
     let norm_a = normalize_title_for_match(&a.title);
@@ -87,16 +158,33 @@ pub fn anime_match_confidence(a: &NormalizedAnime, b: &CanonicalAnime) -> MatchC
     if has_special_or_sequel_marker(&a.title) != has_special_or_sequel_marker(&b.title) {
         return MatchConfidence::NoMatch;
     }
-    if norm_a == norm_b {
-        return MatchConfidence::HighConfidenceMatch;
+
+    let title_matched = norm_a == norm_b
+        || b.alternative_titles
+            .iter()
+            .any(|alt| normalize_title_for_match(alt) == norm_a)
+        || a.alternative_titles
+            .iter()
+            .any(|alt| normalize_title_for_match(alt) == norm_b);
+
+    if !title_matched {
+        return MatchConfidence::NoMatch;
     }
-    if b.alternative_titles
-        .iter()
-        .any(|alt| normalize_title_for_match(alt) == norm_a)
-    {
-        return MatchConfidence::HighConfidenceMatch;
+
+    if let (Some(ya), Some(yb)) = (a.year, b.year) {
+        let diff = ya.abs_diff(yb);
+        if diff > 1 {
+            // Allow wider year gap ONLY when at least one side has an explicit dub/language/season-pack tag
+            // (e.g. "Naruto Shippuden" 2007 vs "Naruto: Shippuden [Hindi]" 2017 or "S1-S2" 2009),
+            // preventing false-positive merges of unrelated remakes like Hunter x Hunter (1999 vs 2011).
+            let has_pack_or_dub = has_dub_or_pack_tag(&a.title) || has_dub_or_pack_tag(&b.title);
+            if !(has_pack_or_dub && diff <= 15) {
+                return MatchConfidence::NoMatch;
+            }
+        }
     }
-    MatchConfidence::NoMatch
+
+    MatchConfidence::HighConfidenceMatch
 }
 
 pub fn merge_search_results(
@@ -127,8 +215,10 @@ pub fn merge_search_results(
                     details_failed: false,
                 });
             }
-            if existing.year.is_none() {
-                existing.year = item.year;
+            match (existing.year, item.year) {
+                (None, Some(y)) => existing.year = Some(y),
+                (Some(ey), Some(iy)) if iy < ey => existing.year = Some(iy),
+                _ => {}
             }
             if existing.poster_url.is_none() {
                 existing.poster_url = item.poster_url;
@@ -136,11 +226,15 @@ pub fn merge_search_results(
             if existing.description.is_none() {
                 existing.description = item.description;
             }
-            // Prefer clean title without [Tag] if current title has brackets
-            if existing.title.contains('[') && !item.title.contains('[') {
-                existing.alternative_titles.push(existing.title.clone());
+            // Prefer clean title without [Tag] or S1-S2 pack suffix
+            if has_dub_or_pack_tag(&existing.title) && !has_dub_or_pack_tag(&item.title) {
+                if !existing.alternative_titles.contains(&existing.title) {
+                    existing.alternative_titles.push(existing.title.clone());
+                }
                 existing.title = item.title;
-            } else if item.title != existing.title && !existing.alternative_titles.contains(&item.title) {
+            } else if item.title != existing.title
+                && !existing.alternative_titles.contains(&item.title)
+            {
                 existing.alternative_titles.push(item.title);
             }
             continue;
@@ -197,14 +291,19 @@ pub fn build_canonical_structure(anime: &mut CanonicalAnime) {
     for rec in &anime.provider_records {
         if let Some(d) = &rec.details {
             if best_year.is_none()
-                && let Some(y) = d.year.as_deref().and_then(|s| s.trim().get(..4)).and_then(|s| s.parse::<u32>().ok())
+                && let Some(y) = d
+                    .year
+                    .as_deref()
+                    .and_then(|s| s.trim().get(..4))
+                    .and_then(|s| s.parse::<u32>().ok())
             {
                 best_year = Some(y);
             }
             if best_desc.is_none() && d.description.as_ref().is_some_and(|s| !s.trim().is_empty()) {
                 best_desc = d.description.clone();
             }
-            if best_poster.is_none() && d.poster_url.as_ref().is_some_and(|s| !s.trim().is_empty()) {
+            if best_poster.is_none() && d.poster_url.as_ref().is_some_and(|s| !s.trim().is_empty())
+            {
                 best_poster = d.poster_url.clone();
             }
             for g in &d.genres {
@@ -220,24 +319,10 @@ pub fn build_canonical_structure(anime: &mut CanonicalAnime) {
     anime.poster_url = best_poster;
     anime.genres = genres;
 
-    // Collect highest season count & highest total episode count separately (Spec Section 9.3 / 9.4)
-    let mut highest_season_count = 0usize;
-    let mut highest_total_episodes = 0usize;
-    let mut any_details = false;
-
-    for rec in &anime.provider_records {
-        if let Some(d) = &rec.details {
-            any_details = true;
-            let sc = d.seasons.iter().filter(|s| s.number > 0 && !s.episodes.is_empty()).count();
-            let ec: usize = d.seasons.iter().map(|s| s.episodes.len()).sum();
-            if sc > highest_season_count {
-                highest_season_count = sc;
-            }
-            if ec > highest_total_episodes {
-                highest_total_episodes = ec;
-            }
-        }
-    }
+    let any_details = anime
+        .provider_records
+        .iter()
+        .any(|rec| rec.details.is_some());
 
     // One-by-one episode mapping across all providers (Spec Section 11)
     let mut episode_buckets: BTreeMap<(bool, usize, usize), Vec<(ProviderKind, String, &Episode)>> =
@@ -331,6 +416,9 @@ pub fn build_canonical_structure(anime: &mut CanonicalAnime) {
     let mut seasons = Vec::with_capacity(seasons_map.len());
     let mut total_episodes = 0usize;
     for ((_, season_num), eps) in seasons_map {
+        if eps.is_empty() {
+            continue;
+        }
         total_episodes += eps.len();
         seasons.push(CanonicalSeason {
             id: format_season_id(&anime.slug_token, season_num),
@@ -341,8 +429,8 @@ pub fn build_canonical_structure(anime: &mut CanonicalAnime) {
     }
 
     anime.seasons = seasons;
-    anime.total_seasons = anime.seasons.len().max(highest_season_count);
-    anime.total_episodes = total_episodes.max(highest_total_episodes);
+    anime.total_seasons = anime.seasons.len();
+    anime.total_episodes = total_episodes;
     anime.season_structure_status = if !any_details {
         "unavailable".to_string()
     } else if anime.provider_records.iter().any(|r| r.details_failed) {
@@ -390,7 +478,13 @@ mod tests {
     use super::*;
     use crate::providers::models::Season;
 
-    fn norm(p: ProviderKind, id: &str, title: &str, year: Option<u32>, mt: MediaType) -> NormalizedAnime {
+    fn norm(
+        p: ProviderKind,
+        id: &str,
+        title: &str,
+        year: Option<u32>,
+        mt: MediaType,
+    ) -> NormalizedAnime {
         NormalizedAnime {
             provider_id: p,
             provider_anime_id: id.to_string(),
@@ -407,13 +501,34 @@ mod tests {
     #[test]
     fn test_identity_matching_merges_same_anime_and_keeps_movies_separate() {
         let items = vec![
-            norm(ProviderKind::AniZone, "az1", "Naruto Shippuden", Some(2007), MediaType::Series),
-            norm(ProviderKind::Dramachi, "dc1", "Naruto Shippuden [Hindi]", Some(2007), MediaType::Series),
-            norm(ProviderKind::MovieBox, "mb1", "Naruto Shippuden: The Movie", Some(2007), MediaType::Movie),
+            norm(
+                ProviderKind::AniZone,
+                "az1",
+                "Naruto Shippuden",
+                Some(2007),
+                MediaType::Series,
+            ),
+            norm(
+                ProviderKind::Dramachi,
+                "dc1",
+                "Naruto Shippuden [Hindi]",
+                Some(2007),
+                MediaType::Series,
+            ),
+            norm(
+                ProviderKind::MovieBox,
+                "mb1",
+                "Naruto Shippuden: The Movie",
+                Some(2007),
+                MediaType::Movie,
+            ),
         ];
         let merged = merge_search_results(items, 50);
         assert_eq!(merged.len(), 2);
-        let series = merged.iter().find(|a| a.media_type == MediaType::Series).unwrap();
+        let series = merged
+            .iter()
+            .find(|a| a.media_type == MediaType::Series)
+            .unwrap();
         assert_eq!(series.provider_records.len(), 2);
         assert_eq!(series.title, "Naruto Shippuden");
     }
@@ -543,5 +658,103 @@ mod tests {
         assert_eq!(anime.seasons[0].episodes.len(), 3);
         assert_eq!(anime.seasons[0].episodes[0].provider_mappings.len(), 2);
         assert_eq!(anime.seasons[0].episodes[2].provider_mappings.len(), 1);
+    }
+
+    #[test]
+    fn test_naruto_shippuden_merges_s1_s2_and_hindi_keeps_boruto_and_movies_separate() {
+        let items = vec![
+            norm(
+                ProviderKind::AniZone,
+                "az1",
+                "Naruto Shippuden",
+                Some(2007),
+                MediaType::Series,
+            ),
+            norm(
+                ProviderKind::MovieBox,
+                "mb1",
+                "Naruto: Shippuden S1-S2",
+                Some(2009),
+                MediaType::Series,
+            ),
+            norm(
+                ProviderKind::MovieBox,
+                "mb2",
+                "Naruto: Shippuden [Hindi]",
+                Some(2017),
+                MediaType::Series,
+            ),
+            norm(
+                ProviderKind::MovieBox,
+                "mb3",
+                "Boruto: Naruto Next Generations S1-S3",
+                Some(2017),
+                MediaType::Series,
+            ),
+            norm(
+                ProviderKind::AniZone,
+                "az2",
+                "Naruto",
+                Some(2002),
+                MediaType::Series,
+            ),
+            norm(
+                ProviderKind::MovieBox,
+                "mb4",
+                "Naruto Shippuden: The Movie",
+                Some(2007),
+                MediaType::Movie,
+            ),
+        ];
+        let merged = merge_search_results(items, 50);
+        assert_eq!(merged.len(), 4);
+        let shippuden = merged
+            .iter()
+            .find(|a| a.title == "Naruto Shippuden" && a.media_type == MediaType::Series)
+            .expect("Naruto Shippuden canonical record should exist");
+        assert_eq!(shippuden.provider_records.len(), 3);
+        assert_eq!(shippuden.year, Some(2007));
+    }
+
+    #[test]
+    fn test_remake_with_large_year_gap_without_dub_tag_stays_separate() {
+        let items = vec![
+            norm(
+                ProviderKind::AniZone,
+                "az1",
+                "Hunter x Hunter",
+                Some(1999),
+                MediaType::Series,
+            ),
+            norm(
+                ProviderKind::MovieBox,
+                "mb1",
+                "Hunter x Hunter",
+                Some(2011),
+                MediaType::Series,
+            ),
+        ];
+        let merged = merge_search_results(items, 50);
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn test_season_range_and_language_normalization() {
+        assert_eq!(
+            normalize_title_for_match("Naruto: Shippuden S1-S2"),
+            "naruto shippuden"
+        );
+        assert_eq!(
+            normalize_title_for_match("Naruto: Shippûden [Hindi]"),
+            "naruto shippuden"
+        );
+        assert_eq!(
+            normalize_title_for_match("Black Clover [English] (2017)"),
+            "black clover"
+        );
+        assert_eq!(
+            normalize_title_for_match("Boruto: Naruto Next Generations S1-S3"),
+            "boruto naruto next generations"
+        );
     }
 }

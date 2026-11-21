@@ -245,6 +245,8 @@ pub struct EpisodeSourcesResponse {
 #[derive(Debug, Deserialize)]
 pub struct ResolveRequest {
     #[serde(default)]
+    pub source_id: Option<String>,
+    #[serde(default)]
     pub audio_language: Option<String>,
     #[serde(default)]
     pub preferred_quality: Option<String>,

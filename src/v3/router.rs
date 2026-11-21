@@ -68,7 +68,10 @@ pub async fn run() -> std::io::Result<()> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
     let listener = TcpListener::bind(addr).await?;
-    log::info!("prophecy_v3_server_listening addr={addr} routes={}", REGISTERED_ANIME_ROUTES.len());
+    log::info!(
+        "prophecy_v3_server_listening addr={addr} routes={}",
+        REGISTERED_ANIME_ROUTES.len()
+    );
 
     let conn_sem = Arc::new(Semaphore::new(256));
     loop {
@@ -96,9 +99,12 @@ async fn handle_connection(
     let mut temp = [0u8; 4096];
     let header_end;
     loop {
-        let n = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buf_chunk(&mut temp)))
-            .await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "read timeout"))??;
+        let n = tokio::time::timeout(
+            Duration::from_secs(10),
+            stream.read(&mut buf_chunk(&mut temp)),
+        )
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "read timeout"))??;
         if n == 0 {
             return Ok(());
         }
@@ -108,7 +114,15 @@ async fn handle_connection(
             break;
         }
         if buf.len() > MAX_REQUEST_BYTES {
-            return write_error(&mut stream, 413, "INVALID_QUERY", "Request headers too large", None).await.map(|_| ());
+            return write_error(
+                &mut stream,
+                413,
+                "INVALID_QUERY",
+                "Request headers too large",
+                None,
+            )
+            .await
+            .map(|_| ());
         }
     }
 
@@ -133,7 +147,15 @@ async fn handle_connection(
     }
 
     if content_length > MAX_BODY_BYTES {
-        return write_error(&mut stream, 413, "INVALID_QUERY", "Request body too large", None).await.map(|_| ());
+        return write_error(
+            &mut stream,
+            413,
+            "INVALID_QUERY",
+            "Request body too large",
+            None,
+        )
+        .await
+        .map(|_| ());
     }
 
     let mut body = buf[header_end + 4..].to_vec();
@@ -157,29 +179,63 @@ async fn handle_connection(
 
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     let session_hdr = headers.get("x-pv-session").map(String::as_str);
-    let session_hash = session_hdr.map(hash_session_id).unwrap_or_else(|| "-".to_string());
+    let session_hash = session_hdr
+        .map(hash_session_id)
+        .unwrap_or_else(|| "-".to_string());
 
     if !check_rate_limit(&state, peer.ip()).await {
-        log::warn!("v3_req request_id={req_id} session_hash={session_hash} route={path} status=429 error_code=RATE_LIMITED");
-        return write_error(&mut stream, 429, "RATE_LIMITED", "Rate limit exceeded.", None).await.map(|_| ());
+        log::warn!(
+            "v3_req request_id={req_id} session_hash={session_hash} route={path} status=429 error_code=RATE_LIMITED"
+        );
+        return write_error(
+            &mut stream,
+            429,
+            "RATE_LIMITED",
+            "Rate limit exceeded.",
+            None,
+        )
+        .await
+        .map(|_| ());
     }
 
     let res = tokio::time::timeout(
         REQUEST_TIMEOUT,
-        dispatch_route(&mut stream, &method, path, query, &headers, &body, &state, &req_id, &session_hash),
+        dispatch_route(
+            &mut stream,
+            &method,
+            path,
+            query,
+            &headers,
+            &body,
+            &state,
+            &req_id,
+            &session_hash,
+        ),
     )
     .await;
 
     let elapsed = started.elapsed().as_millis();
     match res {
         Ok(Ok(status)) => {
-            log::info!("v3_req request_id={req_id} session_hash={session_hash} method={method} route={path} duration_ms={elapsed} status={status}");
+            log::info!(
+                "v3_req request_id={req_id} session_hash={session_hash} method={method} route={path} duration_ms={elapsed} status={status}"
+            );
             Ok(())
         }
         Ok(Err(e)) => Err(e),
         Err(_) => {
-            log::warn!("v3_req request_id={req_id} session_hash={session_hash} method={method} route={path} duration_ms={elapsed} status=504 error_code=INTERNAL_ERROR");
-            write_error(&mut stream, 504, "INTERNAL_ERROR", "Request timed out.", None).await.map(|_| ())
+            log::warn!(
+                "v3_req request_id={req_id} session_hash={session_hash} method={method} route={path} duration_ms={elapsed} status=504 error_code=INTERNAL_ERROR"
+            );
+            write_error(
+                &mut stream,
+                504,
+                "INTERNAL_ERROR",
+                "Request timed out.",
+                None,
+            )
+            .await
+            .map(|_| ())
         }
     }
 }
@@ -243,13 +299,34 @@ pub async fn dispatch_route(
         let session = match state.sessions.get_session(session_hdr).await {
             Ok(s) => s,
             Err(SessionLookupError::Required) => {
-                return write_error(stream, 401, "SESSION_REQUIRED", "Missing X-PV-Session header.", None).await;
+                return write_error(
+                    stream,
+                    401,
+                    "SESSION_REQUIRED",
+                    "Missing X-PV-Session header.",
+                    None,
+                )
+                .await;
             }
             Err(SessionLookupError::Invalid) => {
-                return write_error(stream, 400, "SESSION_INVALID", "Invalid X-PV-Session token format.", None).await;
+                return write_error(
+                    stream,
+                    400,
+                    "SESSION_INVALID",
+                    "Invalid X-PV-Session token format.",
+                    None,
+                )
+                .await;
             }
             Err(SessionLookupError::Expired) => {
-                return write_error(stream, 401, "SESSION_EXPIRED", "The temporary session has expired.", None).await;
+                return write_error(
+                    stream,
+                    401,
+                    "SESSION_EXPIRED",
+                    "The temporary session has expired.",
+                    None,
+                )
+                .await;
             }
         };
 
@@ -295,10 +372,7 @@ async fn handle_search(
 ) -> std::io::Result<u16> {
     let q = parse_query_param(query, "q").unwrap_or_default();
     let trimmed = q.trim();
-    if trimmed.is_empty()
-        || trimmed.len() > 160
-        || trimmed.chars().any(|c| c.is_control())
-    {
+    if trimmed.is_empty() || trimmed.len() > 160 || trimmed.chars().any(|c| c.is_control()) {
         return write_error(
             stream,
             400,
@@ -363,7 +437,11 @@ async fn ensure_anime_hydrated(
         guard.anime_records.get(anime_id).cloned()
     };
     let Some(mut anime) = existing else {
-        return Err((404, "ANIME_NOT_FOUND", "Anime does not exist in this session.".into()));
+        return Err((
+            404,
+            "ANIME_NOT_FOUND",
+            "Anime does not exist in this session.".into(),
+        ));
     };
     if anime.details_hydrated {
         return Ok(anime);
@@ -403,7 +481,9 @@ async fn ensure_anime_hydrated(
 
     let mut guard = session.write().await;
     for season in &anime.seasons {
-        guard.season_index.insert(season.id.clone(), anime.id.clone());
+        guard
+            .season_index
+            .insert(season.id.clone(), anime.id.clone());
         for ep in &season.episodes {
             guard
                 .episode_index
@@ -496,7 +576,14 @@ async fn handle_season_episodes(
         })
     };
     let Some(season) = season_opt else {
-        return write_error(stream, 404, "SEASON_NOT_FOUND", "Season does not exist in this session.", None).await;
+        return write_error(
+            stream,
+            404,
+            "SEASON_NOT_FOUND",
+            "Season does not exist in this session.",
+            None,
+        )
+        .await;
     };
 
     // Audio availability NEVER hides an episode (Spec Section 10.3 & 12.8)
@@ -527,27 +614,54 @@ async fn ensure_episode_sources_hydrated(
     episode_id: &str,
     session: &Arc<tokio::sync::RwLock<TemporarySession>>,
     state: &V3AppState,
-) -> Result<(CanonicalEpisode, Vec<ProviderSourceCandidate>, AudioAvailability), (u16, &'static str, String)> {
+) -> Result<
+    (
+        CanonicalEpisode,
+        Vec<ProviderSourceCandidate>,
+        AudioAvailability,
+    ),
+    (u16, &'static str, String),
+> {
     let loc = {
         let guard = session.read().await;
-        guard.episode_index.get(episode_id).cloned().and_then(|(aid, sid)| {
-            guard.anime_records.get(&aid).and_then(|a| {
-                a.seasons
-                    .iter()
-                    .find(|s| s.id == sid)
-                    .and_then(|s| s.episodes.iter().find(|e| e.id == episode_id).cloned())
+        guard
+            .episode_index
+            .get(episode_id)
+            .cloned()
+            .and_then(|(aid, sid)| {
+                guard.anime_records.get(&aid).and_then(|a| {
+                    let titles: HashMap<(crate::providers::models::ProviderKind, String), String> =
+                        a.provider_records
+                            .iter()
+                            .map(|r| {
+                                (
+                                    (r.provider_id, r.provider_anime_id.clone()),
+                                    r.title.clone(),
+                                )
+                            })
+                            .collect();
+                    a.seasons
+                        .iter()
+                        .find(|s| s.id == sid)
+                        .and_then(|s| s.episodes.iter().find(|e| e.id == episode_id).cloned())
+                        .map(|ep| (ep, titles))
+                })
             })
-        })
     };
-    let Some(mut episode) = loc else {
-        return Err((404, "EPISODE_NOT_FOUND", "Episode does not exist in this session.".into()));
+    let Some((mut episode, provider_titles)) = loc else {
+        return Err((
+            404,
+            "EPISODE_NOT_FOUND",
+            "Episode does not exist in this session.".into(),
+        ));
     };
 
     if let (Some(srcs), Some(audio)) = (episode.sources.clone(), episode.audio.clone()) {
         return Ok((episode, srcs, audio));
     }
 
-    let (srcs, all_failed) = collect_episode_sources(&state.registry, &episode).await;
+    let (srcs, all_failed) =
+        collect_episode_sources(&state.registry, &episode, &provider_titles).await;
     let audio = compute_audio_availability(&srcs, all_failed);
 
     {
@@ -572,10 +686,11 @@ async fn handle_episode_details(
     session: Arc<tokio::sync::RwLock<TemporarySession>>,
     state: &V3AppState,
 ) -> std::io::Result<u16> {
-    let (episode, _srcs, audio) = match ensure_episode_sources_hydrated(episode_id, &session, state).await {
-        Ok(v) => v,
-        Err((st, code, msg)) => return write_error(stream, st, code, &msg, None).await,
-    };
+    let (episode, _srcs, audio) =
+        match ensure_episode_sources_hydrated(episode_id, &session, state).await {
+            Ok(v) => v,
+            Err((st, code, msg)) => return write_error(stream, st, code, &msg, None).await,
+        };
 
     write_json(
         stream,
@@ -601,10 +716,11 @@ async fn handle_episode_sources(
     session: Arc<tokio::sync::RwLock<TemporarySession>>,
     state: &V3AppState,
 ) -> std::io::Result<u16> {
-    let (episode, srcs, _audio) = match ensure_episode_sources_hydrated(episode_id, &session, state).await {
-        Ok(v) => v,
-        Err((st, code, msg)) => return write_error(stream, st, code, &msg, None).await,
-    };
+    let (episode, srcs, _audio) =
+        match ensure_episode_sources_hydrated(episode_id, &session, state).await {
+            Ok(v) => v,
+            Err((st, code, msg)) => return write_error(stream, st, code, &msg, None).await,
+        };
 
     let public: Vec<PublicSourceItem> = srcs
         .iter()
@@ -639,6 +755,7 @@ async fn handle_episode_resolve(
 ) -> std::io::Result<u16> {
     let req: ResolveRequest = if body.is_empty() {
         ResolveRequest {
+            source_id: None,
             audio_language: None,
             preferred_quality: None,
         }
@@ -658,7 +775,9 @@ async fn handle_episode_resolve(
         }
     };
 
-    let (episode, srcs, _audio) = match ensure_episode_sources_hydrated(episode_id, &session, state).await {
+    let (episode, srcs, _audio) = match ensure_episode_sources_hydrated(episode_id, &session, state)
+        .await
+    {
         Ok(v) => v,
         Err((st, code, msg)) => return write_error(stream, st, code, &msg, Some(episode_id)).await,
     };
@@ -667,6 +786,7 @@ async fn handle_episode_resolve(
         &state.registry,
         &episode,
         &srcs,
+        req.source_id.as_deref(),
         req.audio_language.as_deref(),
         req.preferred_quality.as_deref(),
     )
@@ -866,7 +986,14 @@ mod tests {
         assert_eq!(j["error"]["code"], "INVALID_QUERY");
 
         let long_q = "a".repeat(205);
-        let (st, j) = send_http(addr, "GET", &format!("/api/v1/anime/search?q={long_q}"), &[], None).await;
+        let (st, j) = send_http(
+            addr,
+            "GET",
+            &format!("/api/v1/anime/search?q={long_q}"),
+            &[],
+            None,
+        )
+        .await;
         assert_eq!(st, 400);
         assert_eq!(j["error"]["code"], "INVALID_QUERY");
 
@@ -892,7 +1019,10 @@ mod tests {
             addr,
             "GET",
             "/api/v1/anime/NP-A-001",
-            &[("X-PV-Session", "000000000000000000000000000000000000000000000000")],
+            &[(
+                "X-PV-Session",
+                "000000000000000000000000000000000000000000000000",
+            )],
             None,
         )
         .await;
@@ -1005,7 +1135,14 @@ mod tests {
         assert_eq!(st, 200);
         assert_eq!(j["seasons"].as_array().unwrap().len(), 1);
 
-        let (st, j) = send_http(addr, "GET", "/api/v1/seasons/NP-S-001/episodes", &hdrs, None).await;
+        let (st, j) = send_http(
+            addr,
+            "GET",
+            "/api/v1/seasons/NP-S-001/episodes",
+            &hdrs,
+            None,
+        )
+        .await;
         assert_eq!(st, 200);
         // Both episodes visible even when audio is missing on NP-E-002
         assert_eq!(j["episodes"].as_array().unwrap().len(), 2);
@@ -1015,7 +1152,14 @@ mod tests {
         assert_eq!(j["audio"]["english"], "available");
         assert_eq!(j["audio"]["hindi"], "missing");
 
-        let (st, j) = send_http(addr, "GET", "/api/v1/episodes/NP-E-001/sources", &hdrs, None).await;
+        let (st, j) = send_http(
+            addr,
+            "GET",
+            "/api/v1/episodes/NP-E-001/sources",
+            &hdrs,
+            None,
+        )
+        .await;
         assert_eq!(st, 200);
         assert_eq!(j["sources"].as_array().unwrap().len(), 1);
 
@@ -1051,6 +1195,30 @@ mod tests {
             "/api/v1/episodes/NP-E-002/resolve",
             &hdrs,
             Some(r#"{"audio_language":"en"}"#),
+        )
+        .await;
+        assert_eq!(st, 404);
+        assert_eq!(j["error"]["code"], "SOURCE_UNAVAILABLE");
+
+        // Exact source_id selection -> 200 resolved stream_url
+        let (st, j) = send_http(
+            addr,
+            "POST",
+            "/api/v1/episodes/NP-E-001/resolve",
+            &hdrs,
+            Some(r#"{"source_id":"src-1"}"#),
+        )
+        .await;
+        assert_eq!(st, 200);
+        assert_eq!(j["stream_url"], "https://cdn.example.com/ep1.mp4");
+
+        // Invalid source_id -> 404 SOURCE_UNAVAILABLE
+        let (st, j) = send_http(
+            addr,
+            "POST",
+            "/api/v1/episodes/NP-E-001/resolve",
+            &hdrs,
+            Some(r#"{"source_id":"src-does-not-exist"}"#),
         )
         .await;
         assert_eq!(st, 404);
