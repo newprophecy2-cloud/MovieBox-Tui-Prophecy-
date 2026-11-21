@@ -1,4 +1,5 @@
 use crate::unified::normalize_language_code;
+use base64::Engine as _;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -14,6 +15,8 @@ pub struct AudioIdConfig {
     pub sample_seconds: u64,
     pub model_url: Option<String>,
     pub model_api_key: Option<String>,
+    pub gemini_api_key: Option<String>,
+    pub gemini_model: String,
     pub min_confidence: f32,
 }
 
@@ -32,6 +35,15 @@ impl AudioIdConfig {
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
+        let gemini_api_key = std::env::var("GEMINI_API_KEY")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let gemini_model = std::env::var("PV_GEMINI_AUDIO_MODEL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "gemini-2.5-flash".to_string());
         let min_confidence = std::env::var("PV_AUDIO_MIN_CONFIDENCE")
             .ok()
             .and_then(|v| v.trim().parse::<f32>().ok())
@@ -42,9 +54,119 @@ impl AudioIdConfig {
             sample_seconds,
             model_url,
             model_api_key,
+            gemini_api_key,
+            gemini_model,
             min_confidence,
         }
     }
+
+    pub fn is_configured(&self) -> bool {
+        self.model_url.is_some() || self.gemini_api_key.is_some()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FfprobeAudioStream {
+    pub track_index: usize,
+    pub provider_track_id: Option<String>,
+    pub audio_codec: Option<String>,
+    pub channels: Option<String>,
+    pub declared_language_code: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FfprobeOutput {
+    #[serde(default)]
+    streams: Vec<FfprobeStreamEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FfprobeStreamEntry {
+    index: Option<usize>,
+    codec_name: Option<String>,
+    channels: Option<u32>,
+    #[serde(default)]
+    tags: HashMap<String, String>,
+}
+
+pub fn parse_ffprobe_audio_json(json_str: &str) -> Vec<FfprobeAudioStream> {
+    let Ok(parsed) = serde_json::from_str::<FfprobeOutput>(json_str) else {
+        return Vec::new();
+    };
+    parsed
+        .streams
+        .into_iter()
+        .enumerate()
+        .map(|(idx, s)| {
+            let lang_tag = s
+                .tags
+                .get("language")
+                .or_else(|| s.tags.get("LANGUAGE"))
+                .map(String::as_str)
+                .filter(|v| !v.eq_ignore_ascii_case("und"))
+                .and_then(normalize_language_code);
+            FfprobeAudioStream {
+                track_index: idx,
+                provider_track_id: s.index.map(|i| i.to_string()),
+                audio_codec: s.codec_name,
+                channels: s.channels.map(|c| c.to_string()),
+                declared_language_code: lang_tag,
+            }
+        })
+        .collect()
+}
+
+pub async fn extract_ffprobe_audio_streams(
+    stream_url: &str,
+    headers: &HashMap<String, String>,
+) -> Vec<FfprobeAudioStream> {
+    if crate::net::validate_public_url(stream_url, true)
+        .await
+        .is_err()
+    {
+        return Vec::new();
+    }
+    extract_ffprobe_audio_streams_raw(stream_url, headers).await
+}
+
+async fn extract_ffprobe_audio_streams_raw(
+    input: &str,
+    headers: &HashMap<String, String>,
+) -> Vec<FfprobeAudioStream> {
+    let mut cmd = Command::new("ffprobe");
+    cmd.arg("-v")
+        .arg("quiet")
+        .arg("-print_format")
+        .arg("json")
+        .arg("-show_streams")
+        .arg("-select_streams")
+        .arg("a");
+    if !headers.is_empty() {
+        let mut hdr_str = String::new();
+        for (k, v) in headers {
+            if k.eq_ignore_ascii_case("referer")
+                || k.eq_ignore_ascii_case("user-agent")
+                || k.eq_ignore_ascii_case("origin")
+            {
+                hdr_str.push_str(&format!("{k}: {v}\r\n"));
+            }
+        }
+        if !hdr_str.is_empty() {
+            cmd.arg("-headers").arg(hdr_str);
+        }
+    }
+    cmd.arg(input).stdout(Stdio::piped()).stderr(Stdio::null());
+
+    let Ok(out) = tokio::time::timeout(Duration::from_secs(6), cmd.output()).await else {
+        return Vec::new();
+    };
+    let Ok(output) = out else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    parse_ffprobe_audio_json(&String::from_utf8_lossy(&output.stdout))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -73,7 +195,13 @@ pub fn measure_wav_rms_and_duration(wav_bytes: &[u8]) -> Option<(f32, f32)> {
     if wav_bytes.len() <= 44 {
         return None;
     }
-    let pcm = &wav_bytes[44..];
+    let data_offset = wav_bytes
+        .windows(4)
+        .position(|w| w == b"data")
+        .map(|pos| pos + 8)
+        .filter(|&off| off < wav_bytes.len())
+        .unwrap_or(44);
+    let pcm = &wav_bytes[data_offset..];
     let sample_count = pcm.len() / 2;
     if sample_count == 0 {
         return None;
@@ -149,8 +277,16 @@ pub async fn extract_30s_audio_sample(
     {
         return Err("Stream URL failed SSRF/public URL validation".to_string());
     }
+    extract_30s_audio_sample_raw(stream_url, headers, track_index, sample_seconds).await
+}
 
-    let capped_secs = sample_seconds.clamp(5, MAX_SAMPLE_SECONDS);
+async fn extract_30s_audio_sample_raw(
+    input: &str,
+    headers: &HashMap<String, String>,
+    track_index: Option<usize>,
+    sample_seconds: u64,
+) -> Result<Vec<u8>, String> {
+    let capped_secs = sample_seconds.clamp(1, MAX_SAMPLE_SECONDS);
     let mut cmd = Command::new("ffmpeg");
     cmd.arg("-hide_banner")
         .arg("-loglevel")
@@ -176,7 +312,7 @@ pub async fn extract_30s_audio_sample(
     cmd.arg("-t")
         .arg(capped_secs.to_string())
         .arg("-i")
-        .arg(stream_url)
+        .arg(input)
         .arg("-map")
         .arg(&map_spec)
         .arg("-vn")
@@ -235,7 +371,7 @@ pub async fn identify_track_audio_language(
     track_index: Option<usize>,
     config: &AudioIdConfig,
 ) -> SpeechIdResult {
-    let Some(ref model_url) = config.model_url else {
+    if !config.is_configured() {
         return SpeechIdResult {
             language_code: None,
             confidence: None,
@@ -243,7 +379,7 @@ pub async fn identify_track_audio_language(
             detection_method: "none_configured".to_string(),
             verification_status: "unverified".to_string(),
         };
-    };
+    }
 
     let wav =
         match extract_30s_audio_sample(stream_url, headers, track_index, config.sample_seconds)
@@ -261,6 +397,10 @@ pub async fn identify_track_audio_language(
             }
         };
 
+    classify_wav_bytes(wav, config).await
+}
+
+pub async fn classify_wav_bytes(wav: Vec<u8>, config: &AudioIdConfig) -> SpeechIdResult {
     let Some((rms, duration)) = measure_wav_rms_and_duration(&wav) else {
         return SpeechIdResult {
             language_code: None,
@@ -294,33 +434,89 @@ pub async fn identify_track_audio_language(
         };
     };
 
-    let mut req = client
-        .post(model_url)
-        .header("Content-Type", "audio/wav")
-        .body(wav);
-    if let Some(ref key) = config.model_api_key {
-        req = req.bearer_auth(key);
-    }
+    if let Some(ref model_url) = config.model_url {
+        let mut req = client
+            .post(model_url)
+            .header("Content-Type", "audio/wav")
+            .body(wav);
+        if let Some(ref key) = config.model_api_key {
+            req = req.bearer_auth(key);
+        }
 
-    match req.send().await {
-        Ok(resp) if resp.status().is_success() => match resp.json::<ExternalLangIdResponse>().await
-        {
-            Ok(pred) => evaluate_model_prediction(pred, Some(duration), config.min_confidence),
-            Err(_) => SpeechIdResult {
+        return match req.send().await {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<ExternalLangIdResponse>().await {
+                    Ok(pred) => {
+                        evaluate_model_prediction(pred, Some(duration), config.min_confidence)
+                    }
+                    Err(_) => SpeechIdResult {
+                        language_code: None,
+                        confidence: None,
+                        sample_duration_seconds: Some(duration),
+                        detection_method: "speech_lang_id_model".to_string(),
+                        verification_status: "inconclusive".to_string(),
+                    },
+                }
+            }
+            _ => SpeechIdResult {
                 language_code: None,
                 confidence: None,
                 sample_duration_seconds: Some(duration),
                 detection_method: "speech_lang_id_model".to_string(),
-                verification_status: "inconclusive".to_string(),
+                verification_status: "unavailable".to_string(),
             },
-        },
-        _ => SpeechIdResult {
+        };
+    }
+
+    if let Some(ref api_key) = config.gemini_api_key {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&wav);
+        let endpoint = format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+            config.gemini_model, api_key
+        );
+        let body = serde_json::json!({
+            "contents": [{
+                "parts": [
+                    {
+                        "text": "Identify the primary spoken language in this audio clip. Return ONLY JSON with fields: language_code (one of \"hi\", \"en\", \"ja\", or null if unknown/music/mixed), confidence (0.0 to 1.0), speech_detected (boolean), mixed_languages (boolean)."
+                    },
+                    {
+                        "inline_data": {
+                            "mime_type": "audio/wav",
+                            "data": b64
+                        }
+                    }
+                ]
+            }],
+            "generationConfig": {
+                "responseMimeType": "application/json"
+            }
+        });
+        if let Ok(resp) = client.post(&endpoint).json(&body).send().await
+            && resp.status().is_success()
+            && let Ok(val) = resp.json::<serde_json::Value>().await
+            && let Some(text) = val["candidates"][0]["content"]["parts"][0]["text"].as_str()
+            && let Ok(pred) = serde_json::from_str::<ExternalLangIdResponse>(text)
+        {
+            let mut res = evaluate_model_prediction(pred, Some(duration), config.min_confidence);
+            res.detection_method = "gemini_audio_lang_id".to_string();
+            return res;
+        }
+        return SpeechIdResult {
             language_code: None,
             confidence: None,
             sample_duration_seconds: Some(duration),
-            detection_method: "speech_lang_id_model".to_string(),
+            detection_method: "gemini_audio_lang_id".to_string(),
             verification_status: "unavailable".to_string(),
-        },
+        };
+    }
+
+    SpeechIdResult {
+        language_code: None,
+        confidence: None,
+        sample_duration_seconds: Some(duration),
+        detection_method: "none_configured".to_string(),
+        verification_status: "unverified".to_string(),
     }
 }
 
@@ -452,5 +648,112 @@ mod tests {
         );
         assert_eq!(low.language_code, None);
         assert_eq!(low.verification_status, "inconclusive");
+    }
+
+    #[tokio::test]
+    async fn test_ffprobe_and_ffmpeg_30s_sample_and_mock_lang_id_pipeline() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let tmp_mkv =
+            std::env::temp_dir().join(format!("pv_v3_audio_id_test_{}.mkv", std::process::id()));
+        let status = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=2",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=880:duration=2",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=16000:cl=mono:d=2",
+                "-map",
+                "0:a",
+                "-map",
+                "1:a",
+                "-map",
+                "2:a",
+                "-metadata:s:a:0",
+                "language=hin",
+                "-metadata:s:a:1",
+                "language=eng",
+                "-c:a",
+                "aac",
+                tmp_mkv.to_str().unwrap(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .expect("ffmpeg should be installed");
+        assert!(status.success());
+
+        let streams =
+            extract_ffprobe_audio_streams_raw(tmp_mkv.to_str().unwrap(), &HashMap::new()).await;
+        assert_eq!(streams.len(), 3);
+        assert_eq!(streams[0].audio_codec.as_deref(), Some("aac"));
+        assert_eq!(streams[0].declared_language_code.as_deref(), Some("hi"));
+        assert_eq!(streams[1].declared_language_code.as_deref(), Some("en"));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let responses = [
+                r#"{"language_code":"hi","confidence":0.93,"speech_detected":true,"mixed_languages":false}"#,
+                r#"{"language_code":"en","confidence":0.91,"speech_detected":true,"mixed_languages":false}"#,
+            ];
+            for body in responses {
+                if let Ok((mut sock, _)) = listener.accept().await {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                }
+            }
+        });
+
+        let cfg = AudioIdConfig {
+            sample_seconds: 30,
+            model_url: Some(format!("http://{addr}/identify")),
+            model_api_key: None,
+            gemini_api_key: None,
+            gemini_model: "gemini-2.5-flash".to_string(),
+            min_confidence: 0.75,
+        };
+
+        let wav0 =
+            extract_30s_audio_sample_raw(tmp_mkv.to_str().unwrap(), &HashMap::new(), Some(0), 30)
+                .await
+                .unwrap();
+        let res0 = classify_wav_bytes(wav0, &cfg).await;
+        assert_eq!(res0.language_code.as_deref(), Some("hi"));
+        assert_eq!(res0.verification_status, "verified");
+
+        let wav1 =
+            extract_30s_audio_sample_raw(tmp_mkv.to_str().unwrap(), &HashMap::new(), Some(1), 30)
+                .await
+                .unwrap();
+        let res1 = classify_wav_bytes(wav1, &cfg).await;
+        assert_eq!(res1.language_code.as_deref(), Some("en"));
+        assert_eq!(res1.verification_status, "verified");
+
+        let wav2 =
+            extract_30s_audio_sample_raw(tmp_mkv.to_str().unwrap(), &HashMap::new(), Some(2), 30)
+                .await
+                .unwrap();
+        let res2 = classify_wav_bytes(wav2, &cfg).await;
+        assert_eq!(res2.language_code, None);
+        assert_eq!(res2.verification_status, "inconclusive");
+
+        let _ = std::fs::remove_file(&tmp_mkv);
     }
 }
