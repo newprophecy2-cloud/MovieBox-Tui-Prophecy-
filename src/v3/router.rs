@@ -1,11 +1,13 @@
+use crate::providers::models::{MediaType, ProviderKind};
 use crate::v3::audio_sources::{
-    ResolveFailure, collect_episode_sources, compute_audio_availability, resolve_episode_stream,
+    ResolveFailure, collect_episode_sources, compute_audio_availability, group_sources_by_provider,
+    resolve_episode_stream,
 };
-use crate::v3::matching::{build_canonical_structure, merge_search_results};
+use crate::v3::matching::{build_canonical_structure, merge_search_results, query_matches_anime};
 use crate::v3::models::*;
-use crate::v3::providers::ProviderRegistry;
+use crate::v3::providers::{ProviderRegistry, provider_key};
 use crate::v3::session::{SessionConfig, SessionLookupError, SessionStore, hash_session_id};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -383,7 +385,8 @@ async fn handle_search(
         .await;
     }
 
-    let (normalized, failures, total_enabled) = state.registry.search_all(trimmed).await;
+    let (normalized, failures, total_enabled, provider_coverage) =
+        state.registry.search_all(trimmed).await;
     if total_enabled == 0 || (normalized.is_empty() && failures.len() >= total_enabled) {
         return write_error(
             stream,
@@ -395,15 +398,36 @@ async fn handle_search(
         .await;
     }
 
-    let canonical = merge_search_results(normalized, state.sessions.config().max_search_results);
-    let results: Vec<SearchResultItem> = canonical
+    let mut canonical =
+        merge_search_results(normalized, state.sessions.config().max_search_results);
+    canonical.retain(|a| query_matches_anime(trimmed, a));
+
+    let results: Vec<SearchAnimeItem> = canonical
         .iter()
-        .map(|a| SearchResultItem {
-            id: a.id.clone(),
-            title: a.title.clone(),
-            media_type: a.media_type,
-            year: a.year,
-            poster_url: a.poster_url.clone(),
+        .map(|a| {
+            let pid = |k: ProviderKind| -> Option<String> {
+                a.provider_records
+                    .iter()
+                    .find(|r| r.provider_id == k)
+                    .map(|r| r.provider_anime_id.clone())
+            };
+            SearchAnimeItem {
+                anime_id: a.id.clone(),
+                title: a.title.clone(),
+                media_type: a.media_type,
+                year: a.year,
+                poster_url: a.poster_url.clone(),
+                description: a.description.clone(),
+                genres: a.genres.clone(),
+                total_seasons: a.total_seasons,
+                total_episodes: a.total_episodes,
+                provider_ids: ProviderIdsMap {
+                    moviebox: pid(ProviderKind::MovieBox),
+                    anizone: pid(ProviderKind::AniZone),
+                    dramachi: pid(ProviderKind::Dramachi),
+                    fourkhdhub: pid(ProviderKind::FourKHdHub),
+                },
+            }
         })
         .collect();
     let total = results.len();
@@ -418,10 +442,13 @@ async fn handle_search(
         &SearchResponse {
             status: "success",
             session_id,
-            results,
+            query: trimmed.to_string(),
             total,
             partial,
+            provider_coverage,
             provider_failures: failures,
+            results,
+            all_provider_stream_sources: Vec::new(),
         },
     )
     .await
@@ -494,6 +521,36 @@ async fn ensure_anime_hydrated(
     Ok(anime)
 }
 
+fn build_anime_provider_coverage(
+    anime: &CanonicalAnime,
+    registry: &ProviderRegistry,
+) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for entry in &registry.entries {
+        let key = provider_key(entry.provider_id).to_string();
+        if !entry.enabled {
+            map.insert(key, "disabled".to_string());
+            continue;
+        }
+        if let Some(rec) = anime
+            .provider_records
+            .iter()
+            .find(|r| r.provider_id == entry.provider_id)
+        {
+            map.insert(
+                key,
+                if rec.details_failed {
+                    "failed"
+                } else {
+                    "success"
+                }
+                .to_string(),
+            );
+        }
+    }
+    map
+}
+
 async fn handle_anime_details(
     stream: &mut TcpStream,
     anime_id: &str,
@@ -504,14 +561,16 @@ async fn handle_anime_details(
         Ok(a) => a,
         Err((st, code, msg)) => return write_error(stream, st, code, &msg, None).await,
     };
+    let provider_coverage = build_anime_provider_coverage(&anime, &state.registry);
 
     write_json(
         stream,
         200,
         &AnimeDetailsResponse {
             status: "success",
-            id: anime.id,
+            anime_id: anime.id,
             title: anime.title,
+            alternative_titles: anime.alternative_titles,
             media_type: anime.media_type,
             year: anime.year,
             description: anime.description,
@@ -520,6 +579,7 @@ async fn handle_anime_details(
             total_seasons: anime.total_seasons,
             total_episodes: anime.total_episodes,
             season_structure_status: anime.season_structure_status,
+            provider_coverage,
         },
     )
     .await
@@ -536,15 +596,20 @@ async fn handle_anime_seasons(
         Err((st, code, msg)) => return write_error(stream, st, code, &msg, None).await,
     };
 
-    let seasons: Vec<SeasonItemResponse> = anime
-        .seasons
-        .iter()
-        .map(|s| SeasonItemResponse {
-            id: s.id.clone(),
-            season_number: s.season_number,
-            episode_count: s.episodes.len(),
-        })
-        .collect();
+    // Section 6: Do not expose fake Season 1 to the user for movies
+    let seasons: Vec<SeasonItemResponse> = if anime.media_type == MediaType::Movie {
+        Vec::new()
+    } else {
+        anime
+            .seasons
+            .iter()
+            .map(|s| SeasonItemResponse {
+                season_id: s.id.clone(),
+                season_number: s.season_number,
+                episode_count: s.episodes.len(),
+            })
+            .collect()
+    };
 
     write_json(
         stream,
@@ -586,14 +651,15 @@ async fn handle_season_episodes(
         .await;
     };
 
-    // Audio availability NEVER hides an episode (Spec Section 10.3 & 12.8)
+    // Audio availability NEVER hides an episode
     let episodes: Vec<EpisodeItemResponse> = season
         .episodes
         .iter()
         .map(|e| EpisodeItemResponse {
-            id: e.id.clone(),
+            episode_id: e.id.clone(),
             episode_number: e.episode_number,
             title: e.title.clone(),
+            metadata_status: e.metadata_status.clone(),
         })
         .collect();
 
@@ -619,6 +685,7 @@ async fn ensure_episode_sources_hydrated(
         CanonicalEpisode,
         Vec<ProviderSourceCandidate>,
         AudioAvailability,
+        BTreeMap<String, String>,
     ),
     (u16, &'static str, String),
 > {
@@ -630,25 +697,14 @@ async fn ensure_episode_sources_hydrated(
             .cloned()
             .and_then(|(aid, sid)| {
                 guard.anime_records.get(&aid).and_then(|a| {
-                    let titles: HashMap<(crate::providers::models::ProviderKind, String), String> =
-                        a.provider_records
-                            .iter()
-                            .map(|r| {
-                                (
-                                    (r.provider_id, r.provider_anime_id.clone()),
-                                    r.title.clone(),
-                                )
-                            })
-                            .collect();
                     a.seasons
                         .iter()
                         .find(|s| s.id == sid)
                         .and_then(|s| s.episodes.iter().find(|e| e.id == episode_id).cloned())
-                        .map(|ep| (ep, titles))
                 })
             })
     };
-    let Some((mut episode, provider_titles)) = loc else {
+    let Some(mut episode) = loc else {
         return Err((
             404,
             "EPISODE_NOT_FOUND",
@@ -657,11 +713,17 @@ async fn ensure_episode_sources_hydrated(
     };
 
     if let (Some(srcs), Some(audio)) = (episode.sources.clone(), episode.audio.clone()) {
-        return Ok((episode, srcs, audio));
+        let mut cov = BTreeMap::new();
+        for s in &srcs {
+            cov.insert(
+                provider_key(s.provider_id).to_string(),
+                "success".to_string(),
+            );
+        }
+        return Ok((episode, srcs, audio, cov));
     }
 
-    let (srcs, all_failed) =
-        collect_episode_sources(&state.registry, &episode, &provider_titles).await;
+    let (srcs, all_failed, cov) = collect_episode_sources(&state.registry, &episode).await;
     let audio = compute_audio_availability(&srcs, all_failed);
 
     {
@@ -677,7 +739,7 @@ async fn ensure_episode_sources_hydrated(
         }
     }
 
-    Ok((episode, srcs, audio))
+    Ok((episode, srcs, audio, cov))
 }
 
 async fn handle_episode_details(
@@ -686,11 +748,12 @@ async fn handle_episode_details(
     session: Arc<tokio::sync::RwLock<TemporarySession>>,
     state: &V3AppState,
 ) -> std::io::Result<u16> {
-    let (episode, _srcs, audio) =
+    let (episode, _srcs, audio, provider_coverage) =
         match ensure_episode_sources_hydrated(episode_id, &session, state).await {
             Ok(v) => v,
             Err((st, code, msg)) => return write_error(stream, st, code, &msg, None).await,
         };
+    let available_languages = audio.available_languages.clone();
 
     write_json(
         stream,
@@ -703,8 +766,11 @@ async fn handle_episode_details(
             season_number: episode.season_number,
             episode_number: episode.episode_number,
             title: episode.title,
+            metadata_status: episode.metadata_status,
             overview: episode.overview,
+            provider_coverage,
             audio,
+            available_languages,
         },
     )
     .await
@@ -716,22 +782,14 @@ async fn handle_episode_sources(
     session: Arc<tokio::sync::RwLock<TemporarySession>>,
     state: &V3AppState,
 ) -> std::io::Result<u16> {
-    let (episode, srcs, _audio) =
+    let (episode, srcs, _audio, provider_coverage) =
         match ensure_episode_sources_hydrated(episode_id, &session, state).await {
             Ok(v) => v,
             Err((st, code, msg)) => return write_error(stream, st, code, &msg, None).await,
         };
 
-    let public: Vec<PublicSourceItem> = srcs
-        .iter()
-        .map(|s| PublicSourceItem {
-            id: s.source_id.clone(),
-            quality: s.quality.clone(),
-            audio_languages: s.audio_languages.clone(),
-            available: s.available,
-        })
-        .collect();
-    let total = public.len();
+    let providers = group_sources_by_provider(&srcs);
+    let total_sources: usize = providers.iter().map(|g| g.sources.len()).sum();
 
     write_json(
         stream,
@@ -739,8 +797,9 @@ async fn handle_episode_sources(
         &EpisodeSourcesResponse {
             status: "success",
             episode_id: episode.id,
-            sources: public,
-            total,
+            total_sources,
+            provider_coverage,
+            providers,
         },
     )
     .await
@@ -775,12 +834,13 @@ async fn handle_episode_resolve(
         }
     };
 
-    let (episode, srcs, _audio) = match ensure_episode_sources_hydrated(episode_id, &session, state)
-        .await
-    {
-        Ok(v) => v,
-        Err((st, code, msg)) => return write_error(stream, st, code, &msg, Some(episode_id)).await,
-    };
+    let (episode, srcs, _audio, _cov) =
+        match ensure_episode_sources_hydrated(episode_id, &session, state).await {
+            Ok(v) => v,
+            Err((st, code, msg)) => {
+                return write_error(stream, st, code, &msg, Some(episode_id)).await;
+            }
+        };
 
     match resolve_episode_stream(
         &state.registry,
@@ -792,19 +852,7 @@ async fn handle_episode_resolve(
     )
     .await
     {
-        Ok((stream_url, headers)) => {
-            write_json(
-                stream,
-                200,
-                &ResolveSuccessResponse {
-                    status: "success",
-                    episode_id: episode.id,
-                    stream_url,
-                    headers,
-                },
-            )
-            .await
-        }
+        Ok(resp) => write_json(stream, 200, &resp).await,
         Err(ResolveFailure::AudioUnavailable(msg)) => {
             write_error(stream, 404, "AUDIO_UNAVAILABLE", &msg, Some(&episode.id)).await
         }
@@ -862,11 +910,9 @@ async fn write_error(
         status,
         &ApiErrorResponse {
             status: "error",
+            code,
+            message: message.to_string(),
             episode_id: episode_id.map(str::to_string),
-            error: ApiErrorBody {
-                code,
-                message: message.to_string(),
-            },
         },
     )
     .await
@@ -968,7 +1014,7 @@ mod tests {
         ] {
             let (st, j) = send_http(addr, "GET", legacy, &[], None).await;
             assert_eq!(st, 404, "legacy route {legacy} should return 404");
-            assert_eq!(j["error"]["code"], "NOT_FOUND");
+            assert_eq!(j["code"], "NOT_FOUND");
         }
     }
 
@@ -979,11 +1025,11 @@ mod tests {
 
         let (st, j) = send_http(addr, "GET", "/api/v1/anime/search", &[], None).await;
         assert_eq!(st, 400);
-        assert_eq!(j["error"]["code"], "INVALID_QUERY");
+        assert_eq!(j["code"], "INVALID_QUERY");
 
         let (st, j) = send_http(addr, "GET", "/api/v1/anime/search?q=%20%20", &[], None).await;
         assert_eq!(st, 400);
-        assert_eq!(j["error"]["code"], "INVALID_QUERY");
+        assert_eq!(j["code"], "INVALID_QUERY");
 
         let long_q = "a".repeat(205);
         let (st, j) = send_http(
@@ -995,12 +1041,12 @@ mod tests {
         )
         .await;
         assert_eq!(st, 400);
-        assert_eq!(j["error"]["code"], "INVALID_QUERY");
+        assert_eq!(j["code"], "INVALID_QUERY");
 
         // Missing session
         let (st, j) = send_http(addr, "GET", "/api/v1/anime/NP-A-001", &[], None).await;
         assert_eq!(st, 401);
-        assert_eq!(j["error"]["code"], "SESSION_REQUIRED");
+        assert_eq!(j["code"], "SESSION_REQUIRED");
 
         // Invalid session format
         let (st, j) = send_http(
@@ -1012,7 +1058,7 @@ mod tests {
         )
         .await;
         assert_eq!(st, 400);
-        assert_eq!(j["error"]["code"], "SESSION_INVALID");
+        assert_eq!(j["code"], "SESSION_INVALID");
 
         // Unknown / expired session
         let (st, j) = send_http(
@@ -1027,7 +1073,7 @@ mod tests {
         )
         .await;
         assert_eq!(st, 401);
-        assert_eq!(j["error"]["code"], "SESSION_EXPIRED");
+        assert_eq!(j["code"], "SESSION_EXPIRED");
     }
 
     #[tokio::test]
@@ -1058,6 +1104,7 @@ mod tests {
                         season_number: 1,
                         episode_number: 1,
                         title: "Episode 1".to_string(),
+                        metadata_status: "verified".to_string(),
                         overview: None,
                         provider_mappings: vec![],
                         audio: Some(AudioAvailability {
@@ -1070,6 +1117,7 @@ mod tests {
                         sources: Some(vec![ProviderSourceCandidate {
                             source_id: "src-1".to_string(),
                             provider_id: ProviderKind::MovieBox,
+                            provider_name: "MovieBox".to_string(),
                             provider_episode_id: "mb-ep-1".to_string(),
                             provider_season: 1,
                             provider_episode: 1,
@@ -1091,8 +1139,16 @@ mod tests {
                                 resource_id: None,
                             },
                             audio_languages: vec!["en".to_string()],
+                            language: "English".to_string(),
+                            language_code: Some("en".to_string()),
+                            audio_track_id: None,
+                            codec: None,
+                            audio_codec: None,
+                            channels: None,
                             quality: Some("1080p".to_string()),
                             resolution_u64: 1080,
+                            stream_url: Some("https://cdn.example.com/ep1.mp4".to_string()),
+                            headers: HashMap::new(),
                             available: true,
                         }]),
                     },
@@ -1103,6 +1159,7 @@ mod tests {
                         season_number: 1,
                         episode_number: 2,
                         title: "Episode 2".to_string(),
+                        metadata_status: "unverified".to_string(),
                         overview: None,
                         provider_mappings: vec![],
                         audio: Some(AudioAvailability {
@@ -1129,7 +1186,7 @@ mod tests {
 
         let (st, j) = send_http(addr, "GET", "/api/v1/anime/NP-A-001", &hdrs, None).await;
         assert_eq!(st, 200);
-        assert_eq!(j["id"], "NP-A-001");
+        assert_eq!(j["anime_id"], "NP-A-001");
 
         let (st, j) = send_http(addr, "GET", "/api/v1/anime/NP-A-001/seasons", &hdrs, None).await;
         assert_eq!(st, 200);
@@ -1144,13 +1201,13 @@ mod tests {
         )
         .await;
         assert_eq!(st, 200);
-        // Both episodes visible even when audio is missing on NP-E-002
         assert_eq!(j["episodes"].as_array().unwrap().len(), 2);
 
         let (st, j) = send_http(addr, "GET", "/api/v1/episodes/NP-E-001", &hdrs, None).await;
         assert_eq!(st, 200);
         assert_eq!(j["audio"]["english"], "available");
         assert_eq!(j["audio"]["hindi"], "missing");
+        assert_eq!(j["available_languages"][0], "en");
 
         let (st, j) = send_http(
             addr,
@@ -1161,7 +1218,8 @@ mod tests {
         )
         .await;
         assert_eq!(st, 200);
-        assert_eq!(j["sources"].as_array().unwrap().len(), 1);
+        assert_eq!(j["total_sources"], 1);
+        assert_eq!(j["providers"][0]["provider"], "MovieBox");
 
         // Missing requested audio -> 404 AUDIO_UNAVAILABLE
         let (st, j) = send_http(
@@ -1173,7 +1231,7 @@ mod tests {
         )
         .await;
         assert_eq!(st, 404);
-        assert_eq!(j["error"]["code"], "AUDIO_UNAVAILABLE");
+        assert_eq!(j["code"], "AUDIO_UNAVAILABLE");
 
         // Available audio -> 200 resolved stream_url
         let (st, j) = send_http(
@@ -1186,6 +1244,9 @@ mod tests {
         .await;
         assert_eq!(st, 200);
         assert_eq!(j["status"], "success");
+        assert_eq!(j["source_id"], "src-1");
+        assert_eq!(j["provider"], "MovieBox");
+        assert_eq!(j["language_code"], "en");
         assert_eq!(j["stream_url"], "https://cdn.example.com/ep1.mp4");
 
         // Episode with no sources -> 404 SOURCE_UNAVAILABLE
@@ -1198,7 +1259,7 @@ mod tests {
         )
         .await;
         assert_eq!(st, 404);
-        assert_eq!(j["error"]["code"], "SOURCE_UNAVAILABLE");
+        assert_eq!(j["code"], "SOURCE_UNAVAILABLE");
 
         // Exact source_id selection -> 200 resolved stream_url
         let (st, j) = send_http(
@@ -1222,11 +1283,11 @@ mod tests {
         )
         .await;
         assert_eq!(st, 404);
-        assert_eq!(j["error"]["code"], "SOURCE_UNAVAILABLE");
+        assert_eq!(j["code"], "SOURCE_UNAVAILABLE");
 
         // Non-existent anime -> 404 ANIME_NOT_FOUND
         let (st, j) = send_http(addr, "GET", "/api/v1/anime/NP-A-999", &hdrs, None).await;
         assert_eq!(st, 404);
-        assert_eq!(j["error"]["code"], "ANIME_NOT_FOUND");
+        assert_eq!(j["code"], "ANIME_NOT_FOUND");
     }
 }

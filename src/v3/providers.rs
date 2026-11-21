@@ -7,6 +7,7 @@ use crate::providers::models::{
 use crate::providers::moviebox::client::MovieBoxClient;
 use crate::providers::{Provider, ReleaseProvider};
 use crate::v3::models::{NormalizedAnime, ProviderFailureInfo};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
@@ -42,6 +43,26 @@ fn env_flag(key: &str, default: bool) -> bool {
             }
         }
         Err(_) => default,
+    }
+}
+
+pub fn provider_key(p: ProviderKind) -> &'static str {
+    match p {
+        ProviderKind::MovieBox => "moviebox",
+        ProviderKind::AniZone => "anizone",
+        ProviderKind::Dramachi => "dramachi",
+        ProviderKind::FourKHdHub => "fourkhdhub",
+        _ => "unknown",
+    }
+}
+
+pub fn provider_display_name(p: ProviderKind) -> &'static str {
+    match p {
+        ProviderKind::MovieBox => "MovieBox",
+        ProviderKind::AniZone => "AniZone",
+        ProviderKind::Dramachi => "DramaChi",
+        ProviderKind::FourKHdHub => "FourKHDHub",
+        _ => "Unknown",
     }
 }
 
@@ -100,7 +121,20 @@ impl ProviderRegistry {
     pub async fn search_all(
         &self,
         query: &str,
-    ) -> (Vec<NormalizedAnime>, Vec<ProviderFailureInfo>, usize) {
+    ) -> (
+        Vec<NormalizedAnime>,
+        Vec<ProviderFailureInfo>,
+        usize,
+        BTreeMap<String, String>,
+    ) {
+        let mut coverage = BTreeMap::new();
+        for entry in &self.entries {
+            coverage.insert(
+                provider_key(entry.provider_id).to_string(),
+                if entry.enabled { "failed" } else { "disabled" }.to_string(),
+            );
+        }
+
         let enabled = self.enabled_providers();
         let total_enabled = enabled.len();
         let futs = enabled.into_iter().map(|entry| {
@@ -108,7 +142,9 @@ impl ProviderRegistry {
             let q = query.to_string();
             async move {
                 let _permit = reg.concurrency.acquire().await.ok();
-                let res = tokio::time::timeout(entry.timeout, reg.search_one(entry.provider_id, &q)).await;
+                let res =
+                    tokio::time::timeout(entry.timeout, reg.search_one(entry.provider_id, &q))
+                        .await;
                 (entry, res)
             }
         });
@@ -118,30 +154,37 @@ impl ProviderRegistry {
         let mut failures = Vec::new();
 
         for (entry, outcome) in outcomes {
+            let key = provider_key(entry.provider_id).to_string();
             match outcome {
                 Ok(Ok(items)) => {
+                    coverage.insert(key, "success".to_string());
                     for item in items {
                         results.push(normalize_catalog_item(item));
                     }
                 }
                 Ok(Err(err)) => {
-                    log::warn!("v3_search_provider_failed provider={} err={err}", entry.display_name);
+                    log::warn!(
+                        "v3_search_provider_failed provider={} err={err}",
+                        entry.display_name
+                    );
+                    coverage.insert(key.clone(), "failed".to_string());
                     failures.push(ProviderFailureInfo {
-                        provider: entry.provider_id.cache_key().to_string(),
+                        provider: key,
                         reason: err.to_string(),
                     });
                 }
                 Err(_) => {
                     log::warn!("v3_search_provider_timeout provider={}", entry.display_name);
+                    coverage.insert(key.clone(), "failed".to_string());
                     failures.push(ProviderFailureInfo {
-                        provider: entry.provider_id.cache_key().to_string(),
+                        provider: key,
                         reason: "timeout".to_string(),
                     });
                 }
             }
         }
 
-        (results, failures, total_enabled)
+        (results, failures, total_enabled, coverage)
     }
 
     async fn search_one(
@@ -155,7 +198,9 @@ impl ProviderRegistry {
             ProviderKind::Dramachi => Provider::search(&self.dramachi, query, 1).await,
             ProviderKind::FourKHdHub => match &self.fourkhdhub {
                 Some(c) => Provider::search(c, query, 1).await,
-                None => Err(ProviderError::Unavailable("FourKHDHub not configured".into())),
+                None => Err(ProviderError::Unavailable(
+                    "FourKHDHub not configured".into(),
+                )),
             },
             _ => Err(ProviderError::Unavailable("Unsupported provider".into())),
         }
@@ -170,12 +215,18 @@ impl ProviderRegistry {
         let timeout = self.timeout_for(provider);
         let fut = async {
             match provider {
-                ProviderKind::MovieBox => Provider::details(&self.moviebox, provider_anime_id).await,
+                ProviderKind::MovieBox => {
+                    Provider::details(&self.moviebox, provider_anime_id).await
+                }
                 ProviderKind::AniZone => Provider::details(&self.anizone, provider_anime_id).await,
-                ProviderKind::Dramachi => Provider::details(&self.dramachi, provider_anime_id).await,
+                ProviderKind::Dramachi => {
+                    Provider::details(&self.dramachi, provider_anime_id).await
+                }
                 ProviderKind::FourKHdHub => match &self.fourkhdhub {
                     Some(c) => Provider::details(c, provider_anime_id).await,
-                    None => Err(ProviderError::Unavailable("FourKHDHub not configured".into())),
+                    None => Err(ProviderError::Unavailable(
+                        "FourKHDHub not configured".into(),
+                    )),
                 },
                 _ => Err(ProviderError::Unavailable("Unsupported provider".into())),
             }
@@ -197,19 +248,40 @@ impl ProviderRegistry {
         let fut = async {
             match provider {
                 ProviderKind::MovieBox => {
-                    ReleaseProvider::episode_streams(&self.moviebox, provider_anime_id, season, episode).await
+                    ReleaseProvider::episode_streams(
+                        &self.moviebox,
+                        provider_anime_id,
+                        season,
+                        episode,
+                    )
+                    .await
                 }
                 ProviderKind::AniZone => {
-                    ReleaseProvider::episode_streams(&self.anizone, provider_anime_id, season, episode).await
+                    ReleaseProvider::episode_streams(
+                        &self.anizone,
+                        provider_anime_id,
+                        season,
+                        episode,
+                    )
+                    .await
                 }
                 ProviderKind::Dramachi => {
-                    ReleaseProvider::episode_streams(&self.dramachi, provider_anime_id, season, episode).await
+                    ReleaseProvider::episode_streams(
+                        &self.dramachi,
+                        provider_anime_id,
+                        season,
+                        episode,
+                    )
+                    .await
                 }
                 ProviderKind::FourKHdHub => match &self.fourkhdhub {
                     Some(c) => {
-                        ReleaseProvider::episode_streams(c, provider_anime_id, season, episode).await
+                        ReleaseProvider::episode_streams(c, provider_anime_id, season, episode)
+                            .await
                     }
-                    None => Err(ProviderError::Unavailable("FourKHDHub not configured".into())),
+                    None => Err(ProviderError::Unavailable(
+                        "FourKHDHub not configured".into(),
+                    )),
                 },
                 _ => Err(ProviderError::Unavailable("Unsupported provider".into())),
             }

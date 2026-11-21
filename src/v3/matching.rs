@@ -187,6 +187,28 @@ pub fn anime_match_confidence(a: &NormalizedAnime, b: &CanonicalAnime) -> MatchC
     MatchConfidence::HighConfidenceMatch
 }
 
+pub fn query_matches_anime(query: &str, anime: &CanonicalAnime) -> bool {
+    let norm_q = normalize_title_for_match(query);
+    if norm_q.is_empty() {
+        return true;
+    }
+    let q_tokens: Vec<&str> = norm_q.split_whitespace().filter(|t| t.len() >= 2).collect();
+    if q_tokens.is_empty() {
+        return true;
+    }
+
+    let check_title = |candidate: &str| -> bool {
+        let norm_c = normalize_title_for_match(candidate);
+        if norm_c.contains(&norm_q) {
+            return true;
+        }
+        let c_tokens: HashSet<&str> = norm_c.split_whitespace().collect();
+        q_tokens.iter().all(|qt| c_tokens.contains(qt))
+    };
+
+    check_title(&anime.title) || anime.alternative_titles.iter().any(|alt| check_title(alt))
+}
+
 pub fn merge_search_results(
     normalized: Vec<NormalizedAnime>,
     max_results: usize,
@@ -395,13 +417,24 @@ pub fn build_canonical_structure(anime: &mut CanonicalAnime) {
             });
         }
 
+        let (final_title, metadata_status) = if anime.media_type == MediaType::Movie {
+            (anime.title.clone(), "verified".to_string())
+        } else if let Some(t) = title {
+            let is_generic = normalize_title_for_match(&t) == format!("episode {ep_num}");
+            let status = if is_generic { "unverified" } else { "verified" };
+            (t, status.to_string())
+        } else {
+            (format!("Episode {ep_num}"), "unverified".to_string())
+        };
+
         let canonical_ep = CanonicalEpisode {
             id: episode_id,
             anime_id: anime.id.clone(),
             season_id: season_id.clone(),
             season_number: season_num,
             episode_number: ep_num,
-            title: title.unwrap_or_else(|| format!("Episode {ep_num}")),
+            title: final_title,
+            metadata_status,
             overview,
             provider_mappings: mappings,
             audio: None,
@@ -429,8 +462,13 @@ pub fn build_canonical_structure(anime: &mut CanonicalAnime) {
     }
 
     anime.seasons = seasons;
-    anime.total_seasons = anime.seasons.len();
-    anime.total_episodes = total_episodes;
+    if anime.media_type == MediaType::Movie {
+        anime.total_seasons = 0;
+        anime.total_episodes = 0;
+    } else {
+        anime.total_seasons = anime.seasons.len();
+        anime.total_episodes = total_episodes;
+    }
     anime.season_structure_status = if !any_details {
         "unavailable".to_string()
     } else if anime.provider_records.iter().any(|r| r.details_failed) {

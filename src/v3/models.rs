@@ -1,6 +1,6 @@
 use crate::providers::models::{MediaDetails, MediaType, ProviderKind, Release};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,13 +78,22 @@ pub struct AudioAvailability {
 pub struct ProviderSourceCandidate {
     pub source_id: String,
     pub provider_id: ProviderKind,
+    pub provider_name: String,
     pub provider_episode_id: String,
     pub provider_season: usize,
     pub provider_episode: usize,
     pub release: Release,
     pub audio_languages: Vec<String>,
+    pub language: String,
+    pub language_code: Option<String>,
+    pub audio_track_id: Option<String>,
+    pub codec: Option<String>,
+    pub audio_codec: Option<String>,
+    pub channels: Option<String>,
     pub quality: Option<String>,
     pub resolution_u64: u64,
+    pub stream_url: Option<String>,
+    pub headers: HashMap<String, String>,
     pub available: bool,
 }
 
@@ -96,6 +105,7 @@ pub struct CanonicalEpisode {
     pub season_number: usize,
     pub episode_number: usize,
     pub title: String,
+    pub metadata_status: String,
     pub overview: Option<String>,
     pub provider_mappings: Vec<ProviderEpisodeMapping>,
     pub audio: Option<AudioAvailability>,
@@ -142,23 +152,39 @@ pub struct TemporarySession {
     pub next_anime_seq: usize,
 }
 
-#[derive(Debug, Serialize)]
-pub struct SearchResultItem {
-    pub id: String,
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderIdsMap {
+    pub moviebox: Option<String>,
+    pub anizone: Option<String>,
+    pub dramachi: Option<String>,
+    pub fourkhdhub: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchAnimeItem {
+    pub anime_id: String,
     pub title: String,
     pub media_type: MediaType,
     pub year: Option<u32>,
     pub poster_url: Option<String>,
+    pub description: Option<String>,
+    pub genres: Vec<String>,
+    pub total_seasons: usize,
+    pub total_episodes: usize,
+    pub provider_ids: ProviderIdsMap,
 }
 
 #[derive(Debug, Serialize)]
 pub struct SearchResponse {
     pub status: &'static str,
     pub session_id: String,
-    pub results: Vec<SearchResultItem>,
+    pub query: String,
     pub total: usize,
     pub partial: bool,
+    pub provider_coverage: BTreeMap<String, String>,
     pub provider_failures: Vec<ProviderFailureInfo>,
+    pub results: Vec<SearchAnimeItem>,
+    pub all_provider_stream_sources: Vec<PublicSourceItem>,
 }
 
 #[derive(Debug, Serialize)]
@@ -170,8 +196,9 @@ pub struct ProviderFailureInfo {
 #[derive(Debug, Serialize)]
 pub struct AnimeDetailsResponse {
     pub status: &'static str,
-    pub id: String,
+    pub anime_id: String,
     pub title: String,
+    pub alternative_titles: Vec<String>,
     pub media_type: MediaType,
     pub year: Option<u32>,
     pub description: Option<String>,
@@ -180,11 +207,12 @@ pub struct AnimeDetailsResponse {
     pub total_seasons: usize,
     pub total_episodes: usize,
     pub season_structure_status: String,
+    pub provider_coverage: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct SeasonItemResponse {
-    pub id: String,
+    pub season_id: String,
     pub season_number: usize,
     pub episode_count: usize,
 }
@@ -200,9 +228,10 @@ pub struct AnimeSeasonsResponse {
 
 #[derive(Debug, Serialize)]
 pub struct EpisodeItemResponse {
-    pub id: String,
+    pub episode_id: String,
     pub episode_number: usize,
     pub title: String,
+    pub metadata_status: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -222,24 +251,48 @@ pub struct EpisodeDetailsResponse {
     pub season_number: usize,
     pub episode_number: usize,
     pub title: String,
+    pub metadata_status: String,
     pub overview: Option<String>,
+    pub provider_coverage: BTreeMap<String, String>,
     pub audio: AudioAvailability,
+    pub available_languages: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PublicSourceItem {
+    pub source_id: String,
+    pub provider: String,
+    pub stream_url: Option<String>,
+    pub quality: Option<String>,
+    pub language: String,
+    pub language_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_track_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codec: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_codec: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channels: Option<String>,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub headers: HashMap<String, String>,
+    pub availability_status: &'static str,
+    pub available: bool,
 }
 
 #[derive(Debug, Serialize)]
-pub struct PublicSourceItem {
-    pub id: String,
-    pub quality: Option<String>,
-    pub audio_languages: Vec<String>,
-    pub available: bool,
+pub struct ProviderSourcesGroup {
+    pub provider: String,
+    pub sources: Vec<PublicSourceItem>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct EpisodeSourcesResponse {
     pub status: &'static str,
     pub episode_id: String,
-    pub sources: Vec<PublicSourceItem>,
-    pub total: usize,
+    pub total_sources: usize,
+    pub provider_coverage: BTreeMap<String, String>,
+    pub providers: Vec<ProviderSourcesGroup>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -256,21 +309,23 @@ pub struct ResolveRequest {
 pub struct ResolveSuccessResponse {
     pub status: &'static str,
     pub episode_id: String,
+    pub source_id: String,
+    pub provider: String,
+    pub language: String,
+    pub language_code: Option<String>,
+    pub quality: Option<String>,
     pub stream_url: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub headers: Vec<(String, String)>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ApiErrorBody {
-    pub code: &'static str,
-    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_track_id: Option<String>,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub headers: HashMap<String, String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ApiErrorResponse {
     pub status: &'static str,
+    pub code: &'static str,
+    pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub episode_id: Option<String>,
-    pub error: ApiErrorBody,
 }

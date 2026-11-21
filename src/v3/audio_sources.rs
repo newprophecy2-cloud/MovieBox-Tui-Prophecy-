@@ -2,15 +2,26 @@ use crate::providers::models::{ProviderKind, Release};
 use crate::unified::normalize_language_code;
 use crate::v3::models::{
     AudioAvailability, AudioStatus, CanonicalEpisode, ProviderSourceCandidate,
+    ProviderSourcesGroup, PublicSourceItem, ResolveSuccessResponse,
 };
-use crate::v3::providers::ProviderRegistry;
-use std::collections::{HashMap, HashSet};
+use crate::v3::providers::{ProviderRegistry, provider_display_name};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Debug)]
 pub enum ResolveFailure {
     AudioUnavailable(String),
     SourceUnavailable(String),
     ResolutionFailed(String),
+}
+
+pub fn language_display_name(code: Option<&str>) -> String {
+    match code {
+        Some("hi") => "Hindi".to_string(),
+        Some("en") => "English".to_string(),
+        Some("ja") => "Japanese".to_string(),
+        Some(other) if !other.is_empty() => other.to_ascii_uppercase(),
+        _ => "Unknown".to_string(),
+    }
 }
 
 pub fn compute_audio_availability(
@@ -82,58 +93,20 @@ pub fn compute_audio_availability(
     }
 }
 
-pub fn extract_language_hints(rel: &Release, provider_title: Option<&str>) -> Vec<String> {
-    if let Some(code) = rel.language.as_deref().and_then(normalize_language_code) {
-        return vec![code];
-    }
-
-    let mut langs = Vec::new();
-    let mut push_unique = |code: &str| {
-        if !langs.iter().any(|l| l == code) {
-            langs.push(code.to_string());
-        }
-    };
-
-    for source_text in [provider_title, Some(rel.filename.as_str())]
-        .into_iter()
-        .flatten()
-    {
-        let lower = source_text.to_ascii_lowercase();
-        if lower.contains("[hindi]")
-            || lower.contains("(hindi)")
-            || lower.contains("hindi dub")
-            || lower.contains(".hindi.")
-            || lower.contains("_hindi_")
-        {
-            push_unique("hi");
-        }
-        if lower.contains("[english]")
-            || lower.contains("(english)")
-            || lower.contains("english dub")
-            || lower.contains(".eng.")
-            || lower.contains("_eng_")
-        {
-            push_unique("en");
-        }
-        if lower.contains("[japanese]")
-            || lower.contains("(japanese)")
-            || lower.contains("[sub]")
-            || lower.contains("(sub)")
-            || lower.contains(".jpn.")
-        {
-            push_unique("ja");
-        }
-    }
-    langs
+/// Section 9: Provider-wise audio detection.
+/// Uses ONLY verified provider source metadata (`rel.language`).
+/// Never infers language from shared anime titles or unverified filenames.
+pub fn extract_verified_language(rel: &Release) -> Option<String> {
+    rel.language.as_deref().and_then(normalize_language_code)
 }
 
 pub async fn collect_episode_sources(
     registry: &ProviderRegistry,
     episode: &CanonicalEpisode,
-    provider_titles: &HashMap<(ProviderKind, String), String>,
-) -> (Vec<ProviderSourceCandidate>, bool) {
+) -> (Vec<ProviderSourceCandidate>, bool, BTreeMap<String, String>) {
+    let mut coverage = BTreeMap::new();
     if episode.provider_mappings.is_empty() {
-        return (Vec::new(), true);
+        return (Vec::new(), true, coverage);
     }
 
     let futs = episode.provider_mappings.iter().map(|mapping| {
@@ -156,36 +129,58 @@ pub async fn collect_episode_sources(
     let mut candidates = Vec::new();
     let mut any_succeeded = false;
     let mut idx = 0usize;
-    let mut seen_urls: HashSet<(ProviderKind, String)> = HashSet::new();
+    let mut seen_records: HashSet<(ProviderKind, String, Option<String>)> = HashSet::new();
 
     for (mapping, outcome) in outcomes {
+        let pkey = crate::v3::providers::provider_key(mapping.provider_id).to_string();
         match outcome {
             Ok(releases) => {
                 any_succeeded = true;
-                let title_hint = provider_titles
-                    .get(&(mapping.provider_id, mapping.provider_anime_id.clone()))
-                    .map(String::as_str);
+                coverage.insert(pkey, "success".to_string());
                 for rel in releases {
                     if !is_candidate_valid(&rel) {
                         continue;
                     }
-                    let primary_url = rel
-                        .mirrors
-                        .first()
+                    let primary_mirror = rel.mirrors.first();
+                    let primary_url = primary_mirror
                         .map(|m| m.resolver_url.trim().to_string())
                         .unwrap_or_default();
+                    let audio_track_id: Option<String> = None;
                     if !primary_url.is_empty()
-                        && !seen_urls.insert((mapping.provider_id, primary_url))
+                        && !seen_records.insert((
+                            mapping.provider_id,
+                            primary_url.clone(),
+                            audio_track_id.clone(),
+                        ))
                     {
                         continue;
                     }
                     idx += 1;
-                    let audio_languages = extract_language_hints(&rel, title_hint);
+                    let lang_code = extract_verified_language(&rel);
+                    let audio_languages: Vec<String> = lang_code.iter().cloned().collect();
+                    let language = language_display_name(lang_code.as_deref());
                     let resolution_u64 = rel.resolution_u64();
                     let quality = rel.quality.clone();
+                    let codec = rel.codec.clone();
+                    let stream_url = primary_mirror
+                        .filter(|m| m.direct_file)
+                        .map(|m| m.resolver_url.clone());
+                    let mut headers = HashMap::new();
+                    if let Some(m) = primary_mirror {
+                        for (k, v) in &m.headers {
+                            if k.eq_ignore_ascii_case("referer")
+                                || k.eq_ignore_ascii_case("user-agent")
+                                || k.eq_ignore_ascii_case("origin")
+                            {
+                                headers.insert(k.clone(), v.clone());
+                            }
+                        }
+                    }
+
                     candidates.push(ProviderSourceCandidate {
-                        source_id: format!("{}-src-{idx}", episode.id),
+                        source_id: format!("src-{idx}"),
                         provider_id: mapping.provider_id,
+                        provider_name: provider_display_name(mapping.provider_id).to_string(),
                         provider_episode_id: mapping.provider_episode_id.clone().unwrap_or_else(
                             || {
                                 format!(
@@ -198,13 +193,22 @@ pub async fn collect_episode_sources(
                         provider_episode: mapping.provider_episode_number,
                         release: rel,
                         audio_languages,
+                        language,
+                        language_code: lang_code,
+                        audio_track_id,
+                        codec,
+                        audio_codec: None,
+                        channels: None,
                         quality,
                         resolution_u64,
+                        stream_url,
+                        headers,
                         available: true,
                     });
                 }
             }
             Err(err) => {
+                coverage.insert(pkey, "failed".to_string());
                 log::warn!(
                     "v3_episode_sources_failed provider={} episode_id={} err={err}",
                     mapping.provider_id.cache_key(),
@@ -215,7 +219,51 @@ pub async fn collect_episode_sources(
     }
 
     rank_candidates(&mut candidates, None, None);
-    (candidates, !any_succeeded)
+    (candidates, !any_succeeded, coverage)
+}
+
+pub fn to_public_source_item(c: &ProviderSourceCandidate) -> PublicSourceItem {
+    PublicSourceItem {
+        source_id: c.source_id.clone(),
+        provider: c.provider_name.clone(),
+        stream_url: c.stream_url.clone(),
+        quality: c.quality.clone(),
+        language: c.language.clone(),
+        language_code: c.language_code.clone(),
+        audio_track_id: c.audio_track_id.clone(),
+        codec: c.codec.clone(),
+        audio_codec: c.audio_codec.clone(),
+        channels: c.channels.clone(),
+        headers: c.headers.clone(),
+        availability_status: if c.available {
+            "available"
+        } else {
+            "unavailable"
+        },
+        available: c.available,
+    }
+}
+
+pub fn group_sources_by_provider(sources: &[ProviderSourceCandidate]) -> Vec<ProviderSourcesGroup> {
+    let mut order: Vec<String> = Vec::new();
+    let mut map: HashMap<String, Vec<PublicSourceItem>> = HashMap::new();
+    for s in sources {
+        if !map.contains_key(&s.provider_name) {
+            order.push(s.provider_name.clone());
+        }
+        map.entry(s.provider_name.clone())
+            .or_default()
+            .push(to_public_source_item(s));
+    }
+    order
+        .into_iter()
+        .filter_map(|p| {
+            map.remove(&p).map(|srcs| ProviderSourcesGroup {
+                provider: p,
+                sources: srcs,
+            })
+        })
+        .collect()
 }
 
 fn is_candidate_valid(release: &Release) -> bool {
@@ -307,10 +355,10 @@ pub async fn resolve_episode_stream(
     source_id: Option<&str>,
     requested_audio: Option<&str>,
     preferred_quality: Option<&str>,
-) -> Result<(String, Vec<(String, String)>), ResolveFailure> {
+) -> Result<ResolveSuccessResponse, ResolveFailure> {
     if sources.is_empty() {
         return Err(ResolveFailure::SourceUnavailable(
-            "No playable source is available.".to_string(),
+            "The selected source is unavailable.".to_string(),
         ));
     }
 
@@ -323,7 +371,7 @@ pub async fn resolve_episode_stream(
         && normalized_req.is_none()
     {
         return Err(ResolveFailure::AudioUnavailable(format!(
-            "Requested audio language '{raw_audio}' is not supported or unavailable."
+            "The requested audio language '{raw_audio}' is unavailable."
         )));
     }
 
@@ -331,7 +379,7 @@ pub async fn resolve_episode_stream(
         let sid = raw_sid.trim();
         if sid.is_empty() {
             return Err(ResolveFailure::SourceUnavailable(
-                "Requested source_id must not be empty.".to_string(),
+                "The selected source is unavailable.".to_string(),
             ));
         }
         let Some(exact) = sources.iter().find(|c| c.source_id == sid).cloned() else {
@@ -342,9 +390,9 @@ pub async fn resolve_episode_stream(
         if let Some(ref req_lang) = normalized_req
             && !exact.audio_languages.contains(req_lang)
         {
-            return Err(ResolveFailure::AudioUnavailable(format!(
-                "Requested audio language '{req_lang}' is unavailable for source '{sid}'."
-            )));
+            return Err(ResolveFailure::AudioUnavailable(
+                "The requested audio language is unavailable.".to_string(),
+            ));
         }
         vec![exact]
     } else {
@@ -360,15 +408,9 @@ pub async fn resolve_episode_stream(
             .cloned()
             .collect();
         if matching.is_empty() {
-            let any_known_lang = ranked.iter().any(|c| !c.audio_languages.is_empty());
-            if any_known_lang {
-                return Err(ResolveFailure::AudioUnavailable(format!(
-                    "Requested audio language '{req_lang}' is unavailable for this episode."
-                )));
-            }
-            return Err(ResolveFailure::AudioUnavailable(format!(
-                "Requested audio language '{req_lang}' could not be confirmed for this episode."
-            )));
+            return Err(ResolveFailure::AudioUnavailable(
+                "The requested audio language is unavailable.".to_string(),
+            ));
         }
         ranked = matching;
     }
@@ -396,29 +438,41 @@ pub async fn resolve_episode_stream(
                     last_err = Some("Resolved URL failed security validation".to_string());
                     continue;
                 }
-                let safe_headers: Vec<(String, String)> = headers
-                    .into_iter()
-                    .filter(|(k, _)| {
-                        k.eq_ignore_ascii_case("referer")
-                            || k.eq_ignore_ascii_case("user-agent")
-                            || k.eq_ignore_ascii_case("origin")
-                    })
-                    .collect();
-                return Ok((url, safe_headers));
+                let mut safe_headers = HashMap::new();
+                for (k, v) in headers {
+                    if k.eq_ignore_ascii_case("referer")
+                        || k.eq_ignore_ascii_case("user-agent")
+                        || k.eq_ignore_ascii_case("origin")
+                    {
+                        safe_headers.insert(k, v);
+                    }
+                }
+                return Ok(ResolveSuccessResponse {
+                    status: "success",
+                    episode_id: episode.id.clone(),
+                    source_id: candidate.source_id,
+                    provider: candidate.provider_name,
+                    language: candidate.language,
+                    language_code: candidate.language_code,
+                    quality: candidate.quality,
+                    stream_url: url,
+                    audio_track_id: candidate.audio_track_id,
+                    headers: safe_headers,
+                });
             }
             Err(err) => {
                 log::warn!(
-                    "v3_source_resolve_failed provider={} episode_id={} err={err}",
+                    "v3_resolve_candidate_failed provider={} episode_id={} err={err}",
                     candidate.provider_id.cache_key(),
                     episode.id
                 );
-                last_err = Some(err);
+                last_err = Some(err.to_string());
             }
         }
     }
 
-    Err(ResolveFailure::ResolutionFailed(last_err.unwrap_or_else(
-        || "All eligible sources failed to resolve.".to_string(),
+    Err(ResolveFailure::SourceUnavailable(last_err.unwrap_or_else(
+        || "The selected source is unavailable.".to_string(),
     )))
 }
 
@@ -433,10 +487,12 @@ mod tests {
         quality: Option<&str>,
         url: &str,
     ) -> ProviderSourceCandidate {
+        let code = lang.and_then(normalize_language_code);
         ProviderSourceCandidate {
-            source_id: "s1".into(),
+            source_id: format!("src-{url}"),
             provider_id: provider,
-            provider_episode_id: "1".into(),
+            provider_name: provider_display_name(provider).to_string(),
+            provider_episode_id: "ep1".into(),
             provider_season: 1,
             provider_episode: 1,
             release: Release {
@@ -456,9 +512,17 @@ mod tests {
                 }],
                 resource_id: None,
             },
-            audio_languages: lang.and_then(normalize_language_code).into_iter().collect(),
+            audio_languages: code.iter().cloned().collect(),
+            language: language_display_name(code.as_deref()),
+            language_code: code,
+            audio_track_id: None,
+            codec: None,
+            audio_codec: None,
+            channels: None,
             quality: quality.map(str::to_string),
             resolution_u64: quality.and_then(parse_quality_target).unwrap_or(0),
+            stream_url: Some(url.to_string()),
+            headers: HashMap::new(),
             available: true,
         }
     }
@@ -552,23 +616,19 @@ mod tests {
     }
 
     #[test]
-    fn test_title_and_filename_language_hints() {
+    fn test_strict_provider_audio_does_not_infer_from_unverified_filename() {
         let mut c = make_cand(
             ProviderKind::MovieBox,
             None,
             Some("1080p"),
             "https://cdn.example/a.mp4",
         );
+        c.release.filename = "Naruto.Ep01.[Hindi].mkv".into();
+        assert_eq!(extract_verified_language(&c.release), None);
+        c.release.language = Some("hi".into());
         assert_eq!(
-            extract_language_hints(&c.release, Some("Naruto: Shippuden [Hindi]")),
-            vec!["hi"]
+            extract_verified_language(&c.release),
+            Some("hi".to_string())
         );
-        c.release.filename = "Naruto.Ep01.[English].mkv".into();
-        assert_eq!(
-            extract_language_hints(&c.release, Some("Naruto")),
-            vec!["en"]
-        );
-        c.release.filename = "ep.mp4".into();
-        assert!(extract_language_hints(&c.release, Some("Naruto")).is_empty());
     }
 }
