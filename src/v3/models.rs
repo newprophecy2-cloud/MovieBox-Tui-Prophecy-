@@ -74,6 +74,22 @@ pub struct AudioAvailability {
     pub checked_sources: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrackSelectionMetadata {
+    pub format: String,
+    pub track_index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adaptation_set_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub representation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rendition_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language_code: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProviderSourceCandidate {
     pub source_id: String,
@@ -84,12 +100,14 @@ pub struct ProviderSourceCandidate {
     pub provider_episode: usize,
     pub release: Release,
     pub audio_languages: Vec<String>,
+    pub track_index: Option<usize>,
     pub language: String,
     pub language_code: Option<String>,
     pub audio_track_id: Option<String>,
     pub codec: Option<String>,
     pub audio_codec: Option<String>,
     pub channels: Option<String>,
+    pub track_selection_metadata: Option<TrackSelectionMetadata>,
     pub quality: Option<String>,
     pub resolution_u64: u64,
     pub stream_url: Option<String>,
@@ -264,6 +282,8 @@ pub struct PublicSourceItem {
     pub provider: String,
     pub stream_url: Option<String>,
     pub quality: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub track_index: Option<usize>,
     pub language: String,
     pub language_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -274,6 +294,8 @@ pub struct PublicSourceItem {
     pub audio_codec: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub channels: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub track_selection_metadata: Option<TrackSelectionMetadata>,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub headers: HashMap<String, String>,
     pub availability_status: &'static str,
@@ -311,12 +333,22 @@ pub struct ResolveSuccessResponse {
     pub episode_id: String,
     pub source_id: String,
     pub provider: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub track_index: Option<usize>,
     pub language: String,
     pub language_code: Option<String>,
     pub quality: Option<String>,
     pub stream_url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_track_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codec: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_codec: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channels: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub track_selection_metadata: Option<TrackSelectionMetadata>,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub headers: HashMap<String, String>,
 }

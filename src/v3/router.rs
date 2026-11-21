@@ -1139,12 +1139,14 @@ mod tests {
                                 resource_id: None,
                             },
                             audio_languages: vec!["en".to_string()],
+                            track_index: None,
                             language: "English".to_string(),
                             language_code: Some("en".to_string()),
                             audio_track_id: None,
                             codec: None,
                             audio_codec: None,
                             channels: None,
+                            track_selection_metadata: None,
                             quality: Some("1080p".to_string()),
                             resolution_u64: 1080,
                             stream_url: Some("https://cdn.example.com/ep1.mp4".to_string()),
@@ -1289,5 +1291,140 @@ mod tests {
         let (st, j) = send_http(addr, "GET", "/api/v1/anime/NP-A-999", &hdrs, None).await;
         assert_eq!(st, 404);
         assert_eq!(j["code"], "ANIME_NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn test_http_multi_track_same_url_selection() {
+        use crate::providers::models::{MediaType, Release, SourceMirror};
+        let state = V3AppState::from_env();
+        let mpd_url = "https://cdn.example.com/multi.mpd".to_string();
+
+        let make_track_cand =
+            |sid: &str, idx: usize, code: &str, lang: &str, aset: &str| ProviderSourceCandidate {
+                source_id: sid.to_string(),
+                provider_id: ProviderKind::MovieBox,
+                provider_name: "MovieBox".to_string(),
+                provider_episode_id: "mb-1".to_string(),
+                provider_season: 1,
+                provider_episode: 1,
+                release: Release {
+                    provider: ProviderKind::MovieBox,
+                    filename: "multi.mpd".into(),
+                    quality: Some("1080p".to_string()),
+                    codec: Some("hevc".to_string()),
+                    language: Some(code.to_string()),
+                    size_bytes: None,
+                    season: Some(1),
+                    episode: Some(1),
+                    mirrors: vec![SourceMirror {
+                        label: "DASH".into(),
+                        resolver_url: mpd_url.clone(),
+                        headers: vec![],
+                        direct_file: true,
+                    }],
+                    resource_id: None,
+                },
+                audio_languages: vec![code.to_string()],
+                track_index: Some(idx),
+                language: lang.to_string(),
+                language_code: Some(code.to_string()),
+                audio_track_id: Some(aset.to_string()),
+                codec: Some("hevc".to_string()),
+                audio_codec: Some("mp4a.40.2".to_string()),
+                channels: Some("2".to_string()),
+                track_selection_metadata: Some(TrackSelectionMetadata {
+                    format: "dash".to_string(),
+                    track_index: idx,
+                    adaptation_set_id: Some(aset.to_string()),
+                    representation_id: None,
+                    group_id: None,
+                    rendition_name: None,
+                    language_code: Some(code.to_string()),
+                }),
+                quality: Some("1080p".to_string()),
+                resolution_u64: 1080,
+                stream_url: Some(mpd_url.clone()),
+                headers: HashMap::new(),
+                available: true,
+            };
+
+        let anime = CanonicalAnime {
+            id: "NP-A-002".to_string(),
+            slug_token: "multi".to_string(),
+            title: "Multi Track Anime".to_string(),
+            alternative_titles: vec![],
+            media_type: MediaType::Series,
+            year: Some(2024),
+            description: None,
+            poster_url: None,
+            genres: vec![],
+            provider_records: vec![],
+            seasons: vec![CanonicalSeason {
+                id: "NP-S-002".to_string(),
+                anime_id: "NP-A-002".to_string(),
+                season_number: 1,
+                episodes: vec![CanonicalEpisode {
+                    id: "NP-E-010".to_string(),
+                    anime_id: "NP-A-002".to_string(),
+                    season_id: "NP-S-002".to_string(),
+                    season_number: 1,
+                    episode_number: 1,
+                    title: "Episode 1".to_string(),
+                    metadata_status: "verified".to_string(),
+                    overview: None,
+                    provider_mappings: vec![],
+                    audio: Some(AudioAvailability {
+                        hindi: AudioStatus::Available,
+                        english: AudioStatus::Available,
+                        japanese: AudioStatus::Missing,
+                        available_languages: vec!["hi".to_string(), "en".to_string()],
+                        checked_sources: true,
+                    }),
+                    sources: Some(vec![
+                        make_track_cand("src-1", 0, "hi", "Hindi", "2"),
+                        make_track_cand("src-2", 1, "en", "English", "3"),
+                    ]),
+                }],
+            }],
+            total_seasons: 1,
+            total_episodes: 1,
+            season_structure_status: "verified".to_string(),
+            details_hydrated: true,
+        };
+        let session = state.sessions.create_session(vec![anime]).await;
+        let sid = session.read().await.session_id.clone();
+        let addr = spawn_test_server(state).await;
+        let hdrs = [("X-PV-Session", sid.as_str())];
+
+        let (st, j) = send_http(
+            addr,
+            "GET",
+            "/api/v1/episodes/NP-E-010/sources",
+            &hdrs,
+            None,
+        )
+        .await;
+        assert_eq!(st, 200);
+        assert_eq!(j["total_sources"], 2);
+        assert_eq!(j["providers"][0]["sources"][0]["track_index"], 0);
+        assert_eq!(j["providers"][0]["sources"][1]["track_index"], 1);
+        assert_eq!(
+            j["providers"][0]["sources"][0]["stream_url"],
+            j["providers"][0]["sources"][1]["stream_url"]
+        );
+
+        let (st, j) = send_http(
+            addr,
+            "POST",
+            "/api/v1/episodes/NP-E-010/resolve",
+            &hdrs,
+            Some(r#"{"source_id":"src-2","audio_language":"en"}"#),
+        )
+        .await;
+        assert_eq!(st, 200);
+        assert_eq!(j["source_id"], "src-2");
+        assert_eq!(j["track_index"], 1);
+        assert_eq!(j["language_code"], "en");
+        assert_eq!(j["track_selection_metadata"]["adaptation_set_id"], "3");
     }
 }

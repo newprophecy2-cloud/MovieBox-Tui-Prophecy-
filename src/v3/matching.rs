@@ -61,6 +61,14 @@ fn strip_trailing_split_season(trimmed: &str) -> Option<&str> {
         "part 3",
         "cour 1",
         "cour 2",
+        "hindi dubbed",
+        "english dubbed",
+        "hindi dub",
+        "english dub",
+        "dual audio",
+        "multi audio",
+        "dubbed",
+        "subbed",
     ] {
         if lower.ends_with(suffix) && trimmed.len() > suffix.len() {
             let prefix = trimmed[..trimmed.len() - suffix.len()].trim_end();
@@ -105,6 +113,12 @@ fn has_dub_or_pack_tag(raw: &str) -> bool {
         "(sub)",
         "hindi dub",
         "english dub",
+        "hindi dubbed",
+        "english dubbed",
+        "dubbed",
+        "subbed",
+        "dual audio",
+        "multi audio",
         "second season",
         "third season",
         "fourth season",
@@ -140,7 +154,19 @@ pub fn normalize_title_for_match(raw: &str) -> String {
             let is_year = inner.len() == 4 && inner.chars().all(|c| c.is_ascii_digit());
             let is_lang_or_mode = matches!(
                 inner.as_str(),
-                "dub" | "sub" | "hindi" | "english" | "japanese" | "tv" | "uncensored"
+                "dub"
+                    | "sub"
+                    | "dubbed"
+                    | "subbed"
+                    | "hindi"
+                    | "english"
+                    | "japanese"
+                    | "hindi dub"
+                    | "english dub"
+                    | "dual audio"
+                    | "multi audio"
+                    | "tv"
+                    | "uncensored"
             );
             if is_year || is_lang_or_mode {
                 trimmed[..idx].trim()
