@@ -602,4 +602,30 @@ mod tests {
         assert_eq!(det.seasons.len(), 1);
         assert_eq!(det.seasons[0].episodes.len(), 3);
     }
+
+    #[test]
+    fn test_moviebox_max_ep_produces_synthetic_fallback_without_fabricated_ids() {
+        let payload = json!({
+            "subject": {
+                "subjectId": "mb-shippuden-1",
+                "title": "Naruto Shippuden",
+                "subjectType": 2
+            },
+            "seasons": {
+                "seasons": [
+                    {"se": 1, "maxEp": 400}
+                ]
+            }
+        });
+        let det = adapt::moviebox_details_json_to_media_details(&payload).unwrap();
+        assert_eq!(det.seasons.len(), 1);
+        assert_eq!(det.seasons[0].advertised_episode_count, Some(400));
+        assert_eq!(det.seasons[0].episodes.len(), 400);
+        assert!(det.seasons[0].episodes.iter().all(|e| {
+            e.provenance == crate::providers::models::EpisodeProvenance::SyntheticFallback
+                && e.verification == crate::providers::models::EpisodeVerification::Unverified
+                && e.provider_episode_id.is_none()
+                && e.title.is_none()
+        }));
+    }
 }

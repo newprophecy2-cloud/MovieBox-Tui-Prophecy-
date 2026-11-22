@@ -106,6 +106,25 @@ pub struct CatalogItem {
     pub season_count: Option<usize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EpisodeProvenance {
+    ProviderMetadata,
+    #[default]
+    ProviderListing,
+    FilenameDerived,
+    SyntheticFallback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EpisodeVerification {
+    Verified,
+    #[default]
+    Unverified,
+    Rejected,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Episode {
     pub season: usize,
@@ -116,6 +135,10 @@ pub struct Episode {
     pub provider_episode_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_season_id: Option<String>,
+    #[serde(default)]
+    pub provenance: EpisodeProvenance,
+    #[serde(default)]
+    pub verification: EpisodeVerification,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,6 +147,8 @@ pub struct Season {
     pub episodes: Vec<Episode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_season_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advertised_episode_count: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -604,5 +629,36 @@ mod tests {
             details.sibling_ids(),
             vec!["sub_hi".to_string(), "sub_main".to_string()]
         );
+    }
+
+    #[test]
+    fn test_episode_and_season_serialization_backward_compatibility() {
+        let legacy_ep_json = r#"{"season":1,"number":5,"title":"Pilot","overview":null,"provider_episode_id":"ep-5"}"#;
+        let ep: Episode = serde_json::from_str(legacy_ep_json).unwrap();
+        assert_eq!(ep.season, 1);
+        assert_eq!(ep.number, 5);
+        assert_eq!(ep.provider_episode_id.as_deref(), Some("ep-5"));
+        assert_eq!(ep.provenance, EpisodeProvenance::ProviderListing);
+        assert_eq!(ep.verification, EpisodeVerification::Unverified);
+
+        let legacy_season_json = r#"{"number":1,"episodes":[]}"#;
+        let season: Season = serde_json::from_str(legacy_season_json).unwrap();
+        assert_eq!(season.number, 1);
+        assert_eq!(season.advertised_episode_count, None);
+
+        let ep_new = Episode {
+            season: 2,
+            number: 1,
+            title: None,
+            overview: None,
+            provider_episode_id: None,
+            provider_season_id: None,
+            provenance: EpisodeProvenance::SyntheticFallback,
+            verification: EpisodeVerification::Unverified,
+        };
+        let roundtrip: Episode =
+            serde_json::from_str(&serde_json::to_string(&ep_new).unwrap()).unwrap();
+        assert_eq!(roundtrip.provenance, EpisodeProvenance::SyntheticFallback);
+        assert_eq!(roundtrip.verification, EpisodeVerification::Unverified);
     }
 }

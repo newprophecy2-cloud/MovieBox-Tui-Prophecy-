@@ -1,4 +1,4 @@
-use crate::providers::models::{MediaType, ProviderKind};
+use crate::providers::models::{EpisodeProvenance, MediaType, ProviderKind};
 use crate::v3::audio_sources::{
     ResolveFailure, collect_episode_sources, compute_audio_availability, group_sources_by_provider,
     resolve_episode_stream,
@@ -438,6 +438,14 @@ async fn handle_search(
                 genres: a.genres.clone(),
                 total_seasons: a.total_seasons,
                 total_episodes: a.total_episodes,
+                verified_episodes: a.verified_episodes,
+                unverified_episodes: a.unverified_episodes,
+                synthetic_episodes: a.synthetic_episodes,
+                counts_status: if a.details_hydrated {
+                    "hydrated"
+                } else {
+                    "provisional"
+                },
                 provider_ids: ProviderIdsMap {
                     moviebox: pid(ProviderKind::MovieBox),
                     anizone: pid(ProviderKind::AniZone),
@@ -597,6 +605,9 @@ async fn handle_anime_details(
             genres: anime.genres,
             total_seasons: anime.total_seasons,
             total_episodes: anime.total_episodes,
+            verified_episodes: anime.verified_episodes,
+            unverified_episodes: anime.unverified_episodes,
+            synthetic_episodes: anime.synthetic_episodes,
             season_structure_status: anime.season_structure_status,
             provider_coverage,
             provider_variants,
@@ -626,7 +637,12 @@ async fn handle_anime_seasons(
             .map(|s| SeasonItemResponse {
                 season_id: s.id.clone(),
                 season_number: s.season_number,
-                episode_count: s.episodes.len(),
+                episode_count: s.verified_episodes + s.unverified_episodes,
+                verified_episodes: s.verified_episodes,
+                unverified_episodes: s.unverified_episodes,
+                synthetic_episodes: s.synthetic_episodes,
+                advertised_episode_count: s.advertised_episode_count,
+                structure_status: s.structure_status.clone(),
             })
             .collect()
     };
@@ -639,6 +655,10 @@ async fn handle_anime_seasons(
             anime_id: anime.id,
             total_seasons: anime.total_seasons,
             total_episodes: anime.total_episodes,
+            verified_episodes: anime.verified_episodes,
+            unverified_episodes: anime.unverified_episodes,
+            synthetic_episodes: anime.synthetic_episodes,
+            season_structure_status: anime.season_structure_status,
             seasons,
         },
     )
@@ -671,15 +691,19 @@ async fn handle_season_episodes(
         .await;
     };
 
-    // Audio availability NEVER hides an episode
+    // Expose only provider-derived episodes as confirmed episode listings; synthetic fallback
+    // entries are accounted for in synthetic_episodes without inflating total_episodes.
     let episodes: Vec<EpisodeItemResponse> = season
         .episodes
         .iter()
+        .filter(|e| e.provenance != EpisodeProvenance::SyntheticFallback)
         .map(|e| EpisodeItemResponse {
             episode_id: e.id.clone(),
             episode_number: e.episode_number,
             title: e.title.clone(),
             metadata_status: e.metadata_status.clone(),
+            provenance: e.provenance,
+            verification: e.verification,
         })
         .collect();
 
@@ -690,6 +714,10 @@ async fn handle_season_episodes(
             status: "success",
             season_id: season.id,
             total_episodes: episodes.len(),
+            verified_episodes: season.verified_episodes,
+            unverified_episodes: season.unverified_episodes,
+            synthetic_episodes: season.synthetic_episodes,
+            structure_status: season.structure_status,
             episodes,
         },
     )
@@ -803,6 +831,8 @@ async fn handle_episode_details(
             episode_number: episode.episode_number,
             title: episode.title,
             metadata_status: episode.metadata_status,
+            provenance: episode.provenance,
+            verification: episode.verification,
             overview: episode.overview,
             provider_coverage,
             audio,
@@ -1151,6 +1181,11 @@ mod tests {
                 id: "NP-S-001".to_string(),
                 anime_id: "NP-A-001".to_string(),
                 season_number: 1,
+                verified_episodes: 1,
+                unverified_episodes: 0,
+                synthetic_episodes: 0,
+                advertised_episode_count: None,
+                structure_status: "verified".to_string(),
                 episodes: vec![
                     CanonicalEpisode {
                         id: "NP-E-001".to_string(),
@@ -1160,6 +1195,8 @@ mod tests {
                         episode_number: 1,
                         title: "Episode 1".to_string(),
                         metadata_status: "verified".to_string(),
+                        provenance: EpisodeProvenance::ProviderMetadata,
+                        verification: crate::providers::models::EpisodeVerification::Verified,
                         overview: None,
                         provider_mappings: vec![],
                         audio: Some(AudioAvailability {
@@ -1276,6 +1313,8 @@ mod tests {
                         episode_number: 2,
                         title: "Episode 2".to_string(),
                         metadata_status: "unverified".to_string(),
+                        provenance: EpisodeProvenance::ProviderMetadata,
+                        verification: crate::providers::models::EpisodeVerification::Verified,
                         overview: None,
                         provider_mappings: vec![],
                         audio: Some(AudioAvailability {
@@ -1303,6 +1342,9 @@ mod tests {
             }],
             total_seasons: 1,
             total_episodes: 2,
+            verified_episodes: 1,
+            unverified_episodes: 0,
+            synthetic_episodes: 0,
             season_structure_status: "complete".to_string(),
             details_hydrated: true,
         };
@@ -1538,6 +1580,11 @@ mod tests {
                 id: "NP-S-002".to_string(),
                 anime_id: "NP-A-002".to_string(),
                 season_number: 1,
+                verified_episodes: 1,
+                unverified_episodes: 0,
+                synthetic_episodes: 0,
+                advertised_episode_count: None,
+                structure_status: "verified".to_string(),
                 episodes: vec![CanonicalEpisode {
                     id: "NP-E-010".to_string(),
                     anime_id: "NP-A-002".to_string(),
@@ -1546,6 +1593,8 @@ mod tests {
                     episode_number: 1,
                     title: "Episode 1".to_string(),
                     metadata_status: "verified".to_string(),
+                    provenance: EpisodeProvenance::ProviderMetadata,
+                    verification: crate::providers::models::EpisodeVerification::Verified,
                     overview: None,
                     provider_mappings: vec![],
                     audio: Some(AudioAvailability {
@@ -1575,6 +1624,9 @@ mod tests {
             }],
             total_seasons: 1,
             total_episodes: 1,
+            verified_episodes: 1,
+            unverified_episodes: 0,
+            synthetic_episodes: 0,
             season_structure_status: "verified".to_string(),
             details_hydrated: true,
         };
@@ -1637,6 +1689,11 @@ mod tests {
                 id: "NP-S-CACHE".to_string(),
                 anime_id: "NP-A-CACHE".to_string(),
                 season_number: 1,
+                verified_episodes: 1,
+                unverified_episodes: 0,
+                synthetic_episodes: 0,
+                advertised_episode_count: None,
+                structure_status: "verified".to_string(),
                 episodes: vec![CanonicalEpisode {
                     id: "NP-E-CACHE".to_string(),
                     anime_id: "NP-A-CACHE".to_string(),
@@ -1645,6 +1702,8 @@ mod tests {
                     episode_number: 1,
                     title: "Episode 1".to_string(),
                     metadata_status: "verified".to_string(),
+                    provenance: EpisodeProvenance::ProviderMetadata,
+                    verification: crate::providers::models::EpisodeVerification::Verified,
                     overview: None,
                     provider_mappings: vec![],
                     audio: Some(AudioAvailability {
@@ -1701,6 +1760,9 @@ mod tests {
             }],
             total_seasons: 1,
             total_episodes: 1,
+            verified_episodes: 1,
+            unverified_episodes: 0,
+            synthetic_episodes: 0,
             season_structure_status: "verified".to_string(),
             details_hydrated: true,
         };

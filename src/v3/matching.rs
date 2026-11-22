@@ -1,4 +1,6 @@
-use crate::providers::models::{Episode, MediaDetails, MediaType, ProviderKind};
+use crate::providers::models::{
+    Episode, EpisodeProvenance, EpisodeVerification, MediaDetails, MediaType, ProviderKind,
+};
 use crate::v3::models::{
     CanonicalAnime, CanonicalEpisode, CanonicalSeason, EpisodeMappingOutcome, MatchConfidence,
     NormalizedAnime, ProviderAnimeRef, ProviderEpisodeMapping,
@@ -243,6 +245,8 @@ fn has_special_or_sequel_marker(raw: &str) -> Option<&'static str> {
     let lower = raw.to_ascii_lowercase();
     for marker in [
         "ova",
+        "ona",
+        "oad",
         "special",
         "movie",
         "theatrical",
@@ -250,10 +254,15 @@ fn has_special_or_sequel_marker(raw: &str) -> Option<&'static str> {
         "shippûden",
         "boruto",
         "brotherhood",
+        "spin-off",
+        "spinoff",
+        "remake",
+        "recap",
     ] {
         if lower.contains(marker) {
             return Some(match marker {
                 "shippûden" => "shippuden",
+                "spin-off" => "spinoff",
                 other => other,
             });
         }
@@ -411,6 +420,9 @@ pub fn merge_search_results(
             seasons: Vec::new(),
             total_seasons: 0,
             total_episodes: 0,
+            verified_episodes: 0,
+            unverified_episodes: 0,
+            synthetic_episodes: 0,
             season_structure_status: "pending".to_string(),
             details_hydrated: false,
         });
@@ -476,11 +488,13 @@ pub fn build_canonical_structure(anime: &mut CanonicalAnime) {
         String,
         Option<String>,
         Option<String>,
+        Option<String>,
         bool,
         &'a Episode,
     );
     let mut episode_buckets: BTreeMap<(bool, usize, usize), Vec<EpisodeBucketEntry<'_>>> =
         BTreeMap::new();
+    let mut season_advertised_counts: BTreeMap<usize, usize> = BTreeMap::new();
 
     for rec in &anime.provider_records {
         let Some(d) = &rec.details else {
@@ -494,6 +508,7 @@ pub fn build_canonical_structure(anime: &mut CanonicalAnime) {
                 rec.title.clone(),
                 rec.declared_language.clone(),
                 rec.declared_language_code.clone(),
+                None,
                 false,
                 &MOVIES_SYNTHETIC_EP,
             ));
@@ -505,6 +520,13 @@ pub fn build_canonical_structure(anime: &mut CanonicalAnime) {
             None
         };
         for s in &d.seasons {
+            let target_season = split_season_override.unwrap_or(s.number);
+            if let Some(adv) = s.advertised_episode_count {
+                season_advertised_counts
+                    .entry(target_season)
+                    .and_modify(|e| *e = (*e).max(adv))
+                    .or_insert(adv);
+            }
             for ep in &s.episodes {
                 let canonical_season = split_season_override.unwrap_or(ep.season);
                 let key = (canonical_season == 0, canonical_season, ep.number);
@@ -514,6 +536,7 @@ pub fn build_canonical_structure(anime: &mut CanonicalAnime) {
                     rec.title.clone(),
                     rec.declared_language.clone(),
                     rec.declared_language_code.clone(),
+                    s.provider_season_id.clone(),
                     split_season_override.is_some(),
                     ep,
                 ));
@@ -532,10 +555,13 @@ pub fn build_canonical_structure(anime: &mut CanonicalAnime) {
             continue;
         }
 
-        // Prefer a descriptive (non-generic) canonical episode title across all provider entries
+        // Prefer a descriptive (non-generic) canonical episode title across non-synthetic entries
         let mut title: Option<String> = None;
         let mut overview: Option<String> = None;
-        for (_, _, _, _, _, _, ep) in &entries {
+        for (_, _, _, _, _, _, _, ep) in &entries {
+            if ep.provenance == EpisodeProvenance::SyntheticFallback {
+                continue;
+            }
             if let Some(t) = ep.title.as_ref().filter(|s| !s.trim().is_empty()) {
                 let trimmed = t.trim();
                 let is_generic = is_generic_episode_title(trimmed, &anime_norm_title, ep_num);
@@ -560,7 +586,7 @@ pub fn build_canonical_structure(anime: &mut CanonicalAnime) {
         // Count occurrences per (provider_id, provider_anime_id) to detect ambiguous duplicate mappings
         let mut variant_counts: std::collections::HashMap<(ProviderKind, String), usize> =
             std::collections::HashMap::new();
-        for (prov, prov_anime_id, _, _, _, _, _) in &entries {
+        for (prov, prov_anime_id, _, _, _, _, _, _) in &entries {
             *variant_counts
                 .entry((*prov, prov_anime_id.clone()))
                 .or_insert(0) += 1;
@@ -568,6 +594,17 @@ pub fn build_canonical_structure(anime: &mut CanonicalAnime) {
 
         let mut mappings = Vec::new();
         let mut seen_provider_variants = HashSet::new();
+        let mut best_provenance = EpisodeProvenance::SyntheticFallback;
+        let mut any_verified_mapping = false;
+
+        let provenance_rank = |p: EpisodeProvenance| -> usize {
+            match p {
+                EpisodeProvenance::ProviderMetadata => 3,
+                EpisodeProvenance::ProviderListing => 2,
+                EpisodeProvenance::FilenameDerived => 1,
+                EpisodeProvenance::SyntheticFallback => 0,
+            }
+        };
 
         for (
             prov,
@@ -575,6 +612,7 @@ pub fn build_canonical_structure(anime: &mut CanonicalAnime) {
             variant_title,
             variant_lang,
             variant_lang_code,
+            prov_season_id,
             used_split_override,
             ep,
         ) in &entries
@@ -584,16 +622,37 @@ pub fn build_canonical_structure(anime: &mut CanonicalAnime) {
             if !seen_provider_variants.insert(variant_key) {
                 continue;
             }
-            let (outcome, confidence, matching_evidence, exclusion_reason) = evaluate_episode_match(
-                anime.media_type,
-                &anime_norm_title,
-                season_num,
-                ep_num,
-                title.as_deref(),
-                ep,
-                *used_split_override,
-                is_ambiguous,
-            );
+            if provenance_rank(ep.provenance) > provenance_rank(best_provenance) {
+                best_provenance = ep.provenance;
+            }
+            let (outcome, confidence, matching_evidence, exclusion_reason) =
+                if ep.provenance == EpisodeProvenance::SyntheticFallback {
+                    (
+                        EpisodeMappingOutcome::Unmatched,
+                        0.0,
+                        vec!["synthetic_fallback_record".to_string()],
+                        Some("synthetic_fallback_only".to_string()),
+                    )
+                } else {
+                    evaluate_episode_match(
+                        anime.media_type,
+                        &anime_norm_title,
+                        season_num,
+                        ep_num,
+                        title.as_deref(),
+                        ep,
+                        *used_split_override,
+                        is_ambiguous,
+                    )
+                };
+
+            if ep.provenance != EpisodeProvenance::SyntheticFallback
+                && ep.verification == EpisodeVerification::Verified
+                && outcome == EpisodeMappingOutcome::Matched
+            {
+                any_verified_mapping = true;
+            }
+
             mappings.push(ProviderEpisodeMapping {
                 provider_id: *prov,
                 provider_anime_id: prov_anime_id.clone(),
@@ -603,7 +662,13 @@ pub fn build_canonical_structure(anime: &mut CanonicalAnime) {
                 provider_season_number: ep.season,
                 provider_episode_number: ep.number,
                 provider_episode_id: ep.provider_episode_id.clone(),
+                provider_season_id: ep
+                    .provider_season_id
+                    .clone()
+                    .or_else(|| prov_season_id.clone()),
                 title: ep.title.clone(),
+                provenance: ep.provenance,
+                verification: ep.verification,
                 outcome,
                 confidence,
                 matching_evidence,
@@ -640,7 +705,10 @@ pub fn build_canonical_structure(anime: &mut CanonicalAnime) {
                 provider_season_number: season_num,
                 provider_episode_number: ep_num,
                 provider_episode_id: None,
+                provider_season_id: None,
                 title: None,
+                provenance: EpisodeProvenance::ProviderListing,
+                verification: EpisodeVerification::Unverified,
                 outcome: EpisodeMappingOutcome::MissingFromProvider,
                 confidence: 0.0,
                 matching_evidence: evidence,
@@ -648,11 +716,22 @@ pub fn build_canonical_structure(anime: &mut CanonicalAnime) {
             });
         }
 
+        let ep_verification = if best_provenance != EpisodeProvenance::SyntheticFallback
+            && (any_verified_mapping || anime.media_type == MediaType::Movie)
+        {
+            EpisodeVerification::Verified
+        } else {
+            EpisodeVerification::Unverified
+        };
+
         let (final_title, metadata_status) = if anime.media_type == MediaType::Movie {
             (anime.title.clone(), "verified".to_string())
         } else if let Some(t) = title {
-            let is_generic = is_generic_episode_title(&t, &anime_norm_title, ep_num);
-            let status = if is_generic { "unverified" } else { "verified" };
+            let status = if ep_verification == EpisodeVerification::Verified {
+                "verified"
+            } else {
+                "unverified"
+            };
             (t, status.to_string())
         } else {
             (format!("Episode {ep_num}"), "unverified".to_string())
@@ -666,6 +745,8 @@ pub fn build_canonical_structure(anime: &mut CanonicalAnime) {
             episode_number: ep_num,
             title: final_title,
             metadata_status,
+            provenance: best_provenance,
+            verification: ep_verification,
             overview,
             provider_mappings: mappings,
             audio: None,
@@ -685,16 +766,58 @@ pub fn build_canonical_structure(anime: &mut CanonicalAnime) {
     }
 
     let mut seasons = Vec::with_capacity(seasons_map.len());
-    let mut total_episodes = 0usize;
+    let mut total_verified = 0usize;
+    let mut total_unverified = 0usize;
+    let mut total_synthetic = 0usize;
+
     for ((_, season_num), eps) in seasons_map {
         if eps.is_empty() {
             continue;
         }
-        total_episodes += eps.len();
+        let s_verified = eps
+            .iter()
+            .filter(|e| {
+                e.provenance != EpisodeProvenance::SyntheticFallback
+                    && e.verification == EpisodeVerification::Verified
+            })
+            .count();
+        let s_unverified = eps
+            .iter()
+            .filter(|e| {
+                e.provenance != EpisodeProvenance::SyntheticFallback
+                    && e.verification != EpisodeVerification::Verified
+            })
+            .count();
+        let s_synthetic = eps
+            .iter()
+            .filter(|e| e.provenance == EpisodeProvenance::SyntheticFallback)
+            .count();
+
+        total_verified += s_verified;
+        total_unverified += s_unverified;
+        total_synthetic += s_synthetic;
+
+        let s_provider_total = s_verified + s_unverified;
+        let structure_status = if s_verified > 0 && s_unverified == 0 && s_synthetic == 0 {
+            "verified"
+        } else if s_provider_total > 0 {
+            "partial"
+        } else if s_synthetic > 0 {
+            "unverified"
+        } else {
+            "unavailable"
+        }
+        .to_string();
+
         seasons.push(CanonicalSeason {
             id: format_season_id(&anime.slug_token, season_num),
             anime_id: anime.id.clone(),
             season_number: season_num,
+            verified_episodes: s_verified,
+            unverified_episodes: s_unverified,
+            synthetic_episodes: s_synthetic,
+            advertised_episode_count: season_advertised_counts.get(&season_num).copied(),
+            structure_status,
             episodes: eps,
         });
     }
@@ -703,17 +826,37 @@ pub fn build_canonical_structure(anime: &mut CanonicalAnime) {
     if anime.media_type == MediaType::Movie {
         anime.total_seasons = 0;
         anime.total_episodes = 0;
+        anime.verified_episodes = 0;
+        anime.unverified_episodes = 0;
+        anime.synthetic_episodes = 0;
+        anime.season_structure_status = if !any_details {
+            "unavailable".to_string()
+        } else if anime.provider_records.iter().any(|r| r.details_failed) {
+            "partial".to_string()
+        } else {
+            "verified".to_string()
+        };
     } else {
         anime.total_seasons = anime.seasons.len();
-        anime.total_episodes = total_episodes;
+        anime.verified_episodes = total_verified;
+        anime.unverified_episodes = total_unverified;
+        anime.synthetic_episodes = total_synthetic;
+        // Global invariant: total_episodes = verified_episodes + unverified_episodes (synthetic excluded)
+        anime.total_episodes = total_verified + total_unverified;
+        anime.season_structure_status =
+            if !any_details || (anime.total_episodes == 0 && anime.synthetic_episodes == 0) {
+                "unavailable".to_string()
+            } else if anime.total_episodes == 0 && anime.synthetic_episodes > 0 {
+                "unverified".to_string()
+            } else if anime.unverified_episodes > 0
+                || anime.synthetic_episodes > 0
+                || anime.provider_records.iter().any(|r| r.details_failed)
+            {
+                "partial".to_string()
+            } else {
+                "verified".to_string()
+            };
     }
-    anime.season_structure_status = if !any_details {
-        "unavailable".to_string()
-    } else if anime.provider_records.iter().any(|r| r.details_failed) {
-        "partial".to_string()
-    } else {
-        "verified".to_string()
-    };
     anime.details_hydrated = true;
 }
 
@@ -724,6 +867,8 @@ static MOVIES_SYNTHETIC_EP: Episode = Episode {
     overview: None,
     provider_episode_id: None,
     provider_season_id: None,
+    provenance: EpisodeProvenance::ProviderListing,
+    verification: EpisodeVerification::Verified,
 };
 
 /// Recognizes generic / provider-numbered episode titles such as:
@@ -995,9 +1140,12 @@ mod tests {
                                         overview: None,
                                         provider_episode_id: Some(format!("{n}")),
                                         provider_season_id: Some("1".into()),
+                                        provenance: EpisodeProvenance::ProviderMetadata,
+                                        verification: EpisodeVerification::Verified,
                                     })
                                     .collect(),
                                 provider_season_id: Some("1".into()),
+                                advertised_episode_count: None,
                             },
                             Season {
                                 number: 2,
@@ -1008,8 +1156,11 @@ mod tests {
                                     overview: None,
                                     provider_episode_id: Some("4".into()),
                                     provider_season_id: Some("2".into()),
+                                    provenance: EpisodeProvenance::ProviderMetadata,
+                                    verification: EpisodeVerification::Verified,
                                 }],
                                 provider_season_id: Some("2".into()),
+                                advertised_episode_count: None,
                             },
                         ],
                         dubs: vec![],
@@ -1052,9 +1203,12 @@ mod tests {
                                     overview: None,
                                     provider_episode_id: Some(format!("dc-{n}")),
                                     provider_season_id: Some("1".into()),
+                                    provenance: EpisodeProvenance::ProviderMetadata,
+                                    verification: EpisodeVerification::Verified,
                                 })
                                 .collect(),
                             provider_season_id: Some("1".into()),
+                            advertised_episode_count: None,
                         }],
                         dubs: vec![],
                     }),
@@ -1064,6 +1218,9 @@ mod tests {
             seasons: vec![],
             total_seasons: 0,
             total_episodes: 0,
+            verified_episodes: 0,
+            unverified_episodes: 0,
+            synthetic_episodes: 0,
             season_structure_status: "pending".into(),
             details_hydrated: false,
         };
@@ -1381,8 +1538,11 @@ mod tests {
                         overview: None,
                         provider_episode_id: Some(format!("ep-{}", rec.provider_anime_id)),
                         provider_season_id: None,
+                        provenance: EpisodeProvenance::ProviderMetadata,
+                        verification: EpisodeVerification::Verified,
                     }],
                     provider_season_id: None,
+                    advertised_episode_count: None,
                 }],
                 dubs: vec![],
             });
@@ -1416,6 +1576,8 @@ mod tests {
             overview: None,
             provider_episode_id: Some("dc-fid-991".into()),
             provider_season_id: None,
+            provenance: EpisodeProvenance::ProviderMetadata,
+            verification: EpisodeVerification::Verified,
         };
         let (outcome, score, evidence, reason) = evaluate_episode_match(
             MediaType::Series,
@@ -1441,6 +1603,8 @@ mod tests {
             overview: None,
             provider_episode_id: Some("dc-fid-995".into()),
             provider_season_id: None,
+            provenance: EpisodeProvenance::ProviderMetadata,
+            verification: EpisodeVerification::Verified,
         };
         let (outcome, _, _, reason) = evaluate_episode_match(
             MediaType::Series,
@@ -1463,6 +1627,8 @@ mod tests {
             overview: None,
             provider_episode_id: None,
             provider_season_id: None,
+            provenance: EpisodeProvenance::ProviderMetadata,
+            verification: EpisodeVerification::Verified,
         };
         let (outcome, _, _, reason) = evaluate_episode_match(
             MediaType::Series,
@@ -1499,6 +1665,8 @@ mod tests {
             overview: None,
             provider_episode_id: Some("dc-fid-999".into()),
             provider_season_id: None,
+            provenance: EpisodeProvenance::ProviderMetadata,
+            verification: EpisodeVerification::Verified,
         };
         let (outcome, _, _, reason) = evaluate_episode_match(
             MediaType::Series,
@@ -1562,8 +1730,11 @@ mod tests {
                     overview: None,
                     provider_episode_id: None,
                     provider_season_id: None,
+                    provenance: EpisodeProvenance::ProviderMetadata,
+                    verification: EpisodeVerification::Verified,
                 }],
                 provider_season_id: None,
+                advertised_episode_count: None,
             }],
             dubs: vec![],
         });
@@ -1583,5 +1754,212 @@ mod tests {
             Some("provider_details_unavailable")
         );
         assert_eq!(en_map.variant_language_code.as_deref(), Some("en"));
+    }
+
+    #[test]
+    fn test_a_naruto_season_reconciliation_counting_contract() {
+        let make_eps = |season: usize, count: usize, ver: EpisodeVerification| -> Season {
+            Season {
+                number: season,
+                episodes: (1..=count)
+                    .map(|n| Episode {
+                        season,
+                        number: n,
+                        title: if ver == EpisodeVerification::Verified {
+                            Some(format!("Title S{season}E{n}"))
+                        } else {
+                            None
+                        },
+                        overview: None,
+                        provider_episode_id: if ver == EpisodeVerification::Verified {
+                            Some(format!("ep-{season}-{n}"))
+                        } else {
+                            None
+                        },
+                        provider_season_id: Some(season.to_string()),
+                        provenance: if ver == EpisodeVerification::Verified {
+                            EpisodeProvenance::ProviderMetadata
+                        } else {
+                            EpisodeProvenance::ProviderListing
+                        },
+                        verification: ver,
+                    })
+                    .collect(),
+                provider_season_id: Some(season.to_string()),
+                advertised_episode_count: None,
+            }
+        };
+
+        let items = vec![norm(
+            ProviderKind::AniZone,
+            "naruto-2002",
+            "Naruto",
+            Some(2002),
+            MediaType::Series,
+        )];
+        let mut merged = merge_search_results(items, 50);
+        let anime = &mut merged[0];
+        anime.provider_records[0].details = Some(MediaDetails {
+            id: crate::providers::models::ProviderMediaId {
+                provider: ProviderKind::AniZone,
+                value: "naruto-2002".into(),
+            },
+            title: "Naruto".into(),
+            media_type: MediaType::Series,
+            year: Some("2002".into()),
+            description: None,
+            tagline: None,
+            imdb_rating: None,
+            director: None,
+            stars: None,
+            prints: None,
+            audios: None,
+            poster_url: None,
+            duration: None,
+            genres: vec![],
+            seasons: vec![
+                make_eps(1, 220, EpisodeVerification::Verified),
+                make_eps(2, 73, EpisodeVerification::Unverified),
+                make_eps(3, 57, EpisodeVerification::Unverified),
+                make_eps(4, 57, EpisodeVerification::Unverified),
+            ],
+            dubs: vec![],
+        });
+
+        build_canonical_structure(anime);
+        assert_eq!(anime.verified_episodes, 220);
+        assert_eq!(anime.unverified_episodes, 187);
+        assert_eq!(anime.synthetic_episodes, 0);
+        assert_eq!(anime.total_episodes, 407);
+        assert_eq!(
+            anime.total_episodes,
+            anime.verified_episodes + anime.unverified_episodes
+        );
+        assert_eq!(anime.season_structure_status, "partial");
+    }
+
+    #[test]
+    fn test_b_synthetic_fallback_excluded_from_total_and_never_verified() {
+        let s1_real = Season {
+            number: 1,
+            episodes: (1..=500)
+                .map(|n| Episode {
+                    season: 1,
+                    number: n,
+                    title: Some(format!("Shippuden Ep {n}")),
+                    overview: None,
+                    provider_episode_id: Some(format!("az-{n}")),
+                    provider_season_id: Some("1".into()),
+                    provenance: EpisodeProvenance::ProviderMetadata,
+                    verification: EpisodeVerification::Verified,
+                })
+                .collect(),
+            provider_season_id: Some("1".into()),
+            advertised_episode_count: None,
+        };
+        let s2_synth = Season {
+            number: 2,
+            episodes: (1..=400)
+                .map(|n| Episode {
+                    season: 2,
+                    number: n,
+                    title: None,
+                    overview: None,
+                    provider_episode_id: None,
+                    provider_season_id: None,
+                    provenance: EpisodeProvenance::SyntheticFallback,
+                    verification: EpisodeVerification::Unverified,
+                })
+                .collect(),
+            provider_season_id: Some("2".into()),
+            advertised_episode_count: Some(400),
+        };
+
+        let items = vec![norm(
+            ProviderKind::MovieBox,
+            "mb-ship",
+            "Naruto Shippuden",
+            Some(2007),
+            MediaType::Series,
+        )];
+        let mut merged = merge_search_results(items, 50);
+        let anime = &mut merged[0];
+        anime.provider_records[0].details = Some(MediaDetails {
+            id: crate::providers::models::ProviderMediaId {
+                provider: ProviderKind::MovieBox,
+                value: "mb-ship".into(),
+            },
+            title: "Naruto Shippuden".into(),
+            media_type: MediaType::Series,
+            year: Some("2007".into()),
+            description: None,
+            tagline: None,
+            imdb_rating: None,
+            director: None,
+            stars: None,
+            prints: None,
+            audios: None,
+            poster_url: None,
+            duration: None,
+            genres: vec![],
+            seasons: vec![s1_real, s2_synth],
+            dubs: vec![],
+        });
+
+        build_canonical_structure(anime);
+        assert_eq!(anime.verified_episodes, 500);
+        assert_eq!(anime.unverified_episodes, 0);
+        assert_eq!(anime.synthetic_episodes, 400);
+        assert_eq!(anime.total_episodes, 500);
+        assert_eq!(anime.season_structure_status, "partial");
+        assert!(
+            anime.seasons[1]
+                .episodes
+                .iter()
+                .all(|e| e.provider_mappings[0].outcome == EpisodeMappingOutcome::Unmatched)
+        );
+    }
+
+    #[test]
+    fn test_e_canonical_identity_isolation_naruto_shippuden_boruto_remake() {
+        let items = vec![
+            norm(
+                ProviderKind::AniZone,
+                "n1",
+                "Naruto",
+                Some(2002),
+                MediaType::Series,
+            ),
+            norm(
+                ProviderKind::AniZone,
+                "ns1",
+                "Naruto Shippuden",
+                Some(2007),
+                MediaType::Series,
+            ),
+            norm(
+                ProviderKind::AniZone,
+                "b1",
+                "Boruto: Naruto Next Generations",
+                Some(2017),
+                MediaType::Series,
+            ),
+            norm(
+                ProviderKind::MovieBox,
+                "n-ova",
+                "Naruto OVA",
+                Some(2004),
+                MediaType::Series,
+            ),
+            norm(
+                ProviderKind::MovieBox,
+                "n-mov",
+                "Naruto",
+                Some(2004),
+                MediaType::Movie,
+            ),
+        ];
+        let merged = merge_search_results(items, 50);
+        assert_eq!(merged.len(), 5);
     }
 }

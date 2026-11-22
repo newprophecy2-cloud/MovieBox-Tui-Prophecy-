@@ -1659,8 +1659,8 @@ mod tests {
         app.state.available_seasons = vec![crate::providers::models::Season {
             number: 1,
             episodes: vec![],
-
             provider_season_id: None,
+            advertised_episode_count: None,
         }];
         app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::empty()))
             .await;

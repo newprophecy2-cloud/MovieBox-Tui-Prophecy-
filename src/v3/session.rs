@@ -78,7 +78,10 @@ impl SessionStore {
         });
     }
 
-    pub async fn create_session(&self, anime_list: Vec<CanonicalAnime>) -> Arc<RwLock<TemporarySession>> {
+    pub async fn create_session(
+        &self,
+        anime_list: Vec<CanonicalAnime>,
+    ) -> Arc<RwLock<TemporarySession>> {
         let token = generate_session_token();
         let now = Instant::now();
         let expires_at = now + self.config.ttl.min(self.config.idle_ttl);
@@ -175,7 +178,9 @@ impl SessionStore {
         let now = Instant::now();
         let candidates: Vec<(String, Arc<RwLock<TemporarySession>>)> = {
             let map = self.sessions.read().await;
-            map.iter().map(|(k, v)| (k.clone(), Arc::clone(v))).collect()
+            map.iter()
+                .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                .collect()
         };
 
         let mut expired = Vec::new();
@@ -208,7 +213,11 @@ fn is_session_expired(session: &TemporarySession, now: Instant) -> bool {
 }
 
 fn is_valid_token_format(token: &str) -> bool {
-    token.len() >= 32 && token.len() <= 128 && token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    token.len() >= 32
+        && token.len() <= 128
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 pub fn generate_session_token() -> String {
@@ -264,6 +273,9 @@ mod tests {
             seasons: Vec::new(),
             total_seasons: 0,
             total_episodes: 0,
+            verified_episodes: 0,
+            unverified_episodes: 0,
+            synthetic_episodes: 0,
             season_structure_status: "pending".to_string(),
             details_hydrated: false,
         }
@@ -279,15 +291,24 @@ mod tests {
             max_search_results: 20,
         });
 
-        assert_eq!(store.get_session(None).await.unwrap_err(), SessionLookupError::Required);
-        assert_eq!(store.get_session(Some("short")).await.unwrap_err(), SessionLookupError::Invalid);
+        assert_eq!(
+            store.get_session(None).await.unwrap_err(),
+            SessionLookupError::Required
+        );
+        assert_eq!(
+            store.get_session(Some("short")).await.unwrap_err(),
+            SessionLookupError::Invalid
+        );
 
         let sess = store.create_session(vec![dummy_anime("8F21D9")]).await;
         let token = sess.read().await.session_id.clone();
         assert!(store.get_session(Some(&token)).await.is_ok());
 
         tokio::time::sleep(Duration::from_millis(95)).await;
-        assert_eq!(store.get_session(Some(&token)).await.unwrap_err(), SessionLookupError::Expired);
+        assert_eq!(
+            store.get_session(Some(&token)).await.unwrap_err(),
+            SessionLookupError::Expired
+        );
         assert_eq!(store.active_count().await, 0);
     }
 

@@ -967,12 +967,14 @@ impl App {
                             number: 1,
                             title: None,
                             overview: None,
-
                             provider_episode_id: None,
                             provider_season_id: None,
+                            provenance:
+                                crate::providers::models::EpisodeProvenance::SyntheticFallback,
+                            verification: crate::providers::models::EpisodeVerification::Unverified,
                         }],
-
                         provider_season_id: None,
+                        advertised_episode_count: None,
                     }];
                 } else {
                     self.state.available_seasons.clear();

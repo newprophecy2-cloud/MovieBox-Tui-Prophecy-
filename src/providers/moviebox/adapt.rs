@@ -1,6 +1,7 @@
 use crate::providers::models::{
-    AudioTrackOption, CatalogItem, Episode, MediaDetails, MediaType, ProviderError, ProviderKind,
-    ProviderMediaId, Release, Season, SourceMirror, SubtitleOption,
+    AudioTrackOption, CatalogItem, Episode, EpisodeProvenance, EpisodeVerification, MediaDetails,
+    MediaType, ProviderError, ProviderKind, ProviderMediaId, Release, Season, SourceMirror,
+    SubtitleOption,
 };
 use base64::Engine;
 pub fn captions_json_to_options(payload: &serde_json::Value) -> Vec<SubtitleOption> {
@@ -357,6 +358,7 @@ pub fn moviebox_details_json_to_media_details(
     {
         for s in seasons_arr {
             let se_num = s.get("se").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+            let max_ep = s.get("maxEp").and_then(|m| m.as_u64()).map(|m| m as usize);
             let mut episodes = Vec::new();
             if let Some(eps) = s.get("episodeNumbers").and_then(|e| e.as_array()) {
                 for ep in eps {
@@ -366,29 +368,35 @@ pub fn moviebox_details_json_to_media_details(
                             number: ep_num as usize,
                             title: None,
                             overview: None,
-
                             provider_episode_id: None,
-                            provider_season_id: None,
+                            provider_season_id: Some(se_num.to_string()),
+                            provenance: EpisodeProvenance::ProviderListing,
+                            verification: EpisodeVerification::Unverified,
                         });
                     }
                 }
-            } else if let Some(max_ep) = s.get("maxEp").and_then(|m| m.as_u64()) {
-                for ep_num in 1..=max_ep as usize {
+            } else if let Some(max_ep_val) = max_ep {
+                // `maxEp` is an advertised upper bound only, not an explicit episode listing.
+                // Tag generated fallback entries as SyntheticFallback + Unverified and never
+                // fabricate provider_episode_id values.
+                for ep_num in 1..=max_ep_val {
                     episodes.push(Episode {
                         season: se_num,
                         number: ep_num,
                         title: None,
                         overview: None,
-
                         provider_episode_id: None,
                         provider_season_id: None,
+                        provenance: EpisodeProvenance::SyntheticFallback,
+                        verification: EpisodeVerification::Unverified,
                     });
                 }
             }
             seasons.push(Season {
                 number: se_num,
                 episodes,
-                provider_season_id: None,
+                provider_season_id: Some(se_num.to_string()),
+                advertised_episode_count: max_ep,
             });
         }
     }

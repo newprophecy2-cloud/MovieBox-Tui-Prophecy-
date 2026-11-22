@@ -829,13 +829,23 @@ pub async fn collect_episode_sources(
             matching_status: m.outcome,
             exclusion_reason: m.exclusion_reason.clone(),
         });
-        if m.outcome == EpisodeMappingOutcome::Matched {
+        if m.outcome == EpisodeMappingOutcome::Matched
+            && m.provenance != crate::providers::models::EpisodeProvenance::SyntheticFallback
+            && episode.provenance != crate::providers::models::EpisodeProvenance::SyntheticFallback
+        {
             matched_mappings.push(m.clone());
         } else {
-            let reason = m
-                .exclusion_reason
-                .clone()
-                .unwrap_or_else(|| "episode_mismatch".to_string());
+            let reason = if m.provenance
+                == crate::providers::models::EpisodeProvenance::SyntheticFallback
+                || episode.provenance
+                    == crate::providers::models::EpisodeProvenance::SyntheticFallback
+            {
+                "synthetic_episode_unconfirmed".to_string()
+            } else {
+                m.exclusion_reason
+                    .clone()
+                    .unwrap_or_else(|| "episode_mismatch".to_string())
+            };
             excluded_details.push(ExcludedSourceRecord {
                 provider: pkey.clone(),
                 source_id: None,
@@ -2111,6 +2121,8 @@ video.m3u8"#;
             episode_number: 1,
             title: "Ep 1".into(),
             metadata_status: "verified".into(),
+            provenance: crate::providers::models::EpisodeProvenance::ProviderMetadata,
+            verification: crate::providers::models::EpisodeVerification::Verified,
             overview: None,
             provider_mappings: vec![],
             audio: None,
@@ -2282,6 +2294,8 @@ video.m3u8"#;
             episode_number: 1,
             title: "Asta and Yuno".into(),
             metadata_status: "verified".into(),
+            provenance: crate::providers::models::EpisodeProvenance::ProviderMetadata,
+            verification: crate::providers::models::EpisodeVerification::Verified,
             overview: None,
             provider_mappings: vec![crate::v3::models::ProviderEpisodeMapping {
                 provider_id: ProviderKind::Dramachi,
@@ -2292,7 +2306,10 @@ video.m3u8"#;
                 provider_season_number: 1,
                 provider_episode_number: 99,
                 provider_episode_id: Some("dc-ep-99".into()),
+                provider_season_id: None,
                 title: Some("Wrong Episode".into()),
+                provenance: crate::providers::models::EpisodeProvenance::ProviderMetadata,
+                verification: crate::providers::models::EpisodeVerification::Unverified,
                 outcome: EpisodeMappingOutcome::EpisodeMismatch,
                 confidence: 0.0,
                 matching_evidence: vec!["episode_mismatch:expected=1:got=99".into()],
@@ -2458,5 +2475,56 @@ video.m3u8"#;
         assert!(crate::net::validate_url_syntax("http://127.0.0.1/secret", true).is_err());
         assert!(crate::net::validate_url_syntax("http://169.254.169.254/latest", true).is_err());
         assert!(crate::net::validate_url_syntax("https://localhost/admin", false).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_h_synthetic_episode_rejected_from_source_matching() {
+        let ep = CanonicalEpisode {
+            id: "NP-E-SYNTH".into(),
+            anime_id: "NP-A-001".into(),
+            season_id: "NP-S-002".into(),
+            season_number: 2,
+            episode_number: 1,
+            title: "Episode 1".into(),
+            metadata_status: "unverified".into(),
+            provenance: crate::providers::models::EpisodeProvenance::SyntheticFallback,
+            verification: crate::providers::models::EpisodeVerification::Unverified,
+            overview: None,
+            provider_mappings: vec![crate::v3::models::ProviderEpisodeMapping {
+                provider_id: ProviderKind::MovieBox,
+                provider_anime_id: "mb-1".into(),
+                variant_title: Some("Test".into()),
+                variant_language: None,
+                variant_language_code: None,
+                provider_season_number: 2,
+                provider_episode_number: 1,
+                provider_episode_id: None,
+                provider_season_id: None,
+                title: None,
+                provenance: crate::providers::models::EpisodeProvenance::SyntheticFallback,
+                verification: crate::providers::models::EpisodeVerification::Unverified,
+                outcome: EpisodeMappingOutcome::Matched,
+                confidence: 0.0,
+                matching_evidence: vec![],
+                exclusion_reason: None,
+            }],
+            audio: None,
+            sources: None,
+            cached_provider_coverage: None,
+            cached_provider_details: Vec::new(),
+            pipeline_stats: PipelineStats::default(),
+            excluded_sources_count: 0,
+            excluded_reasons: Vec::new(),
+            excluded_details: Vec::new(),
+            matching_diagnostics: Vec::new(),
+        };
+        let reg = ProviderRegistry::from_env();
+        let res = collect_episode_sources(&reg, &ep).await;
+        assert!(res.candidates.is_empty());
+        assert_eq!(res.excluded_details.len(), 1);
+        assert_eq!(
+            res.excluded_details[0].reason,
+            "synthetic_episode_unconfirmed"
+        );
     }
 }

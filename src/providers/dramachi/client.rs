@@ -59,15 +59,37 @@ fn season_from_episode_result(
     let mut seen_ep_numbers = std::collections::HashSet::new();
     let mut mapped = Vec::new();
     for (index, episode) in episodes.iter().enumerate() {
-        let number = parse_episode_number(&episode.f_title).unwrap_or(index + 1);
+        let parsed_num = parse_episode_number(&episode.f_title);
+        let number = parsed_num.unwrap_or(index + 1);
+        let cleaned_title = clean_episode_title(&episode.f_title);
+        let has_fid = !episode.fid.trim().is_empty();
+        let (provenance, verification) = if parsed_num.is_some() && has_fid {
+            (
+                crate::providers::models::EpisodeProvenance::ProviderMetadata,
+                crate::providers::models::EpisodeVerification::Verified,
+            )
+        } else if parsed_num.is_some() {
+            (
+                crate::providers::models::EpisodeProvenance::ProviderListing,
+                crate::providers::models::EpisodeVerification::Unverified,
+            )
+        } else {
+            // Sequential index+1 fallback must never be treated as verified identity.
+            (
+                crate::providers::models::EpisodeProvenance::SyntheticFallback,
+                crate::providers::models::EpisodeVerification::Unverified,
+            )
+        };
         if seen_ep_numbers.insert(number) {
             mapped.push(Episode {
                 season: season_number,
                 number,
-                title: Some(clean_episode_title(&episode.f_title)),
+                title: (!cleaned_title.trim().is_empty()).then_some(cleaned_title),
                 overview: None,
-                provider_episode_id: (!episode.fid.trim().is_empty()).then(|| episode.fid.clone()),
+                provider_episode_id: has_fid.then(|| episode.fid.clone()),
                 provider_season_id: Some(provider_season_id.to_string()),
+                provenance,
+                verification,
             });
         }
     }
@@ -76,6 +98,7 @@ fn season_from_episode_result(
         number: season_number,
         episodes: mapped,
         provider_season_id: Some(provider_season_id.to_string()),
+        advertised_episode_count: None,
     })
 }
 
@@ -493,7 +516,11 @@ impl DramachiClient {
                 .trim_start_matches("https://")
                 .trim_start_matches("http://")
                 .trim_end_matches('/');
-            format!("https://{}/cdn/{}", clean_host, raw_url.trim_start_matches('/'))
+            format!(
+                "https://{}/cdn/{}",
+                clean_host,
+                raw_url.trim_start_matches('/')
+            )
         };
 
         Ok((stream_url, filename))
@@ -649,10 +676,7 @@ fn extract_leading_season_number(name: &str) -> Option<usize> {
     for prefix in ["season", "part", "cour", "s"] {
         if let Some(rest) = lower.strip_prefix(prefix) {
             let trimmed = rest.trim_start_matches([' ', '-', '.', '_']);
-            let num_str: String = trimmed
-                .chars()
-                .take_while(|c| c.is_ascii_digit())
-                .collect();
+            let num_str: String = trimmed.chars().take_while(|c| c.is_ascii_digit()).collect();
             if let Ok(num) = num_str.parse::<usize>()
                 && num > 0
             {

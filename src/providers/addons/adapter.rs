@@ -105,18 +105,26 @@ pub fn meta_detail_to_media_details(detail: &MetaDetail) -> MediaDetails {
             number: season_num,
             episodes: eps
                 .into_iter()
-                .map(|(ep_num, (ep_title, ep_overview))| Episode {
-                    season: season_num,
-                    number: ep_num,
-                    title: ep_title,
-                    overview: ep_overview,
-
-                    provider_episode_id: None,
-                    provider_season_id: None,
+                .map(|(ep_num, (ep_title, ep_overview))| {
+                    let has_title = ep_title.as_deref().is_some_and(|t| !t.trim().is_empty());
+                    Episode {
+                        season: season_num,
+                        number: ep_num,
+                        title: ep_title,
+                        overview: ep_overview,
+                        provider_episode_id: None,
+                        provider_season_id: None,
+                        provenance: crate::providers::models::EpisodeProvenance::ProviderListing,
+                        verification: if has_title {
+                            crate::providers::models::EpisodeVerification::Verified
+                        } else {
+                            crate::providers::models::EpisodeVerification::Unverified
+                        },
+                    }
                 })
                 .collect(),
-
             provider_season_id: None,
+            advertised_episode_count: None,
         })
         .collect::<Vec<_>>();
 

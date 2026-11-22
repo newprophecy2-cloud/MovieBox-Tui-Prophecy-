@@ -1,4 +1,6 @@
-use crate::providers::models::{MediaDetails, MediaType, ProviderKind, Release};
+use crate::providers::models::{
+    EpisodeProvenance, EpisodeVerification, MediaDetails, MediaType, ProviderKind, Release,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
@@ -82,7 +84,10 @@ pub struct ProviderEpisodeMapping {
     pub provider_season_number: usize,
     pub provider_episode_number: usize,
     pub provider_episode_id: Option<String>,
+    pub provider_season_id: Option<String>,
     pub title: Option<String>,
+    pub provenance: EpisodeProvenance,
+    pub verification: EpisodeVerification,
     pub outcome: EpisodeMappingOutcome,
     pub confidence: f32,
     pub matching_evidence: Vec<String>,
@@ -364,6 +369,8 @@ pub struct CanonicalEpisode {
     pub episode_number: usize,
     pub title: String,
     pub metadata_status: String,
+    pub provenance: EpisodeProvenance,
+    pub verification: EpisodeVerification,
     pub overview: Option<String>,
     pub provider_mappings: Vec<ProviderEpisodeMapping>,
     pub audio: Option<AudioAvailability>,
@@ -382,6 +389,11 @@ pub struct CanonicalSeason {
     pub id: String,
     pub anime_id: String,
     pub season_number: usize,
+    pub verified_episodes: usize,
+    pub unverified_episodes: usize,
+    pub synthetic_episodes: usize,
+    pub advertised_episode_count: Option<usize>,
+    pub structure_status: String,
     pub episodes: Vec<CanonicalEpisode>,
 }
 
@@ -400,6 +412,9 @@ pub struct CanonicalAnime {
     pub seasons: Vec<CanonicalSeason>,
     pub total_seasons: usize,
     pub total_episodes: usize,
+    pub verified_episodes: usize,
+    pub unverified_episodes: usize,
+    pub synthetic_episodes: usize,
     pub season_structure_status: String,
     pub details_hydrated: bool,
 }
@@ -436,6 +451,10 @@ pub struct SearchAnimeItem {
     pub genres: Vec<String>,
     pub total_seasons: usize,
     pub total_episodes: usize,
+    pub verified_episodes: usize,
+    pub unverified_episodes: usize,
+    pub synthetic_episodes: usize,
+    pub counts_status: &'static str,
     pub provider_ids: ProviderIdsMap,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_variants: Vec<ProviderVariantInfo>,
@@ -473,6 +492,9 @@ pub struct AnimeDetailsResponse {
     pub genres: Vec<String>,
     pub total_seasons: usize,
     pub total_episodes: usize,
+    pub verified_episodes: usize,
+    pub unverified_episodes: usize,
+    pub synthetic_episodes: usize,
     pub season_structure_status: String,
     pub provider_coverage: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -484,6 +506,12 @@ pub struct SeasonItemResponse {
     pub season_id: String,
     pub season_number: usize,
     pub episode_count: usize,
+    pub verified_episodes: usize,
+    pub unverified_episodes: usize,
+    pub synthetic_episodes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub advertised_episode_count: Option<usize>,
+    pub structure_status: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -492,6 +520,10 @@ pub struct AnimeSeasonsResponse {
     pub anime_id: String,
     pub total_seasons: usize,
     pub total_episodes: usize,
+    pub verified_episodes: usize,
+    pub unverified_episodes: usize,
+    pub synthetic_episodes: usize,
+    pub season_structure_status: String,
     pub seasons: Vec<SeasonItemResponse>,
 }
 
@@ -501,6 +533,8 @@ pub struct EpisodeItemResponse {
     pub episode_number: usize,
     pub title: String,
     pub metadata_status: String,
+    pub provenance: EpisodeProvenance,
+    pub verification: EpisodeVerification,
 }
 
 #[derive(Debug, Serialize)]
@@ -508,6 +542,10 @@ pub struct SeasonEpisodesResponse {
     pub status: &'static str,
     pub season_id: String,
     pub total_episodes: usize,
+    pub verified_episodes: usize,
+    pub unverified_episodes: usize,
+    pub synthetic_episodes: usize,
+    pub structure_status: String,
     pub episodes: Vec<EpisodeItemResponse>,
 }
 
@@ -521,6 +559,8 @@ pub struct EpisodeDetailsResponse {
     pub episode_number: usize,
     pub title: String,
     pub metadata_status: String,
+    pub provenance: EpisodeProvenance,
+    pub verification: EpisodeVerification,
     pub overview: Option<String>,
     pub provider_coverage: BTreeMap<String, String>,
     pub audio: AudioAvailability,

@@ -2685,6 +2685,8 @@ mod tests {
 
                             provider_episode_id: None,
                             provider_season_id: None,
+                            provenance: Default::default(),
+                            verification: Default::default(),
                         },
                         Episode {
                             season: 1,
@@ -2694,6 +2696,8 @@ mod tests {
 
                             provider_episode_id: None,
                             provider_season_id: None,
+                            provenance: Default::default(),
+                            verification: Default::default(),
                         },
                         Episode {
                             season: 1,
@@ -2703,10 +2707,13 @@ mod tests {
 
                             provider_episode_id: None,
                             provider_season_id: None,
+                            provenance: Default::default(),
+                            verification: Default::default(),
                         },
                     ],
 
                     provider_season_id: None,
+                    advertised_episode_count: None,
                 }],
                 dubs: vec![],
             }),
@@ -2721,6 +2728,8 @@ mod tests {
 
                         provider_episode_id: None,
                         provider_season_id: None,
+                        provenance: Default::default(),
+                        verification: Default::default(),
                     },
                     Episode {
                         season: 1,
@@ -2730,6 +2739,8 @@ mod tests {
 
                         provider_episode_id: None,
                         provider_season_id: None,
+                        provenance: Default::default(),
+                        verification: Default::default(),
                     },
                     Episode {
                         season: 1,
@@ -2739,10 +2750,13 @@ mod tests {
 
                         provider_episode_id: None,
                         provider_season_id: None,
+                        provenance: Default::default(),
+                        verification: Default::default(),
                     },
                 ],
 
                 provider_season_id: None,
+                advertised_episode_count: None,
             }],
             available_episode_numbers: vec![vec![1, 2, 10]],
             details_pane: crate::tui::state::DetailsPane::Episodes,
@@ -2805,9 +2819,12 @@ mod tests {
 
                         provider_episode_id: None,
                         provider_season_id: None,
+                        provenance: Default::default(),
+                        verification: Default::default(),
                     }],
 
                     provider_season_id: None,
+                    advertised_episode_count: None,
                 }],
                 dubs: vec![],
             }),
@@ -2824,9 +2841,12 @@ mod tests {
 
                     provider_episode_id: None,
                     provider_season_id: None,
+                    provenance: Default::default(),
+                    verification: Default::default(),
                 }],
 
                 provider_season_id: None,
+                advertised_episode_count: None,
             }],
             available_episode_numbers: vec![vec![1]],
             details_pane: crate::tui::state::DetailsPane::Episodes,
@@ -2897,6 +2917,7 @@ mod tests {
                     episodes: vec![],
 
                     provider_season_id: None,
+                    advertised_episode_count: None,
                 }],
                 dubs: vec![],
             }),
@@ -2905,6 +2926,7 @@ mod tests {
                 episodes: vec![],
 
                 provider_season_id: None,
+                advertised_episode_count: None,
             }],
             ..Default::default()
         };
@@ -3030,9 +3052,12 @@ mod tests {
                         overview: None,
                         provider_episode_id: None,
                         provider_season_id: None,
+                        provenance: Default::default(),
+                        verification: Default::default(),
                     }).collect(),
 
         provider_season_id: None,
+        advertised_episode_count: None,
     }],
                 dubs: vec![
                     AudioTrackOption { subject_id: "1".to_string(), language: "Original".to_string(), label: "Original".to_string() },
@@ -3050,9 +3075,12 @@ mod tests {
                     overview: None,
                     provider_episode_id: None,
                     provider_season_id: None,
+                    provenance: Default::default(),
+                    verification: Default::default(),
                 }).collect(),
 
         provider_season_id: None,
+        advertised_episode_count: None,
     }],
             available_episode_numbers: vec![vec![1, 2, 3]],
             details_pane: crate::tui::state::DetailsPane::Languages,
@@ -3751,6 +3779,8 @@ mod tests {
 
                             provider_episode_id: None,
                             provider_season_id: None,
+                            provenance: Default::default(),
+                            verification: Default::default(),
                         },
                         Episode {
                             season: 1,
@@ -3760,10 +3790,13 @@ mod tests {
 
                             provider_episode_id: None,
                             provider_season_id: None,
+                            provenance: Default::default(),
+                            verification: Default::default(),
                         },
                     ],
 
                     provider_season_id: None,
+                    advertised_episode_count: None,
                 }],
                 dubs: vec![],
             }),
@@ -3778,6 +3811,8 @@ mod tests {
 
                         provider_episode_id: None,
                         provider_season_id: None,
+                        provenance: Default::default(),
+                        verification: Default::default(),
                     },
                     Episode {
                         season: 1,
@@ -3787,10 +3822,13 @@ mod tests {
 
                         provider_episode_id: None,
                         provider_season_id: None,
+                        provenance: Default::default(),
+                        verification: Default::default(),
                     },
                 ],
 
                 provider_season_id: None,
+                advertised_episode_count: None,
             }],
             available_episode_numbers: vec![vec![1, 2]],
             details_pane: crate::tui::state::DetailsPane::Languages,

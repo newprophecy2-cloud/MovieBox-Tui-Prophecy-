@@ -399,9 +399,12 @@ async fn test_series_details_defaults_to_season_one_when_no_history() {
                     overview: None,
                     provider_episode_id: None,
                     provider_season_id: None,
+                    provenance: Default::default(),
+                    verification: Default::default(),
                 })
                 .collect(),
             provider_season_id: None,
+            advertised_episode_count: None,
         })
         .collect();
 
@@ -484,9 +487,12 @@ async fn test_series_details_resumes_watch_history() {
                     overview: None,
                     provider_episode_id: None,
                     provider_season_id: None,
+                    provenance: Default::default(),
+                    verification: Default::default(),
                 })
                 .collect(),
             provider_season_id: None,
+            advertised_episode_count: None,
         })
         .collect();
 
@@ -554,9 +560,12 @@ async fn test_series_details_preserves_season_and_episode_on_language_switch() {
                     overview: None,
                     provider_episode_id: None,
                     provider_season_id: None,
+                    provenance: Default::default(),
+                    verification: Default::default(),
                 })
                 .collect(),
             provider_season_id: None,
+            advertised_episode_count: None,
         })
         .collect();
 

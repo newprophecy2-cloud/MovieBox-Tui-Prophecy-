@@ -293,16 +293,40 @@ impl AniZoneClient {
                             .and_then(Value::as_str)
                             .map(str::to_string)
                             .unwrap_or_else(|| number.to_string());
+                        let title = ep
+                            .get("title")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string);
+                        let has_explicit_id = ep
+                            .get("provider_episode_id")
+                            .or_else(|| ep.get("id"))
+                            .and_then(Value::as_str)
+                            .is_some_and(|s| !s.trim().is_empty());
+                        let (provenance, verification) = if has_explicit_id && title.is_some() {
+                            (
+                                crate::providers::models::EpisodeProvenance::ProviderMetadata,
+                                crate::providers::models::EpisodeVerification::Verified,
+                            )
+                        } else {
+                            (
+                                crate::providers::models::EpisodeProvenance::ProviderListing,
+                                crate::providers::models::EpisodeVerification::Unverified,
+                            )
+                        };
                         Some(Episode {
                             season: ep_season,
                             number,
-                            title: ep.get("title").and_then(Value::as_str).map(str::to_string),
+                            title,
                             overview: ep
                                 .get("description")
                                 .and_then(Value::as_str)
                                 .map(str::to_string),
                             provider_episode_id: Some(ep_id),
                             provider_season_id: Some(ep_season.to_string()),
+                            provenance,
+                            verification,
                         })
                     })
                     .collect::<Vec<_>>();
@@ -310,6 +334,7 @@ impl AniZoneClient {
                     number: s_num,
                     episodes: eps,
                     provider_season_id: Some(s_num.to_string()),
+                    advertised_episode_count: None,
                 })
             })
             .collect::<Vec<_>>();
@@ -687,16 +712,36 @@ impl AniZoneClient {
                 number: season_number,
                 episodes: episodes
                     .into_iter()
-                    .map(|episode| Episode {
-                        season: episode.season.unwrap_or(season_number),
-                        number: episode.number,
-                        title: episode.title,
-                        overview: episode.description,
-                        provider_episode_id: Some(episode.source_number.to_string()),
-                        provider_season_id: episode.season.map(|season| season.to_string()),
+                    .map(|episode| {
+                        let has_title = episode
+                            .title
+                            .as_deref()
+                            .is_some_and(|t| !t.trim().is_empty());
+                        let (provenance, verification) = if has_title {
+                            (
+                                crate::providers::models::EpisodeProvenance::ProviderMetadata,
+                                crate::providers::models::EpisodeVerification::Verified,
+                            )
+                        } else {
+                            (
+                                crate::providers::models::EpisodeProvenance::ProviderListing,
+                                crate::providers::models::EpisodeVerification::Unverified,
+                            )
+                        };
+                        Episode {
+                            season: episode.season.unwrap_or(season_number),
+                            number: episode.number,
+                            title: episode.title,
+                            overview: episode.description,
+                            provider_episode_id: Some(episode.source_number.to_string()),
+                            provider_season_id: episode.season.map(|season| season.to_string()),
+                            provenance,
+                            verification,
+                        }
                     })
                     .collect(),
                 provider_season_id: Some(season_number.to_string()),
+                advertised_episode_count: None,
             }],
             dubs: Vec::new(),
         })
@@ -1160,8 +1205,7 @@ fn parse_episodes(items: &[Value]) -> Vec<ParsedEpisode> {
                 season: parse_season_number(item),
                 number: source_number,
                 source_number,
-                title: pick_title(item.get("title_list"))
-                    .or_else(|| Some(format!("Episode {source_number}"))),
+                title: pick_title(item.get("title_list")),
                 description: item
                     .get("summary")
                     .and_then(Value::as_str)
