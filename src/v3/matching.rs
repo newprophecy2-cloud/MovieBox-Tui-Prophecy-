@@ -837,12 +837,17 @@ pub fn build_canonical_structure(anime: &mut CanonicalAnime) {
             "verified".to_string()
         };
     } else {
-        anime.total_seasons = anime.seasons.len();
+        // Visible seasons & visible episode counts include ONLY Verified, non-synthetic episodes.
+        // Hidden (Unverified / SyntheticFallback) records remain preserved inside `anime.seasons`.
+        anime.total_seasons = anime
+            .seasons
+            .iter()
+            .filter(|s| s.verified_episodes > 0)
+            .count();
         anime.verified_episodes = total_verified;
         anime.unverified_episodes = total_unverified;
         anime.synthetic_episodes = total_synthetic;
-        // Global invariant: total_episodes = verified_episodes + unverified_episodes (synthetic excluded)
-        anime.total_episodes = total_verified + total_unverified;
+        anime.total_episodes = total_verified;
         anime.season_structure_status =
             if !any_details || (anime.total_episodes == 0 && anime.synthetic_episodes == 0) {
                 "unavailable".to_string()
@@ -1830,11 +1835,8 @@ mod tests {
         assert_eq!(anime.verified_episodes, 220);
         assert_eq!(anime.unverified_episodes, 187);
         assert_eq!(anime.synthetic_episodes, 0);
-        assert_eq!(anime.total_episodes, 407);
-        assert_eq!(
-            anime.total_episodes,
-            anime.verified_episodes + anime.unverified_episodes
-        );
+        assert_eq!(anime.total_episodes, 220);
+        assert_eq!(anime.total_seasons, 1);
         assert_eq!(anime.season_structure_status, "partial");
     }
 

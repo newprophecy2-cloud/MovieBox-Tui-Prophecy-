@@ -627,20 +627,22 @@ async fn handle_anime_seasons(
         Err((st, code, msg)) => return write_error(stream, st, code, &msg, None).await,
     };
 
-    // Section 6: Do not expose fake Season 1 to the user for movies
+    // Section 6: Do not expose fake Season 1 to the user for movies.
+    // Only expose seasons that contain at least one Verified, non-synthetic episode.
     let seasons: Vec<SeasonItemResponse> = if anime.media_type == MediaType::Movie {
         Vec::new()
     } else {
         anime
             .seasons
             .iter()
+            .filter(|s| s.verified_episodes > 0)
             .map(|s| SeasonItemResponse {
                 season_id: s.id.clone(),
                 season_number: s.season_number,
-                episode_count: s.verified_episodes + s.unverified_episodes,
+                episode_count: s.verified_episodes,
                 verified_episodes: s.verified_episodes,
-                unverified_episodes: s.unverified_episodes,
-                synthetic_episodes: s.synthetic_episodes,
+                unverified_episodes: 0,
+                synthetic_episodes: 0,
                 advertised_episode_count: s.advertised_episode_count,
                 structure_status: s.structure_status.clone(),
             })
@@ -653,11 +655,11 @@ async fn handle_anime_seasons(
         &AnimeSeasonsResponse {
             status: "success",
             anime_id: anime.id,
-            total_seasons: anime.total_seasons,
-            total_episodes: anime.total_episodes,
+            total_seasons: seasons.len(),
+            total_episodes: anime.verified_episodes,
             verified_episodes: anime.verified_episodes,
-            unverified_episodes: anime.unverified_episodes,
-            synthetic_episodes: anime.synthetic_episodes,
+            unverified_episodes: 0,
+            synthetic_episodes: 0,
             season_structure_status: anime.season_structure_status,
             seasons,
         },
@@ -680,7 +682,7 @@ async fn handle_season_episodes(
                 .and_then(|a| a.seasons.iter().find(|s| s.id == season_id).cloned())
         })
     };
-    let Some(season) = season_opt else {
+    let Some(season) = season_opt.filter(|s| s.verified_episodes > 0) else {
         return write_error(
             stream,
             404,
@@ -691,12 +693,15 @@ async fn handle_season_episodes(
         .await;
     };
 
-    // Expose only provider-derived episodes as confirmed episode listings; synthetic fallback
-    // entries are accounted for in synthetic_episodes without inflating total_episodes.
+    // Only Verified, non-synthetic episodes are visible to users.
+    // Unverified and SyntheticFallback episodes remain preserved internally.
     let episodes: Vec<EpisodeItemResponse> = season
         .episodes
         .iter()
-        .filter(|e| e.provenance != EpisodeProvenance::SyntheticFallback)
+        .filter(|e| {
+            e.provenance != EpisodeProvenance::SyntheticFallback
+                && e.verification == crate::providers::models::EpisodeVerification::Verified
+        })
         .map(|e| EpisodeItemResponse {
             episode_id: e.id.clone(),
             episode_number: e.episode_number,
@@ -714,9 +719,9 @@ async fn handle_season_episodes(
             status: "success",
             season_id: season.id,
             total_episodes: episodes.len(),
-            verified_episodes: season.verified_episodes,
-            unverified_episodes: season.unverified_episodes,
-            synthetic_episodes: season.synthetic_episodes,
+            verified_episodes: episodes.len(),
+            unverified_episodes: 0,
+            synthetic_episodes: 0,
             structure_status: season.structure_status,
             episodes,
         },
@@ -759,6 +764,16 @@ async fn ensure_episode_sources_hydrated(
             "Episode does not exist in this session.".into(),
         ));
     };
+
+    if episode.provenance == EpisodeProvenance::SyntheticFallback
+        || episode.verification != crate::providers::models::EpisodeVerification::Verified
+    {
+        return Err((
+            404,
+            "EPISODE_NOT_FOUND",
+            "Episode does not exist in this session.".into(),
+        ));
+    }
 
     if let (Some(srcs), Some(audio)) = (episode.sources.clone(), episode.audio.clone()) {
         // Bug #12: Return exact persisted provider_coverage so cached & uncached responses match
@@ -1792,5 +1807,194 @@ mod tests {
         assert_eq!(j1, j2);
         assert_eq!(j1["provider_coverage"]["fourkhdhub"], "success");
         assert_eq!(j1["provider_coverage"]["anizone"], "failed");
+    }
+
+    #[tokio::test]
+    async fn test_unverified_and_synthetic_episodes_hidden_from_api_and_playback() {
+        let state = V3AppState::from_env();
+        let make_ep = |id: &str,
+                       sid: &str,
+                       s_num: usize,
+                       ep_num: usize,
+                       prov: EpisodeProvenance,
+                       ver: crate::providers::models::EpisodeVerification| {
+            CanonicalEpisode {
+                id: id.to_string(),
+                anime_id: "NP-A-VIS".to_string(),
+                season_id: sid.to_string(),
+                season_number: s_num,
+                episode_number: ep_num,
+                title: format!("Episode {ep_num}"),
+                metadata_status: if ver == crate::providers::models::EpisodeVerification::Verified {
+                    "verified".to_string()
+                } else {
+                    "unverified".to_string()
+                },
+                provenance: prov,
+                verification: ver,
+                overview: None,
+                provider_mappings: vec![],
+                audio: None,
+                sources: Some(vec![]),
+                cached_provider_coverage: None,
+                cached_provider_details: Vec::new(),
+                pipeline_stats: PipelineStats::default(),
+                excluded_sources_count: 0,
+                excluded_reasons: Vec::new(),
+                excluded_details: Vec::new(),
+                matching_diagnostics: Vec::new(),
+            }
+        };
+
+        let anime = CanonicalAnime {
+            id: "NP-A-VIS".to_string(),
+            slug_token: "vis".to_string(),
+            title: "Visibility Rule Anime".to_string(),
+            alternative_titles: vec![],
+            media_type: MediaType::Series,
+            year: Some(2024),
+            description: None,
+            poster_url: None,
+            genres: vec![],
+            provider_records: vec![],
+            seasons: vec![
+                CanonicalSeason {
+                    id: "NP-S-VIS-001".to_string(),
+                    anime_id: "NP-A-VIS".to_string(),
+                    season_number: 1,
+                    verified_episodes: 1,
+                    unverified_episodes: 1,
+                    synthetic_episodes: 1,
+                    advertised_episode_count: None,
+                    structure_status: "partial".to_string(),
+                    episodes: vec![
+                        make_ep(
+                            "NP-E-VIS-0001",
+                            "NP-S-VIS-001",
+                            1,
+                            1,
+                            EpisodeProvenance::ProviderMetadata,
+                            crate::providers::models::EpisodeVerification::Verified,
+                        ),
+                        make_ep(
+                            "NP-E-VIS-0002",
+                            "NP-S-VIS-001",
+                            1,
+                            2,
+                            EpisodeProvenance::ProviderListing,
+                            crate::providers::models::EpisodeVerification::Unverified,
+                        ),
+                        make_ep(
+                            "NP-E-VIS-0003",
+                            "NP-S-VIS-001",
+                            1,
+                            3,
+                            EpisodeProvenance::SyntheticFallback,
+                            crate::providers::models::EpisodeVerification::Unverified,
+                        ),
+                    ],
+                },
+                CanonicalSeason {
+                    id: "NP-S-VIS-002".to_string(),
+                    anime_id: "NP-A-VIS".to_string(),
+                    season_number: 2,
+                    verified_episodes: 0,
+                    unverified_episodes: 1,
+                    synthetic_episodes: 0,
+                    advertised_episode_count: None,
+                    structure_status: "partial".to_string(),
+                    episodes: vec![make_ep(
+                        "NP-E-VIS-S02-0001",
+                        "NP-S-VIS-002",
+                        2,
+                        1,
+                        EpisodeProvenance::ProviderListing,
+                        crate::providers::models::EpisodeVerification::Unverified,
+                    )],
+                },
+            ],
+            total_seasons: 1,
+            total_episodes: 1,
+            verified_episodes: 1,
+            unverified_episodes: 2,
+            synthetic_episodes: 1,
+            season_structure_status: "partial".to_string(),
+            details_hydrated: true,
+        };
+        let session = state.sessions.create_session(vec![anime]).await;
+        let sid = session.read().await.session_id.clone();
+        let addr = spawn_test_server(state).await;
+        let hdrs = [("X-PV-Session", sid.as_str())];
+
+        // 1. Seasons: only Season 1 (with 1 verified episode) is visible; Season 2 is hidden
+        let (st, j) = send_http(addr, "GET", "/api/v1/anime/NP-A-VIS/seasons", &hdrs, None).await;
+        assert_eq!(st, 200);
+        assert_eq!(j["total_seasons"], 1);
+        assert_eq!(j["total_episodes"], 1);
+        assert_eq!(j["seasons"].as_array().unwrap().len(), 1);
+        assert_eq!(j["seasons"][0]["episode_count"], 1);
+
+        // 2. Season 1 episodes: only Verified NP-E-VIS-0001 appears
+        let (st, j) = send_http(
+            addr,
+            "GET",
+            "/api/v1/seasons/NP-S-VIS-001/episodes",
+            &hdrs,
+            None,
+        )
+        .await;
+        assert_eq!(st, 200);
+        assert_eq!(j["total_episodes"], 1);
+        assert_eq!(j["episodes"].as_array().unwrap().len(), 1);
+        assert_eq!(j["episodes"][0]["episode_id"], "NP-E-VIS-0001");
+
+        // 3. Season 2 (0 verified episodes) is hidden (404)
+        let (st, _) = send_http(
+            addr,
+            "GET",
+            "/api/v1/seasons/NP-S-VIS-002/episodes",
+            &hdrs,
+            None,
+        )
+        .await;
+        assert_eq!(st, 404);
+
+        // 4. Unverified and SyntheticFallback episodes are hidden from details, sources, and resolve
+        for hidden_ep in ["NP-E-VIS-0002", "NP-E-VIS-0003"] {
+            let (st, _) = send_http(
+                addr,
+                "GET",
+                &format!("/api/v1/episodes/{hidden_ep}"),
+                &hdrs,
+                None,
+            )
+            .await;
+            assert_eq!(st, 404);
+            let (st, _) = send_http(
+                addr,
+                "GET",
+                &format!("/api/v1/episodes/{hidden_ep}/sources"),
+                &hdrs,
+                None,
+            )
+            .await;
+            assert_eq!(st, 404);
+            let (st, _) = send_http(
+                addr,
+                "POST",
+                &format!("/api/v1/episodes/{hidden_ep}/resolve"),
+                &hdrs,
+                Some("{}"),
+            )
+            .await;
+            assert_eq!(st, 404);
+        }
+
+        // 5. Internal session still preserves all hidden episodes for auditing
+        let guard = session.read().await;
+        let stored = guard.anime_records.get("NP-A-VIS").unwrap();
+        assert_eq!(stored.seasons.len(), 2);
+        assert_eq!(stored.seasons[0].episodes.len(), 3);
+        assert_eq!(stored.seasons[1].episodes.len(), 1);
     }
 }
