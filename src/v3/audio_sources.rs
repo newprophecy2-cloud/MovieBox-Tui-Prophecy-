@@ -5,9 +5,10 @@ use crate::v3::audio_id::{
 };
 use crate::v3::models::{
     AudioAvailability, AudioStatus, AudioTrackItem, CanonicalEpisode, DetectedLanguageMetadata,
-    EpisodeMappingOutcome, ExcludedSourceRecord, MediaProbeMetadata, NormalizedSourceMetadata,
-    PipelineStats, ProviderCoverageDetail, ProviderSourceCandidate, ProviderSourceMetadata,
-    ProviderSourcesGroup, PublicSourceItem, ResolveSuccessResponse, TrackSelectionMetadata,
+    EpisodeMappingOutcome, EpisodeMatchingDiagnostic, ExcludedSourceRecord, MediaProbeMetadata,
+    NormalizedSourceMetadata, PipelineStats, ProviderCoverageDetail, ProviderSourceCandidate,
+    ProviderSourceMetadata, ProviderSourcesGroup, PublicSourceItem, ResolveSuccessResponse,
+    TrackSelectionMetadata,
 };
 use crate::v3::providers::{ProviderRegistry, provider_display_name, provider_key};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -43,6 +44,7 @@ pub struct SourceCollectionResult {
     pub excluded_sources: usize,
     pub excluded_reasons: Vec<String>,
     pub excluded_details: Vec<ExcludedSourceRecord>,
+    pub matching_diagnostics: Vec<EpisodeMatchingDiagnostic>,
 }
 
 pub fn language_display_name(code: Option<&str>) -> String {
@@ -358,12 +360,43 @@ pub fn compute_audio_availability(
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ValidationFailure {
+    pub reason: String,
+    pub http_status_code: Option<u16>,
+    pub playability_status: String,
+    pub access_status: String,
+}
+
+pub fn redact_url_for_diagnostics(raw: &str) -> String {
+    match url::Url::parse(raw.trim()) {
+        Ok(u) => {
+            let mut base = format!(
+                "{}://{}{}",
+                u.scheme(),
+                u.host_str().unwrap_or(""),
+                u.path()
+            );
+            if u.query().is_some() {
+                base.push_str("?<redacted>");
+            }
+            base
+        }
+        Err(_) => "<invalid_url>".to_string(),
+    }
+}
+
 async fn validate_stream_url_and_inspect(
     url: &str,
     headers: &HashMap<String, String>,
-) -> Result<(String, Vec<ManifestAudioTrack>), String> {
+) -> Result<(String, Option<u16>, Vec<ManifestAudioTrack>), ValidationFailure> {
     if crate::net::validate_public_url(url, true).await.is_err() {
-        return Err("invalid_or_private_url".to_string());
+        return Err(ValidationFailure {
+            reason: "invalid_or_private_url".to_string(),
+            http_status_code: None,
+            playability_status: "unavailable".to_string(),
+            access_status: "blocked".to_string(),
+        });
     }
 
     let lower = url.to_ascii_lowercase();
@@ -373,7 +406,12 @@ async fn validate_stream_url_and_inspect(
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(6))
         .build()
-        .map_err(|_| "http_client_error".to_string())?;
+        .map_err(|_| ValidationFailure {
+            reason: "http_client_error".to_string(),
+            http_status_code: None,
+            playability_status: "unavailable".to_string(),
+            access_status: "error".to_string(),
+        })?;
 
     let mut req = client.get(url);
     if !is_mpd && !is_m3u8 {
@@ -383,10 +421,26 @@ async fn validate_stream_url_and_inspect(
         req = req.header(k.as_str(), v.as_str());
     }
 
-    let resp = req.send().await.map_err(|_| "request_failed".to_string())?;
+    let resp = req.send().await.map_err(|_| ValidationFailure {
+        reason: "request_failed".to_string(),
+        http_status_code: None,
+        playability_status: "unavailable".to_string(),
+        access_status: "unreachable".to_string(),
+    })?;
     let status = resp.status();
+    let code = status.as_u16();
     if !status.is_success() {
-        return Err(format!("http_{}", status.as_u16()));
+        let (playability_status, access_status) = if code == 403 || code == 401 {
+            ("access_forbidden".to_string(), "forbidden".to_string())
+        } else {
+            ("unavailable".to_string(), "error".to_string())
+        };
+        return Err(ValidationFailure {
+            reason: format!("http_{code}"),
+            http_status_code: Some(code),
+            playability_status,
+            access_status,
+        });
     }
 
     let content_type = resp
@@ -397,41 +451,74 @@ async fn validate_stream_url_and_inspect(
         .to_ascii_lowercase();
 
     if is_mpd || is_m3u8 {
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|_| "manifest_read_failed".to_string())?;
+        let bytes = resp.bytes().await.map_err(|_| ValidationFailure {
+            reason: "manifest_read_failed".to_string(),
+            http_status_code: Some(code),
+            playability_status: "unavailable".to_string(),
+            access_status: "error".to_string(),
+        })?;
         if bytes.len() > 512 * 1024 {
-            return Err("manifest_too_large".to_string());
+            return Err(ValidationFailure {
+                reason: "manifest_too_large".to_string(),
+                http_status_code: Some(code),
+                playability_status: "unavailable".to_string(),
+                access_status: "error".to_string(),
+            });
         }
         let text = String::from_utf8_lossy(&bytes);
         if is_mpd {
             if !text.contains("<MPD") {
-                return Err("invalid_mpd_manifest".to_string());
+                return Err(ValidationFailure {
+                    reason: "invalid_mpd_manifest".to_string(),
+                    http_status_code: Some(code),
+                    playability_status: "unavailable".to_string(),
+                    access_status: "invalid_manifest".to_string(),
+                });
             }
             return Ok((
                 "manifest_validated".to_string(),
+                Some(code),
                 parse_dash_mpd_audio_tracks(&text),
             ));
         }
         if !text.contains("#EXTM3U") {
-            return Err("invalid_m3u8_manifest".to_string());
+            return Err(ValidationFailure {
+                reason: "invalid_m3u8_manifest".to_string(),
+                http_status_code: Some(code),
+                playability_status: "unavailable".to_string(),
+                access_status: "invalid_manifest".to_string(),
+            });
         }
         return Ok((
             "manifest_validated".to_string(),
+            Some(code),
             parse_hls_m3u8_audio_tracks(&text),
         ));
     }
 
     if content_type.starts_with("text/html") {
-        return Err("non_media_html_response".to_string());
+        return Err(ValidationFailure {
+            reason: "non_media_html_response".to_string(),
+            http_status_code: Some(code),
+            playability_status: "unavailable".to_string(),
+            access_status: "non_media".to_string(),
+        });
     }
 
-    Ok(("http_reachable".to_string(), Vec::new()))
+    Ok(("http_reachable".to_string(), Some(code), Vec::new()))
 }
 
 pub fn build_media_probe_metadata(
     playability_status: &str,
+    probed_track_count: usize,
+) -> MediaProbeMetadata {
+    build_media_probe_metadata_detailed(playability_status, None, None, probed_track_count)
+}
+
+pub fn build_media_probe_metadata_detailed(
+    playability_status: &str,
+    http_status_code: Option<u16>,
+    access_status_override: Option<&str>,
     probed_track_count: usize,
 ) -> MediaProbeMetadata {
     let manifest_validated = playability_status == "manifest_validated";
@@ -440,13 +527,93 @@ pub fn build_media_probe_metadata(
         playability_status,
         "http_reachable" | "manifest_validated" | "media_probe_validated"
     );
+    let access_status = access_status_override
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if http_reachable {
+                "ok".to_string()
+            } else if playability_status == "access_forbidden" || http_status_code == Some(403) {
+                "forbidden".to_string()
+            } else {
+                "unavailable".to_string()
+            }
+        });
     MediaProbeMetadata {
         http_reachable,
+        http_status_code,
+        access_status,
         manifest_validated,
         media_probe_validated,
         playability_status: playability_status.to_string(),
         device_playback_status: "untested".to_string(),
         probed_track_count,
+    }
+}
+
+/// Builds a non-playable diagnostic record for an excluded candidate (e.g., HTTP 403 on AniZone),
+/// preserving provider-declared language metadata without exposing signed URL credentials.
+pub fn build_validation_excluded_record(
+    provider_key_str: &str,
+    rel: &Release,
+    mirror_label: &str,
+    original_url: &str,
+    failure: &ValidationFailure,
+) -> ExcludedSourceRecord {
+    let declared_langs = extract_declared_languages(rel);
+    let declared_audio_tracks: Vec<AudioTrackItem> = declared_langs
+        .iter()
+        .map(|code| AudioTrackItem {
+            track_id: None,
+            track_index: None,
+            language: language_display_name(Some(code)),
+            language_code: Some(code.clone()),
+            original_language_code: rel.language.clone(),
+            declared_language: Some(language_display_name(Some(code))),
+            declared_language_code: Some(code.clone()),
+            verified_language: None,
+            verified_language_code: None,
+            codec: None,
+            channels: None,
+            sample_rate: None,
+            is_default: None,
+            source: Some("provider_declared".to_string()),
+            verification_status: "unverified".to_string(),
+            track_selection_metadata: None,
+        })
+        .collect();
+    let primary_declared_code = declared_langs.first().cloned();
+    let media_meta = build_media_probe_metadata_detailed(
+        &failure.playability_status,
+        failure.http_status_code,
+        Some(&failure.access_status),
+        0,
+    );
+    ExcludedSourceRecord {
+        provider: provider_key_str.to_string(),
+        source_id: None,
+        stage: "validation".to_string(),
+        reason: failure.reason.clone(),
+        http_status_code: failure.http_status_code,
+        playability_status: Some(failure.playability_status.clone()),
+        declared_language: primary_declared_code
+            .as_deref()
+            .map(|c| language_display_name(Some(c))),
+        declared_language_code: primary_declared_code,
+        declared_audio_tracks,
+        provider_metadata: Some(ProviderSourceMetadata {
+            provider_id: provider_key_str.to_string(),
+            provider_source_id: rel.resource_id.clone(),
+            original_url: Some(redact_url_for_diagnostics(original_url)),
+            mirror_label: Some(mirror_label.to_string()),
+            original_filename: Some(rel.filename.clone()),
+            original_language: rel.language.clone(),
+            original_quality: rel.quality.clone(),
+            original_codec: rel.codec.clone(),
+            size_bytes: rel.size_bytes,
+            original_track_ids: Vec::new(),
+            contributing_variants: Vec::new(),
+        }),
+        media_metadata: Some(media_meta),
     }
 }
 
@@ -515,6 +682,18 @@ pub fn merge_source_candidate(
             existing.provider_metadata.original_track_ids.push(tid);
         }
     }
+    for variant in incoming.provider_metadata.contributing_variants {
+        if !existing
+            .provider_metadata
+            .contributing_variants
+            .contains(&variant)
+        {
+            existing
+                .provider_metadata
+                .contributing_variants
+                .push(variant);
+        }
+    }
     if existing.provider_metadata.original_language.is_none() {
         existing.provider_metadata.original_language = incoming.provider_metadata.original_language;
     }
@@ -558,6 +737,7 @@ pub async fn collect_episode_sources(
     let mut stats = PipelineStats::default();
     let mut excluded_details: Vec<ExcludedSourceRecord> = Vec::new();
     let mut excluded_reasons: Vec<String> = Vec::new();
+    let mut matching_diagnostics: Vec<EpisodeMatchingDiagnostic> = Vec::new();
     let mut provider_detail_map: BTreeMap<String, ProviderCoverageDetail> = BTreeMap::new();
 
     if episode.provider_mappings.is_empty() {
@@ -570,24 +750,52 @@ pub async fn collect_episode_sources(
             excluded_sources: 0,
             excluded_reasons,
             excluded_details,
+            matching_diagnostics,
         };
     }
 
-    // Bug #13: Only accept confidently matched episode mappings; record non-matched separately
+    // Build complete episode matching diagnostics and accept ONLY Matched mappings
     let mut matched_mappings = Vec::new();
     for m in &episode.provider_mappings {
         let pkey = provider_key(m.provider_id).to_string();
+        matching_diagnostics.push(EpisodeMatchingDiagnostic {
+            requested_anime_id: episode.anime_id.clone(),
+            requested_season_number: episode.season_number,
+            requested_episode_number: episode.episode_number,
+            requested_episode_title: episode.title.clone(),
+            provider: pkey.clone(),
+            provider_anime_id: m.provider_anime_id.clone(),
+            provider_episode_id: m.provider_episode_id.clone(),
+            provider_season_number: m.provider_season_number,
+            provider_episode_number: m.provider_episode_number,
+            provider_episode_title: m.title.clone(),
+            matching_score: m.confidence,
+            matching_evidence: m.matching_evidence.clone(),
+            matching_status: m.outcome,
+            exclusion_reason: m.exclusion_reason.clone(),
+        });
         if m.outcome == EpisodeMappingOutcome::Matched {
             matched_mappings.push(m.clone());
         } else {
+            let reason = m
+                .exclusion_reason
+                .clone()
+                .unwrap_or_else(|| "episode_mismatch".to_string());
             excluded_details.push(ExcludedSourceRecord {
                 provider: pkey.clone(),
                 source_id: None,
                 stage: "matching".to_string(),
-                reason: "episode_mismatch".to_string(),
+                reason: reason.clone(),
+                http_status_code: None,
+                playability_status: None,
+                declared_language: m.variant_language.clone(),
+                declared_language_code: m.variant_language_code.clone(),
+                declared_audio_tracks: Vec::new(),
+                provider_metadata: None,
+                media_metadata: None,
             });
             if excluded_reasons.len() < 25 {
-                excluded_reasons.push(format!("{pkey}:episode_mismatch"));
+                excluded_reasons.push(format!("{pkey}:{reason}"));
             }
         }
     }
@@ -633,7 +841,12 @@ pub async fn collect_episode_sources(
                 coverage.insert(pkey.clone(), "success".to_string());
                 pdet.request_status = "success".to_string();
                 stats.raw_sources += releases.len();
-                for rel in releases {
+                for mut rel in releases {
+                    // Preserve language-tagged variant metadata (e.g. MovieBox "Black Clover (Hindi)")
+                    // when the release itself omits a language field.
+                    if rel.language.is_none() && mapping.variant_language.is_some() {
+                        rel.language = mapping.variant_language.clone();
+                    }
                     if rel.mirrors.is_empty() {
                         pdet.excluded_source_count += 1;
                         pdet.errors.push("empty_mirrors".to_string());
@@ -642,6 +855,13 @@ pub async fn collect_episode_sources(
                             source_id: None,
                             stage: "parsing".to_string(),
                             reason: "empty_mirrors".to_string(),
+                            http_status_code: None,
+                            playability_status: None,
+                            declared_language: None,
+                            declared_language_code: None,
+                            declared_audio_tracks: Vec::new(),
+                            provider_metadata: None,
+                            media_metadata: None,
                         });
                         if excluded_reasons.len() < 25 {
                             excluded_reasons.push(format!("{pkey}:empty_mirrors"));
@@ -660,6 +880,13 @@ pub async fn collect_episode_sources(
                                 source_id: None,
                                 stage: "parsing".to_string(),
                                 reason: "invalid_mirror_url".to_string(),
+                                http_status_code: None,
+                                playability_status: None,
+                                declared_language: None,
+                                declared_language_code: None,
+                                declared_audio_tracks: Vec::new(),
+                                provider_metadata: None,
+                                media_metadata: None,
                             });
                             if excluded_reasons.len() < 25 {
                                 excluded_reasons.push(format!("{pkey}:invalid_mirror_url"));
@@ -701,7 +928,21 @@ pub async fn collect_episode_sources(
                             return Err((
                                 pkey,
                                 "resolution".to_string(),
-                                "resolve_failed".to_string(),
+                                ExcludedSourceRecord {
+                                    provider: provider_key(mapping.provider_id).to_string(),
+                                    source_id: None,
+                                    stage: "resolution".to_string(),
+                                    reason: "resolve_failed".to_string(),
+                                    http_status_code: None,
+                                    playability_status: Some("unavailable".to_string()),
+                                    declared_language: single_rel.language.clone(),
+                                    declared_language_code: extract_declared_languages(&single_rel)
+                                        .into_iter()
+                                        .next(),
+                                    declared_audio_tracks: Vec::new(),
+                                    provider_metadata: None,
+                                    media_metadata: None,
+                                },
                             ));
                         }
                     }
@@ -718,8 +959,7 @@ pub async fn collect_episode_sources(
                 }
 
                 match validate_stream_url_and_inspect(&resolved_url, &headers).await {
-                    Ok((mut playability_status, manifest_tracks)) => {
-                        // Bug #5: Integrate FFprobe metadata extraction for non-manifest direct streams
+                    Ok((mut playability_status, http_status_code, manifest_tracks)) => {
                         let ffprobe_tracks = if manifest_tracks.is_empty() {
                             let probed =
                                 extract_ffprobe_audio_streams(&resolved_url, &headers).await;
@@ -737,11 +977,21 @@ pub async fn collect_episode_sources(
                             resolved_url,
                             headers,
                             playability_status,
+                            http_status_code,
                             manifest_tracks,
                             ffprobe_tracks,
                         ))
                     }
-                    Err(reason) => Err((pkey, "validation".to_string(), reason)),
+                    Err(failure) => {
+                        let rec = build_validation_excluded_record(
+                            &pkey,
+                            &single_rel,
+                            &mirror.label,
+                            &mirror.resolver_url,
+                            &failure,
+                        );
+                        Err((pkey, "validation".to_string(), rec))
+                    }
                 }
             }
         });
@@ -760,6 +1010,7 @@ pub async fn collect_episode_sources(
             resolved_url,
             headers,
             playability_status,
+            http_status_code,
             manifest_tracks,
             ffprobe_tracks,
         ) = match item {
@@ -768,23 +1019,18 @@ pub async fn collect_episode_sources(
                 stats.validated_sources += 1;
                 v
             }
-            Err((pkey, stage, reason)) => {
+            Err((pkey, stage, rec)) => {
                 if stage == "validation" {
                     stats.resolved_sources += 1;
                 }
                 if let Some(pdet) = provider_detail_map.get_mut(&pkey) {
                     pdet.excluded_source_count += 1;
-                    pdet.errors.push(reason.clone());
+                    pdet.errors.push(rec.reason.clone());
                 }
-                excluded_details.push(ExcludedSourceRecord {
-                    provider: pkey.clone(),
-                    source_id: None,
-                    stage,
-                    reason: reason.clone(),
-                });
                 if excluded_reasons.len() < 25 {
-                    excluded_reasons.push(format!("{pkey}:{reason}"));
+                    excluded_reasons.push(format!("{pkey}:{}", rec.reason));
                 }
+                excluded_details.push(rec);
                 continue;
             }
         };
@@ -819,7 +1065,7 @@ pub async fn collect_episode_sources(
                 channels: None,
                 sample_rate: None,
                 is_default: None,
-                source: Some("provider".to_string()),
+                source: Some("provider_declared".to_string()),
                 verification_status: "unverified".to_string(),
                 track_selection_metadata: None,
             })
@@ -973,6 +1219,10 @@ pub async fn collect_episode_sources(
             .or_else(|| primary_declared_code.clone());
         let primary_track = audio_tracks.first().cloned();
 
+        let variant_ref = match &mapping.variant_title {
+            Some(vt) if !vt.is_empty() => format!("{}:{vt}", mapping.provider_anime_id),
+            _ => mapping.provider_anime_id.clone(),
+        };
         let provider_metadata = ProviderSourceMetadata {
             provider_id: pkey.clone(),
             provider_source_id: rel.resource_id.clone(),
@@ -984,6 +1234,7 @@ pub async fn collect_episode_sources(
             original_codec: rel.codec.clone(),
             size_bytes: rel.size_bytes,
             original_track_ids,
+            contributing_variants: vec![variant_ref],
         };
         let normalized_metadata = NormalizedSourceMetadata {
             quality: rel.quality.clone(),
@@ -993,7 +1244,12 @@ pub async fn collect_episode_sources(
             primary_language: language_display_name(primary_display_code.as_deref()),
             primary_language_code: primary_display_code.clone(),
         };
-        let media_metadata = build_media_probe_metadata(&playability_status, audio_tracks.len());
+        let media_metadata = build_media_probe_metadata_detailed(
+            &playability_status,
+            http_status_code,
+            Some("ok"),
+            audio_tracks.len(),
+        );
         let detected_language_metadata = DetectedLanguageMetadata {
             declared_language: primary_declared_code
                 .as_deref()
@@ -1065,6 +1321,13 @@ pub async fn collect_episode_sources(
                 source_id: Some(candidates[pos].source_id.clone()),
                 stage: "deduplication".to_string(),
                 reason: "merged_duplicate_url".to_string(),
+                http_status_code,
+                playability_status: Some(candidates[pos].playability_status.clone()),
+                declared_language: None,
+                declared_language_code: None,
+                declared_audio_tracks: Vec::new(),
+                provider_metadata: None,
+                media_metadata: None,
             });
             continue;
         }
@@ -1093,6 +1356,7 @@ pub async fn collect_episode_sources(
         excluded_sources,
         excluded_reasons,
         excluded_details,
+        matching_diagnostics,
     }
 }
 
@@ -1766,6 +2030,7 @@ video.m3u8"#;
             excluded_sources_count: 0,
             excluded_reasons: Vec::new(),
             excluded_details: Vec::new(),
+            matching_diagnostics: Vec::new(),
         };
         let reg = ProviderRegistry::from_env();
         let res = resolve_episode_stream(&reg, &ep, &[fake_hi], None, Some("hi"), None).await;
@@ -1809,6 +2074,7 @@ video.m3u8"#;
         );
         first.audio_tracks = vec![make_track_item(Some("1"), Some(0), "hi", "hin", "aac")];
         first.provider_metadata.original_track_ids = vec!["1".to_string()];
+        first.provider_metadata.contributing_variants = vec!["mb-hi:Black Clover (Hindi)".into()];
 
         let mut second = make_cand(
             ProviderKind::FourKHdHub,
@@ -1818,12 +2084,18 @@ video.m3u8"#;
         );
         second.audio_tracks = vec![make_track_item(Some("2"), Some(1), "en", "eng", "eac3")];
         second.provider_metadata.original_track_ids = vec!["2".to_string()];
+        second.provider_metadata.contributing_variants =
+            vec!["mb-en:Black Clover (English)".into()];
 
         merge_source_candidate(&mut first, second);
         assert_eq!(first.audio_tracks.len(), 2);
         assert_eq!(first.audio_tracks[0].track_id.as_deref(), Some("1"));
         assert_eq!(first.audio_tracks[1].track_id.as_deref(), Some("2"));
         assert_eq!(first.provider_metadata.original_track_ids, vec!["1", "2"]);
+        assert_eq!(
+            first.provider_metadata.contributing_variants,
+            vec!["mb-hi:Black Clover (Hindi)", "mb-en:Black Clover (English)"]
+        );
     }
 
     #[test]
@@ -1917,18 +2189,23 @@ video.m3u8"#;
             season_id: "NP-S-001".into(),
             season_number: 1,
             episode_number: 1,
-            title: "Ep 1".into(),
+            title: "Asta and Yuno".into(),
             metadata_status: "verified".into(),
             overview: None,
             provider_mappings: vec![crate::v3::models::ProviderEpisodeMapping {
-                provider_id: ProviderKind::FourKHdHub,
-                provider_anime_id: "/wrong".into(),
+                provider_id: ProviderKind::Dramachi,
+                provider_anime_id: "40867".into(),
+                variant_title: Some("Black Clover".into()),
+                variant_language: None,
+                variant_language_code: None,
                 provider_season_number: 1,
                 provider_episode_number: 99,
-                provider_episode_id: None,
-                title: None,
-                outcome: EpisodeMappingOutcome::Unmatched,
-                confidence: 0.1,
+                provider_episode_id: Some("dc-ep-99".into()),
+                title: Some("Wrong Episode".into()),
+                outcome: EpisodeMappingOutcome::EpisodeMismatch,
+                confidence: 0.0,
+                matching_evidence: vec!["episode_mismatch:expected=1:got=99".into()],
+                exclusion_reason: Some("episode_mismatch".into()),
             }],
             audio: None,
             sources: None,
@@ -1938,6 +2215,7 @@ video.m3u8"#;
             excluded_sources_count: 0,
             excluded_reasons: Vec::new(),
             excluded_details: Vec::new(),
+            matching_diagnostics: Vec::new(),
         };
         let reg = ProviderRegistry::from_env();
         let res = collect_episode_sources(&reg, &ep).await;
@@ -1945,5 +2223,119 @@ video.m3u8"#;
         assert_eq!(res.excluded_sources, 1);
         assert_eq!(res.excluded_details[0].stage, "matching");
         assert_eq!(res.excluded_details[0].reason, "episode_mismatch");
+        assert_eq!(res.matching_diagnostics.len(), 1);
+        assert_eq!(
+            res.matching_diagnostics[0].matching_status,
+            EpisodeMappingOutcome::EpisodeMismatch
+        );
+        assert_eq!(res.matching_diagnostics[0].provider_anime_id, "40867");
+        assert_eq!(
+            res.matching_diagnostics[0].provider_episode_id.as_deref(),
+            Some("dc-ep-99")
+        );
+    }
+
+    #[test]
+    fn test_anizone_english_metadata_survives_http_403() {
+        let rel = Release {
+            provider: ProviderKind::AniZone,
+            filename: "ijxazsfw Episode 1".into(),
+            quality: None,
+            codec: None,
+            language: Some("English, Japanese".into()),
+            size_bytes: None,
+            season: Some(1),
+            episode: Some(1),
+            mirrors: vec![],
+            resource_id: Some("1".into()),
+        };
+        let failure = ValidationFailure {
+            reason: "http_403".to_string(),
+            http_status_code: Some(403),
+            playability_status: "access_forbidden".to_string(),
+            access_status: "forbidden".to_string(),
+        };
+        let rec = build_validation_excluded_record(
+            "anizone",
+            &rel,
+            "AniZone HLS",
+            "https://cdn.anizone.example/ep1/master.m3u8?token=secret_should_redact",
+            &failure,
+        );
+        assert_eq!(rec.http_status_code, Some(403));
+        assert_eq!(rec.playability_status.as_deref(), Some("access_forbidden"));
+        assert_eq!(rec.declared_language.as_deref(), Some("English"));
+        assert_eq!(rec.declared_language_code.as_deref(), Some("en"));
+        assert_eq!(rec.declared_audio_tracks.len(), 2);
+        assert_eq!(
+            rec.declared_audio_tracks[0].source.as_deref(),
+            Some("provider_declared")
+        );
+        assert_eq!(
+            rec.declared_audio_tracks[0].verification_status,
+            "unverified"
+        );
+        let mm = rec.media_metadata.as_ref().unwrap();
+        assert!(!mm.http_reachable);
+        assert_eq!(mm.http_status_code, Some(403));
+        assert_eq!(mm.access_status, "forbidden");
+        assert_eq!(mm.device_playback_status, "untested");
+        let pm = rec.provider_metadata.as_ref().unwrap();
+        assert!(
+            !pm.original_url
+                .as_deref()
+                .unwrap()
+                .contains("secret_should_redact")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_html_response_rejected_as_direct_media() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut req_buf = [0u8; 1024];
+                let _ = sock.read(&mut req_buf).await;
+                let body = "<html><body>Access Denied</body></html>";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        let url = format!("http://{addr}/video.mp4");
+        let err = validate_stream_url_and_inspect(&url, &HashMap::new())
+            .await
+            .unwrap_err();
+        assert_eq!(err.reason, "non_media_html_response");
+        assert_eq!(err.playability_status, "unavailable");
+    }
+
+    #[test]
+    fn test_different_urls_and_variants_remain_separate() {
+        let mut seen: HashMap<(ProviderKind, String), usize> = HashMap::new();
+        let mut list: Vec<ProviderSourceCandidate> = Vec::new();
+        for (url, quality) in [
+            ("https://cdn.example/hi-1080p.mp4", "1080p"),
+            ("https://cdn.example/en-1080p.mp4", "1080p"),
+            ("https://cdn.example/hi-720p.mp4", "720p"),
+        ] {
+            let c = make_cand(ProviderKind::MovieBox, Some("hi"), Some(quality), url);
+            let key = (c.provider_id, url.to_string());
+            if let Some(&pos) = seen.get(&key) {
+                merge_source_candidate(&mut list[pos], c);
+            } else {
+                seen.insert(key, list.len());
+                list.push(c);
+            }
+        }
+        assert_eq!(list.len(), 3);
     }
 }

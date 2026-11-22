@@ -99,6 +99,42 @@ fn infer_season_from_title(raw: &str) -> Option<usize> {
     None
 }
 
+/// Extracts explicit language metadata from a provider listing title (e.g., `"Black Clover (Hindi)"`
+/// -> `(Some("Hindi"), Some("hi"))`). Never invents a language for untagged titles.
+pub fn extract_title_language_metadata(raw_title: &str) -> (Option<String>, Option<String>) {
+    let lower = raw_title.to_ascii_lowercase();
+    let patterns: &[(&[&str], &str, &str)] = &[
+        (
+            &["(hindi)", "[hindi]", "hindi dub", "hindi dubbed"],
+            "Hindi",
+            "hi",
+        ),
+        (
+            &["(english)", "[english]", "english dub", "english dubbed"],
+            "English",
+            "en",
+        ),
+        (
+            &["(japanese)", "[japanese]", "japanese dub", "japanese audio"],
+            "Japanese",
+            "ja",
+        ),
+        (&["(tamil)", "[tamil]", "tamil dub"], "Tamil", "ta"),
+        (&["(telugu)", "[telugu]", "telugu dub"], "Telugu", "te"),
+        (&["(bengali)", "[bengali]", "bengali dub"], "Bengali", "bn"),
+        (&["(korean)", "[korean]", "korean dub"], "Korean", "ko"),
+        (&["(spanish)", "[spanish]", "spanish dub"], "Spanish", "es"),
+        (&["(french)", "[french]", "french dub"], "French", "fr"),
+        (&["(german)", "[german]", "german dub"], "German", "de"),
+    ];
+    for (needles, name, code) in patterns {
+        if needles.iter().any(|n| lower.contains(n)) {
+            return (Some((*name).to_string()), Some((*code).to_string()));
+        }
+    }
+    (None, None)
+}
+
 fn has_dub_or_pack_tag(raw: &str) -> bool {
     let lower = raw.to_ascii_lowercase();
     if [
@@ -306,10 +342,14 @@ pub fn merge_search_results(
             if !existing.provider_records.iter().any(|r| {
                 r.provider_id == item.provider_id && r.provider_anime_id == item.provider_anime_id
             }) {
+                let (declared_language, declared_language_code) =
+                    extract_title_language_metadata(&item.title);
                 existing.provider_records.push(ProviderAnimeRef {
                     provider_id: item.provider_id,
                     provider_anime_id: item.provider_anime_id.clone(),
                     title: item.title.clone(),
+                    declared_language,
+                    declared_language_code,
                     year: item.year,
                     media_type: item.media_type,
                     details: None,
@@ -345,6 +385,8 @@ pub fn merge_search_results(
         while !used_tokens.insert(token.clone()) {
             token = generate_slug_token();
         }
+        let (declared_language, declared_language_code) =
+            extract_title_language_metadata(&item.title);
         groups.push(CanonicalAnime {
             id: format_anime_id(&token),
             slug_token: token,
@@ -359,6 +401,8 @@ pub fn merge_search_results(
                 provider_id: item.provider_id,
                 provider_anime_id: item.provider_anime_id,
                 title: item.title,
+                declared_language,
+                declared_language_code,
                 year: item.year,
                 media_type: item.media_type,
                 details: None,
@@ -425,8 +469,17 @@ pub fn build_canonical_structure(anime: &mut CanonicalAnime) {
         .iter()
         .any(|rec| rec.details.is_some());
 
-    // One-by-one episode mapping across all providers (Spec Section 11)
-    let mut episode_buckets: BTreeMap<(bool, usize, usize), Vec<(ProviderKind, String, &Episode)>> =
+    // One-by-one episode mapping across all provider variants (preserving every MovieBox/provider variant)
+    type EpisodeBucketEntry<'a> = (
+        ProviderKind,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        bool,
+        &'a Episode,
+    );
+    let mut episode_buckets: BTreeMap<(bool, usize, usize), Vec<EpisodeBucketEntry<'_>>> =
         BTreeMap::new();
 
     for rec in &anime.provider_records {
@@ -438,6 +491,10 @@ pub fn build_canonical_structure(anime: &mut CanonicalAnime) {
             episode_buckets.entry((false, 1, 1)).or_default().push((
                 rec.provider_id,
                 rec.provider_anime_id.clone(),
+                rec.title.clone(),
+                rec.declared_language.clone(),
+                rec.declared_language_code.clone(),
+                false,
                 &MOVIES_SYNTHETIC_EP,
             ));
             continue;
@@ -454,12 +511,17 @@ pub fn build_canonical_structure(anime: &mut CanonicalAnime) {
                 episode_buckets.entry(key).or_default().push((
                     rec.provider_id,
                     rec.provider_anime_id.clone(),
+                    rec.title.clone(),
+                    rec.declared_language.clone(),
+                    rec.declared_language_code.clone(),
+                    split_season_override.is_some(),
                     ep,
                 ));
             }
         }
     }
 
+    let anime_norm_title = normalize_title_for_match(&anime.title);
     let mut seasons_map: BTreeMap<(bool, usize), Vec<CanonicalEpisode>> = BTreeMap::new();
     let mut seen_episode_ids = HashSet::new();
 
@@ -470,42 +532,89 @@ pub fn build_canonical_structure(anime: &mut CanonicalAnime) {
             continue;
         }
 
+        // Prefer a descriptive (non-generic) canonical episode title across all provider entries
         let mut title: Option<String> = None;
         let mut overview: Option<String> = None;
-        let mut mappings = Vec::new();
-        let mut seen_providers = HashSet::new();
-
-        for (prov, prov_anime_id, ep) in &entries {
-            if !seen_providers.insert(*prov) {
-                continue;
-            }
-            if title.is_none()
-                && let Some(t) = ep.title.as_ref().filter(|s| !s.trim().is_empty())
-            {
-                title = Some(t.trim().to_string());
+        for (_, _, _, _, _, _, ep) in &entries {
+            if let Some(t) = ep.title.as_ref().filter(|s| !s.trim().is_empty()) {
+                let trimmed = t.trim();
+                let is_generic = is_generic_episode_title(trimmed, &anime_norm_title, ep_num);
+                match &title {
+                    None => title = Some(trimmed.to_string()),
+                    Some(existing)
+                        if is_generic_episode_title(existing, &anime_norm_title, ep_num)
+                            && !is_generic =>
+                    {
+                        title = Some(trimmed.to_string());
+                    }
+                    _ => {}
+                }
             }
             if overview.is_none()
                 && let Some(o) = ep.overview.as_ref().filter(|s| !s.trim().is_empty())
             {
                 overview = Some(o.trim().to_string());
             }
-            let (outcome, confidence) = compute_episode_mapping_outcome(title.as_deref(), ep);
+        }
+
+        // Count occurrences per (provider_id, provider_anime_id) to detect ambiguous duplicate mappings
+        let mut variant_counts: std::collections::HashMap<(ProviderKind, String), usize> =
+            std::collections::HashMap::new();
+        for (prov, prov_anime_id, _, _, _, _, _) in &entries {
+            *variant_counts
+                .entry((*prov, prov_anime_id.clone()))
+                .or_insert(0) += 1;
+        }
+
+        let mut mappings = Vec::new();
+        let mut seen_provider_variants = HashSet::new();
+
+        for (
+            prov,
+            prov_anime_id,
+            variant_title,
+            variant_lang,
+            variant_lang_code,
+            used_split_override,
+            ep,
+        ) in &entries
+        {
+            let variant_key = (*prov, prov_anime_id.clone());
+            let is_ambiguous = variant_counts.get(&variant_key).copied().unwrap_or(0) > 1;
+            if !seen_provider_variants.insert(variant_key) {
+                continue;
+            }
+            let (outcome, confidence, matching_evidence, exclusion_reason) = evaluate_episode_match(
+                anime.media_type,
+                &anime_norm_title,
+                season_num,
+                ep_num,
+                title.as_deref(),
+                ep,
+                *used_split_override,
+                is_ambiguous,
+            );
             mappings.push(ProviderEpisodeMapping {
                 provider_id: *prov,
                 provider_anime_id: prov_anime_id.clone(),
+                variant_title: Some(variant_title.clone()),
+                variant_language: variant_lang.clone(),
+                variant_language_code: variant_lang_code.clone(),
                 provider_season_number: ep.season,
                 provider_episode_number: ep.number,
                 provider_episode_id: ep.provider_episode_id.clone(),
                 title: ep.title.clone(),
                 outcome,
                 confidence,
+                matching_evidence,
+                exclusion_reason,
             });
         }
 
         let (final_title, metadata_status) = if anime.media_type == MediaType::Movie {
             (anime.title.clone(), "verified".to_string())
         } else if let Some(t) = title {
-            let is_generic = normalize_title_for_match(&t) == format!("episode {ep_num}");
+            let is_generic = is_generic_episode_title(&t, &anime_norm_title, ep_num);
             let status = if is_generic { "unverified" } else { "verified" };
             (t, status.to_string())
         } else {
@@ -530,6 +639,7 @@ pub fn build_canonical_structure(anime: &mut CanonicalAnime) {
             excluded_sources_count: 0,
             excluded_reasons: Vec::new(),
             excluded_details: Vec::new(),
+            matching_diagnostics: Vec::new(),
         };
         seasons_map
             .entry((is_special, season_num))
@@ -579,23 +689,159 @@ static MOVIES_SYNTHETIC_EP: Episode = Episode {
     provider_season_id: None,
 };
 
-fn compute_episode_mapping_outcome(
+/// Recognizes generic / provider-numbered episode titles such as:
+/// `"Episode 1"`, `"Episode 01"`, `"Ep 1"`, `"Black Clover S01E01"`, `"Black Clover Episode 1"`, `"001"`.
+pub fn is_generic_episode_title(raw: &str, anime_norm_title: &str, ep_num: usize) -> bool {
+    let norm = normalize_title_for_match(raw);
+    if norm.is_empty() {
+        return true;
+    }
+    let stripped = if !anime_norm_title.is_empty() {
+        norm.strip_prefix(anime_norm_title).unwrap_or(&norm).trim()
+    } else {
+        norm.as_str()
+    };
+    if stripped.is_empty() {
+        return true;
+    }
+    if stripped.chars().all(|c| c.is_ascii_digit()) {
+        return stripped.parse::<usize>().ok() == Some(ep_num);
+    }
+    for prefix in ["episode ", "ep ", "e ", "e"] {
+        if let Some(rest) = stripped.strip_prefix(prefix) {
+            let digits: String = rest
+                .trim()
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if !digits.is_empty() && digits.parse::<usize>().ok() == Some(ep_num) {
+                let tail = rest.trim()[digits.len()..].trim();
+                if tail.is_empty()
+                    || matches!(
+                        tail,
+                        "dub" | "sub" | "dubbed" | "subbed" | "hd" | "1080p" | "720p" | "480p"
+                    )
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    // Check SxxExx pattern (e.g., "s01e01", "s1e1")
+    let tokens: Vec<&str> = stripped.split_whitespace().collect();
+    if tokens.iter().any(|t| {
+        if let Some(rest) = t.strip_prefix('s')
+            && let Some((s_part, e_part)) = rest.split_once('e')
+            && !s_part.is_empty()
+            && !e_part.is_empty()
+            && s_part.chars().all(|c| c.is_ascii_digit())
+            && e_part.chars().all(|c| c.is_ascii_digit())
+        {
+            return e_part.parse::<usize>().ok() == Some(ep_num);
+        }
+        false
+    }) {
+        return true;
+    }
+    false
+}
+
+/// Structured 5-state episode matching across heterogeneous provider ID and numbering formats.
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_episode_match(
+    media_type: MediaType,
+    anime_norm_title: &str,
+    requested_season: usize,
+    requested_episode: usize,
     canonical_title: Option<&str>,
     candidate: &Episode,
-) -> (EpisodeMappingOutcome, f32) {
+    used_split_season_override: bool,
+    is_ambiguous: bool,
+) -> (EpisodeMappingOutcome, f32, Vec<String>, Option<String>) {
+    let mut evidence = Vec::new();
+
+    if media_type == MediaType::Movie && candidate.season == 0 && candidate.number == 0 {
+        evidence.push("movie_canonical_match".to_string());
+        return (EpisodeMappingOutcome::Matched, 1.0, evidence, None);
+    }
+
+    if candidate.number == 0 {
+        evidence.push("missing_provider_episode_number".to_string());
+        return (
+            EpisodeMappingOutcome::Unmatched,
+            0.0,
+            evidence,
+            Some("missing_episode_metadata".to_string()),
+        );
+    }
+
+    let season_matches = used_split_season_override || candidate.season == requested_season;
+    let episode_matches = candidate.number == requested_episode;
+
+    if !season_matches || !episode_matches {
+        if !season_matches {
+            evidence.push(format!(
+                "season_mismatch:expected={requested_season}:got={}",
+                candidate.season
+            ));
+        }
+        if !episode_matches {
+            evidence.push(format!(
+                "episode_mismatch:expected={requested_episode}:got={}",
+                candidate.number
+            ));
+        }
+        return (
+            EpisodeMappingOutcome::EpisodeMismatch,
+            0.0,
+            evidence,
+            Some("episode_mismatch".to_string()),
+        );
+    }
+
+    evidence.push(if used_split_season_override {
+        "split_season_match".to_string()
+    } else {
+        "season_match".to_string()
+    });
+    evidence.push("episode_number_match".to_string());
+
+    if is_ambiguous {
+        evidence.push("multiple_provider_candidates_for_episode".to_string());
+        return (
+            EpisodeMappingOutcome::Ambiguous,
+            0.5,
+            evidence,
+            Some("ambiguous_episode_candidates".to_string()),
+        );
+    }
+
     match (canonical_title, candidate.title.as_deref()) {
         (Some(a), Some(b)) => {
             let na = normalize_title_for_match(a);
             let nb = normalize_title_for_match(b);
             if !na.is_empty() && na == nb {
-                (EpisodeMappingOutcome::Matched, 1.0)
-            } else if na.starts_with("episode ") || nb.starts_with("episode ") {
-                (EpisodeMappingOutcome::PossibleMatch, 0.7)
+                evidence.push("title_exact_match".to_string());
+                (EpisodeMappingOutcome::Matched, 1.0, evidence, None)
+            } else if is_generic_episode_title(b, anime_norm_title, requested_episode)
+                || is_generic_episode_title(a, anime_norm_title, requested_episode)
+            {
+                evidence.push("provider_numbered_title".to_string());
+                (EpisodeMappingOutcome::Matched, 0.9, evidence, None)
             } else {
-                (EpisodeMappingOutcome::PossibleMatch, 0.65)
+                evidence.push("title_diverged".to_string());
+                (
+                    EpisodeMappingOutcome::ProbableMatch,
+                    0.65,
+                    evidence,
+                    Some("title_confirmation_required".to_string()),
+                )
             }
         }
-        _ => (EpisodeMappingOutcome::Matched, 0.85),
+        _ => {
+            evidence.push("numbered_episode_match".to_string());
+            (EpisodeMappingOutcome::Matched, 0.85, evidence, None)
+        }
     }
 }
 
@@ -679,6 +925,8 @@ mod tests {
                     provider_id: ProviderKind::AniZone,
                     provider_anime_id: "az".into(),
                     title: "Test".into(),
+                    declared_language: None,
+                    declared_language_code: None,
                     year: Some(2020),
                     media_type: MediaType::Series,
                     details: Some(MediaDetails {
@@ -735,6 +983,8 @@ mod tests {
                     provider_id: ProviderKind::Dramachi,
                     provider_anime_id: "dc".into(),
                     title: "Test".into(),
+                    declared_language: None,
+                    declared_language_code: None,
                     year: Some(2020),
                     media_type: MediaType::Series,
                     details: Some(MediaDetails {
@@ -991,5 +1241,223 @@ mod tests {
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].provider_records.len(), 4);
         assert_eq!(merged[0].year, Some(2002));
+    }
+
+    #[test]
+    fn test_moviebox_language_variants_group_and_preserve_all_ids_and_mappings() {
+        let items = vec![
+            norm(
+                ProviderKind::MovieBox,
+                "mb-hi-1",
+                "Black Clover (Hindi)",
+                Some(2017),
+                MediaType::Series,
+            ),
+            norm(
+                ProviderKind::MovieBox,
+                "mb-en-2",
+                "Black Clover (English)",
+                Some(2017),
+                MediaType::Series,
+            ),
+            norm(
+                ProviderKind::MovieBox,
+                "mb-raw-3",
+                "Black Clover",
+                Some(2017),
+                MediaType::Series,
+            ),
+        ];
+        let mut merged = merge_search_results(items, 50);
+        assert_eq!(merged.len(), 1);
+        let anime = &mut merged[0];
+        assert_eq!(anime.title, "Black Clover");
+        assert_eq!(anime.provider_records.len(), 3);
+
+        // Verify explicit language tags extracted and untagged listing does NOT invent Japanese
+        let hi_rec = anime
+            .provider_records
+            .iter()
+            .find(|r| r.provider_anime_id == "mb-hi-1")
+            .unwrap();
+        assert_eq!(hi_rec.declared_language.as_deref(), Some("Hindi"));
+        assert_eq!(hi_rec.declared_language_code.as_deref(), Some("hi"));
+
+        let en_rec = anime
+            .provider_records
+            .iter()
+            .find(|r| r.provider_anime_id == "mb-en-2")
+            .unwrap();
+        assert_eq!(en_rec.declared_language.as_deref(), Some("English"));
+        assert_eq!(en_rec.declared_language_code.as_deref(), Some("en"));
+
+        let raw_rec = anime
+            .provider_records
+            .iter()
+            .find(|r| r.provider_anime_id == "mb-raw-3")
+            .unwrap();
+        assert_eq!(raw_rec.declared_language, None);
+        assert_eq!(raw_rec.declared_language_code, None);
+
+        // Hydrate details on all 3 variants and verify all 3 map to S1E1 (none dropped!)
+        for rec in &mut anime.provider_records {
+            rec.details = Some(MediaDetails {
+                id: crate::providers::models::ProviderMediaId {
+                    provider: ProviderKind::MovieBox,
+                    value: rec.provider_anime_id.clone(),
+                },
+                title: rec.title.clone(),
+                media_type: MediaType::Series,
+                year: Some("2017".into()),
+                description: None,
+                tagline: None,
+                imdb_rating: None,
+                director: None,
+                stars: None,
+                prints: None,
+                audios: None,
+                poster_url: None,
+                duration: None,
+                genres: vec![],
+                seasons: vec![Season {
+                    number: 1,
+                    episodes: vec![Episode {
+                        season: 1,
+                        number: 1,
+                        title: Some("Asta and Yuno".into()),
+                        overview: None,
+                        provider_episode_id: Some(format!("ep-{}", rec.provider_anime_id)),
+                        provider_season_id: None,
+                    }],
+                    provider_season_id: None,
+                }],
+                dubs: vec![],
+            });
+        }
+        build_canonical_structure(anime);
+        assert_eq!(anime.seasons.len(), 1);
+        let ep1 = &anime.seasons[0].episodes[0];
+        assert_eq!(ep1.provider_mappings.len(), 3);
+        let mapped_ids: Vec<&str> = ep1
+            .provider_mappings
+            .iter()
+            .map(|m| m.provider_anime_id.as_str())
+            .collect();
+        assert!(mapped_ids.contains(&"mb-hi-1"));
+        assert!(mapped_ids.contains(&"mb-en-2"));
+        assert!(mapped_ids.contains(&"mb-raw-3"));
+        assert!(
+            ep1.provider_mappings
+                .iter()
+                .all(|m| m.outcome == EpisodeMappingOutcome::Matched)
+        );
+    }
+
+    #[test]
+    fn test_dramachi_structured_episode_matching_states() {
+        // 1. Different provider episode ID + generic provider title ("Black Clover S01E01") matches "Asta and Yuno"
+        let dc_ep1 = Episode {
+            season: 1,
+            number: 1,
+            title: Some("Black Clover S01E01".into()),
+            overview: None,
+            provider_episode_id: Some("dc-fid-991".into()),
+            provider_season_id: None,
+        };
+        let (outcome, score, evidence, reason) = evaluate_episode_match(
+            MediaType::Series,
+            "black clover",
+            1,
+            1,
+            Some("Asta and Yuno"),
+            &dc_ep1,
+            false,
+            false,
+        );
+        assert_eq!(outcome, EpisodeMappingOutcome::Matched);
+        assert!(score >= 0.85);
+        assert!(evidence.contains(&"season_match".to_string()));
+        assert!(evidence.contains(&"episode_number_match".to_string()));
+        assert_eq!(reason, None);
+
+        // 2. Wrong episode produces EpisodeMismatch
+        let wrong_ep = Episode {
+            season: 1,
+            number: 5,
+            title: Some("Black Clover S01E05".into()),
+            overview: None,
+            provider_episode_id: Some("dc-fid-995".into()),
+            provider_season_id: None,
+        };
+        let (outcome, _, _, reason) = evaluate_episode_match(
+            MediaType::Series,
+            "black clover",
+            1,
+            1,
+            Some("Asta and Yuno"),
+            &wrong_ep,
+            false,
+            false,
+        );
+        assert_eq!(outcome, EpisodeMappingOutcome::EpisodeMismatch);
+        assert_eq!(reason.as_deref(), Some("episode_mismatch"));
+
+        // 3. Missing episode number produces Unmatched
+        let missing_ep = Episode {
+            season: 1,
+            number: 0,
+            title: None,
+            overview: None,
+            provider_episode_id: None,
+            provider_season_id: None,
+        };
+        let (outcome, _, _, reason) = evaluate_episode_match(
+            MediaType::Series,
+            "black clover",
+            1,
+            1,
+            Some("Asta and Yuno"),
+            &missing_ep,
+            false,
+            false,
+        );
+        assert_eq!(outcome, EpisodeMappingOutcome::Unmatched);
+        assert_eq!(reason.as_deref(), Some("missing_episode_metadata"));
+
+        // 4. Multiple candidates for same provider/episode produces Ambiguous
+        let (outcome, _, _, reason) = evaluate_episode_match(
+            MediaType::Series,
+            "black clover",
+            1,
+            1,
+            Some("Asta and Yuno"),
+            &dc_ep1,
+            false,
+            true,
+        );
+        assert_eq!(outcome, EpisodeMappingOutcome::Ambiguous);
+        assert_eq!(reason.as_deref(), Some("ambiguous_episode_candidates"));
+
+        // 5. Distinct non-generic titles produce ProbableMatch (never auto-attached)
+        let diverged_ep = Episode {
+            season: 1,
+            number: 1,
+            title: Some("Completely Different Recap Episode".into()),
+            overview: None,
+            provider_episode_id: Some("dc-fid-999".into()),
+            provider_season_id: None,
+        };
+        let (outcome, _, _, reason) = evaluate_episode_match(
+            MediaType::Series,
+            "black clover",
+            1,
+            1,
+            Some("Asta and Yuno"),
+            &diverged_ep,
+            false,
+            false,
+        );
+        assert_eq!(outcome, EpisodeMappingOutcome::ProbableMatch);
+        assert_eq!(reason.as_deref(), Some("title_confirmation_required"));
     }
 }

@@ -387,7 +387,9 @@ impl AniZoneClient {
             filename: format!("{slug} Episode {episode}"),
             quality: None,
             codec: None,
-            language: None,
+            // Preserve AniZone's provider-declared English catalog language metadata
+            // (remains unverified until independently confirmed).
+            language: Some("English".to_string()),
             size_bytes: None,
             season: Some(season),
             episode: Some(episode),
@@ -802,7 +804,9 @@ impl AniZoneClient {
             filename: format!("{slug} Episode {episode}"),
             quality: None,
             codec: None,
-            language: None,
+            // Preserve AniZone's provider-declared English catalog language metadata
+            // (remains unverified until independently confirmed).
+            language: Some("English".to_string()),
             size_bytes: None,
             season: Some(season),
             episode: Some(episode),

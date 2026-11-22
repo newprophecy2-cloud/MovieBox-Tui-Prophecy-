@@ -15,7 +15,10 @@ pub enum MatchConfidence {
 #[serde(rename_all = "snake_case")]
 pub enum EpisodeMappingOutcome {
     Matched,
-    PossibleMatch,
+    #[serde(alias = "possible_match")]
+    ProbableMatch,
+    Ambiguous,
+    EpisodeMismatch,
     Unmatched,
     MissingFromProvider,
 }
@@ -46,22 +49,66 @@ pub struct ProviderAnimeRef {
     pub provider_id: ProviderKind,
     pub provider_anime_id: String,
     pub title: String,
+    pub declared_language: Option<String>,
+    pub declared_language_code: Option<String>,
     pub year: Option<u32>,
     pub media_type: MediaType,
     pub details: Option<MediaDetails>,
     pub details_failed: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderVariantInfo {
+    pub provider_id: String,
+    pub provider_name: String,
+    pub provider_anime_id: String,
+    pub original_title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declared_language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declared_language_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub year: Option<u32>,
+    pub media_type: MediaType,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProviderEpisodeMapping {
     pub provider_id: ProviderKind,
     pub provider_anime_id: String,
+    pub variant_title: Option<String>,
+    pub variant_language: Option<String>,
+    pub variant_language_code: Option<String>,
     pub provider_season_number: usize,
     pub provider_episode_number: usize,
     pub provider_episode_id: Option<String>,
     pub title: Option<String>,
     pub outcome: EpisodeMappingOutcome,
     pub confidence: f32,
+    pub matching_evidence: Vec<String>,
+    pub exclusion_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EpisodeMatchingDiagnostic {
+    pub requested_anime_id: String,
+    pub requested_season_number: usize,
+    pub requested_episode_number: usize,
+    pub requested_episode_title: String,
+    pub provider: String,
+    pub provider_anime_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_episode_id: Option<String>,
+    pub provider_season_number: usize,
+    pub provider_episode_number: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_episode_title: Option<String>,
+    pub matching_score: f32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matching_evidence: Vec<String>,
+    pub matching_status: EpisodeMappingOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exclusion_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -107,6 +154,20 @@ pub struct ExcludedSourceRecord {
     pub source_id: Option<String>,
     pub stage: String,
     pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http_status_code: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub playability_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declared_language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declared_language_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declared_audio_tracks: Vec<AudioTrackItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_metadata: Option<ProviderSourceMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_metadata: Option<MediaProbeMetadata>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -141,6 +202,8 @@ pub struct ProviderSourceMetadata {
     pub size_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub original_track_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contributing_variants: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -160,6 +223,9 @@ pub struct NormalizedSourceMetadata {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MediaProbeMetadata {
     pub http_reachable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http_status_code: Option<u16>,
+    pub access_status: String,
     pub manifest_validated: bool,
     pub media_probe_validated: bool,
     pub playability_status: String,
@@ -276,6 +342,7 @@ pub struct CanonicalEpisode {
     pub excluded_sources_count: usize,
     pub excluded_reasons: Vec<String>,
     pub excluded_details: Vec<ExcludedSourceRecord>,
+    pub matching_diagnostics: Vec<EpisodeMatchingDiagnostic>,
 }
 
 #[derive(Debug, Clone)]
@@ -338,6 +405,8 @@ pub struct SearchAnimeItem {
     pub total_seasons: usize,
     pub total_episodes: usize,
     pub provider_ids: ProviderIdsMap,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_variants: Vec<ProviderVariantInfo>,
 }
 
 #[derive(Debug, Serialize)]
@@ -374,6 +443,8 @@ pub struct AnimeDetailsResponse {
     pub total_episodes: usize,
     pub season_structure_status: String,
     pub provider_coverage: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_variants: Vec<ProviderVariantInfo>,
 }
 
 #[derive(Debug, Serialize)]
@@ -492,6 +563,8 @@ pub struct EpisodeSourcesResponse {
     pub excluded_reasons: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub excluded_details: Vec<ExcludedSourceRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matching_diagnostics: Vec<EpisodeMatchingDiagnostic>,
     pub pipeline_stats: PipelineStats,
     pub available_languages: Vec<String>,
     pub provider_coverage: BTreeMap<String, String>,

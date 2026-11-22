@@ -5,7 +5,7 @@ use crate::v3::audio_sources::{
 };
 use crate::v3::matching::{build_canonical_structure, merge_search_results, query_matches_anime};
 use crate::v3::models::*;
-use crate::v3::providers::{ProviderRegistry, provider_key};
+use crate::v3::providers::{ProviderRegistry, provider_display_name, provider_key};
 use crate::v3::session::{SessionConfig, SessionLookupError, SessionStore, hash_session_id};
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
@@ -367,6 +367,23 @@ fn parse_query_param(query: &str, name: &str) -> Option<String> {
         .map(|(_, v)| v.into_owned())
 }
 
+fn build_provider_variants(anime: &CanonicalAnime) -> Vec<ProviderVariantInfo> {
+    anime
+        .provider_records
+        .iter()
+        .map(|r| ProviderVariantInfo {
+            provider_id: provider_key(r.provider_id).to_string(),
+            provider_name: provider_display_name(r.provider_id).to_string(),
+            provider_anime_id: r.provider_anime_id.clone(),
+            original_title: r.title.clone(),
+            declared_language: r.declared_language.clone(),
+            declared_language_code: r.declared_language_code.clone(),
+            year: r.year,
+            media_type: r.media_type,
+        })
+        .collect()
+}
+
 async fn handle_search(
     stream: &mut TcpStream,
     query: &str,
@@ -427,6 +444,7 @@ async fn handle_search(
                     dramachi: pid(ProviderKind::Dramachi),
                     fourkhdhub: pid(ProviderKind::FourKHdHub),
                 },
+                provider_variants: build_provider_variants(a),
             }
         })
         .collect();
@@ -562,6 +580,7 @@ async fn handle_anime_details(
         Err((st, code, msg)) => return write_error(stream, st, code, &msg, None).await,
     };
     let provider_coverage = build_anime_provider_coverage(&anime, &state.registry);
+    let provider_variants = build_provider_variants(&anime);
 
     write_json(
         stream,
@@ -580,6 +599,7 @@ async fn handle_anime_details(
             total_episodes: anime.total_episodes,
             season_structure_status: anime.season_structure_status,
             provider_coverage,
+            provider_variants,
         },
     )
     .await
@@ -745,6 +765,7 @@ async fn ensure_episode_sources_hydrated(
             ep.excluded_sources_count = collected.excluded_sources;
             ep.excluded_reasons = collected.excluded_reasons.clone();
             ep.excluded_details = collected.excluded_details.clone();
+            ep.matching_diagnostics = collected.matching_diagnostics.clone();
             episode = ep.clone();
         }
     }
@@ -821,6 +842,7 @@ async fn handle_episode_sources(
             excluded_sources: episode.excluded_sources_count,
             excluded_reasons: episode.excluded_reasons,
             excluded_details: episode.excluded_details,
+            matching_diagnostics: episode.matching_diagnostics,
             pipeline_stats: episode.pipeline_stats,
             available_languages: audio.available_languages,
             provider_coverage,
@@ -1202,6 +1224,8 @@ mod tests {
                             },
                             media_metadata: MediaProbeMetadata {
                                 http_reachable: true,
+                                http_status_code: Some(200),
+                                access_status: "ok".to_string(),
                                 manifest_validated: false,
                                 media_probe_validated: false,
                                 playability_status: "http_reachable".to_string(),
@@ -1229,6 +1253,7 @@ mod tests {
                         excluded_sources_count: 0,
                         excluded_reasons: Vec::new(),
                         excluded_details: Vec::new(),
+                        matching_diagnostics: Vec::new(),
                     },
                     CanonicalEpisode {
                         id: "NP-E-002".to_string(),
@@ -1254,6 +1279,7 @@ mod tests {
                         excluded_sources_count: 0,
                         excluded_reasons: Vec::new(),
                         excluded_details: Vec::new(),
+                        matching_diagnostics: Vec::new(),
                     },
                 ],
             }],
@@ -1454,6 +1480,8 @@ mod tests {
                 },
                 media_metadata: MediaProbeMetadata {
                     http_reachable: true,
+                    http_status_code: Some(200),
+                    access_status: "ok".to_string(),
                     manifest_validated: true,
                     media_probe_validated: false,
                     playability_status: "manifest_validated".to_string(),
@@ -1518,6 +1546,7 @@ mod tests {
                     excluded_sources_count: 0,
                     excluded_reasons: Vec::new(),
                     excluded_details: Vec::new(),
+                    matching_diagnostics: Vec::new(),
                 }],
             }],
             total_seasons: 1,
@@ -1626,7 +1655,15 @@ mod tests {
                         source_id: Some("src-1".to_string()),
                         stage: "deduplication".to_string(),
                         reason: "merged_duplicate_url".to_string(),
+                        http_status_code: Some(200),
+                        playability_status: Some("http_reachable".to_string()),
+                        declared_language: None,
+                        declared_language_code: None,
+                        declared_audio_tracks: Vec::new(),
+                        provider_metadata: None,
+                        media_metadata: None,
                     }],
+                    matching_diagnostics: Vec::new(),
                 }],
             }],
             total_seasons: 1,
