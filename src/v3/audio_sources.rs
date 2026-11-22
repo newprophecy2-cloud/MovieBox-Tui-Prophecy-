@@ -1,14 +1,15 @@
 use crate::providers::models::{ProviderKind, Release};
 use crate::unified::normalize_language_code;
 use crate::v3::audio_id::{
-    AudioIdConfig, SpeechIdResult, extract_ffprobe_audio_streams, identify_track_audio_language,
+    AudioIdConfig, FfprobeAudioStream, SpeechIdResult, extract_ffprobe_audio_streams,
+    identify_track_audio_language,
 };
 use crate::v3::models::{
     AudioAvailability, AudioStatus, AudioTrackItem, CanonicalEpisode, DetectedLanguageMetadata,
     EpisodeMappingOutcome, EpisodeMatchingDiagnostic, ExcludedSourceRecord, MediaProbeMetadata,
-    NormalizedSourceMetadata, PipelineStats, ProviderCoverageDetail, ProviderSourceCandidate,
-    ProviderSourceMetadata, ProviderSourcesGroup, PublicSourceItem, ResolveSuccessResponse,
-    SubtitleItem, TrackSelectionMetadata,
+    NormalizedSourceMetadata, PipelineStats, ProviderCoverageDetail, ProviderEpisodeMapping,
+    ProviderSourceCandidate, ProviderSourceMetadata, ProviderSourcesGroup, PublicSourceItem,
+    ResolveSuccessResponse, SubtitleItem, TrackSelectionMetadata,
 };
 use crate::v3::providers::{ProviderRegistry, provider_display_name, provider_key};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -438,6 +439,24 @@ pub fn redact_url_for_diagnostics(raw: &str) -> String {
     }
 }
 
+fn is_same_site_url(target_url: &str, origin_url: &str) -> bool {
+    let (Ok(target), Ok(origin)) = (
+        reqwest::Url::parse(target_url),
+        reqwest::Url::parse(origin_url),
+    ) else {
+        return false;
+    };
+    if target.scheme() != "https" {
+        return false;
+    }
+    let (Some(th), Some(oh)) = (target.host_str(), origin.host_str()) else {
+        return false;
+    };
+    let th = th.to_ascii_lowercase();
+    let oh = oh.to_ascii_lowercase();
+    th == oh || th.ends_with(&format!(".{oh}")) || oh.ends_with(&format!(".{th}"))
+}
+
 async fn validate_stream_url_and_inspect(
     url: &str,
     headers: &HashMap<String, String>,
@@ -829,18 +848,15 @@ pub async fn collect_episode_sources(
             matching_status: m.outcome,
             exclusion_reason: m.exclusion_reason.clone(),
         });
-        if m.outcome == EpisodeMappingOutcome::Matched
-            && m.provenance != crate::providers::models::EpisodeProvenance::SyntheticFallback
-            && episode.provenance != crate::providers::models::EpisodeProvenance::SyntheticFallback
+        if episode.verification == crate::providers::models::EpisodeVerification::Verified
+            && m.outcome == EpisodeMappingOutcome::Matched
         {
             matched_mappings.push(m.clone());
         } else {
-            let reason = if m.provenance
-                == crate::providers::models::EpisodeProvenance::SyntheticFallback
-                || episode.provenance
-                    == crate::providers::models::EpisodeProvenance::SyntheticFallback
+            let reason = if episode.verification
+                != crate::providers::models::EpisodeVerification::Verified
             {
-                "synthetic_episode_unconfirmed".to_string()
+                "canonical_episode_unverified".to_string()
             } else {
                 m.exclusion_reason
                     .clone()
@@ -899,6 +915,8 @@ pub async fn collect_episode_sources(
                     merged_duplicates_count: 0,
                     failed_validation_count: 0,
                     excluded_source_count: 0,
+                    fallback_attempted: false,
+                    fallback_status: None,
                     errors: Vec::new(),
                 });
 
@@ -980,111 +998,234 @@ pub async fn collect_episode_sources(
         }
     }
 
+    async fn resolve_and_validate_mirror(
+        reg: ProviderRegistry,
+        mapping: ProviderEpisodeMapping,
+        single_rel: Release,
+        mirror: crate::providers::models::SourceMirror,
+    ) -> Result<
+        (
+            ProviderEpisodeMapping,
+            Release,
+            crate::providers::models::SourceMirror,
+            String,
+            HashMap<String, String>,
+            Vec<SubtitleItem>,
+            String,
+            Option<u16>,
+            Vec<ManifestAudioTrack>,
+            Vec<FfprobeAudioStream>,
+        ),
+        (
+            String,
+            String,
+            ExcludedSourceRecord,
+            Option<ProviderEpisodeMapping>,
+        ),
+    > {
+        let pkey = provider_key(mapping.provider_id).to_string();
+        let (resolved_url, raw_headers) = if mirror.direct_file {
+            (mirror.resolver_url.clone(), mirror.headers.clone())
+        } else {
+            match reg.resolve_release(mapping.provider_id, &single_rel).await {
+                Ok((u, h)) => (u, h),
+                Err(_) => {
+                    return Err((
+                        pkey,
+                        "resolution".to_string(),
+                        ExcludedSourceRecord {
+                            provider: provider_key(mapping.provider_id).to_string(),
+                            source_id: None,
+                            stage: "resolution".to_string(),
+                            reason: "resolve_failed".to_string(),
+                            http_status_code: None,
+                            playability_status: Some("unavailable".to_string()),
+                            declared_language: single_rel.language.clone(),
+                            declared_language_code: extract_declared_languages(&single_rel)
+                                .into_iter()
+                                .next(),
+                            declared_audio_tracks: Vec::new(),
+                            provider_metadata: None,
+                            media_metadata: None,
+                        },
+                        None,
+                    ));
+                }
+            }
+        };
+
+        let mut headers = HashMap::new();
+        let mut validation_headers = HashMap::new();
+        let mut subtitles: Vec<SubtitleItem> = Vec::new();
+        let same_site_cookie = is_same_site_url(&resolved_url, &mirror.resolver_url);
+        for (k, v) in raw_headers {
+            if k.eq_ignore_ascii_case("x-anizone-subtitle-url") {
+                let trimmed = v.trim();
+                if !trimmed.is_empty()
+                    && crate::net::validate_url_syntax(trimmed, false).is_ok()
+                    && !subtitles.iter().any(|s| s.url == trimmed)
+                {
+                    subtitles.push(SubtitleItem {
+                        language: None,
+                        language_code: None,
+                        label: Some("AniZone Subtitle".to_string()),
+                        url: trimmed.to_string(),
+                        format: Some("vtt".to_string()),
+                        is_default: Some(true),
+                        is_forced: None,
+                        source: "provider".to_string(),
+                    });
+                }
+                continue;
+            }
+            if k.eq_ignore_ascii_case("cookie") {
+                // Keep cookies strictly internal to same-site validation/probe requests;
+                // never expose cookies in public API headers or logs.
+                if same_site_cookie && !v.trim().is_empty() {
+                    validation_headers.insert(k, v);
+                }
+                continue;
+            }
+            if k.eq_ignore_ascii_case("referer")
+                || k.eq_ignore_ascii_case("user-agent")
+                || k.eq_ignore_ascii_case("origin")
+            {
+                validation_headers.insert(k.clone(), v.clone());
+                headers.insert(k, v);
+            }
+        }
+
+        match validate_stream_url_and_inspect(&resolved_url, &validation_headers).await {
+            Ok((mut playability_status, http_status_code, manifest_tracks)) => {
+                let ffprobe_tracks = if manifest_tracks.is_empty() {
+                    let probed =
+                        extract_ffprobe_audio_streams(&resolved_url, &validation_headers).await;
+                    if !probed.is_empty() {
+                        playability_status = "media_probe_validated".to_string();
+                    }
+                    probed
+                } else {
+                    Vec::new()
+                };
+                Ok((
+                    mapping,
+                    single_rel,
+                    mirror,
+                    resolved_url,
+                    headers,
+                    subtitles,
+                    playability_status,
+                    http_status_code,
+                    manifest_tracks,
+                    ffprobe_tracks,
+                ))
+            }
+            Err(failure) => {
+                let rec = build_validation_excluded_record(
+                    &pkey,
+                    &single_rel,
+                    &mirror.label,
+                    &mirror.resolver_url,
+                    &failure,
+                );
+                let retry_mapping = if mapping.provider_id == ProviderKind::AniZone
+                    && failure.http_status_code == Some(403)
+                {
+                    Some(mapping)
+                } else {
+                    None
+                };
+                Err((pkey, "validation".to_string(), rec, retry_mapping))
+            }
+        }
+    }
+
     let validate_futs = mirror_tasks
         .into_iter()
         .map(|(mapping, single_rel, mirror)| {
-            let reg = registry.clone();
-            async move {
-                let pkey = provider_key(mapping.provider_id).to_string();
-                let (resolved_url, raw_headers) = if mirror.direct_file {
-                    (mirror.resolver_url.clone(), mirror.headers.clone())
-                } else {
-                    match reg.resolve_release(mapping.provider_id, &single_rel).await {
-                        Ok((u, h)) => (u, h),
-                        Err(_) => {
-                            return Err((
-                                pkey,
-                                "resolution".to_string(),
-                                ExcludedSourceRecord {
-                                    provider: provider_key(mapping.provider_id).to_string(),
-                                    source_id: None,
-                                    stage: "resolution".to_string(),
-                                    reason: "resolve_failed".to_string(),
-                                    http_status_code: None,
-                                    playability_status: Some("unavailable".to_string()),
-                                    declared_language: single_rel.language.clone(),
-                                    declared_language_code: extract_declared_languages(&single_rel)
-                                        .into_iter()
-                                        .next(),
-                                    declared_audio_tracks: Vec::new(),
-                                    provider_metadata: None,
-                                    media_metadata: None,
-                                },
-                            ));
-                        }
-                    }
-                };
+            resolve_and_validate_mirror(registry.clone(), mapping, single_rel, mirror)
+        });
 
-                let mut headers = HashMap::new();
-                let mut subtitles: Vec<SubtitleItem> = Vec::new();
-                for (k, v) in raw_headers {
-                    if k.eq_ignore_ascii_case("x-anizone-subtitle-url") {
-                        let trimmed = v.trim();
-                        if !trimmed.is_empty()
-                            && crate::net::validate_url_syntax(trimmed, false).is_ok()
-                            && !subtitles.iter().any(|s| s.url == trimmed)
-                        {
-                            subtitles.push(SubtitleItem {
-                                language: None,
-                                language_code: None,
-                                label: Some("AniZone Subtitle".to_string()),
-                                url: trimmed.to_string(),
-                                format: Some("vtt".to_string()),
-                                is_default: Some(true),
-                                is_forced: None,
-                                source: "provider".to_string(),
+    let mut validated = futures::future::join_all(validate_futs).await;
+
+    // Validation-stage AniZone HTTP 403 sub-server fallback (bounded to 1 attempt per mapping).
+    let mut anizone_403_mappings: Vec<ProviderEpisodeMapping> = Vec::new();
+    let mut seen_anizone_fallback_ids: HashSet<String> = HashSet::new();
+    for item in &validated {
+        if let Err((_, _, _, Some(retry_m))) = item
+            && seen_anizone_fallback_ids.insert(retry_m.provider_anime_id.clone())
+        {
+            anizone_403_mappings.push(retry_m.clone());
+        }
+    }
+    if !anizone_403_mappings.is_empty() {
+        if !registry.anizone_has_sub_server() {
+            if let Some(pdet) = provider_detail_map.get_mut("anizone") {
+                pdet.fallback_attempted = false;
+                pdet.fallback_status = Some("not_configured".to_string());
+            }
+        } else {
+            for m in anizone_403_mappings {
+                if let Some(pdet) = provider_detail_map.get_mut("anizone") {
+                    pdet.fallback_attempted = true;
+                }
+                match registry
+                    .fetch_anizone_sub_server_sources(
+                        &m.provider_anime_id,
+                        m.provider_season_number,
+                        m.provider_episode_number,
+                    )
+                    .await
+                {
+                    Ok(fb_releases) if !fb_releases.is_empty() => {
+                        let mut fb_tasks = Vec::new();
+                        for mut rel in fb_releases {
+                            if rel.language.is_none() && m.variant_language.is_some() {
+                                rel.language = m.variant_language.clone();
+                            }
+                            for mirror in rel.mirrors.clone() {
+                                fb_tasks.push(resolve_and_validate_mirror(
+                                    registry.clone(),
+                                    m.clone(),
+                                    rel.clone(),
+                                    mirror,
+                                ));
+                            }
+                        }
+                        if let Some(pdet) = provider_detail_map.get_mut("anizone") {
+                            pdet.source_count += fb_tasks.len();
+                        }
+                        stats.parsed_sources += fb_tasks.len();
+                        stats.matched_sources += fb_tasks.len();
+                        let fb_results = futures::future::join_all(fb_tasks).await;
+                        let any_ok = fb_results.iter().any(|r| r.is_ok());
+                        if let Some(pdet) = provider_detail_map.get_mut("anizone") {
+                            pdet.fallback_status = Some(if any_ok {
+                                "success".to_string()
+                            } else {
+                                "failed".to_string()
                             });
                         }
-                        continue;
+                        validated.extend(fb_results);
                     }
-                    if k.eq_ignore_ascii_case("referer")
-                        || k.eq_ignore_ascii_case("user-agent")
-                        || k.eq_ignore_ascii_case("origin")
-                    {
-                        headers.insert(k, v);
+                    Ok(_) => {
+                        if let Some(pdet) = provider_detail_map.get_mut("anizone") {
+                            pdet.fallback_status = Some("failed".to_string());
+                            pdet.errors.push("anizone_sub_server_empty".to_string());
+                        }
                     }
-                }
-
-                match validate_stream_url_and_inspect(&resolved_url, &headers).await {
-                    Ok((mut playability_status, http_status_code, manifest_tracks)) => {
-                        let ffprobe_tracks = if manifest_tracks.is_empty() {
-                            let probed =
-                                extract_ffprobe_audio_streams(&resolved_url, &headers).await;
-                            if !probed.is_empty() {
-                                playability_status = "media_probe_validated".to_string();
-                            }
-                            probed
-                        } else {
-                            Vec::new()
-                        };
-                        Ok((
-                            mapping,
-                            single_rel,
-                            mirror,
-                            resolved_url,
-                            headers,
-                            subtitles,
-                            playability_status,
-                            http_status_code,
-                            manifest_tracks,
-                            ffprobe_tracks,
-                        ))
-                    }
-                    Err(failure) => {
-                        let rec = build_validation_excluded_record(
-                            &pkey,
-                            &single_rel,
-                            &mirror.label,
-                            &mirror.resolver_url,
-                            &failure,
-                        );
-                        Err((pkey, "validation".to_string(), rec))
+                    Err(err) => {
+                        if let Some(pdet) = provider_detail_map.get_mut("anizone") {
+                            pdet.fallback_status = Some("failed".to_string());
+                            pdet.errors
+                                .push(format!("anizone_sub_server_failed: {err}"));
+                        }
                     }
                 }
             }
-        });
+        }
+    }
 
-    let validated = futures::future::join_all(validate_futs).await;
     let audio_id_cfg = AudioIdConfig::from_env();
     let mut candidates: Vec<ProviderSourceCandidate> = Vec::new();
     let mut idx = 0usize;
@@ -1108,7 +1249,7 @@ pub async fn collect_episode_sources(
                 stats.validated_sources += 1;
                 v
             }
-            Err((pkey, stage, rec)) => {
+            Err((pkey, stage, rec, _)) => {
                 if stage == "validation" {
                     stats.resolved_sources += 1;
                     stats.failed_validation_count += 1;
@@ -2524,7 +2665,97 @@ video.m3u8"#;
         assert_eq!(res.excluded_details.len(), 1);
         assert_eq!(
             res.excluded_details[0].reason,
-            "synthetic_episode_unconfirmed"
+            "canonical_episode_unverified"
         );
+    }
+
+    #[tokio::test]
+    async fn test_verified_canonical_episode_allows_unverified_matched_mapping() {
+        let ep = CanonicalEpisode {
+            id: "NP-E-VERIFIED".into(),
+            anime_id: "NP-A-001".into(),
+            season_id: "NP-S-001".into(),
+            season_number: 1,
+            episode_number: 7,
+            title: "Greetings from a Stuffed Toy".into(),
+            metadata_status: "verified".into(),
+            provenance: crate::providers::models::EpisodeProvenance::ProviderListing,
+            verification: crate::providers::models::EpisodeVerification::Verified,
+            overview: None,
+            provider_mappings: vec![
+                crate::v3::models::ProviderEpisodeMapping {
+                    provider_id: ProviderKind::MovieBox,
+                    provider_anime_id: "mb-nonexistent".into(),
+                    variant_title: Some("Bleach (Hindi)".into()),
+                    variant_language: Some("Hindi".into()),
+                    variant_language_code: Some("hi".into()),
+                    provider_season_number: 1,
+                    provider_episode_number: 7,
+                    provider_episode_id: None,
+                    provider_season_id: None,
+                    title: Some("Episode 7".into()),
+                    provenance: crate::providers::models::EpisodeProvenance::SyntheticFallback,
+                    verification: crate::providers::models::EpisodeVerification::Unverified,
+                    outcome: EpisodeMappingOutcome::Matched,
+                    confidence: 0.6,
+                    matching_evidence: vec!["controlled_numbered_fallback".into()],
+                    exclusion_reason: None,
+                },
+                crate::v3::models::ProviderEpisodeMapping {
+                    provider_id: ProviderKind::Dramachi,
+                    provider_anime_id: "dc-1".into(),
+                    variant_title: Some("Bleach".into()),
+                    variant_language: None,
+                    variant_language_code: None,
+                    provider_season_number: 1,
+                    provider_episode_number: 8,
+                    provider_episode_id: None,
+                    provider_season_id: None,
+                    title: Some("Episode 8".into()),
+                    provenance: crate::providers::models::EpisodeProvenance::ProviderListing,
+                    verification: crate::providers::models::EpisodeVerification::Verified,
+                    outcome: EpisodeMappingOutcome::EpisodeMismatch,
+                    confidence: 0.0,
+                    matching_evidence: vec![],
+                    exclusion_reason: Some("episode_mismatch".into()),
+                },
+            ],
+            audio: None,
+            sources: None,
+            cached_provider_coverage: None,
+            cached_provider_details: Vec::new(),
+            pipeline_stats: PipelineStats::default(),
+            excluded_sources_count: 0,
+            excluded_reasons: Vec::new(),
+            excluded_details: Vec::new(),
+            matching_diagnostics: Vec::new(),
+        };
+        let reg = ProviderRegistry::from_env();
+        let res = collect_episode_sources(&reg, &ep).await;
+        // MovieBox was attempted (not rejected at matching stage); only Dramachi was excluded at matching stage.
+        assert_eq!(res.excluded_details.len(), 1);
+        assert_eq!(res.excluded_details[0].provider, "dramachi");
+        assert_eq!(res.excluded_details[0].reason, "episode_mismatch");
+        assert!(res.provider_coverage.contains_key("moviebox"));
+    }
+
+    #[test]
+    fn test_same_site_cookie_check_blocks_unrelated_domains() {
+        assert!(is_same_site_url(
+            "https://cdn.anizone.to/stream/master.m3u8",
+            "https://anizone.to/anime/bleach/7"
+        ));
+        assert!(is_same_site_url(
+            "https://anizone.to/stream/master.m3u8",
+            "https://anizone.to/anime/bleach/7"
+        ));
+        assert!(!is_same_site_url(
+            "https://othercdn.example.com/stream/master.m3u8",
+            "https://anizone.to/anime/bleach/7"
+        ));
+        assert!(!is_same_site_url(
+            "http://anizone.to/stream/master.m3u8",
+            "https://anizone.to/anime/bleach/7"
+        ));
     }
 }

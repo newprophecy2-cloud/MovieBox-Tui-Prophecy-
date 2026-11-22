@@ -291,6 +291,28 @@ impl ProviderRegistry {
             .map_err(|_| ProviderError::Unavailable(format!("{provider} sources timed out")))?
     }
 
+    pub fn anizone_has_sub_server(&self) -> bool {
+        self.anizone.has_sub_server()
+    }
+
+    pub async fn fetch_anizone_sub_server_sources(
+        &self,
+        provider_anime_id: &str,
+        season: usize,
+        episode: usize,
+    ) -> Result<Vec<Release>, String> {
+        let _permit = self.concurrency.acquire().await.ok();
+        let timeout = self.timeout_for(ProviderKind::AniZone);
+        tokio::time::timeout(
+            timeout,
+            self.anizone
+                .releases_via_sub_server_fallback(provider_anime_id, season, episode),
+        )
+        .await
+        .map_err(|_| "AniZone sub-server fallback timed out".to_string())?
+        .map_err(|e| e.to_string())
+    }
+
     pub async fn resolve_release(
         &self,
         provider: ProviderKind,

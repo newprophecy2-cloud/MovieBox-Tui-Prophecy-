@@ -1743,6 +1743,8 @@ mod tests {
                         merged_duplicates_count: 1,
                         failed_validation_count: 0,
                         excluded_source_count: 0,
+                        fallback_attempted: false,
+                        fallback_status: None,
                         errors: vec![],
                     }],
                     pipeline_stats: PipelineStats {

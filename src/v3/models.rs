@@ -213,6 +213,10 @@ pub struct ProviderCoverageDetail {
     pub merged_duplicates_count: usize,
     pub failed_validation_count: usize,
     pub excluded_source_count: usize,
+    #[serde(default)]
+    pub fallback_attempted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_status: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<String>,
 }

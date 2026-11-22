@@ -627,12 +627,35 @@ pub fn build_canonical_structure(anime: &mut CanonicalAnime) {
             }
             let (outcome, confidence, matching_evidence, exclusion_reason) =
                 if ep.provenance == EpisodeProvenance::SyntheticFallback {
-                    (
-                        EpisodeMappingOutcome::Unmatched,
-                        0.0,
-                        vec!["synthetic_fallback_record".to_string()],
-                        Some("synthetic_fallback_only".to_string()),
-                    )
+                    if is_ambiguous {
+                        (
+                            EpisodeMappingOutcome::Ambiguous,
+                            0.30,
+                            vec!["synthetic_fallback_ambiguous".to_string()],
+                            Some("ambiguous_episode_match".to_string()),
+                        )
+                    } else if ep.season == season_num && ep.number == ep_num {
+                        // Controlled numbered fallback: eligible for source collection ONLY
+                        // when another provider verifies the canonical episode. Never sets
+                        // `any_verified_mapping` and preserves `Unverified` on the mapping.
+                        (
+                            EpisodeMappingOutcome::Matched,
+                            0.60,
+                            vec![
+                                "season_match".to_string(),
+                                "episode_number_match".to_string(),
+                                "controlled_numbered_fallback".to_string(),
+                            ],
+                            None,
+                        )
+                    } else {
+                        (
+                            EpisodeMappingOutcome::EpisodeMismatch,
+                            0.0,
+                            vec!["synthetic_fallback_mismatch".to_string()],
+                            Some("episode_mismatch".to_string()),
+                        )
+                    }
                 } else {
                     evaluate_episode_match(
                         anime.media_type,
@@ -1918,7 +1941,9 @@ mod tests {
             anime.seasons[1]
                 .episodes
                 .iter()
-                .all(|e| e.provider_mappings[0].outcome == EpisodeMappingOutcome::Unmatched)
+                .all(|e| e.verification == EpisodeVerification::Unverified
+                    && e.provider_mappings[0].verification == EpisodeVerification::Unverified
+                    && e.provider_mappings[0].outcome == EpisodeMappingOutcome::Matched)
         );
     }
 
@@ -1963,5 +1988,126 @@ mod tests {
         ];
         let merged = merge_search_results(items, 50);
         assert_eq!(merged.len(), 5);
+    }
+
+    #[test]
+    fn test_global_one_verified_provider_verifies_canonical_episode_preserving_unverified_mapping()
+    {
+        let items = vec![
+            norm(
+                ProviderKind::AniZone,
+                "bleach-az",
+                "Bleach",
+                Some(2004),
+                MediaType::Series,
+            ),
+            norm(
+                ProviderKind::MovieBox,
+                "bleach-mb",
+                "Bleach (Hindi)",
+                Some(2004),
+                MediaType::Series,
+            ),
+        ];
+        let mut merged = merge_search_results(items, 50);
+        assert_eq!(merged.len(), 1);
+        let anime = &mut merged[0];
+        anime.provider_records[0].details = Some(MediaDetails {
+            id: crate::providers::models::ProviderMediaId {
+                provider: ProviderKind::AniZone,
+                value: "bleach-az".into(),
+            },
+            title: "Bleach".into(),
+            media_type: MediaType::Series,
+            year: Some("2004".into()),
+            description: None,
+            tagline: None,
+            imdb_rating: None,
+            director: None,
+            stars: None,
+            prints: None,
+            audios: None,
+            poster_url: None,
+            duration: None,
+            genres: vec![],
+            seasons: vec![Season {
+                number: 1,
+                provider_season_id: None,
+                advertised_episode_count: None,
+                episodes: vec![Episode {
+                    season: 1,
+                    number: 7,
+                    title: Some("Greetings from a Stuffed Toy".into()),
+                    overview: None,
+                    provider_episode_id: Some("7".into()),
+                    provider_season_id: None,
+                    provenance: EpisodeProvenance::ProviderListing,
+                    verification: EpisodeVerification::Verified,
+                }],
+            }],
+            dubs: vec![],
+        });
+        anime.provider_records[1].details = Some(MediaDetails {
+            id: crate::providers::models::ProviderMediaId {
+                provider: ProviderKind::MovieBox,
+                value: "bleach-mb".into(),
+            },
+            title: "Bleach (Hindi)".into(),
+            media_type: MediaType::Series,
+            year: Some("2004".into()),
+            description: None,
+            tagline: None,
+            imdb_rating: None,
+            director: None,
+            stars: None,
+            prints: None,
+            audios: None,
+            poster_url: None,
+            duration: None,
+            genres: vec![],
+            seasons: vec![Season {
+                number: 1,
+                provider_season_id: Some("mb-s1".into()),
+                advertised_episode_count: None,
+                episodes: vec![Episode {
+                    season: 1,
+                    number: 7,
+                    title: Some("Episode 7".into()),
+                    overview: None,
+                    provider_episode_id: None,
+                    provider_season_id: Some("mb-s1".into()),
+                    provenance: EpisodeProvenance::SyntheticFallback,
+                    verification: EpisodeVerification::Unverified,
+                }],
+            }],
+            dubs: vec![],
+        });
+
+        build_canonical_structure(anime);
+        assert_eq!(anime.seasons.len(), 1);
+        let ep = &anime.seasons[0].episodes[0];
+        assert_eq!(ep.episode_number, 7);
+        assert_eq!(ep.title, "Greetings from a Stuffed Toy");
+        assert_eq!(ep.verification, EpisodeVerification::Verified);
+        assert_eq!(ep.provider_mappings.len(), 2);
+
+        let az = ep
+            .provider_mappings
+            .iter()
+            .find(|m| m.provider_id == ProviderKind::AniZone)
+            .unwrap();
+        assert_eq!(az.verification, EpisodeVerification::Verified);
+        assert_eq!(az.outcome, EpisodeMappingOutcome::Matched);
+
+        // MovieBox mapping keeps its own Unverified state, NOT overwritten to Verified,
+        // yet has outcome == Matched so it remains eligible for source collection!
+        let mb = ep
+            .provider_mappings
+            .iter()
+            .find(|m| m.provider_id == ProviderKind::MovieBox)
+            .unwrap();
+        assert_eq!(mb.verification, EpisodeVerification::Unverified);
+        assert_eq!(mb.provenance, EpisodeProvenance::SyntheticFallback);
+        assert_eq!(mb.outcome, EpisodeMappingOutcome::Matched);
     }
 }

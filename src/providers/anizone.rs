@@ -61,6 +61,7 @@ struct EpisodePage {
 struct WatchData {
     hls: String,
     subtitles: Vec<SubtitleDescriptor>,
+    cookies: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -922,6 +923,12 @@ impl AniZoneClient {
             ),
             ("User-Agent".to_string(), DEFAULT_UA.to_string()),
         ];
+        if !watch.cookies.is_empty() && is_same_site_cookie_host(&watch.hls, BASE_URL) {
+            let cookie_str = cookie_header(&watch.cookies);
+            if !cookie_str.is_empty() {
+                headers.push(("Cookie".to_string(), cookie_str));
+            }
+        }
         if !watch.subtitles.is_empty() {
             headers.push((
                 "X-AniZone-Subtitle-Count".into(),
@@ -1014,7 +1021,8 @@ impl AniZoneClient {
     }
 
     async fn scrape_watch(&self, slug: &str, episode: usize) -> Result<WatchData, AniZoneError> {
-        let (html, _) = self.fetch_page(&format!("/anime/{slug}/{episode}")).await?;
+        let (html, set_cookies) = self.fetch_page(&format!("/anime/{slug}/{episode}")).await?;
+        let cookies = merge_cookies(HashMap::new(), set_cookies);
         let player = json_call_argument(&html, "vidstackPlayer")
             .ok_or_else(|| AniZoneError::Parse("player payload not found".into()))?;
         let hls = normalize_url(
@@ -1054,7 +1062,31 @@ impl AniZoneClient {
                 })
             })
             .collect();
-        Ok(WatchData { hls, subtitles })
+        Ok(WatchData {
+            hls,
+            subtitles,
+            cookies,
+        })
+    }
+
+    pub fn has_sub_server(&self) -> bool {
+        self.sub_server_url.is_some()
+    }
+
+    pub async fn releases_via_sub_server_fallback(
+        &self,
+        slug: &str,
+        season: usize,
+        episode: usize,
+    ) -> Result<Vec<Release>, AniZoneError> {
+        let Some(sub_base) = &self.sub_server_url else {
+            return Err(AniZoneError::Parse(
+                "AniZone sub-server not configured".into(),
+            ));
+        };
+        self.prefer_sub_server.store(true, Ordering::Relaxed);
+        self.releases_via_sub_server(sub_base, slug, season, episode)
+            .await
     }
 }
 
@@ -1418,6 +1450,24 @@ fn cookie_header(cookies: &HashMap<String, String>) -> String {
         .join("; ")
 }
 
+fn is_same_site_cookie_host(target_url: &str, origin_url: &str) -> bool {
+    let (Ok(target), Ok(origin)) = (
+        reqwest::Url::parse(target_url),
+        reqwest::Url::parse(origin_url),
+    ) else {
+        return false;
+    };
+    if target.scheme() != "https" {
+        return false;
+    }
+    let (Some(th), Some(oh)) = (target.host_str(), origin.host_str()) else {
+        return false;
+    };
+    let th = th.to_ascii_lowercase();
+    let oh = oh.to_ascii_lowercase();
+    th == oh || th.ends_with(&format!(".{oh}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1579,5 +1629,25 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("502"));
+    }
+
+    #[test]
+    fn same_site_cookie_host_scopes_cookies_safely() {
+        assert!(is_same_site_cookie_host(
+            "https://anizone.to/hls/ep7.m3u8",
+            BASE_URL
+        ));
+        assert!(is_same_site_cookie_host(
+            "https://cdn.anizone.to/hls/ep7.m3u8",
+            BASE_URL
+        ));
+        assert!(!is_same_site_cookie_host(
+            "https://evil.example.com/hls/ep7.m3u8",
+            BASE_URL
+        ));
+        assert!(!is_same_site_cookie_host(
+            "http://anizone.to/hls/ep7.m3u8",
+            BASE_URL
+        ));
     }
 }
