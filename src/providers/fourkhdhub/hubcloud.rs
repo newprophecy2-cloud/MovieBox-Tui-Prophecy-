@@ -164,13 +164,14 @@ fn extract_resolver_urls(drive_html: &str) -> Vec<String> {
         .select(&SEL_DOWNLOAD)
         .filter_map(|node| node.value().attr("href"))
         .filter_map(|href| {
-            let url = Url::parse(href).ok()?;
+            let trimmed = href.trim();
+            let url = Url::parse(trimmed).ok()?;
             let host = url.host_str()?.to_ascii_lowercase();
             (url.scheme() == "https"
                 && ((host.starts_with("hubcloud.") || host.contains(".hubcloud."))
                     || host == "gamerxyt.com"
                     || host.ends_with(".gamerxyt.com")))
-            .then(|| url.to_string())
+            .then(|| trimmed.to_string())
         })
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
@@ -302,10 +303,10 @@ fn decode_greenmotors_payload(payload: &str) -> Option<String> {
 fn extract_hubcloud_drive_url(html: &str) -> Option<String> {
     let document = Html::parse_document(html);
     document.select(&SEL_LINKS).find_map(|node| {
-        let raw = node.value().attr("href")?;
+        let raw = node.value().attr("href")?.trim();
         let url = Url::parse(raw).ok()?;
         let host = url.host_str()?;
-        (host.contains("hubcloud.") && url.path().starts_with("/drive/")).then(|| url.to_string())
+        (host.contains("hubcloud.") && url.path().starts_with("/drive/")).then(|| raw.to_string())
     })
 }
 
@@ -402,8 +403,15 @@ fn validate_hubdrive_url(raw: &str) -> Result<(), FourKHdHubError> {
 }
 
 pub fn validate_playback_url(raw: &str) -> Result<String, FourKHdHubError> {
-    let url =
-        normalize_playback_url_str(raw).ok_or_else(|| FourKHdHubError::InvalidUrl(raw.into()))?;
+    let trimmed = raw.trim();
+    let (url, preserve_exact) = match Url::parse(trimmed) {
+        Ok(u) => (u, true),
+        Err(_) => (
+            normalize_playback_url_str(trimmed)
+                .ok_or_else(|| FourKHdHubError::InvalidUrl(raw.into()))?,
+            false,
+        ),
+    };
     if url.scheme() != "https" || url.host_str().is_none() {
         return Err(FourKHdHubError::InvalidUrl(raw.into()));
     }
@@ -422,7 +430,11 @@ pub fn validate_playback_url(raw: &str) -> Result<String, FourKHdHubError> {
     {
         return Err(FourKHdHubError::InvalidUrl(raw.into()));
     }
-    Ok(url.to_string())
+    if preserve_exact && !trimmed.chars().any(char::is_whitespace) {
+        Ok(trimmed.to_string())
+    } else {
+        Ok(url.to_string())
+    }
 }
 
 fn normalize_playback_url_str(raw: &str) -> Option<Url> {

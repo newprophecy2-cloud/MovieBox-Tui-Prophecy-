@@ -4,8 +4,9 @@ use crate::v3::audio_id::{
     AudioIdConfig, SpeechIdResult, extract_ffprobe_audio_streams, identify_track_audio_language,
 };
 use crate::v3::models::{
-    AudioAvailability, AudioStatus, AudioTrackItem, CanonicalEpisode, EpisodeMappingOutcome,
-    ExcludedSourceRecord, PipelineStats, ProviderCoverageDetail, ProviderSourceCandidate,
+    AudioAvailability, AudioStatus, AudioTrackItem, CanonicalEpisode, DetectedLanguageMetadata,
+    EpisodeMappingOutcome, ExcludedSourceRecord, MediaProbeMetadata, NormalizedSourceMetadata,
+    PipelineStats, ProviderCoverageDetail, ProviderSourceCandidate, ProviderSourceMetadata,
     ProviderSourcesGroup, PublicSourceItem, ResolveSuccessResponse, TrackSelectionMetadata,
 };
 use crate::v3::providers::{ProviderRegistry, provider_display_name, provider_key};
@@ -23,10 +24,12 @@ pub enum ResolveFailure {
 pub struct ManifestAudioTrack {
     pub track_index: usize,
     pub audio_track_id: String,
+    pub original_language_code: Option<String>,
     pub language_code: Option<String>,
     pub language: String,
     pub audio_codec: Option<String>,
     pub channels: Option<String>,
+    pub is_default: Option<bool>,
     pub track_selection_metadata: TrackSelectionMetadata,
 }
 
@@ -171,10 +174,12 @@ pub fn parse_dash_mpd_audio_tracks(xml: &str) -> Vec<ManifestAudioTrack> {
             tracks.push(ManifestAudioTrack {
                 track_index,
                 audio_track_id,
+                original_language_code: lang_raw,
                 language_code: language_code.clone(),
                 language,
                 audio_codec,
                 channels,
+                is_default: None,
                 track_selection_metadata: TrackSelectionMetadata {
                     format: "dash".to_string(),
                     track_index,
@@ -250,10 +255,12 @@ pub fn parse_hls_m3u8_audio_tracks(m3u8: &str) -> Vec<ManifestAudioTrack> {
         let track_index = tracks.len();
         let group_id = attrs.get("GROUP-ID").cloned();
         let rendition_name = attrs.get("NAME").cloned();
-        let language_code = normalize_manifest_lang(attrs.get("LANGUAGE").map(String::as_str));
+        let original_language_code = attrs.get("LANGUAGE").cloned();
+        let language_code = normalize_manifest_lang(original_language_code.as_deref());
         let language = language_display_name(language_code.as_deref());
         let audio_codec = attrs.get("CODECS").cloned();
         let channels = attrs.get("CHANNELS").cloned();
+        let is_default = attrs.get("DEFAULT").map(|v| v.eq_ignore_ascii_case("YES"));
         let audio_track_id = match (&group_id, &rendition_name) {
             (Some(g), Some(n)) => format!("{g}:{n}"),
             (_, Some(n)) => n.clone(),
@@ -263,10 +270,12 @@ pub fn parse_hls_m3u8_audio_tracks(m3u8: &str) -> Vec<ManifestAudioTrack> {
         tracks.push(ManifestAudioTrack {
             track_index,
             audio_track_id,
+            original_language_code,
             language_code: language_code.clone(),
             language,
             audio_codec,
             channels,
+            is_default,
             track_selection_metadata: TrackSelectionMetadata {
                 format: "hls".to_string(),
                 track_index,
@@ -380,6 +389,13 @@ async fn validate_stream_url_and_inspect(
         return Err(format!("http_{}", status.as_u16()));
     }
 
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
     if is_mpd || is_m3u8 {
         let bytes = resp
             .bytes()
@@ -407,7 +423,131 @@ async fn validate_stream_url_and_inspect(
         ));
     }
 
+    if content_type.starts_with("text/html") {
+        return Err("non_media_html_response".to_string());
+    }
+
     Ok(("http_reachable".to_string(), Vec::new()))
+}
+
+pub fn build_media_probe_metadata(
+    playability_status: &str,
+    probed_track_count: usize,
+) -> MediaProbeMetadata {
+    let manifest_validated = playability_status == "manifest_validated";
+    let media_probe_validated = playability_status == "media_probe_validated";
+    let http_reachable = matches!(
+        playability_status,
+        "http_reachable" | "manifest_validated" | "media_probe_validated"
+    );
+    MediaProbeMetadata {
+        http_reachable,
+        manifest_validated,
+        media_probe_validated,
+        playability_status: playability_status.to_string(),
+        device_playback_status: "untested".to_string(),
+        probed_track_count,
+    }
+}
+
+fn audio_track_identity(t: &AudioTrackItem) -> String {
+    if let Some(ref id) = t.track_id {
+        format!(
+            "id:{id}:idx:{}:lang:{}",
+            t.track_index.map(|i| i.to_string()).unwrap_or_default(),
+            t.declared_language_code.as_deref().unwrap_or("")
+        )
+    } else if let Some(idx) = t.track_index {
+        format!(
+            "idx:{idx}:lang:{}:codec:{}",
+            t.declared_language_code.as_deref().unwrap_or(""),
+            t.codec.as_deref().unwrap_or("")
+        )
+    } else {
+        format!(
+            "decl:{}:orig:{}:codec:{}:ch:{}",
+            t.declared_language_code.as_deref().unwrap_or(""),
+            t.original_language_code.as_deref().unwrap_or(""),
+            t.codec.as_deref().unwrap_or(""),
+            t.channels.as_deref().unwrap_or("")
+        )
+    }
+}
+
+/// Merges distinct audio tracks into `existing` without duplicating identical track entries.
+pub fn merge_audio_tracks(existing: &mut Vec<AudioTrackItem>, incoming: Vec<AudioTrackItem>) {
+    let mut seen: HashSet<String> = existing.iter().map(audio_track_identity).collect();
+    for track in incoming {
+        let key = audio_track_identity(&track);
+        if seen.insert(key) {
+            existing.push(track);
+        }
+    }
+}
+
+/// Merges an incoming candidate sharing the same `(provider_id, resolved_url)` into `existing`,
+/// preserving all distinct audio tracks, declared languages, and original track IDs.
+pub fn merge_source_candidate(
+    existing: &mut ProviderSourceCandidate,
+    incoming: ProviderSourceCandidate,
+) {
+    merge_audio_tracks(&mut existing.audio_tracks, incoming.audio_tracks);
+    merge_audio_tracks(
+        &mut existing.declared_audio_tracks,
+        incoming.declared_audio_tracks,
+    );
+    for lang in incoming.audio_languages {
+        if !existing.audio_languages.contains(&lang) {
+            existing.audio_languages.push(lang);
+        }
+    }
+    for lang in incoming.normalized_metadata.declared_languages {
+        if !existing
+            .normalized_metadata
+            .declared_languages
+            .contains(&lang)
+        {
+            existing.normalized_metadata.declared_languages.push(lang);
+        }
+    }
+    for tid in incoming.provider_metadata.original_track_ids {
+        if !existing.provider_metadata.original_track_ids.contains(&tid) {
+            existing.provider_metadata.original_track_ids.push(tid);
+        }
+    }
+    if existing.provider_metadata.original_language.is_none() {
+        existing.provider_metadata.original_language = incoming.provider_metadata.original_language;
+    }
+    if existing.declared_language.is_none() && incoming.declared_language.is_some() {
+        existing.declared_language = incoming.declared_language;
+        existing.declared_language_code = incoming.declared_language_code;
+    }
+    if existing.verified_language.is_none() && incoming.verified_language.is_some() {
+        existing.verified_language = incoming.verified_language;
+        existing.verified_language_code = incoming.verified_language_code;
+        existing.verification_status = incoming.verification_status;
+    }
+    if existing.quality.is_none() && incoming.quality.is_some() {
+        existing.quality = incoming.quality;
+        existing.resolution_u64 = incoming.resolution_u64;
+        existing.normalized_metadata.quality = existing.quality.clone();
+        existing.normalized_metadata.resolution_u64 = existing.resolution_u64;
+    }
+    if existing.codec.is_none() && incoming.codec.is_some() {
+        existing.codec = incoming.codec;
+        existing.normalized_metadata.video_codec = existing.codec.clone();
+    }
+    existing.media_metadata.probed_track_count = existing.audio_tracks.len();
+    if existing.media_metadata.playability_status == "http_reachable"
+        && matches!(
+            incoming.media_metadata.playability_status.as_str(),
+            "manifest_validated" | "media_probe_validated"
+        )
+    {
+        existing.playability_status = incoming.playability_status;
+        existing.media_metadata = incoming.media_metadata;
+        existing.media_metadata.probed_track_count = existing.audio_tracks.len();
+    }
 }
 
 pub async fn collect_episode_sources(
@@ -593,6 +733,7 @@ pub async fn collect_episode_sources(
                         Ok((
                             mapping,
                             single_rel,
+                            mirror,
                             resolved_url,
                             headers,
                             playability_status,
@@ -607,14 +748,15 @@ pub async fn collect_episode_sources(
 
     let validated = futures::future::join_all(validate_futs).await;
     let audio_id_cfg = AudioIdConfig::from_env();
-    let mut candidates = Vec::new();
+    let mut candidates: Vec<ProviderSourceCandidate> = Vec::new();
     let mut idx = 0usize;
-    let mut seen_urls: HashSet<(ProviderKind, String)> = HashSet::new();
+    let mut seen_url_index: HashMap<(ProviderKind, String), usize> = HashMap::new();
 
     for item in validated {
         let (
             mapping,
             rel,
+            mirror,
             resolved_url,
             headers,
             playability_status,
@@ -648,22 +790,9 @@ pub async fn collect_episode_sources(
         };
 
         let pkey = provider_key(mapping.provider_id).to_string();
-        if !seen_urls.insert((mapping.provider_id, resolved_url.clone())) {
-            if let Some(pdet) = provider_detail_map.get_mut(&pkey) {
-                pdet.excluded_source_count += 1;
-            }
-            excluded_details.push(ExcludedSourceRecord {
-                provider: pkey,
-                source_id: None,
-                stage: "deduplication".to_string(),
-                reason: "duplicate_url".to_string(),
-            });
-            continue;
-        }
-
-        if let Some(pdet) = provider_detail_map.get_mut(&pkey) {
-            pdet.validated_source_count += 1;
-        }
+        let existing_idx = seen_url_index
+            .get(&(mapping.provider_id, resolved_url.clone()))
+            .copied();
 
         let provider_ep_id = mapping.provider_episode_id.clone().unwrap_or_else(|| {
             format!(
@@ -672,7 +801,7 @@ pub async fn collect_episode_sources(
             )
         });
 
-        // Bug #4: Preserve multi-language provider declarations independently
+        // Fix A: Preserve original provider declarations independently of FFprobe/normalization
         let declared_langs = extract_declared_languages(&rel);
         let declared_audio_tracks: Vec<AudioTrackItem> = declared_langs
             .iter()
@@ -681,6 +810,7 @@ pub async fn collect_episode_sources(
                 track_index: None,
                 language: language_display_name(Some(code)),
                 language_code: Some(code.clone()),
+                original_language_code: rel.language.clone(),
                 declared_language: Some(language_display_name(Some(code))),
                 declared_language_code: Some(code.clone()),
                 verified_language: None,
@@ -689,14 +819,16 @@ pub async fn collect_episode_sources(
                 channels: None,
                 sample_rate: None,
                 is_default: None,
+                source: Some("provider".to_string()),
                 verification_status: "unverified".to_string(),
                 track_selection_metadata: None,
             })
             .collect();
 
-        // Bug #6: ONE source URL = ONE ProviderSourceCandidate with Vec<AudioTrackItem>
+        // ONE source URL = ONE ProviderSourceCandidate with Vec<AudioTrackItem>
         let mut audio_tracks: Vec<AudioTrackItem> = Vec::new();
         let mut verified_langs_for_source: Vec<String> = Vec::new();
+        let mut original_track_ids: Vec<String> = Vec::new();
         let mut first_speech: Option<SpeechIdResult> = None;
 
         if !manifest_tracks.is_empty() {
@@ -718,6 +850,9 @@ pub async fn collect_episode_sources(
                 {
                     verified_langs_for_source.push(vc.clone());
                 }
+                if !original_track_ids.contains(&track.audio_track_id) {
+                    original_track_ids.push(track.audio_track_id.clone());
+                }
                 let declared_code = track.language_code.clone();
                 let display_code = verified_code.clone().or_else(|| declared_code.clone());
                 audio_tracks.push(AudioTrackItem {
@@ -725,6 +860,7 @@ pub async fn collect_episode_sources(
                     track_index: Some(track.track_index),
                     language: language_display_name(display_code.as_deref()),
                     language_code: display_code,
+                    original_language_code: track.original_language_code,
                     declared_language: declared_code
                         .as_deref()
                         .map(|c| language_display_name(Some(c))),
@@ -736,7 +872,8 @@ pub async fn collect_episode_sources(
                     codec: track.audio_codec,
                     channels: track.channels,
                     sample_rate: None,
-                    is_default: None,
+                    is_default: track.is_default,
+                    source: Some("manifest".to_string()),
                     verification_status: speech.verification_status.clone(),
                     track_selection_metadata: Some(track.track_selection_metadata),
                 });
@@ -763,6 +900,11 @@ pub async fn collect_episode_sources(
                 {
                     verified_langs_for_source.push(vc.clone());
                 }
+                if let Some(ref tid) = ftrack.provider_track_id
+                    && !original_track_ids.contains(tid)
+                {
+                    original_track_ids.push(tid.clone());
+                }
                 let declared_code = ftrack.declared_language_code.clone();
                 let display_code = verified_code.clone().or_else(|| declared_code.clone());
                 audio_tracks.push(AudioTrackItem {
@@ -770,6 +912,7 @@ pub async fn collect_episode_sources(
                     track_index: Some(ftrack.track_index),
                     language: language_display_name(display_code.as_deref()),
                     language_code: display_code,
+                    original_language_code: ftrack.original_language_code,
                     declared_language: declared_code
                         .as_deref()
                         .map(|c| language_display_name(Some(c))),
@@ -782,6 +925,7 @@ pub async fn collect_episode_sources(
                     channels: ftrack.channels,
                     sample_rate: ftrack.sample_rate,
                     is_default: ftrack.is_default,
+                    source: Some("ffprobe".to_string()),
                     verification_status: speech.verification_status.clone(),
                     track_selection_metadata: Some(TrackSelectionMetadata {
                         format: "container".to_string(),
@@ -811,7 +955,6 @@ pub async fn collect_episode_sources(
             first_speech = Some(speech);
         }
 
-        idx += 1;
         let primary_speech = first_speech.unwrap_or(SpeechIdResult {
             language_code: None,
             confidence: None,
@@ -819,18 +962,54 @@ pub async fn collect_episode_sources(
             detection_method: "none_configured".to_string(),
             verification_status: "unverified".to_string(),
         });
-        let primary_declared_code = audio_tracks
-            .first()
-            .and_then(|t| t.declared_language_code.clone())
-            .or_else(|| declared_langs.first().cloned());
+        let primary_declared_code = declared_langs.first().cloned().or_else(|| {
+            audio_tracks
+                .first()
+                .and_then(|t| t.declared_language_code.clone())
+        });
         let primary_verified_code = verified_langs_for_source.first().cloned();
         let primary_display_code = primary_verified_code
             .clone()
             .or_else(|| primary_declared_code.clone());
         let primary_track = audio_tracks.first().cloned();
 
-        candidates.push(ProviderSourceCandidate {
-            source_id: format!("src-{idx}"),
+        let provider_metadata = ProviderSourceMetadata {
+            provider_id: pkey.clone(),
+            provider_source_id: rel.resource_id.clone(),
+            original_url: Some(mirror.resolver_url.clone()),
+            mirror_label: Some(mirror.label.clone()),
+            original_filename: Some(rel.filename.clone()),
+            original_language: rel.language.clone(),
+            original_quality: rel.quality.clone(),
+            original_codec: rel.codec.clone(),
+            size_bytes: rel.size_bytes,
+            original_track_ids,
+        };
+        let normalized_metadata = NormalizedSourceMetadata {
+            quality: rel.quality.clone(),
+            resolution_u64: rel.resolution_u64(),
+            video_codec: rel.codec.clone(),
+            declared_languages: declared_langs,
+            primary_language: language_display_name(primary_display_code.as_deref()),
+            primary_language_code: primary_display_code.clone(),
+        };
+        let media_metadata = build_media_probe_metadata(&playability_status, audio_tracks.len());
+        let detected_language_metadata = DetectedLanguageMetadata {
+            declared_language: primary_declared_code
+                .as_deref()
+                .map(|c| language_display_name(Some(c))),
+            declared_language_code: primary_declared_code.clone(),
+            detected_language: primary_verified_code
+                .as_deref()
+                .map(|c| language_display_name(Some(c))),
+            detected_language_code: primary_verified_code.clone(),
+            confidence: primary_speech.confidence,
+            detection_method: primary_speech.detection_method.clone(),
+            verification_status: primary_speech.verification_status.clone(),
+        };
+
+        let candidate = ProviderSourceCandidate {
+            source_id: String::new(),
             provider_id: mapping.provider_id,
             provider_name: provider_display_name(mapping.provider_id).to_string(),
             provider_episode_id: provider_ep_id,
@@ -866,10 +1045,38 @@ pub async fn collect_episode_sources(
                 .and_then(|t| t.track_selection_metadata.clone()),
             audio_tracks,
             declared_audio_tracks,
-            stream_url: Some(resolved_url),
+            provider_metadata,
+            normalized_metadata,
+            media_metadata,
+            detected_language_metadata,
+            stream_url: Some(resolved_url.clone()),
             headers,
             available: true,
-        });
+        };
+
+        // Fix B: Merge duplicate URL entries instead of discarding subsequent audio tracks
+        if let Some(pos) = existing_idx {
+            merge_source_candidate(&mut candidates[pos], candidate);
+            if let Some(pdet) = provider_detail_map.get_mut(&pkey) {
+                pdet.excluded_source_count += 1;
+            }
+            excluded_details.push(ExcludedSourceRecord {
+                provider: pkey,
+                source_id: Some(candidates[pos].source_id.clone()),
+                stage: "deduplication".to_string(),
+                reason: "merged_duplicate_url".to_string(),
+            });
+            continue;
+        }
+
+        if let Some(pdet) = provider_detail_map.get_mut(&pkey) {
+            pdet.validated_source_count += 1;
+        }
+        idx += 1;
+        let mut candidate = candidate;
+        candidate.source_id = format!("src-{idx}");
+        seen_url_index.insert((mapping.provider_id, resolved_url), candidates.len());
+        candidates.push(candidate);
     }
 
     rank_candidates(&mut candidates, None, None);
@@ -915,6 +1122,10 @@ pub fn to_public_source_item(c: &ProviderSourceCandidate) -> PublicSourceItem {
         track_selection_metadata: c.track_selection_metadata.clone(),
         audio_tracks: c.audio_tracks.clone(),
         declared_audio_tracks: c.declared_audio_tracks.clone(),
+        provider_metadata: c.provider_metadata.clone(),
+        normalized_metadata: c.normalized_metadata.clone(),
+        media_metadata: c.media_metadata.clone(),
+        detected_language_metadata: c.detected_language_metadata.clone(),
         headers: c.headers.clone(),
         availability_status: if c.available {
             "available"
@@ -1227,6 +1438,10 @@ pub async fn resolve_episode_stream(
                         .and_then(|t| t.track_selection_metadata)
                         .or(candidate.track_selection_metadata),
                     audio_tracks: candidate.audio_tracks,
+                    provider_metadata: candidate.provider_metadata,
+                    normalized_metadata: candidate.normalized_metadata,
+                    media_metadata: candidate.media_metadata,
+                    detected_language_metadata: candidate.detected_language_metadata,
                     headers: safe_headers,
                 });
             }
@@ -1311,6 +1526,39 @@ mod tests {
             track_selection_metadata: None,
             audio_tracks: Vec::new(),
             declared_audio_tracks: Vec::new(),
+            provider_metadata: ProviderSourceMetadata {
+                provider_id: provider_key(provider).to_string(),
+                original_url: Some(url.to_string()),
+                original_language: lang.map(str::to_string),
+                original_quality: quality.map(str::to_string),
+                ..Default::default()
+            },
+            normalized_metadata: NormalizedSourceMetadata {
+                quality: quality.map(str::to_string),
+                resolution_u64: quality.and_then(parse_quality_target).unwrap_or(0),
+                declared_languages: code.iter().cloned().collect(),
+                primary_language: language_display_name(code.as_deref()),
+                primary_language_code: code.clone(),
+                ..Default::default()
+            },
+            media_metadata: build_media_probe_metadata("http_reachable", 0),
+            detected_language_metadata: DetectedLanguageMetadata {
+                declared_language: code.as_deref().map(|c| language_display_name(Some(c))),
+                declared_language_code: code.clone(),
+                detected_language: code.as_deref().map(|c| language_display_name(Some(c))),
+                detected_language_code: code.clone(),
+                confidence: code.as_ref().map(|_| 0.95),
+                detection_method: if code.is_some() {
+                    "speech_lang_id_model".to_string()
+                } else {
+                    "none_configured".to_string()
+                },
+                verification_status: if code.is_some() {
+                    "verified".to_string()
+                } else {
+                    "unverified".to_string()
+                },
+            },
             quality: quality.map(str::to_string),
             resolution_u64: quality.and_then(parse_quality_target).unwrap_or(0),
             stream_url: Some(url.to_string()),
@@ -1522,5 +1770,180 @@ video.m3u8"#;
         let reg = ProviderRegistry::from_env();
         let res = resolve_episode_stream(&reg, &ep, &[fake_hi], None, Some("hi"), None).await;
         assert!(matches!(res, Err(ResolveFailure::AudioUnavailable(_))));
+    }
+
+    fn make_track_item(
+        id: Option<&str>,
+        idx: Option<usize>,
+        code: &str,
+        orig: &str,
+        codec: &str,
+    ) -> AudioTrackItem {
+        AudioTrackItem {
+            track_id: id.map(str::to_string),
+            track_index: idx,
+            language: language_display_name(Some(code)),
+            language_code: Some(code.to_string()),
+            original_language_code: Some(orig.to_string()),
+            declared_language: Some(language_display_name(Some(code))),
+            declared_language_code: Some(code.to_string()),
+            verified_language: None,
+            verified_language_code: None,
+            codec: Some(codec.to_string()),
+            channels: Some("2".to_string()),
+            sample_rate: Some("48000".to_string()),
+            is_default: Some(idx == Some(0)),
+            source: Some("ffprobe".to_string()),
+            verification_status: "unverified".to_string(),
+            track_selection_metadata: None,
+        }
+    }
+
+    #[test]
+    fn test_merge_duplicate_url_preserves_two_audio_tracks() {
+        let mut first = make_cand(
+            ProviderKind::FourKHdHub,
+            Some("hi"),
+            Some("1080p"),
+            "https://cdn.example/same.mkv",
+        );
+        first.audio_tracks = vec![make_track_item(Some("1"), Some(0), "hi", "hin", "aac")];
+        first.provider_metadata.original_track_ids = vec!["1".to_string()];
+
+        let mut second = make_cand(
+            ProviderKind::FourKHdHub,
+            Some("en"),
+            Some("1080p"),
+            "https://cdn.example/same.mkv",
+        );
+        second.audio_tracks = vec![make_track_item(Some("2"), Some(1), "en", "eng", "eac3")];
+        second.provider_metadata.original_track_ids = vec!["2".to_string()];
+
+        merge_source_candidate(&mut first, second);
+        assert_eq!(first.audio_tracks.len(), 2);
+        assert_eq!(first.audio_tracks[0].track_id.as_deref(), Some("1"));
+        assert_eq!(first.audio_tracks[1].track_id.as_deref(), Some("2"));
+        assert_eq!(first.provider_metadata.original_track_ids, vec!["1", "2"]);
+    }
+
+    #[test]
+    fn test_merge_duplicate_audio_tracks_deduplicates_cleanly() {
+        let mut tracks = vec![make_track_item(Some("1"), Some(0), "hi", "hin", "aac")];
+        let incoming = vec![
+            make_track_item(Some("1"), Some(0), "hi", "hin", "aac"),
+            make_track_item(Some("2"), Some(1), "ja", "jpn", "aac"),
+        ];
+        merge_audio_tracks(&mut tracks, incoming);
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].declared_language_code.as_deref(), Some("hi"));
+        assert_eq!(tracks[1].declared_language_code.as_deref(), Some("ja"));
+    }
+
+    #[test]
+    fn test_provider_track_ids_and_declared_language_survive_pipeline() {
+        let mpd = r#"<MPD><Period>
+            <AdaptationSet id="aud-hin-01" contentType="audio" mimeType="audio/mp4" lang="hin-IN" codecs="mp4a.40.2">
+                <AudioChannelConfiguration value="2"/>
+            </AdaptationSet>
+            <AdaptationSet id="aud-jpn-02" contentType="audio" mimeType="audio/mp4" lang="jpn" codecs="ec-3">
+                <AudioChannelConfiguration value="6"/>
+            </AdaptationSet>
+        </Period></MPD>"#;
+        let tracks = parse_dash_mpd_audio_tracks(mpd);
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].audio_track_id, "aud-hin-01");
+        assert_eq!(tracks[0].original_language_code.as_deref(), Some("hin-IN"));
+        assert_eq!(tracks[0].language_code.as_deref(), Some("hi"));
+        assert_eq!(tracks[1].audio_track_id, "aud-jpn-02");
+        assert_eq!(tracks[1].original_language_code.as_deref(), Some("jpn"));
+        assert_eq!(tracks[1].language_code.as_deref(), Some("ja"));
+
+        let rel = Release {
+            provider: ProviderKind::FourKHdHub,
+            filename: "Black.Clover.S01E01.1080p.mkv".into(),
+            quality: Some("1080p".into()),
+            codec: Some("H.265".into()),
+            language: Some("Hindi, English, Japanese".into()),
+            size_bytes: Some(500_000_000),
+            season: Some(1),
+            episode: Some(1),
+            mirrors: vec![],
+            resource_id: Some("prov-src-42".into()),
+        };
+        let declared = extract_declared_languages(&rel);
+        assert_eq!(declared, vec!["hi", "en", "ja"]);
+    }
+
+    #[test]
+    fn test_ffprobe_metadata_does_not_overwrite_provider_metadata() {
+        let mut cand = make_cand(
+            ProviderKind::FourKHdHub,
+            Some("Hindi, English"),
+            Some("1080p"),
+            "https://cdn.example/bc.mkv",
+        );
+        cand.provider_metadata.original_language = Some("Hindi, English".to_string());
+        cand.provider_metadata.provider_source_id = Some("hub-99".to_string());
+        cand.audio_tracks = vec![make_track_item(Some("1"), Some(0), "ja", "jpn", "aac")];
+        cand.media_metadata = build_media_probe_metadata("media_probe_validated", 1);
+
+        let public = to_public_source_item(&cand);
+        assert_eq!(
+            public.provider_metadata.original_language.as_deref(),
+            Some("Hindi, English")
+        );
+        assert_eq!(
+            public.provider_metadata.provider_source_id.as_deref(),
+            Some("hub-99")
+        );
+        assert_eq!(public.audio_tracks[0].source.as_deref(), Some("ffprobe"));
+        assert_eq!(public.audio_tracks[0].verification_status, "unverified");
+    }
+
+    #[test]
+    fn test_http_200_does_not_claim_media_probe_validated() {
+        let meta = build_media_probe_metadata("http_reachable", 0);
+        assert!(meta.http_reachable);
+        assert!(!meta.manifest_validated);
+        assert!(!meta.media_probe_validated);
+        assert_eq!(meta.device_playback_status, "untested");
+    }
+
+    #[tokio::test]
+    async fn test_mismatched_episode_mappings_are_excluded() {
+        let ep = CanonicalEpisode {
+            id: "NP-E-MISMATCH".into(),
+            anime_id: "NP-A-001".into(),
+            season_id: "NP-S-001".into(),
+            season_number: 1,
+            episode_number: 1,
+            title: "Ep 1".into(),
+            metadata_status: "verified".into(),
+            overview: None,
+            provider_mappings: vec![crate::v3::models::ProviderEpisodeMapping {
+                provider_id: ProviderKind::FourKHdHub,
+                provider_anime_id: "/wrong".into(),
+                provider_season_number: 1,
+                provider_episode_number: 99,
+                provider_episode_id: None,
+                title: None,
+                outcome: EpisodeMappingOutcome::Unmatched,
+                confidence: 0.1,
+            }],
+            audio: None,
+            sources: None,
+            cached_provider_coverage: None,
+            cached_provider_details: Vec::new(),
+            pipeline_stats: PipelineStats::default(),
+            excluded_sources_count: 0,
+            excluded_reasons: Vec::new(),
+            excluded_details: Vec::new(),
+        };
+        let reg = ProviderRegistry::from_env();
+        let res = collect_episode_sources(&reg, &ep).await;
+        assert!(res.candidates.is_empty());
+        assert_eq!(res.excluded_sources, 1);
+        assert_eq!(res.excluded_details[0].stage, "matching");
+        assert_eq!(res.excluded_details[0].reason, "episode_mismatch");
     }
 }

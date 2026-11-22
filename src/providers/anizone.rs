@@ -12,7 +12,8 @@ use std::time::Duration;
 
 const BASE_URL: &str = "https://anizone.to";
 const DEFAULT_SUB_SERVER_URL: &str = "https://anizone-prophecy-sub-server.onrender.com";
-const DEFAULT_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0";
+const DEFAULT_UA: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0";
 const MAX_HTML_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PAGES: usize = 64;
 const PAGE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -127,9 +128,9 @@ impl AniZoneClient {
             return false;
         }
         match err {
-            AniZoneError::Network(req_err) => req_err
-                .status()
-                .is_some_and(|s| s == reqwest::StatusCode::FORBIDDEN || s == reqwest::StatusCode::TOO_MANY_REQUESTS),
+            AniZoneError::Network(req_err) => req_err.status().is_some_and(|s| {
+                s == reqwest::StatusCode::FORBIDDEN || s == reqwest::StatusCode::TOO_MANY_REQUESTS
+            }),
             _ => false,
         }
     }
@@ -254,8 +255,9 @@ impl AniZoneClient {
                     .filter_map(|ep| {
                         let number = ep.get("number").and_then(Value::as_u64)? as usize;
                         let ep_season =
-                            ep.get("season").and_then(Value::as_u64).unwrap_or(s_num as u64)
-                                as usize;
+                            ep.get("season")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(s_num as u64) as usize;
                         let ep_id = ep
                             .get("provider_episode_id")
                             .or_else(|| ep.get("id"))
@@ -442,10 +444,7 @@ impl AniZoneClient {
                             .map_err(|_| AniZoneError::Parse("response was not UTF-8".into()))?;
                         return Ok((text, cookies));
                     }
-                    let retryable = matches!(
-                        status.as_u16(),
-                        408 | 429 | 500 | 502 | 503 | 504
-                    );
+                    let retryable = matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504);
                     let err = response.error_for_status().unwrap_err();
                     if !retryable || attempt == 2 {
                         return Err(AniZoneError::Network(err));
@@ -559,7 +558,9 @@ impl AniZoneClient {
             Ok(details) => Ok(details),
             Err(err) if self.should_fallback_to_sub_server(&err) => {
                 if let Some(sub_base) = &self.sub_server_url {
-                    log::warn!("anizone direct details blocked ({err}); falling back to sub-server");
+                    log::warn!(
+                        "anizone direct details blocked ({err}); falling back to sub-server"
+                    );
                     self.prefer_sub_server.store(true, Ordering::Relaxed);
                     return self.details_via_sub_server(sub_base, slug).await;
                 }
@@ -850,9 +851,7 @@ impl AniZoneClient {
                 max_height: None,
             });
         }
-        let watch = self
-            .scrape_watch(slug, source_number)
-            .await?;
+        let watch = self.scrape_watch(slug, source_number).await?;
         let subtitle = watch
             .subtitles
             .iter()
@@ -990,9 +989,10 @@ fn validate_slug(slug: &str) -> Result<&str, AniZoneError> {
     }
 }
 fn normalize_url(value: &str) -> Result<String, AniZoneError> {
-    let value = value.replace("\\/", "/");
-    let url = crate::net::validate_url_syntax(&value, false).map_err(AniZoneError::Parse)?;
-    Ok(url.to_string())
+    let unescaped = value.replace("\\/", "/");
+    let trimmed = unescaped.trim();
+    let _ = crate::net::validate_url_syntax(trimmed, false).map_err(AniZoneError::Parse)?;
+    Ok(trimmed.to_string())
 }
 #[cfg(test)]
 fn parse_search_items(html: &str) -> Result<Vec<SearchItem>, AniZoneError> {

@@ -1185,6 +1185,38 @@ mod tests {
                             track_selection_metadata: None,
                             audio_tracks: Vec::new(),
                             declared_audio_tracks: Vec::new(),
+                            provider_metadata: ProviderSourceMetadata {
+                                provider_id: "moviebox".to_string(),
+                                original_url: Some("https://cdn.example.com/ep1.mp4".to_string()),
+                                original_language: Some("en".to_string()),
+                                original_quality: Some("1080p".to_string()),
+                                ..Default::default()
+                            },
+                            normalized_metadata: NormalizedSourceMetadata {
+                                quality: Some("1080p".to_string()),
+                                resolution_u64: 1080,
+                                declared_languages: vec!["en".to_string()],
+                                primary_language: "English".to_string(),
+                                primary_language_code: Some("en".to_string()),
+                                ..Default::default()
+                            },
+                            media_metadata: MediaProbeMetadata {
+                                http_reachable: true,
+                                manifest_validated: false,
+                                media_probe_validated: false,
+                                playability_status: "http_reachable".to_string(),
+                                device_playback_status: "untested".to_string(),
+                                probed_track_count: 0,
+                            },
+                            detected_language_metadata: DetectedLanguageMetadata {
+                                declared_language: Some("English".to_string()),
+                                declared_language_code: Some("en".to_string()),
+                                detected_language: Some("English".to_string()),
+                                detected_language_code: Some("en".to_string()),
+                                confidence: Some(0.95),
+                                detection_method: "speech_lang_id_model".to_string(),
+                                verification_status: "verified".to_string(),
+                            },
                             quality: Some("1080p".to_string()),
                             resolution_u64: 1080,
                             stream_url: Some("https://cdn.example.com/ep1.mp4".to_string()),
@@ -1403,6 +1435,40 @@ mod tests {
                 playability_status: "manifest_validated".to_string(),
                 audio_tracks: Vec::new(),
                 declared_audio_tracks: Vec::new(),
+                provider_metadata: ProviderSourceMetadata {
+                    provider_id: "moviebox".to_string(),
+                    original_url: Some(mpd_url.clone()),
+                    original_language: Some(code.to_string()),
+                    original_quality: Some("1080p".to_string()),
+                    original_codec: Some("hevc".to_string()),
+                    original_track_ids: vec![aset.to_string()],
+                    ..Default::default()
+                },
+                normalized_metadata: NormalizedSourceMetadata {
+                    quality: Some("1080p".to_string()),
+                    resolution_u64: 1080,
+                    video_codec: Some("hevc".to_string()),
+                    declared_languages: vec![code.to_string()],
+                    primary_language: lang.to_string(),
+                    primary_language_code: Some(code.to_string()),
+                },
+                media_metadata: MediaProbeMetadata {
+                    http_reachable: true,
+                    manifest_validated: true,
+                    media_probe_validated: false,
+                    playability_status: "manifest_validated".to_string(),
+                    device_playback_status: "untested".to_string(),
+                    probed_track_count: 0,
+                },
+                detected_language_metadata: DetectedLanguageMetadata {
+                    declared_language: Some(lang.to_string()),
+                    declared_language_code: Some(code.to_string()),
+                    detected_language: Some(lang.to_string()),
+                    detected_language_code: Some(code.to_string()),
+                    confidence: Some(0.95),
+                    detection_method: "speech_lang_id_model".to_string(),
+                    verification_status: "verified".to_string(),
+                },
                 quality: Some("1080p".to_string()),
                 resolution_u64: 1080,
                 stream_url: Some(mpd_url.clone()),
@@ -1494,5 +1560,105 @@ mod tests {
         assert_eq!(j["track_index"], 1);
         assert_eq!(j["language_code"], "en");
         assert_eq!(j["track_selection_metadata"]["adaptation_set_id"], "3");
+    }
+
+    #[tokio::test]
+    async fn test_cached_and_uncached_episode_sources_metadata_match() {
+        let state = V3AppState::from_env();
+        let mut cov = BTreeMap::new();
+        cov.insert("fourkhdhub".to_string(), "success".to_string());
+        cov.insert("anizone".to_string(), "failed".to_string());
+
+        let anime = CanonicalAnime {
+            id: "NP-A-CACHE".to_string(),
+            slug_token: "cache".to_string(),
+            title: "Cache Test Anime".to_string(),
+            alternative_titles: vec![],
+            media_type: MediaType::Series,
+            year: Some(2024),
+            description: None,
+            poster_url: None,
+            genres: vec![],
+            provider_records: vec![],
+            seasons: vec![CanonicalSeason {
+                id: "NP-S-CACHE".to_string(),
+                anime_id: "NP-A-CACHE".to_string(),
+                season_number: 1,
+                episodes: vec![CanonicalEpisode {
+                    id: "NP-E-CACHE".to_string(),
+                    anime_id: "NP-A-CACHE".to_string(),
+                    season_id: "NP-S-CACHE".to_string(),
+                    season_number: 1,
+                    episode_number: 1,
+                    title: "Episode 1".to_string(),
+                    metadata_status: "verified".to_string(),
+                    overview: None,
+                    provider_mappings: vec![],
+                    audio: Some(AudioAvailability {
+                        hindi: AudioStatus::Unknown,
+                        english: AudioStatus::Unknown,
+                        japanese: AudioStatus::Unknown,
+                        available_languages: vec![],
+                        checked_sources: true,
+                    }),
+                    sources: Some(vec![]),
+                    cached_provider_coverage: Some(cov),
+                    cached_provider_details: vec![ProviderCoverageDetail {
+                        provider: "4KHDHub".to_string(),
+                        request_status: "success".to_string(),
+                        source_count: 2,
+                        validated_source_count: 1,
+                        excluded_source_count: 1,
+                        errors: vec![],
+                    }],
+                    pipeline_stats: PipelineStats {
+                        raw_sources: 2,
+                        parsed_sources: 2,
+                        matched_sources: 2,
+                        resolved_sources: 2,
+                        validated_sources: 2,
+                        returned_sources: 1,
+                    },
+                    excluded_sources_count: 1,
+                    excluded_reasons: vec!["fourkhdhub:merged_duplicate_url".to_string()],
+                    excluded_details: vec![ExcludedSourceRecord {
+                        provider: "fourkhdhub".to_string(),
+                        source_id: Some("src-1".to_string()),
+                        stage: "deduplication".to_string(),
+                        reason: "merged_duplicate_url".to_string(),
+                    }],
+                }],
+            }],
+            total_seasons: 1,
+            total_episodes: 1,
+            season_structure_status: "verified".to_string(),
+            details_hydrated: true,
+        };
+        let session = state.sessions.create_session(vec![anime]).await;
+        let sid = session.read().await.session_id.clone();
+        let addr = spawn_test_server(state).await;
+        let hdrs = [("X-PV-Session", sid.as_str())];
+
+        let (st1, j1) = send_http(
+            addr,
+            "GET",
+            "/api/v1/episodes/NP-E-CACHE/sources",
+            &hdrs,
+            None,
+        )
+        .await;
+        let (st2, j2) = send_http(
+            addr,
+            "GET",
+            "/api/v1/episodes/NP-E-CACHE/sources",
+            &hdrs,
+            None,
+        )
+        .await;
+        assert_eq!(st1, 200);
+        assert_eq!(st2, 200);
+        assert_eq!(j1, j2);
+        assert_eq!(j1["provider_coverage"]["fourkhdhub"], "success");
+        assert_eq!(j1["provider_coverage"]["anizone"], "failed");
     }
 }

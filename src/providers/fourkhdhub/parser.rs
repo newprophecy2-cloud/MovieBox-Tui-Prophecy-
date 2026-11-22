@@ -212,7 +212,8 @@ pub fn parse_releases(
     let size_selector = &*SEL_BADGE_SIZE;
     let page_language =
         find_metadata(&document, "Audios:").and_then(|value| normalize_language_label(&value));
-    let mut grouped: HashMap<String, Release> = HashMap::new();
+    let mut grouped: HashMap<(String, Option<String>, Option<String>, Option<String>), Release> =
+        HashMap::new();
 
     for item in document.select(item_selector) {
         let filename = text_of(item.select(filename_selector).next()).unwrap_or_default();
@@ -226,8 +227,8 @@ pub fn parse_releases(
         let mirrors = item
             .select(link_selector)
             .filter_map(|link| {
-                let href = link.value().attr("href")?;
-                let validated = crate::net::validate_url_syntax(href, false).ok()?;
+                let raw_href = link.value().attr("href")?.trim();
+                let validated = crate::net::validate_url_syntax(raw_href, false).ok()?;
                 let host = validated.host_str()?.to_ascii_lowercase();
                 if validated.path().to_ascii_lowercase().contains("logout") {
                     return None;
@@ -235,7 +236,9 @@ pub fn parse_releases(
                 let label = text_of(Some(link)).unwrap_or_else(|| "Source".into());
                 Some(SourceMirror {
                     label,
-                    resolver_url: validated.to_string(),
+                    // Preserve the exact original href byte-for-byte so signed URLs
+                    // (e.g., Cloudflare R2 / S3 presigned query params) are never mutated.
+                    resolver_url: raw_href.to_string(),
                     headers: Vec::new(),
                     direct_file: !host.contains("hubcloud.")
                         && !host.contains("hubdrive.")
@@ -251,21 +254,33 @@ pub fn parse_releases(
             .select(size_selector)
             .filter_map(|node| text_of(Some(node)))
             .find(|text| crate::providers::models::parse_size_bytes(text).is_some());
-        let key = normalize_filename(&filename);
+        let quality = detect_quality(&filename);
+        let codec = detect_codec(&filename);
+        let language = detect_language(&filename).or_else(|| page_language.clone());
+        let size_bytes = size_text
+            .as_deref()
+            .and_then(crate::providers::models::parse_size_bytes);
+        let key = (
+            normalize_filename(&filename),
+            quality.clone(),
+            codec.clone(),
+            language.clone(),
+        );
         let release = grouped.entry(key).or_insert_with(|| Release {
             provider: ProviderKind::FourKHdHub,
-            quality: detect_quality(&filename),
-            codec: detect_codec(&filename),
-            language: detect_language(&filename).or_else(|| page_language.clone()),
-            size_bytes: size_text
-                .as_deref()
-                .and_then(crate::providers::models::parse_size_bytes),
+            quality,
+            codec,
+            language,
+            size_bytes,
             season: parsed_episode.map(|value| value.0),
             episode: parsed_episode.map(|value| value.1),
             filename: filename.clone(),
             mirrors: Vec::new(),
             resource_id: None,
         });
+        if release.size_bytes.is_none() && size_bytes.is_some() {
+            release.size_bytes = size_bytes;
+        }
         for mirror in mirrors {
             if !release
                 .mirrors
@@ -716,10 +731,10 @@ mod tests {
     }
 
     #[test]
-    fn release_mirror_filter_normalizes_https_and_rejects_invalid_targets() {
+    fn release_mirror_filter_preserves_valid_https_and_rejects_invalid_targets() {
         let releases = parse_releases(
             r#"<div class="download-item"><div class="file-title">Example.1080p.mp4</div>
-                <a href="HTTPS://Example.com/video.mp4">valid</a>
+                <a href="https://example.com/video.mp4">valid</a>
                 <a href="https://example.com/LOGOUT">logout</a>
                 <a href="http://example.com/video.mp4">http</a>
                 <a href="https://localhost/video.mp4">localhost</a>
@@ -734,6 +749,58 @@ mod tests {
             releases[0].mirrors[0].resolver_url,
             "https://example.com/video.mp4"
         );
+    }
+
+    #[test]
+    fn test_signed_url_preserved_byte_for_byte() {
+        let signed = "https://pub-example.r2.cloudflarestorage.com/anime/Black.Clover.S01E01.mkv?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=DUMMY%2F20261122%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261122T000000Z&X-Amz-Expires=3600&X-Amz-SignedHeaders=host&X-Amz-Signature=deadbeef0123456789abcdef&response-content-disposition=attachment%3B%20filename%3D%22Black%20Clover%20%5B1080p%5D.mkv%22";
+        let html = format!(
+            r#"<div id="episodes"><div class="episode-download-item"><div class="episode-file-title">Black.Clover.S01E01.1080p.Hindi.x265.mkv</div><a href="{signed}">Direct</a></div></div>"#
+        );
+        let releases = parse_releases(&html, 1, 1).unwrap();
+        assert_eq!(releases.len(), 1);
+        assert_eq!(releases[0].mirrors.len(), 1);
+        assert_eq!(releases[0].mirrors[0].resolver_url, signed);
+        let validated =
+            crate::providers::fourkhdhub::hubcloud::validate_playback_url(signed).unwrap();
+        assert_eq!(validated, signed);
+    }
+
+    #[test]
+    fn test_fourkhdhub_grouping_keeps_distinct_quality_codec_language_separate() {
+        let html = r#"<div id="episodes">
+            <div class="episode-download-item">
+                <div class="episode-file-title">Black.Clover.S01E01.1080p.Hindi.x264.mkv</div>
+                <a href="https://cdn.example.com/bc-1080-hi-x264.mkv">Mirror 1</a>
+            </div>
+            <div class="episode-download-item">
+                <div class="episode-file-title">Black.Clover.S01E01.1080p.English.x265.mkv</div>
+                <a href="https://cdn.example.com/bc-1080-en-x265.mkv">Mirror 2</a>
+            </div>
+            <div class="episode-download-item">
+                <div class="episode-file-title">Black.Clover.S01E01.720p.Hindi.x264.mkv</div>
+                <a href="https://cdn.example.com/bc-720-hi-x264.mkv">Mirror 3</a>
+            </div>
+        </div>"#;
+        let releases = parse_releases(html, 1, 1).unwrap();
+        assert_eq!(releases.len(), 3);
+        assert!(
+            releases
+                .iter()
+                .any(|r| r.quality.as_deref() == Some("1080p")
+                    && r.codec.as_deref() == Some("H.264")
+                    && r.language.as_deref() == Some("Hindi"))
+        );
+        assert!(
+            releases
+                .iter()
+                .any(|r| r.quality.as_deref() == Some("1080p")
+                    && r.codec.as_deref() == Some("H.265")
+                    && r.language.as_deref() == Some("English"))
+        );
+        assert!(releases.iter().any(|r| r.quality.as_deref() == Some("720p")
+            && r.codec.as_deref() == Some("H.264")
+            && r.language.as_deref() == Some("Hindi")));
     }
 
     #[test]

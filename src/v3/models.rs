@@ -120,6 +120,69 @@ pub struct ProviderCoverageDetail {
     pub errors: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderSourceMetadata {
+    pub provider_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_source_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mirror_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_filename: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_quality: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_codec: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub original_track_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NormalizedSourceMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quality: Option<String>,
+    pub resolution_u64: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_codec: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declared_languages: Vec<String>,
+    pub primary_language: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary_language_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MediaProbeMetadata {
+    pub http_reachable: bool,
+    pub manifest_validated: bool,
+    pub media_probe_validated: bool,
+    pub playability_status: String,
+    pub device_playback_status: String,
+    pub probed_track_count: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct DetectedLanguageMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declared_language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declared_language_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detected_language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detected_language_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
+    pub detection_method: String,
+    pub verification_status: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AudioTrackItem {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -128,6 +191,8 @@ pub struct AudioTrackItem {
     pub track_index: Option<usize>,
     pub language: String,
     pub language_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_language_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub declared_language: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -144,6 +209,8 @@ pub struct AudioTrackItem {
     pub sample_rate: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_default: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     pub verification_status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub track_selection_metadata: Option<TrackSelectionMetadata>,
@@ -179,6 +246,10 @@ pub struct ProviderSourceCandidate {
     pub track_selection_metadata: Option<TrackSelectionMetadata>,
     pub audio_tracks: Vec<AudioTrackItem>,
     pub declared_audio_tracks: Vec<AudioTrackItem>,
+    pub provider_metadata: ProviderSourceMetadata,
+    pub normalized_metadata: NormalizedSourceMetadata,
+    pub media_metadata: MediaProbeMetadata,
+    pub detected_language_metadata: DetectedLanguageMetadata,
     pub quality: Option<String>,
     pub resolution_u64: u64,
     pub stream_url: Option<String>,
@@ -394,6 +465,10 @@ pub struct PublicSourceItem {
     pub audio_tracks: Vec<AudioTrackItem>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub declared_audio_tracks: Vec<AudioTrackItem>,
+    pub provider_metadata: ProviderSourceMetadata,
+    pub normalized_metadata: NormalizedSourceMetadata,
+    pub media_metadata: MediaProbeMetadata,
+    pub detected_language_metadata: DetectedLanguageMetadata,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub headers: HashMap<String, String>,
     pub availability_status: &'static str,
@@ -472,6 +547,10 @@ pub struct ResolveSuccessResponse {
     pub track_selection_metadata: Option<TrackSelectionMetadata>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub audio_tracks: Vec<AudioTrackItem>,
+    pub provider_metadata: ProviderSourceMetadata,
+    pub normalized_metadata: NormalizedSourceMetadata,
+    pub media_metadata: MediaProbeMetadata,
+    pub detected_language_metadata: DetectedLanguageMetadata,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub headers: HashMap<String, String>,
 }

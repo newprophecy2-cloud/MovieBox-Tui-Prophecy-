@@ -93,6 +93,7 @@ pub struct FfprobeAudioStream {
     pub channels: Option<String>,
     pub sample_rate: Option<String>,
     pub is_default: Option<bool>,
+    pub original_language_code: Option<String>,
     pub declared_language_code: Option<String>,
 }
 
@@ -128,11 +129,14 @@ pub fn parse_ffprobe_audio_json(json_str: &str) -> Vec<FfprobeAudioStream> {
         .into_iter()
         .enumerate()
         .map(|(idx, s)| {
-            let lang_tag = s
+            let raw_lang = s
                 .tags
                 .get("language")
                 .or_else(|| s.tags.get("LANGUAGE"))
-                .map(String::as_str)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty());
+            let lang_tag = raw_lang
+                .as_deref()
                 .filter(|v| !v.eq_ignore_ascii_case("und"))
                 .and_then(normalize_language_code);
             FfprobeAudioStream {
@@ -142,6 +146,7 @@ pub fn parse_ffprobe_audio_json(json_str: &str) -> Vec<FfprobeAudioStream> {
                 channels: s.channels.map(|c| c.to_string()),
                 sample_rate: s.sample_rate,
                 is_default: s.disposition.map(|d| d.default != 0),
+                original_language_code: raw_lang,
                 declared_language_code: lang_tag,
             }
         })
@@ -496,9 +501,12 @@ pub async fn classify_wav_bytes(wav: Vec<u8>, config: &AudioIdConfig) -> SpeechI
         return match req.send().await {
             Ok(resp) if resp.status().is_success() => {
                 match resp.json::<ExternalLangIdResponse>().await {
-                    Ok(pred) => {
-                        evaluate_model_prediction(pred, Some(duration), config.min_confidence)
-                    }
+                    Ok(pred) => evaluate_model_prediction_with_languages(
+                        pred,
+                        Some(duration),
+                        config.min_confidence,
+                        &config.supported_languages,
+                    ),
                     Err(_) => SpeechIdResult {
                         language_code: None,
                         confidence: None,
@@ -528,7 +536,7 @@ pub async fn classify_wav_bytes(wav: Vec<u8>, config: &AudioIdConfig) -> SpeechI
             "contents": [{
                 "parts": [
                     {
-                        "text": "Identify the primary spoken language in this audio clip. Return ONLY JSON with fields: language_code (one of \"hi\", \"en\", \"ja\", or null if unknown/music/mixed), confidence (0.0 to 1.0), speech_detected (boolean), mixed_languages (boolean)."
+                        "text": "Identify the primary spoken language in this audio clip. Return ONLY JSON with fields: language_code (ISO-639-1 code such as \"hi\", \"en\", \"ja\", \"bn\", \"ta\", \"te\", \"ko\", \"es\", \"fr\", \"de\", or null if unknown/music/mixed), confidence (0.0 to 1.0), speech_detected (boolean), mixed_languages (boolean)."
                     },
                     {
                         "inline_data": {
@@ -548,7 +556,12 @@ pub async fn classify_wav_bytes(wav: Vec<u8>, config: &AudioIdConfig) -> SpeechI
             && let Some(text) = val["candidates"][0]["content"]["parts"][0]["text"].as_str()
             && let Ok(pred) = serde_json::from_str::<ExternalLangIdResponse>(text)
         {
-            let mut res = evaluate_model_prediction(pred, Some(duration), config.min_confidence);
+            let mut res = evaluate_model_prediction_with_languages(
+                pred,
+                Some(duration),
+                config.min_confidence,
+                &config.supported_languages,
+            );
             res.detection_method = "gemini_audio_lang_id".to_string();
             return res;
         }
@@ -809,5 +822,53 @@ mod tests {
         assert_eq!(res2.verification_status, "inconclusive");
 
         let _ = std::fs::remove_file(&tmp_mkv);
+    }
+
+    #[tokio::test]
+    async fn test_missing_language_detector_returns_unverified_without_failing() {
+        let cfg = AudioIdConfig {
+            sample_seconds: 30,
+            model_url: None,
+            model_api_key: None,
+            gemini_api_key: None,
+            gemini_model: "gemini-2.5-flash".to_string(),
+            min_confidence: 0.75,
+            supported_languages: DEFAULT_SUPPORTED_LANGUAGES
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+        };
+        assert!(!cfg.is_configured());
+        let res = identify_track_audio_language(
+            "https://cdn.example.com/sample.mkv",
+            &HashMap::new(),
+            Some(0),
+            &cfg,
+        )
+        .await;
+        assert_eq!(res.language_code, None);
+        assert_eq!(res.detection_method, "none_configured");
+        assert_eq!(res.verification_status, "unverified");
+    }
+
+    #[tokio::test]
+    async fn test_gemini_failure_does_not_break_backend() {
+        let cfg = AudioIdConfig {
+            sample_seconds: 30,
+            model_url: None,
+            model_api_key: None,
+            gemini_api_key: Some("invalid-test-key".to_string()),
+            gemini_model: "nonexistent-model-test".to_string(),
+            min_confidence: 0.75,
+            supported_languages: DEFAULT_SUPPORTED_LANGUAGES
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+        };
+        let wav = make_wav(8000, 2);
+        let res = classify_wav_bytes(wav, &cfg).await;
+        assert_eq!(res.language_code, None);
+        assert_eq!(res.detection_method, "gemini_audio_lang_id");
+        assert_eq!(res.verification_status, "unavailable");
     }
 }

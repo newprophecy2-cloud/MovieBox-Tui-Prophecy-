@@ -433,7 +433,12 @@ impl FourKHdHubClient {
                     )));
                 }
             }
-            Ok((final_url.to_string(), is_seekable))
+            let final_str = if final_url.as_str() == validated_url {
+                validated_url
+            } else {
+                final_url.to_string()
+            };
+            Ok((final_str, is_seekable))
         };
 
         tokio::time::timeout(std::time::Duration::from_secs(6), probe)
