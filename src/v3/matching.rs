@@ -524,6 +524,8 @@ pub fn build_canonical_structure(anime: &mut CanonicalAnime) {
             provider_mappings: mappings,
             audio: None,
             sources: None,
+            excluded_sources_count: 0,
+            excluded_reasons: Vec::new(),
         };
         seasons_map
             .entry((is_special, season_num))

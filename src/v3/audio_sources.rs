@@ -2,7 +2,7 @@ use crate::providers::models::{ProviderKind, Release};
 use crate::unified::normalize_language_code;
 use crate::v3::audio_id::{AudioIdConfig, SpeechIdResult, identify_track_audio_language};
 use crate::v3::models::{
-    AudioAvailability, AudioStatus, CanonicalEpisode, ProviderSourceCandidate,
+    AudioAvailability, AudioStatus, AudioTrackItem, CanonicalEpisode, ProviderSourceCandidate,
     ProviderSourcesGroup, PublicSourceItem, ResolveSuccessResponse, TrackSelectionMetadata,
 };
 use crate::v3::providers::{ProviderRegistry, provider_display_name, provider_key};
@@ -341,13 +341,74 @@ pub fn extract_verified_language(rel: &Release) -> Option<String> {
     rel.language.as_deref().and_then(normalize_language_code)
 }
 
+async fn validate_stream_url_and_inspect(
+    url: &str,
+    headers: &HashMap<String, String>,
+) -> Result<Vec<ManifestAudioTrack>, String> {
+    if crate::net::validate_public_url(url, true).await.is_err() {
+        return Err("invalid_or_private_url".to_string());
+    }
+
+    let lower = url.to_ascii_lowercase();
+    let is_mpd = lower.contains(".mpd");
+    let is_m3u8 = lower.contains(".m3u8");
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(6))
+        .build()
+        .map_err(|_| "http_client_error".to_string())?;
+
+    let mut req = client.get(url);
+    if !is_mpd && !is_m3u8 {
+        req = req.header("Range", "bytes=0-1023");
+    }
+    for (k, v) in headers {
+        req = req.header(k.as_str(), v.as_str());
+    }
+
+    let resp = req.send().await.map_err(|_| "request_failed".to_string())?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("http_{}", status.as_u16()));
+    }
+
+    if is_mpd || is_m3u8 {
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|_| "manifest_read_failed".to_string())?;
+        if bytes.len() > 512 * 1024 {
+            return Err("manifest_too_large".to_string());
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        if is_mpd {
+            if !text.contains("<MPD") {
+                return Err("invalid_mpd_manifest".to_string());
+            }
+            return Ok(parse_dash_mpd_audio_tracks(&text));
+        }
+        if !text.contains("#EXTM3U") {
+            return Err("invalid_m3u8_manifest".to_string());
+        }
+        return Ok(parse_hls_m3u8_audio_tracks(&text));
+    }
+
+    Ok(Vec::new())
+}
+
 pub async fn collect_episode_sources(
     registry: &ProviderRegistry,
     episode: &CanonicalEpisode,
-) -> (Vec<ProviderSourceCandidate>, bool, BTreeMap<String, String>) {
+) -> (
+    Vec<ProviderSourceCandidate>,
+    bool,
+    BTreeMap<String, String>,
+    usize,
+    Vec<String>,
+) {
     let mut coverage = BTreeMap::new();
     if episode.provider_mappings.is_empty() {
-        return (Vec::new(), true, coverage);
+        return (Vec::new(), true, coverage, 0, Vec::new());
     }
 
     let futs = episode.provider_mappings.iter().map(|mapping| {
@@ -367,18 +428,38 @@ pub async fn collect_episode_sources(
     });
 
     let outcomes = futures::future::join_all(futs).await;
-    let mut raw_releases = Vec::new();
+    let mut mirror_tasks = Vec::new();
     let mut any_succeeded = false;
+    let mut excluded_sources = 0usize;
+    let mut excluded_reasons: Vec<String> = Vec::new();
 
     for (mapping, outcome) in outcomes {
         let pkey = provider_key(mapping.provider_id).to_string();
         match outcome {
             Ok(releases) => {
                 any_succeeded = true;
-                coverage.insert(pkey, "success".to_string());
+                coverage.insert(pkey.clone(), "success".to_string());
                 for rel in releases {
-                    if is_candidate_valid(&rel) {
-                        raw_releases.push((mapping.clone(), rel));
+                    if rel.mirrors.is_empty() {
+                        excluded_sources += 1;
+                        if excluded_reasons.len() < 20 {
+                            excluded_reasons.push(format!("{pkey}:empty_mirrors"));
+                        }
+                        continue;
+                    }
+                    // Phase 2: Enumerate EVERY mirror variant across every provider (never .first())
+                    for mirror in &rel.mirrors {
+                        let u = mirror.resolver_url.trim();
+                        if u.is_empty() || crate::net::validate_url_syntax(u, true).is_err() {
+                            excluded_sources += 1;
+                            if excluded_reasons.len() < 20 {
+                                excluded_reasons.push(format!("{pkey}:invalid_mirror_url"));
+                            }
+                            continue;
+                        }
+                        let mut single_rel = rel.clone();
+                        single_rel.mirrors = vec![mirror.clone()];
+                        mirror_tasks.push((mapping.clone(), single_rel, mirror.clone()));
                     }
                 }
             }
@@ -393,42 +474,59 @@ pub async fn collect_episode_sources(
         }
     }
 
-    // Inspect DASH/MPD and HLS/M3U8 manifests concurrently for direct stream URLs
-    let inspect_futs = raw_releases.iter().map(|(mapping, rel)| async move {
-        let primary_mirror = rel.mirrors.first();
-        let mut headers = HashMap::new();
-        if let Some(m) = primary_mirror {
-            for (k, v) in &m.headers {
-                if k.eq_ignore_ascii_case("referer")
-                    || k.eq_ignore_ascii_case("user-agent")
-                    || k.eq_ignore_ascii_case("origin")
-                {
-                    headers.insert(k.clone(), v.clone());
+    // Resolve non-direct mirrors and validate every stream URL concurrently
+    let validate_futs = mirror_tasks
+        .into_iter()
+        .map(|(mapping, single_rel, mirror)| {
+            let reg = registry.clone();
+            async move {
+                let pkey = provider_key(mapping.provider_id);
+                let (resolved_url, raw_headers) = if mirror.direct_file {
+                    (mirror.resolver_url.clone(), mirror.headers.clone())
+                } else {
+                    match reg.resolve_release(mapping.provider_id, &single_rel).await {
+                        Ok((u, h)) => (u, h),
+                        Err(_) => {
+                            return Err(format!("{pkey}:resolve_failed"));
+                        }
+                    }
+                };
+
+                let mut headers = HashMap::new();
+                for (k, v) in raw_headers {
+                    if k.eq_ignore_ascii_case("referer")
+                        || k.eq_ignore_ascii_case("user-agent")
+                        || k.eq_ignore_ascii_case("origin")
+                    {
+                        headers.insert(k, v);
+                    }
+                }
+
+                match validate_stream_url_and_inspect(&resolved_url, &headers).await {
+                    Ok(tracks) => Ok((mapping, single_rel, resolved_url, headers, tracks)),
+                    Err(reason) => Err(format!("{pkey}:{reason}")),
                 }
             }
-        }
-        let tracks = if let Some(m) = primary_mirror.filter(|m| m.direct_file) {
-            inspect_manifest_audio_tracks(&m.resolver_url, &headers).await
-        } else {
-            Vec::new()
-        };
-        (mapping.clone(), rel.clone(), headers, tracks)
-    });
+        });
 
-    let inspected = futures::future::join_all(inspect_futs).await;
+    let validated = futures::future::join_all(validate_futs).await;
     let audio_id_cfg = AudioIdConfig::from_env();
     let mut candidates = Vec::new();
     let mut idx = 0usize;
     let mut seen_records: HashSet<(ProviderKind, String, Option<String>)> = HashSet::new();
 
-    for (mapping, rel, headers, tracks) in inspected {
-        let primary_mirror = rel.mirrors.first();
-        let primary_url = primary_mirror
-            .map(|m| m.resolver_url.trim().to_string())
-            .unwrap_or_default();
-        let stream_url = primary_mirror
-            .filter(|m| m.direct_file)
-            .map(|m| m.resolver_url.clone());
+    for item in validated {
+        let (mapping, rel, resolved_url, headers, tracks) = match item {
+            Ok(v) => v,
+            Err(reason) => {
+                excluded_sources += 1;
+                if excluded_reasons.len() < 20 {
+                    excluded_reasons.push(reason);
+                }
+                continue;
+            }
+        };
+
         let provider_ep_id = mapping.provider_episode_id.clone().unwrap_or_else(|| {
             format!(
                 "{}:{}",
@@ -437,9 +535,7 @@ pub async fn collect_episode_sources(
         });
 
         if tracks.is_empty() {
-            if !primary_url.is_empty()
-                && !seen_records.insert((mapping.provider_id, primary_url.clone(), None))
-            {
+            if !seen_records.insert((mapping.provider_id, resolved_url.clone(), None)) {
                 continue;
             }
             idx += 1;
@@ -447,23 +543,25 @@ pub async fn collect_episode_sources(
             let declared_lang = declared_code
                 .as_deref()
                 .map(|c| language_display_name(Some(c)));
-            let speech: SpeechIdResult = if let Some(ref s_url) = stream_url {
-                identify_track_audio_language(s_url, &headers, None, &audio_id_cfg).await
-            } else {
-                SpeechIdResult {
-                    language_code: None,
-                    confidence: None,
-                    sample_duration_seconds: None,
-                    detection_method: "resolver_only".to_string(),
-                    verification_status: "unverified".to_string(),
-                }
-            };
+            let speech: SpeechIdResult =
+                identify_track_audio_language(&resolved_url, &headers, None, &audio_id_cfg).await;
             let verified_code = if speech.verification_status == "verified" {
                 speech.language_code.clone()
             } else {
                 None
             };
             let audio_languages: Vec<String> = verified_code.iter().cloned().collect();
+            let lang_display = language_display_name(verified_code.as_deref());
+            let track_item = AudioTrackItem {
+                track_id: None,
+                track_index: None,
+                language: lang_display.clone(),
+                language_code: verified_code.clone(),
+                codec: None,
+                channels: None,
+                verification_status: speech.verification_status.clone(),
+                track_selection_metadata: None,
+            };
             candidates.push(ProviderSourceCandidate {
                 source_id: format!("src-{idx}"),
                 provider_id: mapping.provider_id,
@@ -478,7 +576,7 @@ pub async fn collect_episode_sources(
                 audio_languages,
                 track_index: None,
                 provider_track_id: None,
-                language: language_display_name(verified_code.as_deref()),
+                language: lang_display,
                 language_code: verified_code,
                 declared_language: declared_lang,
                 declared_language_code: declared_code,
@@ -489,21 +587,20 @@ pub async fn collect_episode_sources(
                 detection_method: speech.detection_method,
                 confidence: speech.confidence,
                 verification_status: speech.verification_status,
+                playability_status: "server_validated".to_string(),
                 track_selection_metadata: None,
-                stream_url,
+                audio_tracks: vec![track_item],
+                stream_url: Some(resolved_url),
                 headers,
                 available: true,
             });
         } else {
-            // One independently selectable audio track = one source entry (same stream_url preserved)
             for track in tracks {
-                if !primary_url.is_empty()
-                    && !seen_records.insert((
-                        mapping.provider_id,
-                        primary_url.clone(),
-                        Some(track.audio_track_id.clone()),
-                    ))
-                {
+                if !seen_records.insert((
+                    mapping.provider_id,
+                    resolved_url.clone(),
+                    Some(track.audio_track_id.clone()),
+                )) {
                     continue;
                 }
                 idx += 1;
@@ -514,23 +611,13 @@ pub async fn collect_episode_sources(
                 let declared_lang = declared_code
                     .as_deref()
                     .map(|c| language_display_name(Some(c)));
-                let speech: SpeechIdResult = if let Some(ref s_url) = stream_url {
-                    identify_track_audio_language(
-                        s_url,
-                        &headers,
-                        Some(track.track_index),
-                        &audio_id_cfg,
-                    )
-                    .await
-                } else {
-                    SpeechIdResult {
-                        language_code: None,
-                        confidence: None,
-                        sample_duration_seconds: None,
-                        detection_method: "resolver_only".to_string(),
-                        verification_status: "unverified".to_string(),
-                    }
-                };
+                let speech: SpeechIdResult = identify_track_audio_language(
+                    &resolved_url,
+                    &headers,
+                    Some(track.track_index),
+                    &audio_id_cfg,
+                )
+                .await;
                 let verified_code = if speech.verification_status == "verified" {
                     speech.language_code.clone()
                 } else {
@@ -538,6 +625,16 @@ pub async fn collect_episode_sources(
                 };
                 let audio_languages: Vec<String> = verified_code.iter().cloned().collect();
                 let language = language_display_name(verified_code.as_deref());
+                let track_item = AudioTrackItem {
+                    track_id: Some(track.audio_track_id.clone()),
+                    track_index: Some(track.track_index),
+                    language: language.clone(),
+                    language_code: verified_code.clone(),
+                    codec: track.audio_codec.clone(),
+                    channels: track.channels.clone(),
+                    verification_status: speech.verification_status.clone(),
+                    track_selection_metadata: Some(track.track_selection_metadata.clone()),
+                };
                 candidates.push(ProviderSourceCandidate {
                     source_id: format!("src-{idx}"),
                     provider_id: mapping.provider_id,
@@ -563,8 +660,10 @@ pub async fn collect_episode_sources(
                     detection_method: speech.detection_method,
                     confidence: speech.confidence,
                     verification_status: speech.verification_status,
+                    playability_status: "server_validated".to_string(),
                     track_selection_metadata: Some(track.track_selection_metadata),
-                    stream_url: stream_url.clone(),
+                    audio_tracks: vec![track_item],
+                    stream_url: Some(resolved_url.clone()),
                     headers: headers.clone(),
                     available: true,
                 });
@@ -573,7 +672,13 @@ pub async fn collect_episode_sources(
     }
 
     rank_candidates(&mut candidates, None, None);
-    (candidates, !any_succeeded, coverage)
+    (
+        candidates,
+        !any_succeeded,
+        coverage,
+        excluded_sources,
+        excluded_reasons,
+    )
 }
 
 pub fn to_public_source_item(c: &ProviderSourceCandidate) -> PublicSourceItem {
@@ -596,7 +701,9 @@ pub fn to_public_source_item(c: &ProviderSourceCandidate) -> PublicSourceItem {
         detection_method: c.detection_method.clone(),
         confidence: c.confidence,
         verification_status: c.verification_status.clone(),
+        playability_status: c.playability_status.clone(),
         track_selection_metadata: c.track_selection_metadata.clone(),
+        audio_tracks: c.audio_tracks.clone(),
         headers: c.headers.clone(),
         availability_status: if c.available {
             "available"
@@ -788,10 +895,22 @@ pub async fn resolve_episode_stream(
         if !candidate.available {
             continue;
         }
-        match registry
-            .resolve_release(candidate.provider_id, &candidate.release)
-            .await
+        let resolved = if let Some(ref pre_url) = candidate.stream_url
+            && candidate.playability_status == "server_validated"
         {
+            let hdrs: Vec<(String, String)> = candidate
+                .headers
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            Ok((pre_url.clone(), hdrs))
+        } else {
+            registry
+                .resolve_release(candidate.provider_id, &candidate.release)
+                .await
+        };
+
+        match resolved {
             Ok((url, headers)) => {
                 if let Err(err) = crate::net::validate_public_url(&url, true).await {
                     log::warn!(
@@ -832,7 +951,9 @@ pub async fn resolve_episode_stream(
                     detection_method: candidate.detection_method,
                     confidence: candidate.confidence,
                     verification_status: candidate.verification_status,
+                    playability_status: candidate.playability_status,
                     track_selection_metadata: candidate.track_selection_metadata,
+                    audio_tracks: candidate.audio_tracks,
                     headers: safe_headers,
                 });
             }
@@ -911,7 +1032,9 @@ mod tests {
             } else {
                 "unverified".to_string()
             },
+            playability_status: "server_validated".to_string(),
             track_selection_metadata: None,
+            audio_tracks: Vec::new(),
             quality: quality.map(str::to_string),
             resolution_u64: quality.and_then(parse_quality_target).unwrap_or(0),
             stream_url: Some(url.to_string()),
@@ -1121,6 +1244,8 @@ video.m3u8"#;
             provider_mappings: vec![],
             audio: None,
             sources: None,
+            excluded_sources_count: 0,
+            excluded_reasons: Vec::new(),
         };
         let reg = ProviderRegistry::from_env();
         let res = resolve_episode_stream(&reg, &ep, &[fake_hi], None, Some("hi"), None).await;

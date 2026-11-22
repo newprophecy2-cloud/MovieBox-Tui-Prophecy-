@@ -398,9 +398,9 @@ async fn handle_search(
         .await;
     }
 
-    let mut canonical =
-        merge_search_results(normalized, state.sessions.config().max_search_results);
+    let mut canonical = merge_search_results(normalized, usize::MAX);
     canonical.retain(|a| query_matches_anime(trimmed, a));
+    canonical.truncate(state.sessions.config().max_search_results);
 
     let results: Vec<SearchAnimeItem> = canonical
         .iter()
@@ -723,7 +723,8 @@ async fn ensure_episode_sources_hydrated(
         return Ok((episode, srcs, audio, cov));
     }
 
-    let (srcs, all_failed, cov) = collect_episode_sources(&state.registry, &episode).await;
+    let (srcs, all_failed, cov, excluded_count, excluded_reasons) =
+        collect_episode_sources(&state.registry, &episode).await;
     let audio = compute_audio_availability(&srcs, all_failed);
 
     {
@@ -735,6 +736,8 @@ async fn ensure_episode_sources_hydrated(
         {
             ep.sources = Some(srcs.clone());
             ep.audio = Some(audio.clone());
+            ep.excluded_sources_count = excluded_count;
+            ep.excluded_reasons = excluded_reasons;
             episode = ep.clone();
         }
     }
@@ -782,7 +785,7 @@ async fn handle_episode_sources(
     session: Arc<tokio::sync::RwLock<TemporarySession>>,
     state: &V3AppState,
 ) -> std::io::Result<u16> {
-    let (episode, srcs, _audio, provider_coverage) =
+    let (episode, srcs, audio, provider_coverage) =
         match ensure_episode_sources_hydrated(episode_id, &session, state).await {
             Ok(v) => v,
             Err((st, code, msg)) => return write_error(stream, st, code, &msg, None).await,
@@ -790,6 +793,10 @@ async fn handle_episode_sources(
 
     let providers = group_sources_by_provider(&srcs);
     let total_sources: usize = providers.iter().map(|g| g.sources.len()).sum();
+    let verified_sources = srcs
+        .iter()
+        .filter(|s| s.verification_status == "verified")
+        .count();
 
     write_json(
         stream,
@@ -798,6 +805,10 @@ async fn handle_episode_sources(
             status: "success",
             episode_id: episode.id,
             total_sources,
+            verified_sources,
+            excluded_sources: episode.excluded_sources_count,
+            excluded_reasons: episode.excluded_reasons,
+            available_languages: audio.available_languages,
             provider_coverage,
             providers,
         },
@@ -1153,13 +1164,17 @@ mod tests {
                             detection_method: "speech_lang_id_model".to_string(),
                             confidence: Some(0.95),
                             verification_status: "verified".to_string(),
+                            playability_status: "server_validated".to_string(),
                             track_selection_metadata: None,
+                            audio_tracks: Vec::new(),
                             quality: Some("1080p".to_string()),
                             resolution_u64: 1080,
                             stream_url: Some("https://cdn.example.com/ep1.mp4".to_string()),
                             headers: HashMap::new(),
                             available: true,
                         }]),
+                        excluded_sources_count: 0,
+                        excluded_reasons: Vec::new(),
                     },
                     CanonicalEpisode {
                         id: "NP-E-002".to_string(),
@@ -1179,6 +1194,8 @@ mod tests {
                             checked_sources: true,
                         }),
                         sources: Some(vec![]),
+                        excluded_sources_count: 0,
+                        excluded_reasons: Vec::new(),
                     },
                 ],
             }],
@@ -1355,6 +1372,8 @@ mod tests {
                     rendition_name: None,
                     language_code: Some(code.to_string()),
                 }),
+                playability_status: "server_validated".to_string(),
+                audio_tracks: Vec::new(),
                 quality: Some("1080p".to_string()),
                 resolution_u64: 1080,
                 stream_url: Some(mpd_url.clone()),
@@ -1398,6 +1417,8 @@ mod tests {
                         make_track_cand("src-1", 0, "hi", "Hindi", "2"),
                         make_track_cand("src-2", 1, "en", "English", "3"),
                     ]),
+                    excluded_sources_count: 0,
+                    excluded_reasons: Vec::new(),
                 }],
             }],
             total_seasons: 1,
