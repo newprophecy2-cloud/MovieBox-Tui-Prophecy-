@@ -350,6 +350,8 @@ pub fn moviebox_details_json_to_media_details(
     let mut seasons = Vec::new();
     if let Some(seasons_arr) = subject
         .get("seasons")
+        .or_else(|| payload.get("seasons"))
+        .or_else(|| payload.get("data").and_then(|d| d.get("seasons")))
         .and_then(|s| s.get("seasons").or(Some(s)))
         .and_then(|s| s.as_array())
     {
@@ -1137,8 +1139,7 @@ mod tests {
 
     #[test]
     fn test_detector_releases_use_signed_files_with_user_agent_only() {
-        let notice =
-            "https://macdn.aoneroom.com/other/2026/10/10/notice.mp4";
+        let notice = "https://macdn.aoneroom.com/other/2026/10/10/notice.mp4";
         let details = json!({"title": "Dune", "resourceDetectors": [
             {"downloadUrl": "https://cdn.example.com/a.mp4?sign=x", "resolutionList": [
                 {"resourceId": "r480", "se": 0, "ep": 0, "resolution": 480, "size": "537628837",

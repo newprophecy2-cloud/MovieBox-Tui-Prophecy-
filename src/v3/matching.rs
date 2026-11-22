@@ -611,6 +611,43 @@ pub fn build_canonical_structure(anime: &mut CanonicalAnime) {
             });
         }
 
+        // BUG-04 fix: Explicitly account for every provider variant on the canonical anime
+        // (e.g., MovieBox English) even if its details failed or lacked this episode.
+        for rec in &anime.provider_records {
+            let vkey = (rec.provider_id, rec.provider_anime_id.clone());
+            if seen_provider_variants.contains(&vkey) {
+                continue;
+            }
+            let (reason, evidence) = if rec.details_failed || rec.details.is_none() {
+                (
+                    "provider_details_unavailable".to_string(),
+                    vec!["provider_details_unavailable".to_string()],
+                )
+            } else {
+                (
+                    "episode_not_in_provider_variant".to_string(),
+                    vec![format!(
+                        "episode_missing_in_variant:S{season_num:02}E{ep_num:02}"
+                    )],
+                )
+            };
+            mappings.push(ProviderEpisodeMapping {
+                provider_id: rec.provider_id,
+                provider_anime_id: rec.provider_anime_id.clone(),
+                variant_title: Some(rec.title.clone()),
+                variant_language: rec.declared_language.clone(),
+                variant_language_code: rec.declared_language_code.clone(),
+                provider_season_number: season_num,
+                provider_episode_number: ep_num,
+                provider_episode_id: None,
+                title: None,
+                outcome: EpisodeMappingOutcome::MissingFromProvider,
+                confidence: 0.0,
+                matching_evidence: evidence,
+                exclusion_reason: Some(reason),
+            });
+        }
+
         let (final_title, metadata_status) = if anime.media_type == MediaType::Movie {
             (anime.title.clone(), "verified".to_string())
         } else if let Some(t) = title {
@@ -1036,7 +1073,23 @@ mod tests {
         assert_eq!(anime.total_episodes, 4);
         assert_eq!(anime.seasons[0].episodes.len(), 3);
         assert_eq!(anime.seasons[0].episodes[0].provider_mappings.len(), 2);
-        assert_eq!(anime.seasons[0].episodes[2].provider_mappings.len(), 1);
+        assert_eq!(anime.seasons[0].episodes[2].provider_mappings.len(), 2);
+        assert_eq!(
+            anime.seasons[0].episodes[2]
+                .provider_mappings
+                .iter()
+                .filter(|m| m.outcome == EpisodeMappingOutcome::Matched)
+                .count(),
+            1
+        );
+        assert_eq!(
+            anime.seasons[0].episodes[2]
+                .provider_mappings
+                .iter()
+                .filter(|m| m.outcome == EpisodeMappingOutcome::MissingFromProvider)
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -1459,5 +1512,76 @@ mod tests {
         );
         assert_eq!(outcome, EpisodeMappingOutcome::ProbableMatch);
         assert_eq!(reason.as_deref(), Some("title_confirmation_required"));
+    }
+
+    #[test]
+    fn test_missing_provider_variant_recorded_in_episode_mappings() {
+        let items = vec![
+            norm(
+                ProviderKind::MovieBox,
+                "2316544915590759384",
+                "Black Clover [Hindi] S1-S2",
+                Some(2017),
+                MediaType::Series,
+            ),
+            norm(
+                ProviderKind::MovieBox,
+                "9162827393101350104",
+                "Black Clover [English]",
+                Some(2017),
+                MediaType::Series,
+            ),
+        ];
+        let mut merged = merge_search_results(items, 50);
+        let anime = &mut merged[0];
+        // Hydrate Hindi variant with S1E1, leave English variant without S1E1
+        anime.provider_records[0].details = Some(MediaDetails {
+            id: crate::providers::models::ProviderMediaId {
+                provider: ProviderKind::MovieBox,
+                value: "2316544915590759384".into(),
+            },
+            title: "Black Clover [Hindi] S1-S2".into(),
+            media_type: MediaType::Series,
+            year: Some("2017".into()),
+            description: None,
+            tagline: None,
+            imdb_rating: None,
+            director: None,
+            stars: None,
+            prints: None,
+            audios: None,
+            poster_url: None,
+            duration: None,
+            genres: vec![],
+            seasons: vec![Season {
+                number: 1,
+                episodes: vec![Episode {
+                    season: 1,
+                    number: 1,
+                    title: Some("Asta and Yuno".into()),
+                    overview: None,
+                    provider_episode_id: None,
+                    provider_season_id: None,
+                }],
+                provider_season_id: None,
+            }],
+            dubs: vec![],
+        });
+        anime.provider_records[1].details_failed = true;
+
+        build_canonical_structure(anime);
+        let ep1 = &anime.seasons[0].episodes[0];
+        assert_eq!(ep1.provider_mappings.len(), 2);
+        let en_map = ep1
+            .provider_mappings
+            .iter()
+            .find(|m| m.provider_anime_id == "9162827393101350104")
+            .unwrap();
+        assert_eq!(en_map.outcome, EpisodeMappingOutcome::MissingFromProvider);
+        assert_eq!(
+            en_map.exclusion_reason.as_deref(),
+            Some("provider_details_unavailable")
+        );
+        assert_eq!(en_map.variant_language_code.as_deref(), Some("en"));
     }
 }

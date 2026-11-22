@@ -143,7 +143,42 @@ impl AniZoneClient {
             .send()
             .await?;
         let status = response.status();
-        let body: Value = response.json().await?;
+        let bytes = response.bytes().await?;
+        if bytes.len() > MAX_HTML_BYTES {
+            return Err(AniZoneError::Parse(
+                "AniZone sub-server response exceeded size limit".into(),
+            ));
+        }
+
+        if !status.is_success() {
+            if let Ok(body) = serde_json::from_slice::<Value>(&bytes) {
+                let code = body
+                    .pointer("/error/code")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let message = body
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("AniZone sub-server error");
+                if code == "NOT_FOUND" || status == reqwest::StatusCode::NOT_FOUND {
+                    return Err(AniZoneError::NotFound);
+                }
+                return Err(AniZoneError::Parse(format!(
+                    "HTTP {}: {message}",
+                    status.as_u16()
+                )));
+            }
+            if status == reqwest::StatusCode::NOT_FOUND {
+                return Err(AniZoneError::NotFound);
+            }
+            return Err(AniZoneError::Parse(format!(
+                "AniZone sub-server returned HTTP {}",
+                status.as_u16()
+            )));
+        }
+
+        let body: Value = serde_json::from_slice(&bytes)
+            .map_err(|_| AniZoneError::Parse("invalid AniZone sub-server JSON".into()))?;
         if body.get("status").and_then(Value::as_str) == Some("error") {
             let code = body
                 .pointer("/error/code")
@@ -153,16 +188,10 @@ impl AniZoneClient {
                 .pointer("/error/message")
                 .and_then(Value::as_str)
                 .unwrap_or("AniZone sub-server error");
-            if code == "NOT_FOUND" || status == reqwest::StatusCode::NOT_FOUND {
+            if code == "NOT_FOUND" {
                 return Err(AniZoneError::NotFound);
             }
             return Err(AniZoneError::Parse(message.to_string()));
-        }
-        if !status.is_success() {
-            return Err(AniZoneError::Parse(format!(
-                "AniZone sub-server returned HTTP {}",
-                status.as_u16()
-            )));
         }
         Ok(body)
     }
@@ -325,33 +354,12 @@ impl AniZoneClient {
             .get("sources")
             .and_then(Value::as_array)
             .ok_or(AniZoneError::NotFound)?;
-        let first = sources.first().ok_or(AniZoneError::NotFound)?;
-        let hls = first
-            .get("url")
-            .and_then(Value::as_str)
-            .ok_or_else(|| AniZoneError::Parse("missing AniZone source URL".into()))?
-            .to_string();
-        let mut headers = Vec::new();
-        if let Some(hdr_obj) = first.get("headers").and_then(Value::as_object) {
-            for (k, v) in hdr_obj {
-                if let Some(val) = v.as_str() {
-                    headers.push((k.clone(), val.to_string()));
-                }
-            }
-        }
-        if headers.is_empty() {
-            headers.push((
-                "Referer".to_string(),
-                format!("{BASE_URL}/anime/{slug}/{episode}"),
-            ));
-            headers.push(("User-Agent".to_string(), DEFAULT_UA.to_string()));
+        if sources.is_empty() {
+            return Err(AniZoneError::NotFound);
         }
         let sub_arr = data.get("subtitles").and_then(Value::as_array);
         let sub_count = sub_arr.map(|s| s.len()).unwrap_or(0);
-        if sub_count > 0 {
-            headers.push(("X-AniZone-Subtitle-Count".into(), sub_count.to_string()));
-        }
-        if let Some(best_sub) = sub_arr.and_then(|subs| {
+        let best_sub = sub_arr.and_then(|subs| {
             subs.iter()
                 .max_by_key(|item| {
                     let is_default = item
@@ -374,33 +382,109 @@ impl AniZoneClient {
                 })
                 .and_then(|item| item.get("url").and_then(Value::as_str))
                 .map(str::to_string)
-        }) {
-            headers.push(("X-AniZone-Subtitle-Url".into(), best_sub));
-        }
+        });
         let resource_id = data
             .get("source_id")
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| episode.to_string());
-        Ok(vec![Release {
-            provider: ProviderKind::AniZone,
-            filename: format!("{slug} Episode {episode}"),
-            quality: None,
-            codec: None,
+
+        let mut releases = Vec::new();
+        for (idx, src) in sources.iter().enumerate() {
+            let Some(hls) = src
+                .get("url")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let mut headers = Vec::new();
+            if let Some(hdr_obj) = src.get("headers").and_then(Value::as_object) {
+                for (k, v) in hdr_obj {
+                    if let Some(val) = v.as_str() {
+                        headers.push((k.clone(), val.to_string()));
+                    }
+                }
+            }
+            if headers.is_empty() {
+                headers.push((
+                    "Referer".to_string(),
+                    format!("{BASE_URL}/anime/{slug}/{episode}"),
+                ));
+                headers.push(("User-Agent".to_string(), DEFAULT_UA.to_string()));
+            }
+            if sub_count > 0 {
+                headers.push(("X-AniZone-Subtitle-Count".into(), sub_count.to_string()));
+            }
+            if let Some(ref sub_url) = best_sub {
+                headers.push(("X-AniZone-Subtitle-Url".into(), sub_url.clone()));
+            }
+            let quality = src
+                .get("quality")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let codec = src
+                .get("codec")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
             // Preserve AniZone's provider-declared English catalog language metadata
-            // (remains unverified until independently confirmed).
-            language: Some("English".to_string()),
-            size_bytes: None,
-            season: Some(season),
-            episode: Some(episode),
-            mirrors: vec![SourceMirror {
-                label: "AniZone HLS".into(),
-                resolver_url: hls,
-                headers,
-                direct_file: false,
-            }],
-            resource_id: Some(resource_id),
-        }])
+            // (or explicit source language if provided; remains unverified until independently confirmed).
+            let language = src
+                .get("language")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| "English".to_string());
+            let label = src
+                .get("label")
+                .or_else(|| src.get("name"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    if sources.len() > 1 {
+                        format!("AniZone HLS #{}", idx + 1)
+                    } else {
+                        "AniZone HLS".to_string()
+                    }
+                });
+            let src_id = src
+                .get("source_id")
+                .or_else(|| src.get("id"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| resource_id.clone());
+
+            releases.push(Release {
+                provider: ProviderKind::AniZone,
+                filename: format!("{slug} Episode {episode}"),
+                quality,
+                codec,
+                language: Some(language),
+                size_bytes: None,
+                season: Some(season),
+                episode: Some(episode),
+                mirrors: vec![SourceMirror {
+                    label,
+                    resolver_url: hls,
+                    headers,
+                    direct_file: false,
+                }],
+                resource_id: Some(src_id),
+            });
+        }
+        if releases.is_empty() {
+            return Err(AniZoneError::Parse("missing AniZone source URL".into()));
+        }
+        Ok(releases)
     }
 
     fn url(&self, path: &str) -> Url {
@@ -1367,5 +1451,89 @@ mod tests {
         let item = parse_search_items(html).unwrap().remove(0);
         assert_eq!(item.cover.as_deref(), Some("https://example.com/cover.jpg"));
         assert_eq!(item.episode_count, Some(170));
+    }
+
+    #[tokio::test]
+    async fn sub_server_enumerates_multiple_sources_and_preserves_english_and_http_errors() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for i in 0..2 {
+                if let Ok((mut sock, _)) = listener.accept().await {
+                    let mut req_buf = [0u8; 1024];
+                    let _ = sock.read(&mut req_buf).await;
+                    let resp = if i == 0 {
+                        let body = serde_json::json!({
+                            "status": "success",
+                            "data": {
+                                "source_id": "az-ep1",
+                                "sources": [
+                                    {
+                                        "url": "https://cdn1.example.com/1080.m3u8",
+                                        "quality": "1080p",
+                                        "codec": "h264",
+                                        "headers": {"Referer": "https://anizone.to/"}
+                                    },
+                                    {
+                                        "url": "https://cdn2.example.com/720.m3u8",
+                                        "quality": "720p",
+                                        "codec": "hevc",
+                                        "language": "English"
+                                    }
+                                ],
+                                "subtitles": [
+                                    {"url": "https://cdn.example.com/en.vtt", "language": "en", "format": "vtt", "default": true}
+                                ]
+                            }
+                        })
+                        .to_string();
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                    } else {
+                        let body = "<html><body>502 Bad Gateway</body></html>";
+                        format!(
+                            "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                    };
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.flush().await;
+                }
+            }
+        });
+
+        let client = AniZoneClient::new();
+        let sub_base = Url::parse(&format!("http://{addr}/")).unwrap();
+        let releases = client
+            .releases_via_sub_server(&sub_base, "black-clover", 1, 1)
+            .await
+            .unwrap();
+        assert_eq!(releases.len(), 2);
+        assert_eq!(releases[0].language.as_deref(), Some("English"));
+        assert_eq!(releases[0].quality.as_deref(), Some("1080p"));
+        assert_eq!(releases[1].language.as_deref(), Some("English"));
+        assert_eq!(releases[1].quality.as_deref(), Some("720p"));
+        assert_eq!(releases[1].codec.as_deref(), Some("hevc"));
+        assert_eq!(
+            releases[0].mirrors[0].resolver_url,
+            "https://cdn1.example.com/1080.m3u8"
+        );
+        assert_eq!(
+            releases[1].mirrors[0].resolver_url,
+            "https://cdn2.example.com/720.m3u8"
+        );
+
+        let err = client
+            .releases_via_sub_server(&sub_base, "black-clover", 1, 2)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("502"));
     }
 }

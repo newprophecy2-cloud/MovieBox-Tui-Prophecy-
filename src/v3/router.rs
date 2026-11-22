@@ -550,20 +550,20 @@ fn build_anime_provider_coverage(
             map.insert(key, "disabled".to_string());
             continue;
         }
-        if let Some(rec) = anime
+        let matching: Vec<_> = anime
             .provider_records
             .iter()
-            .find(|r| r.provider_id == entry.provider_id)
-        {
-            map.insert(
-                key,
-                if rec.details_failed {
-                    "failed"
-                } else {
-                    "success"
-                }
-                .to_string(),
-            );
+            .filter(|r| r.provider_id == entry.provider_id)
+            .collect();
+        if !matching.is_empty() {
+            let any_ok = matching.iter().any(|r| !r.details_failed);
+            let any_fail = matching.iter().any(|r| r.details_failed);
+            let status = match (any_ok, any_fail) {
+                (true, false) => "success",
+                (true, true) => "partial",
+                (false, _) => "failed",
+            };
+            map.insert(key, status.to_string());
         }
     }
     map
@@ -840,11 +840,18 @@ async fn handle_episode_sources(
             total_sources,
             verified_sources,
             excluded_sources: episode.excluded_sources_count,
+            merged_duplicates_count: episode.pipeline_stats.merged_duplicates_count,
+            failed_validation_count: episode.pipeline_stats.failed_validation_count,
             excluded_reasons: episode.excluded_reasons,
             excluded_details: episode.excluded_details,
             matching_diagnostics: episode.matching_diagnostics,
             pipeline_stats: episode.pipeline_stats,
             available_languages: audio.available_languages,
+            declared_languages: audio.declared_languages,
+            manifest_languages: audio.manifest_languages,
+            observed_track_languages: audio.observed_track_languages,
+            verified_languages: audio.verified_languages,
+            language_verification_status: audio.language_verification_status,
             provider_coverage,
             provider_details: episode.cached_provider_details,
             providers,
@@ -1160,6 +1167,11 @@ mod tests {
                             english: AudioStatus::Available,
                             japanese: AudioStatus::Unknown,
                             available_languages: vec!["en".to_string()],
+                            declared_languages: vec!["en".to_string()],
+                            manifest_languages: Vec::new(),
+                            observed_track_languages: Vec::new(),
+                            verified_languages: vec!["en".to_string()],
+                            language_verification_status: "verified".to_string(),
                             checked_sources: true,
                         }),
                         sources: Some(vec![ProviderSourceCandidate {
@@ -1207,6 +1219,7 @@ mod tests {
                             track_selection_metadata: None,
                             audio_tracks: Vec::new(),
                             declared_audio_tracks: Vec::new(),
+                            subtitles: Vec::new(),
                             provider_metadata: ProviderSourceMetadata {
                                 provider_id: "moviebox".to_string(),
                                 original_url: Some("https://cdn.example.com/ep1.mp4".to_string()),
@@ -1270,6 +1283,11 @@ mod tests {
                             english: AudioStatus::Missing,
                             japanese: AudioStatus::Missing,
                             available_languages: vec![],
+                            declared_languages: Vec::new(),
+                            manifest_languages: Vec::new(),
+                            observed_track_languages: Vec::new(),
+                            verified_languages: Vec::new(),
+                            language_verification_status: "unverified".to_string(),
                             checked_sources: true,
                         }),
                         sources: Some(vec![]),
@@ -1461,6 +1479,7 @@ mod tests {
                 playability_status: "manifest_validated".to_string(),
                 audio_tracks: Vec::new(),
                 declared_audio_tracks: Vec::new(),
+                subtitles: Vec::new(),
                 provider_metadata: ProviderSourceMetadata {
                     provider_id: "moviebox".to_string(),
                     original_url: Some(mpd_url.clone()),
@@ -1534,6 +1553,11 @@ mod tests {
                         english: AudioStatus::Available,
                         japanese: AudioStatus::Missing,
                         available_languages: vec!["hi".to_string(), "en".to_string()],
+                        declared_languages: vec!["hi".to_string(), "en".to_string()],
+                        manifest_languages: vec!["hi".to_string(), "en".to_string()],
+                        observed_track_languages: vec!["hi".to_string(), "en".to_string()],
+                        verified_languages: vec!["hi".to_string(), "en".to_string()],
+                        language_verification_status: "verified".to_string(),
                         checked_sources: true,
                     }),
                     sources: Some(vec![
@@ -1628,6 +1652,11 @@ mod tests {
                         english: AudioStatus::Unknown,
                         japanese: AudioStatus::Unknown,
                         available_languages: vec![],
+                        declared_languages: Vec::new(),
+                        manifest_languages: Vec::new(),
+                        observed_track_languages: Vec::new(),
+                        verified_languages: Vec::new(),
+                        language_verification_status: "unverified".to_string(),
                         checked_sources: true,
                     }),
                     sources: Some(vec![]),
@@ -1637,7 +1666,9 @@ mod tests {
                         request_status: "success".to_string(),
                         source_count: 2,
                         validated_source_count: 1,
-                        excluded_source_count: 1,
+                        merged_duplicates_count: 1,
+                        failed_validation_count: 0,
+                        excluded_source_count: 0,
                         errors: vec![],
                     }],
                     pipeline_stats: PipelineStats {
@@ -1646,6 +1677,8 @@ mod tests {
                         matched_sources: 2,
                         resolved_sources: 2,
                         validated_sources: 2,
+                        merged_duplicates_count: 1,
+                        failed_validation_count: 0,
                         returned_sources: 1,
                     },
                     excluded_sources_count: 1,

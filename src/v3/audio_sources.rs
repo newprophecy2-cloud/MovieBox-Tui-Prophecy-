@@ -8,7 +8,7 @@ use crate::v3::models::{
     EpisodeMappingOutcome, EpisodeMatchingDiagnostic, ExcludedSourceRecord, MediaProbeMetadata,
     NormalizedSourceMetadata, PipelineStats, ProviderCoverageDetail, ProviderSourceCandidate,
     ProviderSourceMetadata, ProviderSourcesGroup, PublicSourceItem, ResolveSuccessResponse,
-    TrackSelectionMetadata,
+    SubtitleItem, TrackSelectionMetadata,
 };
 use crate::v3::providers::{ProviderRegistry, provider_display_name, provider_key};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -302,16 +302,58 @@ pub fn compute_audio_availability(
             english: AudioStatus::Unknown,
             japanese: AudioStatus::Unknown,
             available_languages: Vec::new(),
+            declared_languages: Vec::new(),
+            manifest_languages: Vec::new(),
+            observed_track_languages: Vec::new(),
+            verified_languages: Vec::new(),
+            language_verification_status: "unverified".to_string(),
             checked_sources: false,
         };
     }
 
+    let sort_lang_vec = |v: &mut Vec<String>| {
+        v.sort_by_key(|code| match code.as_str() {
+            "hi" => 0,
+            "en" => 1,
+            "ja" => 2,
+            _ => 3,
+        });
+    };
+
     let mut langs = Vec::new();
     let mut seen = HashSet::new();
+    let mut declared_languages = Vec::new();
+    let mut seen_declared = HashSet::new();
+    let mut manifest_languages = Vec::new();
+    let mut seen_manifest = HashSet::new();
+    let mut observed_track_languages = Vec::new();
+    let mut seen_observed = HashSet::new();
     let mut any_explicit_lang = false;
     let mut any_unknown_lang = false;
 
     for src in sources {
+        for l in &src.normalized_metadata.declared_languages {
+            if seen_declared.insert(l.clone()) {
+                declared_languages.push(l.clone());
+            }
+        }
+        for t in &src.declared_audio_tracks {
+            if let Some(ref l) = t.declared_language_code
+                && seen_declared.insert(l.clone())
+            {
+                declared_languages.push(l.clone());
+            }
+        }
+        for t in &src.audio_tracks {
+            if let Some(ref l) = t.declared_language_code {
+                if t.source.as_deref() == Some("manifest") && seen_manifest.insert(l.clone()) {
+                    manifest_languages.push(l.clone());
+                }
+                if seen_observed.insert(l.clone()) {
+                    observed_track_languages.push(l.clone());
+                }
+            }
+        }
         if src.audio_languages.is_empty() {
             any_unknown_lang = true;
             continue;
@@ -324,22 +366,26 @@ pub fn compute_audio_availability(
         }
     }
 
+    sort_lang_vec(&mut declared_languages);
+    sort_lang_vec(&mut manifest_languages);
+    sort_lang_vec(&mut observed_track_languages);
+
     if !any_explicit_lang {
         return AudioAvailability {
             hindi: AudioStatus::Unknown,
             english: AudioStatus::Unknown,
             japanese: AudioStatus::Unknown,
             available_languages: Vec::new(),
+            declared_languages,
+            manifest_languages,
+            observed_track_languages,
+            verified_languages: Vec::new(),
+            language_verification_status: "unverified".to_string(),
             checked_sources: true,
         };
     }
 
-    langs.sort_by_key(|code| match code.as_str() {
-        "hi" => 0,
-        "en" => 1,
-        "ja" => 2,
-        _ => 3,
-    });
+    sort_lang_vec(&mut langs);
 
     let status_for = |target: &str| -> AudioStatus {
         if seen.contains(target) {
@@ -351,11 +397,17 @@ pub fn compute_audio_availability(
         }
     };
 
+    let verified_languages = langs.clone();
     AudioAvailability {
         hindi: status_for("hi"),
         english: status_for("en"),
         japanese: status_for("ja"),
         available_languages: langs,
+        declared_languages,
+        manifest_languages,
+        observed_track_languages,
+        verified_languages,
+        language_verification_status: "verified".to_string(),
         checked_sources: true,
     }
 }
@@ -403,17 +455,15 @@ async fn validate_stream_url_and_inspect(
     let is_mpd = lower.contains(".mpd");
     let is_m3u8 = lower.contains(".m3u8");
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(6))
-        .build()
-        .map_err(|_| ValidationFailure {
-            reason: "http_client_error".to_string(),
-            http_status_code: None,
-            playability_status: "unavailable".to_string(),
-            access_status: "error".to_string(),
-        })?;
+    static VALIDATION_CLIENT: std::sync::LazyLock<reqwest::Client> =
+        std::sync::LazyLock::new(|| {
+            crate::net::http_client_builder_base()
+                .timeout(Duration::from_secs(6))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new())
+        });
 
-    let mut req = client.get(url);
+    let mut req = VALIDATION_CLIENT.get(url);
     if !is_mpd && !is_m3u8 {
         req = req.header("Range", "bytes=0-1023");
     }
@@ -663,6 +713,11 @@ pub fn merge_source_candidate(
         &mut existing.declared_audio_tracks,
         incoming.declared_audio_tracks,
     );
+    for sub in incoming.subtitles {
+        if !existing.subtitles.iter().any(|s| s.url == sub.url) {
+            existing.subtitles.push(sub);
+        }
+    }
     for lang in incoming.audio_languages {
         if !existing.audio_languages.contains(&lang) {
             existing.audio_languages.push(lang);
@@ -831,6 +886,8 @@ pub async fn collect_episode_sources(
                     request_status: "failed".to_string(),
                     source_count: 0,
                     validated_source_count: 0,
+                    merged_duplicates_count: 0,
+                    failed_validation_count: 0,
                     excluded_source_count: 0,
                     errors: Vec::new(),
                 });
@@ -949,7 +1006,27 @@ pub async fn collect_episode_sources(
                 };
 
                 let mut headers = HashMap::new();
+                let mut subtitles: Vec<SubtitleItem> = Vec::new();
                 for (k, v) in raw_headers {
+                    if k.eq_ignore_ascii_case("x-anizone-subtitle-url") {
+                        let trimmed = v.trim();
+                        if !trimmed.is_empty()
+                            && crate::net::validate_url_syntax(trimmed, false).is_ok()
+                            && !subtitles.iter().any(|s| s.url == trimmed)
+                        {
+                            subtitles.push(SubtitleItem {
+                                language: None,
+                                language_code: None,
+                                label: Some("AniZone Subtitle".to_string()),
+                                url: trimmed.to_string(),
+                                format: Some("vtt".to_string()),
+                                is_default: Some(true),
+                                is_forced: None,
+                                source: "provider".to_string(),
+                            });
+                        }
+                        continue;
+                    }
                     if k.eq_ignore_ascii_case("referer")
                         || k.eq_ignore_ascii_case("user-agent")
                         || k.eq_ignore_ascii_case("origin")
@@ -976,6 +1053,7 @@ pub async fn collect_episode_sources(
                             mirror,
                             resolved_url,
                             headers,
+                            subtitles,
                             playability_status,
                             http_status_code,
                             manifest_tracks,
@@ -1009,6 +1087,7 @@ pub async fn collect_episode_sources(
             mirror,
             resolved_url,
             headers,
+            subtitles,
             playability_status,
             http_status_code,
             manifest_tracks,
@@ -1022,9 +1101,13 @@ pub async fn collect_episode_sources(
             Err((pkey, stage, rec)) => {
                 if stage == "validation" {
                     stats.resolved_sources += 1;
+                    stats.failed_validation_count += 1;
                 }
                 if let Some(pdet) = provider_detail_map.get_mut(&pkey) {
                     pdet.excluded_source_count += 1;
+                    if stage == "validation" {
+                        pdet.failed_validation_count += 1;
+                    }
                     pdet.errors.push(rec.reason.clone());
                 }
                 if excluded_reasons.len() < 25 {
@@ -1301,6 +1384,7 @@ pub async fn collect_episode_sources(
                 .and_then(|t| t.track_selection_metadata.clone()),
             audio_tracks,
             declared_audio_tracks,
+            subtitles,
             provider_metadata,
             normalized_metadata,
             media_metadata,
@@ -1313,8 +1397,9 @@ pub async fn collect_episode_sources(
         // Fix B: Merge duplicate URL entries instead of discarding subsequent audio tracks
         if let Some(pos) = existing_idx {
             merge_source_candidate(&mut candidates[pos], candidate);
+            stats.merged_duplicates_count += 1;
             if let Some(pdet) = provider_detail_map.get_mut(&pkey) {
-                pdet.excluded_source_count += 1;
+                pdet.merged_duplicates_count += 1;
             }
             excluded_details.push(ExcludedSourceRecord {
                 provider: pkey,
@@ -1344,7 +1429,10 @@ pub async fn collect_episode_sources(
 
     rank_candidates(&mut candidates, None, None);
     stats.returned_sources = candidates.len();
-    let excluded_sources = excluded_details.len();
+    let excluded_sources = excluded_details
+        .iter()
+        .filter(|d| d.reason != "merged_duplicate_url")
+        .count();
     let provider_details: Vec<ProviderCoverageDetail> = provider_detail_map.into_values().collect();
 
     SourceCollectionResult {
@@ -1386,6 +1474,7 @@ pub fn to_public_source_item(c: &ProviderSourceCandidate) -> PublicSourceItem {
         track_selection_metadata: c.track_selection_metadata.clone(),
         audio_tracks: c.audio_tracks.clone(),
         declared_audio_tracks: c.declared_audio_tracks.clone(),
+        subtitles: c.subtitles.clone(),
         provider_metadata: c.provider_metadata.clone(),
         normalized_metadata: c.normalized_metadata.clone(),
         media_metadata: c.media_metadata.clone(),
@@ -1702,6 +1791,7 @@ pub async fn resolve_episode_stream(
                         .and_then(|t| t.track_selection_metadata)
                         .or(candidate.track_selection_metadata),
                     audio_tracks: candidate.audio_tracks,
+                    subtitles: candidate.subtitles,
                     provider_metadata: candidate.provider_metadata,
                     normalized_metadata: candidate.normalized_metadata,
                     media_metadata: candidate.media_metadata,
@@ -1790,6 +1880,7 @@ mod tests {
             track_selection_metadata: None,
             audio_tracks: Vec::new(),
             declared_audio_tracks: Vec::new(),
+            subtitles: Vec::new(),
             provider_metadata: ProviderSourceMetadata {
                 provider_id: provider_key(provider).to_string(),
                 original_url: Some(url.to_string()),
@@ -2337,5 +2428,35 @@ video.m3u8"#;
             }
         }
         assert_eq!(list.len(), 3);
+    }
+
+    #[test]
+    fn test_audio_availability_separates_declared_observed_and_verified() {
+        let mut c = make_cand(
+            ProviderKind::FourKHdHub,
+            None,
+            Some("1080p"),
+            "https://cdn.example/multi.mkv",
+        );
+        c.audio_languages.clear();
+        c.verification_status = "unverified".to_string();
+        c.normalized_metadata.declared_languages = vec!["hi".into(), "en".into()];
+        c.audio_tracks = vec![make_track_item(Some("1"), Some(0), "ja", "jpn", "aac")];
+
+        let avail = compute_audio_availability(&[c], false);
+        assert!(avail.available_languages.is_empty());
+        assert!(avail.verified_languages.is_empty());
+        assert_eq!(avail.declared_languages, vec!["hi", "en"]);
+        assert_eq!(avail.observed_track_languages, vec!["ja"]);
+        assert_eq!(avail.language_verification_status, "unverified");
+    }
+
+    #[tokio::test]
+    async fn test_redirect_to_loopback_blocked_in_production_client() {
+        // Confirm validate_url_syntax (used by http_client_builder_base redirect policy)
+        // rejects loopback and private IP redirect destinations.
+        assert!(crate::net::validate_url_syntax("http://127.0.0.1/secret", true).is_err());
+        assert!(crate::net::validate_url_syntax("http://169.254.169.254/latest", true).is_err());
+        assert!(crate::net::validate_url_syntax("https://localhost/admin", false).is_err());
     }
 }

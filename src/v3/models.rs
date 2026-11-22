@@ -117,8 +117,35 @@ pub struct AudioAvailability {
     pub english: AudioStatus,
     pub japanese: AudioStatus,
     pub available_languages: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declared_languages: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub manifest_languages: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observed_track_languages: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verified_languages: Vec<String>,
+    pub language_verification_status: String,
     #[serde(skip_serializing)]
     pub checked_sources: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubtitleItem {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_default: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_forced: Option<bool>,
+    pub source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -144,6 +171,8 @@ pub struct PipelineStats {
     pub matched_sources: usize,
     pub resolved_sources: usize,
     pub validated_sources: usize,
+    pub merged_duplicates_count: usize,
+    pub failed_validation_count: usize,
     pub returned_sources: usize,
 }
 
@@ -176,6 +205,8 @@ pub struct ProviderCoverageDetail {
     pub request_status: String,
     pub source_count: usize,
     pub validated_source_count: usize,
+    pub merged_duplicates_count: usize,
+    pub failed_validation_count: usize,
     pub excluded_source_count: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<String>,
@@ -312,6 +343,7 @@ pub struct ProviderSourceCandidate {
     pub track_selection_metadata: Option<TrackSelectionMetadata>,
     pub audio_tracks: Vec<AudioTrackItem>,
     pub declared_audio_tracks: Vec<AudioTrackItem>,
+    pub subtitles: Vec<SubtitleItem>,
     pub provider_metadata: ProviderSourceMetadata,
     pub normalized_metadata: NormalizedSourceMetadata,
     pub media_metadata: MediaProbeMetadata,
@@ -536,6 +568,8 @@ pub struct PublicSourceItem {
     pub audio_tracks: Vec<AudioTrackItem>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub declared_audio_tracks: Vec<AudioTrackItem>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subtitles: Vec<SubtitleItem>,
     pub provider_metadata: ProviderSourceMetadata,
     pub normalized_metadata: NormalizedSourceMetadata,
     pub media_metadata: MediaProbeMetadata,
@@ -559,6 +593,8 @@ pub struct EpisodeSourcesResponse {
     pub total_sources: usize,
     pub verified_sources: usize,
     pub excluded_sources: usize,
+    pub merged_duplicates_count: usize,
+    pub failed_validation_count: usize,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub excluded_reasons: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -567,6 +603,15 @@ pub struct EpisodeSourcesResponse {
     pub matching_diagnostics: Vec<EpisodeMatchingDiagnostic>,
     pub pipeline_stats: PipelineStats,
     pub available_languages: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declared_languages: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub manifest_languages: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observed_track_languages: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verified_languages: Vec<String>,
+    pub language_verification_status: String,
     pub provider_coverage: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub provider_details: Vec<ProviderCoverageDetail>,
@@ -620,6 +665,8 @@ pub struct ResolveSuccessResponse {
     pub track_selection_metadata: Option<TrackSelectionMetadata>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub audio_tracks: Vec<AudioTrackItem>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subtitles: Vec<SubtitleItem>,
     pub provider_metadata: ProviderSourceMetadata,
     pub normalized_metadata: NormalizedSourceMetadata,
     pub media_metadata: MediaProbeMetadata,

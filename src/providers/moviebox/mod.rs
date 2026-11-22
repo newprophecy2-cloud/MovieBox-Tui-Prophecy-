@@ -270,6 +270,12 @@ impl MovieBoxClient {
             .get("subjectType")
             .and_then(|s| s.as_i64())
             .or_else(|| details.get("stype").and_then(|s| s.as_i64()))
+            .or_else(|| {
+                details
+                    .get("subject")
+                    .and_then(|sub| sub.get("subjectType").or_else(|| sub.get("stype")))
+                    .and_then(|s| s.as_i64())
+            })
             .unwrap_or(1);
 
         if stype == 2 {
@@ -575,5 +581,25 @@ mod tests {
         );
         let err = empty_streams_error(0, None);
         assert!(err.to_string().contains("No stream sources"));
+    }
+
+    #[test]
+    fn test_details_parses_top_level_seasons_with_nested_subject() {
+        let payload = json!({
+            "subject": {
+                "subjectId": "9162827393101350104",
+                "title": "Black Clover [English]",
+                "subjectType": 2
+            },
+            "seasons": {
+                "seasons": [
+                    {"se": 1, "maxEp": 3}
+                ]
+            }
+        });
+        let det = adapt::moviebox_details_json_to_media_details(&payload).unwrap();
+        assert_eq!(det.id.value, "9162827393101350104");
+        assert_eq!(det.seasons.len(), 1);
+        assert_eq!(det.seasons[0].episodes.len(), 3);
     }
 }
