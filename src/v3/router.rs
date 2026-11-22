@@ -713,19 +713,22 @@ async fn ensure_episode_sources_hydrated(
     };
 
     if let (Some(srcs), Some(audio)) = (episode.sources.clone(), episode.audio.clone()) {
-        let mut cov = BTreeMap::new();
-        for s in &srcs {
-            cov.insert(
-                provider_key(s.provider_id).to_string(),
-                "success".to_string(),
-            );
-        }
+        // Bug #12: Return exact persisted provider_coverage so cached & uncached responses match
+        let cov = episode.cached_provider_coverage.clone().unwrap_or_else(|| {
+            let mut fallback = BTreeMap::new();
+            for s in &srcs {
+                fallback.insert(
+                    provider_key(s.provider_id).to_string(),
+                    "success".to_string(),
+                );
+            }
+            fallback
+        });
         return Ok((episode, srcs, audio, cov));
     }
 
-    let (srcs, all_failed, cov, excluded_count, excluded_reasons) =
-        collect_episode_sources(&state.registry, &episode).await;
-    let audio = compute_audio_availability(&srcs, all_failed);
+    let collected = collect_episode_sources(&state.registry, &episode).await;
+    let audio = compute_audio_availability(&collected.candidates, collected.all_failed);
 
     {
         let mut guard = session.write().await;
@@ -734,15 +737,24 @@ async fn ensure_episode_sources_hydrated(
             && let Some(season) = anime.seasons.iter_mut().find(|s| s.id == sid)
             && let Some(ep) = season.episodes.iter_mut().find(|e| e.id == episode_id)
         {
-            ep.sources = Some(srcs.clone());
+            ep.sources = Some(collected.candidates.clone());
             ep.audio = Some(audio.clone());
-            ep.excluded_sources_count = excluded_count;
-            ep.excluded_reasons = excluded_reasons;
+            ep.cached_provider_coverage = Some(collected.provider_coverage.clone());
+            ep.cached_provider_details = collected.provider_details.clone();
+            ep.pipeline_stats = collected.pipeline_stats.clone();
+            ep.excluded_sources_count = collected.excluded_sources;
+            ep.excluded_reasons = collected.excluded_reasons.clone();
+            ep.excluded_details = collected.excluded_details.clone();
             episode = ep.clone();
         }
     }
 
-    Ok((episode, srcs, audio, cov))
+    Ok((
+        episode,
+        collected.candidates,
+        audio,
+        collected.provider_coverage,
+    ))
 }
 
 async fn handle_episode_details(
@@ -808,8 +820,11 @@ async fn handle_episode_sources(
             verified_sources,
             excluded_sources: episode.excluded_sources_count,
             excluded_reasons: episode.excluded_reasons,
+            excluded_details: episode.excluded_details,
+            pipeline_stats: episode.pipeline_stats,
             available_languages: audio.available_languages,
             provider_coverage,
+            provider_details: episode.cached_provider_details,
             providers,
         },
     )
@@ -1156,6 +1171,8 @@ mod tests {
                             language_code: Some("en".to_string()),
                             declared_language: Some("English".to_string()),
                             declared_language_code: Some("en".to_string()),
+                            verified_language: Some("English".to_string()),
+                            verified_language_code: Some("en".to_string()),
                             audio_track_id: None,
                             codec: None,
                             audio_codec: None,
@@ -1164,17 +1181,22 @@ mod tests {
                             detection_method: "speech_lang_id_model".to_string(),
                             confidence: Some(0.95),
                             verification_status: "verified".to_string(),
-                            playability_status: "server_validated".to_string(),
+                            playability_status: "http_reachable".to_string(),
                             track_selection_metadata: None,
                             audio_tracks: Vec::new(),
+                            declared_audio_tracks: Vec::new(),
                             quality: Some("1080p".to_string()),
                             resolution_u64: 1080,
                             stream_url: Some("https://cdn.example.com/ep1.mp4".to_string()),
                             headers: HashMap::new(),
                             available: true,
                         }]),
+                        cached_provider_coverage: None,
+                        cached_provider_details: Vec::new(),
+                        pipeline_stats: PipelineStats::default(),
                         excluded_sources_count: 0,
                         excluded_reasons: Vec::new(),
+                        excluded_details: Vec::new(),
                     },
                     CanonicalEpisode {
                         id: "NP-E-002".to_string(),
@@ -1194,8 +1216,12 @@ mod tests {
                             checked_sources: true,
                         }),
                         sources: Some(vec![]),
+                        cached_provider_coverage: None,
+                        cached_provider_details: Vec::new(),
+                        pipeline_stats: PipelineStats::default(),
                         excluded_sources_count: 0,
                         excluded_reasons: Vec::new(),
+                        excluded_details: Vec::new(),
                     },
                 ],
             }],
@@ -1355,6 +1381,8 @@ mod tests {
                 language_code: Some(code.to_string()),
                 declared_language: Some(lang.to_string()),
                 declared_language_code: Some(code.to_string()),
+                verified_language: Some(lang.to_string()),
+                verified_language_code: Some(code.to_string()),
                 audio_track_id: Some(aset.to_string()),
                 codec: Some("hevc".to_string()),
                 audio_codec: Some("mp4a.40.2".to_string()),
@@ -1372,8 +1400,9 @@ mod tests {
                     rendition_name: None,
                     language_code: Some(code.to_string()),
                 }),
-                playability_status: "server_validated".to_string(),
+                playability_status: "manifest_validated".to_string(),
                 audio_tracks: Vec::new(),
+                declared_audio_tracks: Vec::new(),
                 quality: Some("1080p".to_string()),
                 resolution_u64: 1080,
                 stream_url: Some(mpd_url.clone()),
@@ -1417,8 +1446,12 @@ mod tests {
                         make_track_cand("src-1", 0, "hi", "Hindi", "2"),
                         make_track_cand("src-2", 1, "en", "English", "3"),
                     ]),
+                    cached_provider_coverage: None,
+                    cached_provider_details: Vec::new(),
+                    pipeline_stats: PipelineStats::default(),
                     excluded_sources_count: 0,
                     excluded_reasons: Vec::new(),
+                    excluded_details: Vec::new(),
                 }],
             }],
             total_seasons: 1,

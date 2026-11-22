@@ -10,6 +10,10 @@ use tokio::process::Command;
 const MAX_SAMPLE_SECONDS: u64 = 30;
 const MAX_WAV_BYTES: usize = 2 * 1024 * 1024; // 30s * 16kHz * 2 bytes ~= 960 KB
 
+pub const DEFAULT_SUPPORTED_LANGUAGES: &[&str] = &[
+    "hi", "en", "ja", "bn", "ta", "te", "ml", "kn", "mr", "ko", "es", "fr", "de",
+];
+
 #[derive(Debug, Clone)]
 pub struct AudioIdConfig {
     pub sample_seconds: u64,
@@ -18,6 +22,7 @@ pub struct AudioIdConfig {
     pub gemini_api_key: Option<String>,
     pub gemini_model: String,
     pub min_confidence: f32,
+    pub supported_languages: Vec<String>,
 }
 
 impl AudioIdConfig {
@@ -49,6 +54,20 @@ impl AudioIdConfig {
             .and_then(|v| v.trim().parse::<f32>().ok())
             .map(|v| v.clamp(0.5, 0.99))
             .unwrap_or(0.75);
+        let supported_languages = std::env::var("PV_AUDIO_SUPPORTED_LANGUAGES")
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .filter_map(|s| normalize_language_code(s.trim()))
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| {
+                DEFAULT_SUPPORTED_LANGUAGES
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect()
+            });
 
         Self {
             sample_seconds,
@@ -57,6 +76,7 @@ impl AudioIdConfig {
             gemini_api_key,
             gemini_model,
             min_confidence,
+            supported_languages,
         }
     }
 
@@ -71,6 +91,8 @@ pub struct FfprobeAudioStream {
     pub provider_track_id: Option<String>,
     pub audio_codec: Option<String>,
     pub channels: Option<String>,
+    pub sample_rate: Option<String>,
+    pub is_default: Option<bool>,
     pub declared_language_code: Option<String>,
 }
 
@@ -81,10 +103,18 @@ struct FfprobeOutput {
 }
 
 #[derive(Debug, Deserialize)]
+struct FfprobeDisposition {
+    #[serde(default)]
+    default: i32,
+}
+
+#[derive(Debug, Deserialize)]
 struct FfprobeStreamEntry {
     index: Option<usize>,
     codec_name: Option<String>,
     channels: Option<u32>,
+    sample_rate: Option<String>,
+    disposition: Option<FfprobeDisposition>,
     #[serde(default)]
     tags: HashMap<String, String>,
 }
@@ -110,6 +140,8 @@ pub fn parse_ffprobe_audio_json(json_str: &str) -> Vec<FfprobeAudioStream> {
                 provider_track_id: s.index.map(|i| i.to_string()),
                 audio_codec: s.codec_name,
                 channels: s.channels.map(|c| c.to_string()),
+                sample_rate: s.sample_rate,
+                is_default: s.disposition.map(|d| d.default != 0),
                 declared_language_code: lang_tag,
             }
         })
@@ -226,6 +258,24 @@ pub fn evaluate_model_prediction(
     measured_duration: Option<f32>,
     min_confidence: f32,
 ) -> SpeechIdResult {
+    let default_langs: Vec<String> = DEFAULT_SUPPORTED_LANGUAGES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    evaluate_model_prediction_with_languages(
+        pred,
+        measured_duration,
+        min_confidence,
+        &default_langs,
+    )
+}
+
+pub fn evaluate_model_prediction_with_languages(
+    pred: ExternalLangIdResponse,
+    measured_duration: Option<f32>,
+    min_confidence: f32,
+    supported_languages: &[String],
+) -> SpeechIdResult {
     let duration = pred.duration_seconds.or(measured_duration);
 
     if pred.speech_detected == Some(false) || pred.mixed_languages == Some(true) {
@@ -243,7 +293,7 @@ pub fn evaluate_model_prediction(
         .language_code
         .as_deref()
         .and_then(normalize_language_code)
-        .filter(|c| matches!(c.as_str(), "hi" | "en" | "ja"));
+        .filter(|c| supported_languages.iter().any(|s| s == c));
 
     match (norm_code, conf >= min_confidence) {
         (Some(code), true) => SpeechIdResult {
@@ -728,6 +778,10 @@ mod tests {
             gemini_api_key: None,
             gemini_model: "gemini-2.5-flash".to_string(),
             min_confidence: 0.75,
+            supported_languages: DEFAULT_SUPPORTED_LANGUAGES
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
         };
 
         let wav0 =

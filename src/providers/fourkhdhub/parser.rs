@@ -436,21 +436,37 @@ fn parse_season_episode(value: &str) -> Option<(usize, usize)> {
 
 fn detect_quality(value: &str) -> Option<String> {
     let lower = value.to_ascii_lowercase();
-    if lower.contains("2160p")
-        || lower.contains("2160")
-        || lower.contains("4k")
-        || lower.contains("uhd")
-    {
-        Some("2160p".to_string())
-    } else if lower.contains("1080p") || lower.contains("1080") || lower.contains("fhd") {
-        Some("1080p".to_string())
-    } else if lower.contains("720p") || lower.contains("720") || lower.contains("hd") {
-        Some("720p".to_string())
-    } else if lower.contains("480p") || lower.contains("480") || lower.contains("sd") {
-        Some("480p".to_string())
-    } else {
-        None
+    let tokens: Vec<&str> = lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty() && !t.contains("4khdhub") && !t.contains("hdhub"))
+        .collect();
+
+    // Pass 1: explicit resolution tokens first (never misclassify 1080p/720p as 2160p from domain name)
+    for tok in &tokens {
+        match *tok {
+            "2160p" | "2160" => return Some("2160p".to_string()),
+            "1440p" | "1440" => return Some("1440p".to_string()),
+            "1080p" | "1080" => return Some("1080p".to_string()),
+            "720p" | "720" => return Some("720p".to_string()),
+            "576p" | "576" => return Some("576p".to_string()),
+            "540p" | "540" => return Some("540p".to_string()),
+            "480p" | "480" => return Some("480p".to_string()),
+            "360p" | "360" => return Some("360p".to_string()),
+            _ => {}
+        }
     }
+
+    // Pass 2: standalone quality aliases only (not substrings inside website/provider names)
+    for tok in &tokens {
+        match *tok {
+            "4k" | "uhd" => return Some("2160p".to_string()),
+            "fhd" => return Some("1080p".to_string()),
+            "sd" => return Some("480p".to_string()),
+            _ => {}
+        }
+    }
+
+    None
 }
 
 fn detect_codec(value: &str) -> Option<String> {
@@ -735,6 +751,15 @@ mod tests {
             detect_quality("Show.S01E01.FHD.1080p.mkv").as_deref(),
             Some("1080p")
         );
+        assert_eq!(
+            detect_quality("Black.Clover.S01E01.1080p.4kHdHub.Com.mkv").as_deref(),
+            Some("1080p")
+        );
+        assert_eq!(
+            detect_quality("Black.Clover.S01E01.720p.4kHdHub.Com.mkv").as_deref(),
+            Some("720p")
+        );
+        assert_eq!(detect_quality("Black.Clover.S01E01.4kHdHub.Com.mkv"), None);
         assert_eq!(
             detect_quality("Video.1080.WEB-DL").as_deref(),
             Some("1080p")

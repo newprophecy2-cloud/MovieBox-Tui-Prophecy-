@@ -524,8 +524,12 @@ pub fn build_canonical_structure(anime: &mut CanonicalAnime) {
             provider_mappings: mappings,
             audio: None,
             sources: None,
+            cached_provider_coverage: None,
+            cached_provider_details: Vec::new(),
+            pipeline_stats: crate::v3::models::PipelineStats::default(),
             excluded_sources_count: 0,
             excluded_reasons: Vec::new(),
+            excluded_details: Vec::new(),
         };
         seasons_map
             .entry((is_special, season_num))

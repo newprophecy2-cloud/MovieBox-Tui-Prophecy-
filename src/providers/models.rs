@@ -267,17 +267,18 @@ impl Release {
             .is_some_and(|q| q.eq_ignore_ascii_case("multi") || q.eq_ignore_ascii_case("multi-res"))
     }
 
+    pub fn parsed_resolution_u64(&self) -> Option<u64> {
+        self.quality.as_deref().and_then(|q| {
+            let trimmed = q.trim();
+            if trimmed.eq_ignore_ascii_case("4k") || trimmed.eq_ignore_ascii_case("uhd") {
+                return Some(2160);
+            }
+            trimmed.trim_end_matches(['p', 'P']).parse::<u64>().ok()
+        })
+    }
+
     pub fn resolution_u64(&self) -> u64 {
-        self.quality
-            .as_deref()
-            .and_then(|q| {
-                let trimmed = q.trim();
-                if trimmed.eq_ignore_ascii_case("4k") || trimmed.eq_ignore_ascii_case("uhd") {
-                    return Some(2160);
-                }
-                trimmed.trim_end_matches(['p', 'P']).parse::<u64>().ok()
-            })
-            .unwrap_or(1080)
+        self.parsed_resolution_u64().unwrap_or(0)
     }
 
     pub fn resolution_i64(&self) -> i64 {
@@ -501,7 +502,8 @@ mod tests {
         assert_eq!(make_release(Some("4k")).resolution_u64(), 2160);
         assert_eq!(make_release(Some("2160p")).resolution_u64(), 2160);
         assert_eq!(make_release(Some("1080p")).resolution_u64(), 1080);
-        assert_eq!(make_release(None).resolution_u64(), 1080);
+        assert_eq!(make_release(None).resolution_u64(), 0);
+        assert_eq!(make_release(None).parsed_resolution_u64(), None);
     }
 
     #[test]
