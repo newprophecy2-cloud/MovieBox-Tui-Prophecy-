@@ -265,7 +265,9 @@ pub async fn build_home_catalog(registry: &ProviderRegistry) -> Option<CachedHom
                     }
                 }
                 build_canonical_structure(&mut anime);
-                if anime.verified_episodes > 0 {
+                let has_playable_movie = anime.media_type == MediaType::Movie
+                    && anime.seasons.iter().any(|s| !s.episodes.is_empty());
+                if anime.verified_episodes > 0 || has_playable_movie {
                     let anilist_poster = media
                         .cover_image
                         .as_ref()
@@ -309,9 +311,9 @@ pub async fn build_home_catalog(registry: &ProviderRegistry) -> Option<CachedHom
                         poster_url: anilist_poster.or_else(|| provider_poster.clone()),
                         poster_fallback_url: provider_poster,
                         banner_url: media.banner_image.clone(),
-                        total_seasons: anime.total_seasons,
-                        total_episodes: media.episodes.unwrap_or(anime.total_episodes),
-                        verified_episodes: anime.verified_episodes,
+                        total_seasons: if has_playable_movie { 1 } else { anime.total_seasons },
+                        total_episodes: media.episodes.unwrap_or(if has_playable_movie { 1 } else { anime.total_episodes }),
+                        verified_episodes: if has_playable_movie { 1 } else { anime.verified_episodes },
                         primary_episode_id: primary_ep,
                         counts_status: "hydrated",
                         available_providers: avail_providers,
