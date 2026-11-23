@@ -330,8 +330,8 @@ pub async fn dispatch_route(
         .await;
     }
 
-    // Route 0: GET /api/v1/home
-    if method == "GET" && normalized == "/api/v1/home" {
+    // Route 0: GET /api/v1/catalog/home
+    if method == "GET" && normalized == "/api/v1/catalog/home" {
         return handle_home(stream, state).await;
     }
 

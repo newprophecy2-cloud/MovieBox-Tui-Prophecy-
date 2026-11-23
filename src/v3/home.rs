@@ -11,7 +11,7 @@ use tokio::sync::Semaphore;
 const ANILIST_ENDPOINT: &str = "https://graphql.anilist.co";
 const HOME_QUERY: &str = r#"
 query HomeFeeds {
-  trending: Page(page: 1, perPage: 12) {
+  trending: Page(page: 1, perPage: 6) {
     media(type: ANIME, sort: TRENDING_DESC, isAdult: false) {
       id format status seasonYear averageScore genres description(asHtml: false)
       episodes
@@ -20,7 +20,7 @@ query HomeFeeds {
       bannerImage
     }
   }
-  seasonal: Page(page: 1, perPage: 12) {
+  seasonal: Page(page: 1, perPage: 6) {
     media(type: ANIME, sort: POPULARITY_DESC, status: RELEASING, isAdult: false) {
       id format status seasonYear averageScore genres description(asHtml: false)
       episodes
@@ -29,7 +29,7 @@ query HomeFeeds {
       bannerImage
     }
   }
-  popular: Page(page: 1, perPage: 12) {
+  popular: Page(page: 1, perPage: 6) {
     media(type: ANIME, sort: POPULARITY_DESC, isAdult: false) {
       id format status seasonYear averageScore genres description(asHtml: false)
       episodes
@@ -38,7 +38,7 @@ query HomeFeeds {
       bannerImage
     }
   }
-  movies: Page(page: 1, perPage: 12) {
+  movies: Page(page: 1, perPage: 6) {
     media(type: ANIME, format: MOVIE, sort: POPULARITY_DESC, isAdult: false) {
       id format status seasonYear averageScore genres description(asHtml: false)
       episodes
@@ -205,7 +205,7 @@ pub async fn build_home_catalog(registry: &ProviderRegistry) -> Option<CachedHom
         }
     }
 
-    let sem = Arc::new(Semaphore::new(4));
+    let sem = Arc::new(Semaphore::new(6));
     let tasks = unique_media.into_iter().map(|media| {
         let reg = registry.clone();
         let permit_sem = sem.clone();
@@ -216,7 +216,10 @@ pub async fn build_home_catalog(registry: &ProviderRegistry) -> Option<CachedHom
                 .format
                 .as_deref()
                 .is_some_and(|f| f.eq_ignore_ascii_case("MOVIE"));
-            let (normalized, _, _, _) = reg.search_all(&title).await;
+            let (normalized, _, _, _) =
+                tokio::time::timeout(Duration::from_secs(6), reg.search_all(&title))
+                    .await
+                    .ok()?;
             if normalized.is_empty() {
                 return None;
             }
