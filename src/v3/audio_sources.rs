@@ -1097,7 +1097,11 @@ pub async fn collect_episode_sources(
 
         match validate_stream_url_and_inspect(&resolved_url, &validation_headers).await {
             Ok((mut playability_status, http_status_code, manifest_tracks)) => {
-                let ffprobe_tracks = if manifest_tracks.is_empty() {
+                let sync_ffprobe = std::env::var("PV_SYNC_FFPROBE")
+                    .ok()
+                    .as_deref()
+                    == Some("1");
+                let ffprobe_tracks = if sync_ffprobe && manifest_tracks.is_empty() {
                     let probed =
                         extract_ffprobe_audio_streams(&resolved_url, &validation_headers).await;
                     if !probed.is_empty() {

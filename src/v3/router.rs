@@ -1,8 +1,9 @@
 use crate::providers::models::{EpisodeProvenance, MediaType, ProviderKind};
 use crate::v3::audio_sources::{
-    ResolveFailure, collect_episode_sources, compute_audio_availability, group_sources_by_provider,
-    resolve_episode_stream,
+    ResolveFailure, SourceCollectionResult, collect_episode_sources, compute_audio_availability,
+    group_sources_by_provider, resolve_episode_stream,
 };
+use crate::v3::home::{CachedHomeData, HomeResponse, build_home_catalog};
 use crate::v3::matching::{build_canonical_structure, merge_search_results, query_matches_anime};
 use crate::v3::models::*;
 use crate::v3::providers::{ProviderRegistry, provider_display_name, provider_key};
@@ -14,13 +15,25 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 
 static REQ_SEQ: AtomicU64 = AtomicU64::new(1);
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 64 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
+const SEARCH_CACHE_TTL: Duration = Duration::from_secs(600);
+const ANIME_CACHE_TTL: Duration = Duration::from_secs(1200);
+const SOURCE_CACHE_TTL: Duration = Duration::from_secs(1200);
+const HOME_CACHE_TTL: Duration = Duration::from_secs(1200);
+
+type CachedSearchEntry = (
+    Instant,
+    Vec<NormalizedAnime>,
+    Vec<ProviderFailure>,
+    usize,
+    BTreeMap<String, String>,
+);
 
 #[derive(Clone)]
 pub struct V3AppState {
@@ -28,6 +41,12 @@ pub struct V3AppState {
     pub registry: ProviderRegistry,
     pub rate_limiter: Arc<Mutex<HashMap<IpAddr, (Instant, u32)>>>,
     pub rate_limit_per_min: u32,
+    pub global_search_cache: Arc<RwLock<HashMap<String, CachedSearchEntry>>>,
+    pub global_anime_cache: Arc<RwLock<HashMap<String, (Instant, CanonicalAnime)>>>,
+    pub global_source_cache:
+        Arc<RwLock<HashMap<String, (Instant, SourceCollectionResult, AudioAvailability)>>>,
+    pub home_cache: Arc<RwLock<Option<CachedHomeData>>>,
+    pub home_refresh_lock: Arc<Mutex<()>>,
 }
 
 impl V3AppState {
@@ -42,6 +61,11 @@ impl V3AppState {
             registry: ProviderRegistry::from_env(),
             rate_limiter: Arc::new(Mutex::new(HashMap::new())),
             rate_limit_per_min,
+            global_search_cache: Arc::new(RwLock::new(HashMap::new())),
+            global_anime_cache: Arc::new(RwLock::new(HashMap::new())),
+            global_source_cache: Arc::new(RwLock::new(HashMap::new())),
+            home_cache: Arc::new(RwLock::new(None)),
+            home_refresh_lock: Arc::new(Mutex::new(())),
         }
     }
 }
@@ -59,6 +83,22 @@ pub const REGISTERED_ANIME_ROUTES: [&str; 7] = [
 pub async fn run() -> std::io::Result<()> {
     let state = V3AppState::from_env();
     state.sessions.spawn_cleanup_task();
+
+    // Pre-warm Home catalog on startup and refresh every 15 minutes in the background.
+    {
+        let bg_state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                let _lock = bg_state.home_refresh_lock.lock().await;
+                if let Some(data) = build_home_catalog(&bg_state.registry).await {
+                    let mut w = bg_state.home_cache.write().await;
+                    *w = Some(data);
+                }
+                drop(_lock);
+                tokio::time::sleep(Duration::from_secs(900)).await;
+            }
+        });
+    }
 
     let port = std::env::var("PORT")
         .ok()
@@ -290,6 +330,11 @@ pub async fn dispatch_route(
         .await;
     }
 
+    // Route 0: GET /api/v1/home
+    if method == "GET" && normalized == "/api/v1/home" {
+        return handle_home(stream, state).await;
+    }
+
     // Route 1: GET /api/v1/anime/search?q={query}
     if method == "GET" && normalized == "/api/v1/anime/search" {
         return handle_search(stream, query, state).await;
@@ -384,6 +429,69 @@ fn build_provider_variants(anime: &CanonicalAnime) -> Vec<ProviderVariantInfo> {
         .collect()
 }
 
+async fn handle_home(
+    stream: &mut TcpStream,
+    state: &V3AppState,
+) -> std::io::Result<u16> {
+    let cached_now = {
+        let r = state.home_cache.read().await;
+        r.clone()
+    };
+    let (data, was_cached) = if let Some(d) = cached_now {
+        if d.built_at.elapsed() >= HOME_CACHE_TTL {
+            let bg = state.clone();
+            tokio::spawn(async move {
+                if let Ok(_guard) = bg.home_refresh_lock.try_lock()
+                    && let Some(fresh) = build_home_catalog(&bg.registry).await
+                {
+                    let mut w = bg.home_cache.write().await;
+                    *w = Some(fresh);
+                }
+            });
+        }
+        (d, true)
+    } else {
+        let _lock = state.home_refresh_lock.lock().await;
+        let double_check = { state.home_cache.read().await.clone() };
+        if let Some(d) = double_check {
+            (d, true)
+        } else {
+            match build_home_catalog(&state.registry).await {
+                Some(fresh) => {
+                    let mut w = state.home_cache.write().await;
+                    *w = Some(fresh.clone());
+                    (fresh, false)
+                }
+                None => {
+                    return write_error(
+                        stream,
+                        502,
+                        "HOME_UNAVAILABLE",
+                        "Could not build home catalog from upstream metadata.",
+                        None,
+                    )
+                    .await;
+                }
+            }
+        }
+    };
+
+    let session = state.sessions.create_session(data.seeded_anime).await;
+    let session_id = { session.read().await.session_id.clone() };
+
+    write_json(
+        stream,
+        200,
+        &HomeResponse {
+            status: "success",
+            session_id,
+            cached: was_cached,
+            sections: data.sections,
+        },
+    )
+    .await
+}
+
 async fn handle_search(
     stream: &mut TcpStream,
     query: &str,
@@ -402,8 +510,44 @@ async fn handle_search(
         .await;
     }
 
-    let (normalized, failures, total_enabled, provider_coverage) =
-        state.registry.search_all(trimmed).await;
+    let cache_key = trimmed.to_lowercase();
+    let cached_hit = {
+        let guard = state.global_search_cache.read().await;
+        guard
+            .get(&cache_key)
+            .filter(|(ts, ..)| ts.elapsed() < SEARCH_CACHE_TTL)
+            .cloned()
+    };
+
+    let (normalized, failures, total_enabled, provider_coverage) = if let Some((
+        _,
+        norm,
+        fail,
+        tot,
+        cov,
+    )) = cached_hit
+    {
+        (norm, fail, tot, cov)
+    } else {
+        let res = state.registry.search_all(trimmed).await;
+        if !res.0.is_empty() {
+            let mut w = state.global_search_cache.write().await;
+            if w.len() > 500 {
+                w.retain(|_, (ts, ..)| ts.elapsed() < SEARCH_CACHE_TTL);
+            }
+            w.insert(
+                cache_key,
+                (
+                    Instant::now(),
+                    res.0.clone(),
+                    res.1.clone(),
+                    res.2,
+                    res.3.clone(),
+                ),
+            );
+        }
+        res
+    };
     if total_enabled == 0 || (normalized.is_empty() && failures.len() >= total_enabled) {
         return write_error(
             stream,
@@ -500,6 +644,29 @@ async fn ensure_anime_hydrated(
         return Ok(anime);
     }
 
+    let cached_anime = {
+        let guard = state.global_anime_cache.read().await;
+        guard
+            .get(&anime.id)
+            .filter(|(ts, _)| ts.elapsed() < ANIME_CACHE_TTL)
+            .map(|(_, a)| a.clone())
+    };
+    if let Some(hit) = cached_anime {
+        let mut guard = session.write().await;
+        for season in &hit.seasons {
+            guard
+                .season_index
+                .insert(season.id.clone(), hit.id.clone());
+            for ep in &season.episodes {
+                guard
+                    .episode_index
+                    .insert(ep.id.clone(), (hit.id.clone(), season.id.clone()));
+            }
+        }
+        guard.anime_records.insert(hit.id.clone(), hit.clone());
+        return Ok(hit);
+    }
+
     let futs = anime.provider_records.iter().map(|rec| {
         let reg = state.registry.clone();
         let pid = rec.provider_id;
@@ -531,6 +698,44 @@ async fn ensure_anime_hydrated(
     }
 
     build_canonical_structure(&mut anime);
+
+    // Retry failed providers once if Movie or Series yielded 0 verified episodes.
+    if anime.verified_episodes == 0
+        && anime.provider_records.iter().any(|r| r.details_failed)
+    {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let retry_futs = anime
+            .provider_records
+            .iter()
+            .filter(|r| r.details_failed)
+            .map(|rec| {
+                let reg = state.registry.clone();
+                let pid = rec.provider_id;
+                let aid = rec.provider_anime_id.clone();
+                async move { (pid, aid.clone(), reg.fetch_details(pid, &aid).await) }
+            });
+        let retry_outcomes = futures::future::join_all(retry_futs).await;
+        for (pid, aid, res) in retry_outcomes {
+            if let Some(rec) = anime
+                .provider_records
+                .iter_mut()
+                .find(|r| r.provider_id == pid && r.provider_anime_id == aid)
+                && let Ok(det) = res
+            {
+                rec.details = Some(det);
+                rec.details_failed = false;
+            }
+        }
+        build_canonical_structure(&mut anime);
+    }
+
+    if anime.verified_episodes > 0 {
+        let mut w = state.global_anime_cache.write().await;
+        if w.len() > 500 {
+            w.retain(|_, (ts, _)| ts.elapsed() < ANIME_CACHE_TTL);
+        }
+        w.insert(anime.id.clone(), (Instant::now(), anime.clone()));
+    }
 
     let mut guard = session.write().await;
     for season in &anime.seasons {
@@ -790,8 +995,46 @@ async fn ensure_episode_sources_hydrated(
         return Ok((episode, srcs, audio, cov));
     }
 
-    let collected = collect_episode_sources(&state.registry, &episode).await;
-    let audio = compute_audio_availability(&collected.candidates, collected.all_failed);
+    let mut source_cache_parts: Vec<String> = episode
+        .provider_mappings
+        .iter()
+        .map(|m| {
+            format!(
+                "{}:{}:{}:{}",
+                provider_key(m.provider_id),
+                m.provider_anime_id,
+                m.provider_season_number,
+                m.provider_episode_number
+            )
+        })
+        .collect();
+    source_cache_parts.sort();
+    let source_cache_key = source_cache_parts.join("|");
+
+    let global_hit = if !source_cache_key.is_empty() {
+        let guard = state.global_source_cache.read().await;
+        guard
+            .get(&source_cache_key)
+            .filter(|(ts, ..)| ts.elapsed() < SOURCE_CACHE_TTL)
+            .map(|(_, c, a)| (c.clone(), a.clone()))
+    } else {
+        None
+    };
+
+    let (collected, audio) = if let Some((c, a)) = global_hit {
+        (c, a)
+    } else {
+        let c = collect_episode_sources(&state.registry, &episode).await;
+        let a = compute_audio_availability(&c.candidates, c.all_failed);
+        if !source_cache_key.is_empty() && !c.candidates.is_empty() {
+            let mut w = state.global_source_cache.write().await;
+            if w.len() > 1000 {
+                w.retain(|_, (ts, ..)| ts.elapsed() < SOURCE_CACHE_TTL);
+            }
+            w.insert(source_cache_key, (Instant::now(), c.clone(), a.clone()));
+        }
+        (c, a)
+    };
 
     {
         let mut guard = session.write().await;
