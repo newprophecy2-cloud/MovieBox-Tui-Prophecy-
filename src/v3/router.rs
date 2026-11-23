@@ -729,7 +729,9 @@ async fn ensure_anime_hydrated(
         build_canonical_structure(&mut anime);
     }
 
-    if anime.verified_episodes > 0 {
+    let has_playable_movie = anime.media_type == MediaType::Movie
+        && anime.seasons.iter().any(|s| !s.episodes.is_empty());
+    if anime.verified_episodes > 0 || has_playable_movie {
         let mut w = state.global_anime_cache.write().await;
         if w.len() > 500 {
             w.retain(|_, (ts, _)| ts.elapsed() < ANIME_CACHE_TTL);
@@ -794,6 +796,15 @@ async fn handle_anime_details(
     };
     let provider_coverage = build_anime_provider_coverage(&anime, &state.registry);
     let provider_variants = build_provider_variants(&anime);
+    let primary_episode_id = if anime.media_type == MediaType::Movie {
+        anime
+            .seasons
+            .first()
+            .and_then(|s| s.episodes.first())
+            .map(|e| e.id.clone())
+    } else {
+        None
+    };
 
     write_json(
         stream,
@@ -814,6 +825,7 @@ async fn handle_anime_details(
             unverified_episodes: anime.unverified_episodes,
             synthetic_episodes: anime.synthetic_episodes,
             season_structure_status: anime.season_structure_status,
+            primary_episode_id,
             provider_coverage,
             provider_variants,
         },

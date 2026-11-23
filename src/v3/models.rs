@@ -500,6 +500,8 @@ pub struct AnimeDetailsResponse {
     pub unverified_episodes: usize,
     pub synthetic_episodes: usize,
     pub season_structure_status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary_episode_id: Option<String>,
     pub provider_coverage: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_variants: Vec<ProviderVariantInfo>,
