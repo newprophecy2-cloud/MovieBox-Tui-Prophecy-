@@ -477,7 +477,7 @@ pub struct SearchResponse {
     pub all_provider_stream_sources: Vec<PublicSourceItem>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ProviderFailureInfo {
     pub provider: String,
     pub reason: String,

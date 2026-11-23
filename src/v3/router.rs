@@ -30,7 +30,7 @@ const HOME_CACHE_TTL: Duration = Duration::from_secs(1200);
 type CachedSearchEntry = (
     Instant,
     Vec<NormalizedAnime>,
-    Vec<ProviderFailure>,
+    Vec<ProviderFailureInfo>,
     usize,
     BTreeMap<String, String>,
 );

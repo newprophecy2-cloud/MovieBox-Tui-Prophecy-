@@ -35,7 +35,7 @@ pub struct ManifestAudioTrack {
     pub track_selection_metadata: TrackSelectionMetadata,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SourceCollectionResult {
     pub candidates: Vec<ProviderSourceCandidate>,
     pub all_failed: bool,
